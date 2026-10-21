@@ -1,0 +1,45 @@
+[build-system]
+requires = ["setuptools>=80"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "itsm-backend"
+version = "0.1.0"
+description = "ITSM backend foundation: FastAPI API, SQLAlchemy database layer and Huey task adapter."
+requires-python = ">=3.14"
+license = "UNLICENSED"
+dependencies = [
+    "fastapi==0.156.8",
+    "uvicorn==0.54.0",
+    "pydantic==2.14.1",
+    "pydantic-settings==2.16.1",
+    "SQLAlchemy==2.1.5",
+    "alembic==1.20.0",
+    "huey==3.4.0",
+    "psycopg[binary]==3.3.6",
+    "redis==8.1.0",
+    "PyMySQL==1.2.3",
+]
+
+[project.optional-dependencies]
+# Not installed or validated on this host: no OS ODBC driver available yet.
+mssql = ["pyodbc==5.3.0"]
+
+[project.scripts]
+itsm-tasks = "itsm.tasks.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["itsm*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+
+[tool.ruff]
+line-length = 100
+target-version = "py314"
+src = ["itsm", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = ["B008"]
