@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import logging
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from typing import Any
 
@@ -12,9 +12,12 @@ from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from itsm import __version__
+from itsm.agents.api import create_agent_router
+from itsm.agents.runtime import AgentRuntime
 from itsm.config import Settings, get_settings
 from itsm.database import (
     Readiness,
@@ -30,7 +33,9 @@ from itsm.identity.api import (
     mutation_guard,
 )
 from itsm.identity.service import AuthContext, IdentityService
+from itsm.inventory.api import create_inventory_router
 from itsm.logging import configure_logging, log_event
+from itsm.mcp.server import create_mcp_server
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
 
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{8,64}$"
@@ -97,13 +102,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     settings = settings or get_settings()
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
 
+    sessions: dict[str, Callable[[], Session]] = {}
+
+    def late_session_factory() -> Session:
+        return sessions["factory"]()
+
+    # FastMCP requires its own lifespan and reuses the API session factory.
+    mcp_app = create_mcp_server(settings, late_session_factory).http_app(path="/mcp")
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         engine = create_engine_from_settings(settings)
+        factory = create_session_factory(engine)
+        sessions["factory"] = factory
         app.state.settings = settings
         app.state.engine = engine
-        app.state.session_factory = create_session_factory(engine)
+        app.state.session_factory = factory
         app.state.task_queue = create_task_queue(settings)
+        app.state.agent_runtime = AgentRuntime(settings, app.state.session_factory)
         log_event(
             logger,
             "app.started",
@@ -113,7 +129,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             task_storage=settings.task_storage,
         )
         try:
-            yield
+            async with mcp_app.lifespan(app):
+                yield
         finally:
             engine.dispose()
             log_event(logger, "app.stopped", app=settings.app_name)
@@ -255,8 +272,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["optional_services"] = _optional_services(settings)
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
+    api.include_router(create_inventory_router())
+    api.include_router(create_agent_router())
     api.include_router(create_identity_router())
     app.include_router(api)
+    app.mount(settings.api_prefix, mcp_app)
     return app
 
 
