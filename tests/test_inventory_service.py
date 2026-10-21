@@ -6,7 +6,7 @@ from collections.abc import Callable
 
 import pytest
 from itsm.config import Settings
-from itsm.identity.service import Conflict, NotFound, PermissionDenied, ValidationFailed
+from itsm.identity.service import NotFound, PermissionDenied, ValidationFailed
 from itsm.inventory.service import InventoryService
 from sqlalchemy.orm import Session
 from tests.inventory_support import OPERATOR, READER, Catalog, asset_values, prepare
@@ -45,14 +45,22 @@ def test_create_preserves_explicit_quick_code_and_status(catalog: Catalog) -> No
     assert created.site == "Example Site"
 
 
-def test_quick_code_is_unique_case_insensitively(catalog: Catalog) -> None:
+def test_quick_code_collision_is_case_insensitive_and_advances_the_suffix(
+    catalog: Catalog,
+) -> None:
     with catalog.session() as session:
-        service(catalog, session).create(catalog.admin(), asset_values(quick_code="SITE-DEMO-001"))
+        first = service(catalog, session).create(
+            catalog.admin(), asset_values(quick_code="SITE-DEMO-001")
+        )
 
-    with pytest.raises(Conflict), catalog.session() as session:
-        service(catalog, session).create(catalog.admin(), asset_values(quick_code="SITE-DEMO-001"))
+    with catalog.session() as session:
+        second = service(catalog, session).create(
+            catalog.admin(), asset_values(quick_code="SITE-DEMO-001")
+        )
 
-    assert catalog.asset_count() == 1
+    assert second.quick_code == "SITE-DEMO-002"
+    assert second.id != first.id
+    assert catalog.asset_count() == 2
 
 
 def test_update_changes_quick_code_and_keeps_the_same_id(catalog: Catalog) -> None:
@@ -156,12 +164,12 @@ def test_responsible_changes_require_the_assign_permission(catalog: Catalog) -> 
         )
 
 
-def test_batch_create_is_atomic_on_duplicate_quick_code(catalog: Catalog) -> None:
+def test_batch_create_advances_a_colliding_numeric_suffix(catalog: Catalog) -> None:
     with catalog.session() as session:
         service(catalog, session).create(catalog.admin(), asset_values(quick_code="DUP-1"))
 
-    with pytest.raises(Conflict), catalog.session() as session:
-        service(catalog, session).batch(
+    with catalog.session() as session:
+        result = service(catalog, session).batch(
             catalog.admin(),
             create=[
                 asset_values(quick_code="NEW-1"),
@@ -169,7 +177,8 @@ def test_batch_create_is_atomic_on_duplicate_quick_code(catalog: Catalog) -> Non
             ],
         )
 
-    assert catalog.asset_count() == 1
+    assert [view.quick_code for view in result.created] == ["NEW-1", "dup-2"]
+    assert catalog.asset_count() == 3
 
 
 def test_batch_create_requires_assign_for_a_responsible(catalog: Catalog) -> None:

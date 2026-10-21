@@ -239,9 +239,15 @@ def test_chat_tool_registry_is_bounded_to_inventory_operations(
 
     assert response.status_code == 200
     assert seen["tools"] == [
+        "archive_asset",
         "batch_update_assets",
+        "clone_asset",
         "create_asset",
         "get_asset",
+        "get_asset_history",
+        "get_inventory_config",
+        "restore_asset",
+        "retire_asset",
         "search_assets",
         "update_asset",
     ]

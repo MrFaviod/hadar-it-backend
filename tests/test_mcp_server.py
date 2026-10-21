@@ -26,6 +26,12 @@ TOOL_NAMES = {
     "create_asset",
     "update_asset",
     "batch_update_assets",
+    "clone_asset",
+    "archive_asset",
+    "restore_asset",
+    "retire_asset",
+    "get_asset_history",
+    "get_inventory_config",
 }
 
 
@@ -229,6 +235,7 @@ def test_mcp_batch_is_bounded_atomic_and_compact(mcp: McpServer) -> None:
         "responsible",
         "status",
         "ip",
+        "archived",
     }
 
     with pytest.raises(ToolError):

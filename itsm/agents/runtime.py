@@ -1,6 +1,6 @@
 """Conversational inventory assistant built on a real Pydantic AI agent.
 
-The agent is deliberately narrow: five typed inventory tools over the canonical
+The agent is deliberately narrow: eleven typed inventory tools over the canonical
 service, a server-configured provider/model and bounded steps, history, input
 and output. It has no shell, SQL, filesystem or HTTP tool, and untrusted chat
 text cannot grant permissions or supply a principal.
@@ -23,6 +23,8 @@ from itsm.identity.service import (
     Principal,
     ValidationFailed,
 )
+from itsm.inventory.catalog import InventoryCatalog
+from itsm.inventory.projection import project, validate_fields
 from itsm.inventory.service import (
     AssetView,
     BatchResult,
@@ -51,6 +53,12 @@ TOOL_NAMES: tuple[str, ...] = (
     "create_asset",
     "update_asset",
     "batch_update_assets",
+    "clone_asset",
+    "archive_asset",
+    "restore_asset",
+    "retire_asset",
+    "get_asset_history",
+    "get_inventory_config",
 )
 MAX_RESULTS = 50
 
@@ -153,6 +161,8 @@ class BatchUpdateArg(BaseModel):
     responsible: str | None = None
     status: str | None = None
     description: str | None = None
+    cost: str | float | None = None
+    technical: dict[str, Any] | None = None
 
 
 @contextmanager
@@ -169,11 +179,12 @@ def _record(
     tool: str,
     status: Literal["completed", "failed", "denied"],
     views: tuple[AssetView, ...] = (),
+    fields: list[str] | None = None,
 ) -> None:
     deps.actions.append(ChatAction(tool=tool, status=status, assetIds=[view.id for view in views]))
     for view in views:
         if len(deps.results) < MAX_RESULTS:
-            deps.results.append(view.as_payload())
+            deps.results.append(project(view, fields))
 
 
 def _failure(
@@ -187,9 +198,11 @@ def _execute(
     deps: AgentDeps,
     tool: str,
     operation: Callable[[InventoryService], Any],
+    fields: list[str] | None = None,
 ) -> dict[str, Any]:
     """Run one tool through the canonical service and record a compact action."""
     try:
+        validate_fields(fields)
         with _service(deps) as inventory:
             result = operation(inventory)
     except PermissionDenied:
@@ -205,21 +218,21 @@ def _execute(
         return _failure(deps, tool, "failed", "La operación no pudo completarse.")
 
     if isinstance(result, AssetView):
-        _record(deps, tool, "completed", (result,))
-        return {"ok": True, "asset": result.as_payload()}
+        _record(deps, tool, "completed", (result,), fields)
+        return {"ok": True, "asset": project(result, fields)}
     if isinstance(result, InventoryPage):
-        _record(deps, tool, "completed", result.items)
+        _record(deps, tool, "completed", result.items, fields)
         return {
             "ok": True,
             "total": result.total,
-            "items": [item.as_payload() for item in result.items],
+            "items": [project(item, fields) for item in result.items],
         }
     if isinstance(result, BatchResult):
-        _record(deps, tool, "completed", result.created + result.updated)
+        _record(deps, tool, "completed", result.created + result.updated, fields)
         return {
             "ok": True,
-            "created": [item.as_payload() for item in result.created],
-            "updated": [item.as_payload() for item in result.updated],
+            "created": [project(item, fields) for item in result.created],
+            "updated": [project(item, fields) for item in result.updated],
         }
     return {"ok": True, "result": result}
 
@@ -234,6 +247,8 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         status: str | None = None,
         quick_code: str | None = None,
         limit: int = 10,
+        archived: bool | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Buscar activos por texto, categoría, sede, estado o código rápido."""
         return _execute(
@@ -247,16 +262,21 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
                 status=status,
                 quick_code=quick_code,
                 limit=limit,
+                archived=archived,
             ),
+            fields,
         )
 
     @agent.tool
-    def get_asset(ctx: RunContext[AgentDeps], asset_id: str) -> dict[str, Any]:
+    def get_asset(
+        ctx: RunContext[AgentDeps], asset_id: str, fields: list[str] | None = None
+    ) -> dict[str, Any]:
         """Consultar el detalle de un activo por su id permanente."""
         return _execute(
             ctx.deps,
             "get_asset",
             lambda inventory: inventory.get(ctx.deps.principal, asset_id),
+            fields,
         )
 
     @agent.tool
@@ -275,6 +295,9 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         responsible: str | None = None,
         status: str | None = None,
         description: str | None = None,
+        cost: str | float | None = None,
+        technical: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Registrar un activo nuevo con los datos que aportó la persona."""
         values = {
@@ -291,6 +314,8 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "responsible": responsible,
             "status": status,
             "description": description,
+            "cost": cost,
+            "technical": technical,
         }
         return _execute(
             ctx.deps,
@@ -299,6 +324,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
                 ctx.deps.principal,
                 {key: value for key, value in values.items() if value is not None},
             ),
+            fields,
         )
 
     @agent.tool
@@ -318,6 +344,9 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         responsible: str | None = None,
         status: str | None = None,
         description: str | None = None,
+        cost: str | float | None = None,
+        technical: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Actualizar campos concretos de un activo existente; nunca su id."""
         values = {
@@ -334,17 +363,20 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "responsible": responsible,
             "status": status,
             "description": description,
+            "cost": cost,
+            "technical": technical,
         }
         changes = {key: value for key, value in values.items() if value is not None}
         return _execute(
             ctx.deps,
             "update_asset",
             lambda inventory: inventory.update(ctx.deps.principal, asset_id, changes),
+            fields,
         )
 
     @agent.tool
     def batch_update_assets(
-        ctx: RunContext[AgentDeps], updates: list[BatchUpdateArg]
+        ctx: RunContext[AgentDeps], updates: list[BatchUpdateArg], fields: list[str] | None = None
     ) -> dict[str, Any]:
         """Actualizar varios activos en una sola operación atómica y acotada."""
         changes = []
@@ -356,6 +388,75 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ctx.deps,
             "batch_update_assets",
             lambda inventory: inventory.batch(ctx.deps.principal, update=changes),
+            fields,
+        )
+
+    @agent.tool
+    def clone_asset(
+        ctx: RunContext[AgentDeps],
+        asset_id: str,
+        name: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Duplicar con UUID nuevo, sin heredar el archivado ni las imágenes."""
+        return _execute(
+            ctx.deps,
+            "clone_asset",
+            lambda service: service.clone(
+                ctx.deps.principal, asset_id, {"name": name} if name else None
+            ),
+            fields,
+        )
+
+    @agent.tool
+    def archive_asset(
+        ctx: RunContext[AgentDeps], asset_id: str, reason: str | None = None
+    ) -> dict[str, Any]:
+        """Archivar sin cambiar estado, responsable ni ubicación."""
+        return _execute(
+            ctx.deps,
+            "archive_asset",
+            lambda service: service.archive(ctx.deps.principal, asset_id, reason=reason),
+        )
+
+    @agent.tool
+    def restore_asset(ctx: RunContext[AgentDeps], asset_id: str) -> dict[str, Any]:
+        """Restaurar un activo archivado, sin alterar sus otros datos."""
+        return _execute(
+            ctx.deps, "restore_asset", lambda service: service.restore(ctx.deps.principal, asset_id)
+        )
+
+    @agent.tool
+    def retire_asset(ctx: RunContext[AgentDeps], asset_id: str, reason: str) -> dict[str, Any]:
+        """Dar de baja con motivo y controles de transición y asignación."""
+        return _execute(
+            ctx.deps,
+            "retire_asset",
+            lambda service: service.retire(ctx.deps.principal, asset_id, reason=reason),
+        )
+
+    @agent.tool
+    def get_asset_history(
+        ctx: RunContext[AgentDeps], asset_id: str, limit: int = 20, offset: int = 0
+    ) -> dict[str, Any]:
+        """Consultar historial acotado por UUID permanente."""
+        return _execute(
+            ctx.deps,
+            "get_asset_history",
+            lambda service: service.history(
+                ctx.deps.principal, asset_id, limit=limit, offset=offset
+            ).as_payload(),
+        )
+
+    @agent.tool
+    def get_inventory_config(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Consultar formularios, campos, estados y reglas configurados."""
+        return _execute(
+            ctx.deps,
+            "get_inventory_config",
+            lambda service: InventoryCatalog(service._session, ctx.deps.settings).get(
+                ctx.deps.principal
+            ),
         )
 
 

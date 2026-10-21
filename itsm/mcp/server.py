@@ -27,6 +27,8 @@ from itsm.identity.service import (
     Principal,
     ValidationFailed,
 )
+from itsm.inventory.catalog import InventoryCatalog
+from itsm.inventory.projection import project, validate_fields
 from itsm.inventory.service import BATCH_LIMIT, AssetView, InventoryService
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -39,18 +41,12 @@ TOOL_NAMES: tuple[str, ...] = (
     "create_asset",
     "update_asset",
     "batch_update_assets",
-)
-
-COMPACT_FIELDS: tuple[str, ...] = (
-    "id",
-    "quickCode",
-    "name",
-    "category",
-    "site",
-    "location",
-    "responsible",
-    "status",
-    "ip",
+    "clone_asset",
+    "archive_asset",
+    "restore_asset",
+    "retire_asset",
+    "get_asset_history",
+    "get_inventory_config",
 )
 
 INSTRUCTIONS = """\
@@ -60,10 +56,9 @@ change. Use search/get before updating, and never assume an asset exists.
 """
 
 
-def compact(view: AssetView) -> dict[str, Any]:
-    """Return only the fields an external agent needs."""
-    payload = view.as_payload()
-    return {field: payload[field] for field in COMPACT_FIELDS}
+def compact(view: AssetView, fields: list[str] | None = None) -> dict[str, Any]:
+    """Project only explicitly allowed public fields."""
+    return project(view, fields)
 
 
 class DatabaseTokenVerifier(TokenVerifier):
@@ -115,6 +110,8 @@ class BatchUpdateInput(BaseModel):
     responsible: str | None = None
     status: str | None = None
     description: str | None = None
+    cost: str | float | None = None
+    technical: dict[str, Any] | None = None
 
 
 def _bearer_token() -> str:
@@ -175,6 +172,8 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         status: str | None = None,
         quick_code: str | None = None,
         limit: int = 10,
+        archived: bool | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Search assets by text, category, site, status or quick code."""
 
@@ -187,17 +186,18 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 status=status,
                 quick_code=quick_code,
                 limit=limit,
+                archived=archived,
             )
-            return {"total": page.total, "items": [compact(view) for view in page.items]}
+            return {"total": page.total, "items": [compact(view, fields) for view in page.items]}
 
         return run(operation)
 
     @server.tool
-    def get_asset(asset_id: str) -> dict[str, Any]:
+    def get_asset(asset_id: str, fields: list[str] | None = None) -> dict[str, Any]:
         """Read one asset by its permanent UUID."""
 
         def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
-            return compact(service.get(principal, asset_id))
+            return compact(service.get(principal, asset_id), fields)
 
         return run(operation)
 
@@ -216,6 +216,9 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         responsible: str | None = None,
         status: str | None = None,
         description: str | None = None,
+        cost: str | float | None = None,
+        technical: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a new asset; the server generates the permanent id."""
         values = {
@@ -232,14 +235,18 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             "responsible": responsible,
             "status": status,
             "description": description,
+            "cost": cost,
+            "technical": technical,
         }
 
         def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
             return compact(
                 service.create(
                     principal,
                     {key: value for key, value in values.items() if value is not None},
-                )
+                ),
+                fields,
             )
 
         return run(operation)
@@ -260,6 +267,9 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         responsible: str | None = None,
         status: str | None = None,
         description: str | None = None,
+        cost: str | float | None = None,
+        technical: dict[str, Any] | None = None,
+        fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update selected fields of one asset; its permanent id never changes."""
         values = {
@@ -276,16 +286,21 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             "responsible": responsible,
             "status": status,
             "description": description,
+            "cost": cost,
+            "technical": technical,
         }
         changes = {key: value for key, value in values.items() if value is not None}
 
         def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
-            return compact(service.update(principal, asset_id, changes))
+            validate_fields(fields)
+            return compact(service.update(principal, asset_id, changes), fields)
 
         return run(operation)
 
     @server.tool
-    def batch_update_assets(updates: list[BatchUpdateInput]) -> dict[str, Any]:
+    def batch_update_assets(
+        updates: list[BatchUpdateInput], fields: list[str] | None = None
+    ) -> dict[str, Any]:
         """Update several assets atomically; the whole batch is bounded."""
         if len(updates) > BATCH_LIMIT:
             raise ToolError(f"updates must have at most {BATCH_LIMIT} entries")
@@ -296,13 +311,63 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             changes.append({"id": asset_id, **payload})
 
         def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
             result = service.batch(principal, update=changes)
             return {
-                "created": [compact(view) for view in result.created],
-                "updated": [compact(view) for view in result.updated],
+                "created": [compact(view, fields) for view in result.created],
+                "updated": [compact(view, fields) for view in result.updated],
             }
 
         return run(operation)
+
+    @server.tool
+    def clone_asset(
+        asset_id: str, name: str | None = None, fields: list[str] | None = None
+    ) -> dict[str, Any]:
+        """Duplicate an asset with a fresh permanent UUID and quick code."""
+
+        def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
+            return compact(
+                service.clone(principal, asset_id, {"name": name} if name else None), fields
+            )
+
+        return run(operation)
+
+    @server.tool
+    def archive_asset(asset_id: str, reason: str | None = None) -> dict[str, Any]:
+        """Archive without changing location, responsible or status."""
+        return run(
+            lambda service, principal: compact(service.archive(principal, asset_id, reason=reason))
+        )
+
+    @server.tool
+    def restore_asset(asset_id: str) -> dict[str, Any]:
+        """Remove the archive flag without changing other asset properties."""
+        return run(lambda service, principal: compact(service.restore(principal, asset_id)))
+
+    @server.tool
+    def retire_asset(asset_id: str, reason: str) -> dict[str, Any]:
+        """Retire with a recorded reason and service-level assignment checks."""
+        return run(
+            lambda service, principal: compact(service.retire(principal, asset_id, reason=reason))
+        )
+
+    @server.tool
+    def get_asset_history(asset_id: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+        """Read bounded immutable history, including retained history after purge."""
+        return run(
+            lambda service, principal: service.history(
+                principal, asset_id, limit=limit, offset=offset
+            ).as_payload()
+        )
+
+    @server.tool
+    def get_inventory_config() -> dict[str, Any]:
+        """Read configured category forms, fields, statuses and code rules."""
+        return run(
+            lambda service, principal: InventoryCatalog(service._session, settings).get(principal)
+        )
 
     return server
 

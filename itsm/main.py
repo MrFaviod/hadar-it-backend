@@ -34,6 +34,7 @@ from itsm.identity.api import (
 )
 from itsm.identity.service import AuthContext, IdentityService
 from itsm.inventory.api import create_inventory_router
+from itsm.inventory.catalog_api import create_catalog_router
 from itsm.logging import configure_logging, log_event
 from itsm.mcp.server import create_mcp_server
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
@@ -273,6 +274,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
     api.include_router(create_inventory_router())
+    api.include_router(create_catalog_router())
     api.include_router(create_agent_router())
     api.include_router(create_identity_router())
     app.include_router(api)

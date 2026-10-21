@@ -65,6 +65,12 @@ def test_create_read_and_search_return_the_same_asset(
         "responsible",
         "status",
         "description",
+        "cost",
+        "technical",
+        "archived",
+        "archivedAt",
+        "archivedBy",
+        "images",
         "createdAt",
         "updatedAt",
     }
@@ -114,12 +120,12 @@ def test_cookie_mutations_require_origin_and_csrf(
     assert catalog.asset_count() == 0
 
 
-def test_duplicate_quick_code_is_a_conflict_without_partial_write(
+def test_duplicate_numeric_quick_code_advances_without_overwriting(
     signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     catalog: Catalog,
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
-    create_asset(test_client, auth, quick_code="SITE-DEMO-001")
+    original = create_asset(test_client, auth, quick_code="SITE-DEMO-001")
 
     duplicate = test_client.post(
         "/api/v1/assets",
@@ -127,9 +133,12 @@ def test_duplicate_quick_code_is_a_conflict_without_partial_write(
         headers=auth,
     )
 
-    assert duplicate.status_code == 409
-    assert duplicate.json()["error"]["code"] == "conflict"
-    assert catalog.asset_count() == 1
+    assert duplicate.status_code == 201, duplicate.text
+    assert duplicate.json()["quickCode"] == "SITE-DEMO-002"
+    assert duplicate.json()["id"] != original["id"]
+    assert catalog.asset_count() == 2
+    stored = test_client.get(f"/api/v1/assets/{original['id']}", headers=auth)
+    assert stored.json()["quickCode"] == "SITE-DEMO-001"
 
 
 def test_validation_rejects_extra_fields_and_unknown_status(
@@ -191,7 +200,10 @@ def test_batch_is_atomic_and_reports_both_halves(
     rejected = test_client.post(
         "/api/v1/assets/batch",
         json={
-            "create": [api_values(quick_code="B-2"), api_values(quick_code="b-1")],
+            "create": [
+                api_values(quick_code="B-MANUAL"),
+                api_values(quick_code="b-manual"),
+            ],
             "update": [],
         },
         headers=auth,
