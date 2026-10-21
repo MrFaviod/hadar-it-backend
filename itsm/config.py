@@ -7,6 +7,7 @@ container environment or a secret manager.
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from typing import Any, Literal
@@ -32,6 +33,10 @@ SUPPORTED_DATABASE_DRIVERS = frozenset(
 )
 
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+
+# Provider credentials are read by the provider SDKs from the process environment;
+# they are never modeled as ITSM_ settings and never accepted from a request.
+PROVIDER_SECRET_ENV = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
@@ -78,6 +83,15 @@ class Settings(BaseSettings):
 
     log_level: str = "INFO"
 
+    # Conversational agent. The provider/model pair is server configuration;
+    # an empty value means the agent is explicitly unavailable (HTTP 503).
+    agent_model: str = ""
+    agent_max_steps: int = Field(default=8, ge=1, le=16)
+    agent_max_history_messages: int = Field(default=20, ge=0, le=50)
+    agent_max_output_tokens: int = Field(default=1024, ge=64, le=4096)
+    agent_message_max_length: int = Field(default=4000, ge=1, le=8000)
+    agent_openai_base_url: str | None = None
+
     prometheus_url: str | None = None
     meilisearch_url: str | None = None
     service_redis_url: str | None = None
@@ -118,6 +132,32 @@ class Settings(BaseSettings):
         if level not in LOG_LEVELS:
             raise ValueError(f"log_level must be one of {sorted(LOG_LEVELS)}")
         return level
+
+    @field_validator("agent_model")
+    @classmethod
+    def _validate_agent_model(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            return ""
+        provider, separator, model = normalized.partition(":")
+        if not separator or not provider or not model:
+            raise ValueError("agent_model must use the 'provider:model' form")
+        if provider not in {"openai", "anthropic"}:
+            raise ValueError("agent_model provider must be openai or anthropic")
+        if any(character.isspace() for character in model):
+            raise ValueError("agent_model must not contain whitespace")
+        return normalized
+
+    @field_validator("agent_openai_base_url")
+    @classmethod
+    def _validate_agent_base_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip()
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise ValueError("agent_openai_base_url must be an http(s) URL")
+        return normalized
 
     @field_validator("auth_origin")
     @classmethod
@@ -188,6 +228,14 @@ class Settings(BaseSettings):
             password = _url_password(raw)
             if password:
                 values.add(password)
+        if self.agent_openai_base_url:
+            password = _url_password(self.agent_openai_base_url)
+            if password:
+                values.add(password)
+        for name in PROVIDER_SECRET_ENV:
+            secret = os.environ.get(name)
+            if secret:
+                values.add(secret)
         return tuple(sorted(value for value in values if value))
 
 
