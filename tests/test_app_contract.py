@@ -29,13 +29,14 @@ def test_sqlite_queue_directory_is_created_on_demand(
 
 
 def test_unusable_queue_storage_returns_service_unavailable(
-    client: Callable[..., TestClient], settings_factory: Callable[..., Settings]
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+    settings_factory: Callable[..., Settings],
 ) -> None:
     # /proc cannot be created or written, so the queue directory is unusable.
     settings = settings_factory(task_sqlite_path=Path("/proc/itsm-tasks/huey.db"))
-    test_client = client(settings)
+    test_client, auth = signed_in_client(settings)
 
-    response = test_client.post("/api/v1/tasks/demo", json={"message": "ping"})
+    response = test_client.post("/api/v1/tasks/demo", json={"message": "ping"}, headers=auth)
 
     assert response.status_code == 503, response.text
     assert response.json()["error"]["code"] == "unavailable"

@@ -29,11 +29,11 @@ def task_state(test_client: TestClient, task_id: str) -> dict[str, object]:
 
 
 def test_failing_job_retries_bounded_and_reports_a_safe_error(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(task_retries=2, task_retry_delay_seconds=2.0)
-    test_client = client(settings)
+    test_client, _ = signed_in_client(settings)
     task_id = submit_failure(settings, "fallo controlado")
 
     observed: list[str] = []
@@ -53,11 +53,11 @@ def test_failing_job_retries_bounded_and_reports_a_safe_error(
 
 
 def test_cli_reports_persisted_status_for_the_failed_job(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(task_retries=0, task_retry_delay_seconds=0.0)
-    test_client = client(settings)
+    test_client, _ = signed_in_client(settings)
     task_id = submit_failure(settings, "sin reintentos")
 
     with running_worker(settings):

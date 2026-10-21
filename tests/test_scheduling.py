@@ -11,15 +11,16 @@ from tests.conftest import running_worker, wait_for_status
 
 
 def test_delayed_job_survives_worker_restart(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(demo_max_delay_seconds=10)
-    test_client = client(settings)
+    test_client, auth = signed_in_client(settings)
 
     response = test_client.post(
         "/api/v1/tasks/demo",
         json={"message": "diferido", "delay_seconds": 2},
+        headers=auth,
     )
 
     assert response.status_code == 202, response.text
@@ -40,14 +41,15 @@ def test_delayed_job_survives_worker_restart(
 
 
 def test_delay_above_the_configured_bound_is_rejected(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
 ) -> None:
-    test_client = client(settings_factory(demo_max_delay_seconds=5))
+    test_client, auth = signed_in_client(settings_factory(demo_max_delay_seconds=5))
 
     response = test_client.post(
         "/api/v1/tasks/demo",
         json={"message": "demasiado tarde", "delay_seconds": 6},
+        headers=auth,
     )
 
     assert response.status_code == 422
@@ -55,13 +57,15 @@ def test_delay_above_the_configured_bound_is_rejected(
 
 
 def test_negative_delay_is_rejected(
-    client: Callable[..., TestClient], settings_factory: Callable[..., Settings]
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+    settings_factory: Callable[..., Settings],
 ) -> None:
-    test_client = client(settings_factory())
+    test_client, auth = signed_in_client(settings_factory())
 
     response = test_client.post(
         "/api/v1/tasks/demo",
         json={"message": "ahora", "delay_seconds": -1},
+        headers=auth,
     )
 
     assert response.status_code == 422

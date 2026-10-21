@@ -8,7 +8,7 @@ from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from typing import Any
 
-from fastapi import APIRouter, FastAPI, HTTPException, Path, Request
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
@@ -22,6 +22,14 @@ from itsm.database import (
     create_engine_from_settings,
     create_session_factory,
 )
+from itsm.identity.api import (
+    authenticated_actor,
+    create_identity_router,
+    get_identity_service,
+    install_error_handlers,
+    mutation_guard,
+)
+from itsm.identity.service import AuthContext, IdentityService
 from itsm.logging import configure_logging, log_event
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
 
@@ -37,6 +45,7 @@ ERROR_STATUS_CODES = {
     405: "method_not_allowed",
     409: "conflict",
     422: "validation_error",
+    429: "too_many_requests",
     503: "unavailable",
 }
 
@@ -114,6 +123,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    install_error_handlers(app)
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next: Any) -> Any:
@@ -172,7 +182,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return {"status": "ok"}
 
     @api.post("/tasks/demo", status_code=202)
-    def submit_demo_task(payload: DemoTaskRequest, request: Request) -> TaskAcceptedResponse:
+    def submit_demo_task(
+        payload: DemoTaskRequest,
+        request: Request,
+        context: AuthContext = Depends(mutation_guard),
+        identity: IdentityService = Depends(get_identity_service),
+    ) -> TaskAcceptedResponse:
         """Queue the bounded echo demo task; no caller-defined task names."""
         if len(payload.message) > settings.demo_message_max_length:
             raise HTTPException(
@@ -192,6 +207,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         except TaskStorageUnavailable as exc:
             log_event(logger, "task.storage_unavailable", level=logging.ERROR)
             raise HTTPException(status_code=503, detail="task storage unavailable") from exc
+        identity.record_operation(
+            context.principal,
+            action="tasks.demo.submit",
+            resource=f"task:{status.task_id}",
+        )
         log_event(
             logger,
             "task.submitted",
@@ -205,6 +225,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     def demo_task_status(
         request: Request,
         task_id: str = Path(pattern=TASK_ID_PATTERN),
+        context: AuthContext = Depends(authenticated_actor),
     ) -> TaskStatusResponse:
         """Read the stored task state without consuming the result."""
         try:
@@ -234,6 +255,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["optional_services"] = _optional_services(settings)
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
+    api.include_router(create_identity_router())
     app.include_router(api)
     return app
 
