@@ -30,6 +30,7 @@ PERMISSION_CATALOG: Final[tuple[str, ...]] = (
     "assets.view",
     "assets.edit",
     "assets.assign",
+    "assets.purge",
     "assets.remote",
     "people.view",
     "people.create",
@@ -82,8 +83,17 @@ BUILT_IN_ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
 
 # Machines never receive identity/policy administration, even when a role that
 # contains those codes is assigned to them, and never inherit the admin role.
+# Permanent asset purge is human-only: the service refuses it for any machine
+# actor and the permission itself is never effective for a machine identity.
 MACHINE_FORBIDDEN_PERMISSIONS: Final[frozenset[str]] = frozenset(
-    {"users.view", "users.create", "users.edit", "roles.manage", "sessions.manage"}
+    {
+        "users.view",
+        "users.create",
+        "users.edit",
+        "roles.manage",
+        "sessions.manage",
+        "assets.purge",
+    }
 )
 
 # Sensitive machine operations additionally require an explicit approval

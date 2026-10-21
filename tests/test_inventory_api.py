@@ -65,6 +65,12 @@ def test_create_read_and_search_return_the_same_asset(
         "responsible",
         "status",
         "description",
+        "cost",
+        "technical",
+        "archived",
+        "archivedAt",
+        "archivedBy",
+        "images",
         "createdAt",
         "updatedAt",
     }
