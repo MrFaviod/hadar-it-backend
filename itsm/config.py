@@ -7,8 +7,10 @@ container environment or a secret manager.
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 from typing import Any, Literal
+from urllib.parse import urlsplit
 
 from pydantic import Field, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -30,6 +32,8 @@ SUPPORTED_DATABASE_DRIVERS = frozenset(
 )
 
 LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
+
+COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
 class Settings(BaseSettings):
@@ -59,6 +63,18 @@ class Settings(BaseSettings):
     demo_message_max_length: int = Field(default=200, ge=1, le=1000)
     demo_max_delay_seconds: int = Field(default=30, ge=0, le=300)
     demo_periodic_minutes: int = Field(default=0, ge=0, le=60)
+
+    # Identity and authentication. ``auth_origin`` is the browser origin allowed
+    # to call the API with cookies; ``auth_cookie_secure`` must be disabled
+    # explicitly for plain-HTTP local development.
+    auth_origin: str = "http://localhost:18080"
+    auth_cookie_secure: bool = True
+    auth_cookie_name: str = "itsm_session"
+    auth_session_minutes_default: int = Field(default=480, ge=5, le=1440)
+    auth_login_max_attempts: int = Field(default=5, ge=1, le=100)
+    auth_login_window_minutes: int = Field(default=15, ge=1, le=1440)
+    auth_password_min_length: int = Field(default=12, ge=8, le=128)
+    auth_password_max_length: int = Field(default=128, ge=16, le=1024)
 
     log_level: str = "INFO"
 
@@ -103,6 +119,25 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(LOG_LEVELS)}")
         return level
 
+    @field_validator("auth_origin")
+    @classmethod
+    def _validate_auth_origin(cls, value: str) -> str:
+        origin = value.strip().rstrip("/")
+        parts = urlsplit(origin)
+        if parts.scheme not in {"http", "https"} or not parts.netloc:
+            raise ValueError("auth_origin must be an http(s) origin such as http://localhost:18080")
+        if parts.path or parts.query or parts.fragment or parts.username or parts.password:
+            raise ValueError("auth_origin must not contain a path, query, fragment or credentials")
+        return origin
+
+    @field_validator("auth_cookie_name")
+    @classmethod
+    def _validate_cookie_name(cls, value: str) -> str:
+        name = value.strip()
+        if not COOKIE_NAME_PATTERN.match(name):
+            raise ValueError("auth_cookie_name must be a valid cookie token")
+        return name
+
     @model_validator(mode="after")
     def _validate_task_storage(self) -> Settings:
         if self.task_storage == "redis" and not self.task_redis_url:
@@ -111,6 +146,8 @@ class Settings(BaseSettings):
             raise ValueError("task_storage=postgres requires task_postgres_dsn")
         if self.task_storage == "sqlite":
             self._reject_shared_sqlite_file()
+        if self.auth_password_max_length <= self.auth_password_min_length:
+            raise ValueError("auth_password_max_length must exceed auth_password_min_length")
         return self
 
     def _reject_shared_sqlite_file(self) -> None:
