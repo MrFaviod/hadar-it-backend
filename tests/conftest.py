@@ -38,6 +38,8 @@ def settings_factory(tmp_path: Path) -> Callable[..., Settings]:
             "demo_max_delay_seconds": 15,
             "demo_message_max_length": 50,
             "log_level": "INFO",
+            "auth_origin": "http://testserver",
+            "auth_cookie_secure": False,
         }
         values.update(overrides)
         return Settings(_env_file=None, **values)
@@ -64,6 +66,14 @@ def worker_environment(settings: Settings) -> dict[str, str]:
             "ITSM_DEMO_MESSAGE_MAX_LENGTH": str(settings.demo_message_max_length),
             "ITSM_DEMO_MAX_DELAY_SECONDS": str(settings.demo_max_delay_seconds),
             "ITSM_DEMO_PERIODIC_MINUTES": str(settings.demo_periodic_minutes),
+            "ITSM_AUTH_ORIGIN": settings.auth_origin,
+            "ITSM_AUTH_COOKIE_SECURE": str(settings.auth_cookie_secure).lower(),
+            "ITSM_AUTH_COOKIE_NAME": settings.auth_cookie_name,
+            "ITSM_AUTH_SESSION_MINUTES_DEFAULT": str(settings.auth_session_minutes_default),
+            "ITSM_AUTH_LOGIN_MAX_ATTEMPTS": str(settings.auth_login_max_attempts),
+            "ITSM_AUTH_LOGIN_WINDOW_MINUTES": str(settings.auth_login_window_minutes),
+            "ITSM_AUTH_PASSWORD_MIN_LENGTH": str(settings.auth_password_min_length),
+            "ITSM_AUTH_PASSWORD_MAX_LENGTH": str(settings.auth_password_max_length),
         }
     )
     return env
@@ -192,6 +202,68 @@ def client(settings_factory: Callable[..., Settings]) -> Iterator[Callable[..., 
         test_client.__enter__()
         opened.append(test_client)
         return test_client
+
+    try:
+        yield make
+    finally:
+        for test_client in opened:
+            test_client.__exit__(None, None, None)
+
+
+ADMIN_USERNAME = "ana.admin"
+ADMIN_NAME = "Ana Admin"
+ADMIN_PASSWORD = "installer-password-2026"
+
+
+def bootstrap_admin(settings: Settings) -> None:
+    """Create the installation administrator through the identity service."""
+    from itsm.database import create_engine_from_settings, create_session_factory
+    from itsm.identity.service import BootstrapRefused, IdentityService
+
+    session = create_session_factory(create_engine_from_settings(settings))()
+    try:
+        IdentityService(session, settings).bootstrap_admin(
+            ADMIN_USERNAME, ADMIN_NAME, ADMIN_PASSWORD
+        )
+    except BootstrapRefused:
+        pass
+    finally:
+        session.close()
+
+
+def sign_in(test_client: TestClient, settings: Settings) -> dict[str, str]:
+    """Log a client in over HTTP and return the CSRF/origin headers a browser sends."""
+    response = test_client.post(
+        f"{settings.api_prefix}/auth/login",
+        json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+        headers={"Origin": settings.auth_origin},
+    )
+    assert response.status_code == 200, response.text
+    return {
+        "X-CSRF-Token": str(response.json()["csrfToken"]),
+        "Origin": settings.auth_origin,
+    }
+
+
+@pytest.fixture
+def signed_in_client(
+    settings_factory: Callable[..., Settings],
+) -> Iterator[Callable[..., tuple[TestClient, dict[str, str]]]]:
+    """Factory for a migrated app with a bootstrapped, authenticated administrator."""
+    opened: list[TestClient] = []
+
+    def make(
+        settings: Settings | None = None,
+    ) -> tuple[TestClient, dict[str, str]]:
+        from itsm.main import create_app
+
+        resolved = settings if settings is not None else settings_factory()
+        assert run_migrations(resolved).returncode == 0
+        bootstrap_admin(resolved)
+        test_client = TestClient(create_app(resolved))
+        test_client.__enter__()
+        opened.append(test_client)
+        return test_client, sign_in(test_client, resolved)
 
     try:
         yield make
