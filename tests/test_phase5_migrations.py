@@ -12,7 +12,7 @@ SettingsFactory = Callable[..., Settings]
 
 ASSET_ID = "33333333-3333-3333-3333-333333333333"
 PRE_PHASE5 = "0008_directory_relationships"
-HEAD = "0009_asset_directory"
+HEAD = "0010_redundancy"
 
 ORGANIZATION_COLUMNS = {
     "site_id",

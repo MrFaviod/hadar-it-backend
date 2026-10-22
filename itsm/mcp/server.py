@@ -34,6 +34,7 @@ from itsm.inventory.catalog import InventoryCatalog
 from itsm.inventory.organization import moment
 from itsm.inventory.projection import history_payload, project, validate_fields
 from itsm.inventory.service import BATCH_LIMIT, AssetView, InventoryService
+from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
@@ -62,6 +63,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "remove_relationship",
     "move_host",
     "get_asset_map",
+    "list_redundancy_groups",
+    "get_redundancy_group",
+    "save_redundancy_group",
 )
 
 INSTRUCTIONS = """\
@@ -104,6 +108,16 @@ class DatabaseTokenVerifier(TokenVerifier):
                 "username": context.principal.username,
             },
         )
+
+
+class RedundancyMemberInput(BaseModel):
+    """One group member as sent on the wire; the asset id must already exist."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=36)
+    role: str | None = None
+    share: Any = None
 
 
 class BatchUpdateInput(BaseModel):
@@ -222,6 +236,20 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 raise ToolError("authentication required") from None
             yield (
                 RelationshipService(session, settings, identity=identity, source="mcp"),
+                context.principal,
+            )
+
+    @contextmanager
+    def redundancy() -> Iterator[tuple[RedundancyService, Principal]]:
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield (
+                RedundancyService(session, settings, identity=identity, source="mcp"),
                 context.principal,
             )
 
@@ -710,6 +738,96 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             return service.map(principal, site_id=site_id, limit=limit, offset=offset).as_payload()
 
         return run(operation)
+
+    @server.tool
+    def list_redundancy_groups(
+        query: str | None = None,
+        active: bool | None = None,
+        mode: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List redundancy groups with their replicas in one bounded page."""
+
+        def operation(service: RedundancyService, principal: Principal) -> dict[str, Any]:
+            page = service.list(
+                principal,
+                query=query,
+                active=active,
+                mode=mode,
+                limit=limit,
+                offset=offset,
+            )
+            return {"groups": page.as_payload()}
+
+        return run_with(redundancy, operation)
+
+    @server.tool
+    def get_redundancy_group(group_id: str) -> dict[str, Any]:
+        """Read one redundancy group: mode, activation, roles and real hosts."""
+
+        def operation(service: RedundancyService, principal: Principal) -> dict[str, Any]:
+            return {"group": service.get(principal, group_id).as_payload()}
+
+        return run_with(redundancy, operation)
+
+    @server.tool
+    def save_redundancy_group(
+        group_id: str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        mode: str | None = None,
+        active: bool | None = None,
+        members: list[RedundancyMemberInput] | None = None,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create a group (no group_id) or replace it with a complete member list."""
+
+        def operation(service: RedundancyService, principal: Principal) -> dict[str, Any]:
+            specs = (
+                None
+                if members is None
+                else [
+                    {"asset_id": member.asset_id, "role": member.role, "share": member.share}
+                    for member in members
+                ]
+            )
+            if group_id is None:
+                if name is None or mode is None or specs is None:
+                    raise ValidationFailed("name, mode and members are required to create a group")
+                view = service.create(
+                    principal,
+                    name=name,
+                    mode=mode,
+                    members=specs,
+                    description=description,
+                    active=True if active is None else active,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                )
+            else:
+                changes: dict[str, Any] = {
+                    "reason": reason,
+                    "notes": notes,
+                    "effective_at": moment(effective_at),
+                }
+                if name is not None:
+                    changes["name"] = name
+                if description is not None:
+                    changes["description"] = description
+                if mode is not None:
+                    changes["mode"] = mode
+                if active is not None:
+                    changes["active"] = active
+                if specs is not None:
+                    changes["members"] = specs
+                view = service.update(principal, group_id, **changes)
+            return {"group": view.as_payload()}
+
+        return run_with(redundancy, operation)
 
     return server
 

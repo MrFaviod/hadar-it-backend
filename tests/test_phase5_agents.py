@@ -36,6 +36,8 @@ TOOL_NAMES = {
     "retire_asset",
     "get_asset_history",
     "get_inventory_config",
+    "get_redundancy_group",
+    "list_redundancy_groups",
     "search_locations",
     "search_people",
     "assign_asset",
@@ -46,6 +48,7 @@ TOOL_NAMES = {
     "remove_relationship",
     "move_host",
     "get_asset_map",
+    "save_redundancy_group",
 }
 
 

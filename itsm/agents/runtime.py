@@ -35,6 +35,7 @@ from itsm.inventory.service import (
     InventoryPage,
     InventoryService,
 )
+from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent, RunContext
@@ -74,6 +75,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "remove_relationship",
     "move_host",
     "get_asset_map",
+    "list_redundancy_groups",
+    "get_redundancy_group",
+    "save_redundancy_group",
 )
 MAX_RESULTS = 50
 
@@ -217,6 +221,30 @@ def _relations(deps: AgentDeps) -> Iterator[RelationshipService]:
         )
     finally:
         session.close()
+
+
+@contextmanager
+def _redundancy(deps: AgentDeps) -> Iterator[RedundancyService]:
+    session = deps.session_factory()
+    try:
+        yield RedundancyService(
+            session,
+            deps.settings,
+            identity=IdentityService(session, deps.settings),
+            source="agent",
+        )
+    finally:
+        session.close()
+
+
+class RedundancyMemberArg(BaseModel):
+    """One member of a group; the asset id must be an existing permanent UUID."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    asset_id: str = Field(min_length=1, max_length=36)
+    role: str | None = None
+    share: Any = None
 
 
 def _record(
@@ -817,6 +845,104 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             return mapped.as_payload()
 
         return _collect(ctx.deps, "get_asset_map", operation)
+
+    @agent.tool
+    def list_redundancy_groups(
+        ctx: RunContext[AgentDeps],
+        query: str | None = None,
+        active: bool | None = None,
+        mode: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Listar grupos de redundancia con sus réplicas, de forma acotada."""
+
+        def operation() -> dict[str, Any]:
+            with _redundancy(ctx.deps) as redundancy:
+                page = redundancy.list(
+                    ctx.deps.principal,
+                    query=query,
+                    active=active,
+                    mode=mode,
+                    limit=limit,
+                    offset=offset,
+                )
+            return {"groups": page.as_payload()}
+
+        return _collect(ctx.deps, "list_redundancy_groups", operation)
+
+    @agent.tool
+    def get_redundancy_group(ctx: RunContext[AgentDeps], group_id: str) -> dict[str, Any]:
+        """Leer un grupo de redundancia: modo, activación, roles y hosts reales."""
+
+        def operation() -> dict[str, Any]:
+            with _redundancy(ctx.deps) as redundancy:
+                view = redundancy.get(ctx.deps.principal, group_id)
+            return {"group": view.as_payload()}
+
+        return _collect(ctx.deps, "get_redundancy_group", operation)
+
+    @agent.tool
+    def save_redundancy_group(
+        ctx: RunContext[AgentDeps],
+        group_id: str | None = None,
+        name: str | None = None,
+        description: str | None = None,
+        mode: str | None = None,
+        active: bool | None = None,
+        members: list[RedundancyMemberArg] | None = None,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Crear un grupo (sin group_id) o modificarlo con la lista completa de réplicas."""
+
+        def operation() -> dict[str, Any]:
+            specs = (
+                None
+                if members is None
+                else [
+                    {"asset_id": member.asset_id, "role": member.role, "share": member.share}
+                    for member in members
+                ]
+            )
+            with _redundancy(ctx.deps) as redundancy:
+                if group_id is None:
+                    if name is None or mode is None or specs is None:
+                        raise ValidationFailed(
+                            "name, mode and members are required to create a group"
+                        )
+                    view = redundancy.create(
+                        ctx.deps.principal,
+                        name=name,
+                        mode=mode,
+                        members=specs,
+                        description=description,
+                        active=True if active is None else active,
+                        reason=reason,
+                        notes=notes,
+                        effective_at=moment(effective_at),
+                    )
+                else:
+                    changes: dict[str, Any] = {
+                        "reason": reason,
+                        "notes": notes,
+                        "effective_at": moment(effective_at),
+                    }
+                    if name is not None:
+                        changes["name"] = name
+                    if description is not None:
+                        changes["description"] = description
+                    if mode is not None:
+                        changes["mode"] = mode
+                    if active is not None:
+                        changes["active"] = active
+                    if specs is not None:
+                        changes["members"] = specs
+                    view = redundancy.update(ctx.deps.principal, group_id, **changes)
+            return {"group": view.as_payload()}
+
+        return _collect(ctx.deps, "save_redundancy_group", operation)
 
 
 def resolve_model(settings: Settings) -> Model:

@@ -1309,6 +1309,7 @@ class InventoryService:
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if asset.archived_at is not None:
             raise Conflict("asset is already archived")
+        self._assert_no_active_redundancy_membership(asset.id)
         note = _reason(reason, required=False)
         before = self._snapshot(asset)
         now = utcnow()
@@ -1411,6 +1412,7 @@ class InventoryService:
         purged_at = utcnow()
         quick_code = asset.quick_code
         self._assert_no_relationships(asset.id)
+        self._assert_no_redundancy_membership(asset.id)
         self._session.execute(delete(AssetMedia).where(AssetMedia.asset_id == asset.id))
         self._session.add(
             AssetTombstone(
@@ -1682,6 +1684,36 @@ class InventoryService:
         ).first()
         if related is not None:
             raise Conflict("asset has relationships; remove them before a permanent purge")
+
+    def _assert_no_redundancy_membership(self, asset_id: str) -> None:
+        """Purge guard: a redundancy member must be removed from its group first."""
+        from itsm.redundancy.models import RedundancyGroupMember
+
+        member = self._session.execute(
+            select(RedundancyGroupMember.id)
+            .where(RedundancyGroupMember.asset_id == asset_id)
+            .limit(1)
+        ).first()
+        if member is not None:
+            raise Conflict(
+                "asset belongs to a redundancy group; remove it from the group before a purge"
+            )
+
+    def _assert_no_active_redundancy_membership(self, asset_id: str) -> None:
+        """An active redundancy group must never keep an archived member."""
+        from itsm.redundancy.models import RedundancyGroup, RedundancyGroupMember
+
+        member = self._session.execute(
+            select(RedundancyGroupMember.id)
+            .join(RedundancyGroup, RedundancyGroup.id == RedundancyGroupMember.group_id)
+            .where(
+                RedundancyGroupMember.asset_id == asset_id,
+                RedundancyGroup.active.is_(True),
+            )
+            .limit(1)
+        ).first()
+        if member is not None:
+            raise Conflict("an active redundancy group cannot include archived assets")
 
     def _new_asset(self, prepared: Mapping[str, Any]) -> Asset:
         now = utcnow()
