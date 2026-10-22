@@ -88,6 +88,11 @@ class AssetHistory(InventoryBase):
     reason: Mapped[str | None] = mapped_column(String(500), nullable=True)
     actor_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     actor_username: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="internal")
+    entity_type: Mapped[str] = mapped_column(String(32), nullable=False, default="asset")
+    entity_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    effective_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notes: Mapped[str | None] = mapped_column(String(500), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

@@ -86,6 +86,13 @@ TECHNICAL_LIST_MAX = 20
 TECHNICAL_NUMBER_LIMIT = Decimal("1000000000000")
 REASON_MIN = 4
 REASON_MAX = 500
+NOTES_MAX = 500
+
+# Trusted origin of one history event. Adapters pass their transport context at
+# construction time; a request payload can never choose it.
+HISTORY_SOURCES: frozenset[str] = frozenset({"rest", "agent", "mcp", "internal"})
+DEFAULT_HISTORY_SOURCE = "internal"
+_ENTITY_TYPE_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,31}$")
 
 _QUICK_CODE_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._/-]{0,31}$")
 _TECHNICAL_KEY_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_.-]{0,63}$")
@@ -244,6 +251,49 @@ def _reason(value: Any, *, required: bool) -> str | None:
     return normalized
 
 
+def _notes(value: Any) -> str | None:
+    """Validate an optional free-text observation attached to one history event."""
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValidationFailed("notes must be text")
+    normalized = value.strip()
+    if not normalized:
+        return None
+    if len(normalized) > NOTES_MAX:
+        raise ValidationFailed(f"notes must be at most {NOTES_MAX} characters")
+    return normalized
+
+
+def _effective_at(value: Any) -> datetime | None:
+    """Validate an optional effective time; it must carry an explicit timezone."""
+    if value is None:
+        return None
+    if not isinstance(value, datetime):
+        raise ValidationFailed("effectiveAt must be an ISO timestamp")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValidationFailed("effectiveAt must include a timezone")
+    return as_utc(value)
+
+
+def _history_source(value: Any) -> str:
+    if not isinstance(value, str) or value not in HISTORY_SOURCES:
+        raise ValidationFailed("source must be one of " + ", ".join(sorted(HISTORY_SOURCES)))
+    return value
+
+
+def _entity_type(value: Any) -> str:
+    if not isinstance(value, str) or not _ENTITY_TYPE_PATTERN.match(value):
+        raise ValidationFailed("entityType must be 2-32 lowercase letters, digits or underscore")
+    return value
+
+
+def _entity_id(value: Any) -> str:
+    if not isinstance(value, str) or not value.strip() or len(value.strip()) > 36:
+        raise ValidationFailed("entityId must be 1-36 characters")
+    return value.strip()
+
+
 def _normalize(field: str, value: Any) -> Any:
     if field == "quick_code":
         return _quick_code(value)
@@ -378,6 +428,11 @@ class HistoryView:
     reason: str | None
     actor_id: str | None
     actor_username: str | None
+    source: str
+    entity_type: str
+    entity_id: str | None
+    effective_at: datetime | None
+    notes: str | None
     created_at: datetime
 
     def as_payload(self) -> dict[str, Any]:
@@ -397,6 +452,17 @@ class HistoryView:
             "actorId": self.actor_id,
             "actorUsername": self.actor_username,
             "createdAt": _iso(self.created_at),
+        }
+
+    def structured_payload(self) -> dict[str, Any]:
+        """Legacy payload plus the additive origin/entity/effective metadata."""
+        return {
+            **self.as_payload(),
+            "source": self.source,
+            "entityType": self.entity_type,
+            "entityId": self.entity_id,
+            "effectiveAt": None if self.effective_at is None else _iso(self.effective_at),
+            "notes": self.notes,
         }
 
 
@@ -474,10 +540,12 @@ class InventoryService:
         settings: Settings,
         *,
         identity: IdentityService | None = None,
+        source: str = DEFAULT_HISTORY_SOURCE,
     ) -> None:
         self._session = session
         self._settings = settings
         self._identity = identity or IdentityService(session, settings)
+        self._source = _history_source(source)
         self._catalog = InventoryCatalog(session, settings, identity=self._identity)
         self._pending_sequences: dict[str, int] = {}
         self._reserved_codes: set[str] = set()
@@ -530,6 +598,16 @@ class InventoryService:
         stored = list(assets)
         urls = self._image_urls([asset.id for asset in stored])
         return tuple(self._view(asset, urls.get(asset.id, {})) for asset in stored)
+
+    def _views_by_ids(self, asset_ids: Sequence[str]) -> dict[str, AssetView]:
+        """Batched projection for bounded graph queries; never one lookup per id."""
+        unique_ids = list(dict.fromkeys(asset_ids))
+        if not unique_ids:
+            return {}
+        stored = list(
+            self._session.execute(select(Asset).where(Asset.id.in_(unique_ids))).scalars()
+        )
+        return {asset.id: view for asset, view in zip(stored, self._views(stored), strict=True)}
 
     # ------------------------------------------------------------ validation
     def _prepare_create(self, values: Mapping[str, Any]) -> dict[str, Any]:
@@ -962,6 +1040,7 @@ class InventoryService:
 
         purged_at = utcnow()
         quick_code = asset.quick_code
+        self._assert_no_relationships(asset.id)
         self._session.execute(delete(AssetMedia).where(AssetMedia.asset_id == asset.id))
         self._session.add(
             AssetTombstone(
@@ -1119,6 +1198,11 @@ class InventoryService:
             reason=entry.reason,
             actor_id=entry.actor_id,
             actor_username=entry.actor_username,
+            source=entry.source,
+            entity_type=entry.entity_type,
+            entity_id=entry.entity_id,
+            effective_at=None if entry.effective_at is None else as_utc(entry.effective_at),
+            notes=entry.notes,
             created_at=entry.created_at,
         )
 
@@ -1155,12 +1239,31 @@ class InventoryService:
         before: Mapping[str, Any] | None = None,
         reason: str | None = None,
         cleared: bool = False,
+        changes: Mapping[str, Any] | None = None,
+        notes: Any = None,
+        effective_at: Any = None,
+        source: str | None = None,
+        entity_type: str | None = None,
+        entity_id: str | None = None,
     ) -> None:
+        """Append one structured event; relation code calls this instead of copying rules.
+
+        Asset lifecycle callers keep the previous behavior. Relationship callers
+        pass an explicit ``changes`` object plus the trusted origin/entity and the
+        optional effective time, reason and observations. The row shares the same
+        transaction as the business write.
+        """
         snapshot = self._snapshot(asset)
-        if cleared:
-            old_state: Mapping[str, Any] = snapshot
-            new_state: Mapping[str, Any] = dict.fromkeys(snapshot)
-            changes = {
+        old_state: Mapping[str, Any]
+        new_state: Mapping[str, Any]
+        if changes is not None:
+            old_state = snapshot
+            new_state = snapshot
+            prepared_changes = dict(changes)
+        elif cleared:
+            old_state = snapshot
+            new_state = dict.fromkeys(snapshot)
+            prepared_changes = {
                 field: {"old": _json_value(value), "new": None}
                 for field, value in snapshot.items()
                 if value is not None
@@ -1168,7 +1271,10 @@ class InventoryService:
         else:
             old_state = before or {}
             new_state = snapshot
-            changes = self._diff(before, snapshot)
+            prepared_changes = self._diff(before, snapshot)
+        metadata_source = self._source if source is None else _history_source(source)
+        metadata_entity_type = "asset" if entity_type is None else _entity_type(entity_type)
+        metadata_entity_id = asset.id if entity_id is None else _entity_id(entity_id)
         sequence = self._next_sequence()
         self._session.add(
             AssetHistory(
@@ -1182,13 +1288,30 @@ class InventoryService:
                 status_new=new_state.get("status"),
                 archived_old=old_state.get("archived"),
                 archived_new=new_state.get("archived"),
-                changes=changes,
+                changes=prepared_changes,
                 reason=reason,
                 actor_id=principal.actor_id,
                 actor_username=principal.username,
+                source=metadata_source,
+                entity_type=metadata_entity_type,
+                entity_id=metadata_entity_id,
+                effective_at=_effective_at(effective_at),
+                notes=_notes(notes),
                 created_at=utcnow(),
             )
         )
+
+    def _assert_no_relationships(self, asset_id: str) -> None:
+        """Purge guard: an asset with edges cannot be permanently removed."""
+        from itsm.relationships.models import Relationship
+
+        related = self._session.execute(
+            select(Relationship.id)
+            .where(or_(Relationship.source_id == asset_id, Relationship.target_id == asset_id))
+            .limit(1)
+        ).first()
+        if related is not None:
+            raise Conflict("asset has relationships; remove them before a permanent purge")
 
     def _new_asset(self, prepared: Mapping[str, Any]) -> Asset:
         now = utcnow()
