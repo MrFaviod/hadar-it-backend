@@ -25,6 +25,7 @@ from itsm.database import (
     create_engine_from_settings,
     create_session_factory,
 )
+from itsm.directory.api import create_directory_router
 from itsm.identity.api import (
     authenticated_actor,
     create_identity_router,
@@ -275,6 +276,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     api.include_router(create_inventory_router())
     api.include_router(create_catalog_router())
+    api.include_router(create_directory_router())
     api.include_router(create_agent_router())
     api.include_router(create_identity_router())
     app.include_router(api)
