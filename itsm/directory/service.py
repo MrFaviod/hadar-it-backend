@@ -119,6 +119,11 @@ def _iso(value: datetime) -> str:
     return as_utc(value).isoformat()
 
 
+def format_person_label(name: str, job_title: str | None) -> str:
+    """One derivation of the public person label for directory and inventory."""
+    return name if not job_title else f"{name} ({job_title})"
+
+
 @dataclass(frozen=True)
 class DepartmentView:
     id: str
@@ -153,7 +158,7 @@ class PersonView:
     @property
     def label(self) -> str:
         """Canonical label the parent uses instead of legacy free-text matching."""
-        return self.name if not self.job_title else f"{self.name} ({self.job_title})"
+        return format_person_label(self.name, self.job_title)
 
     def as_payload(self) -> dict[str, Any]:
         return {
@@ -736,6 +741,12 @@ class DirectoryService:
         effective = _effective_at(effective_at)
         reason_text = _text(reason, "reason", REASON_MAX)
         note = _text(notes, "notes", NOTES_MAX)
+        if (
+            prepared.get("status") == "inactive"
+            and person.status == "active"
+            and person.status is not None
+        ):
+            self._assert_person_unused(person.id)
         before = self._person_snapshot(person)
         timestamp = self._now()
         for field, value in prepared.items():
@@ -1299,8 +1310,37 @@ class DirectoryService:
                 )
             ).scalar_one()
         )
-        if active_children or active_people:
-            raise Conflict("location still has active children or people")
+        if (
+            active_children
+            or active_people
+            or self._active_assets(self._location_assets(location_id))
+        ):
+            raise Conflict("location still has active children, people or assets")
+
+    def _assert_person_unused(self, person_id: str) -> None:
+        if self._active_assets(self._person_assets(person_id)):
+            raise Conflict("person still has active assigned assets")
+
+    def _location_assets(self, location_id: str) -> Any:
+        """Condition counting unarchived assets bound to a site or a location id."""
+        from sqlalchemy import or_
+
+        from itsm.inventory.models import Asset
+
+        return or_(Asset.site_id == location_id, Asset.location_id == location_id)
+
+    def _person_assets(self, person_id: str) -> Any:
+        from itsm.inventory.models import Asset
+
+        return Asset.responsible_person_id == person_id
+
+    def _active_assets(self, condition: Any) -> bool:
+        from itsm.inventory.models import Asset
+
+        found = self._session.execute(
+            select(Asset.id).where(condition, Asset.archived_at.is_(None)).limit(1)
+        ).first()
+        return found is not None
 
     def _assert_no_cycle(self, location: DirectoryLocation, parent_id: str | None) -> None:
         seen = {location.id}

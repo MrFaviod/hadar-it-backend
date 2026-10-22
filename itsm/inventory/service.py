@@ -43,10 +43,12 @@ from itsm.identity.service import (
     Principal,
     ValidationFailed,
 )
+from itsm.inventory import organization
 from itsm.inventory.catalog import InventoryCatalog
 from itsm.inventory.codes import InventoryCodeSequence, allocate, serialized
 from itsm.inventory.media import MEDIA_ROLES, validate_image, validate_role
 from itsm.inventory.models import Asset, AssetHistory, AssetMedia, AssetTombstone
+from itsm.inventory.organization import AssetMap, MapPosition, MapSite
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
@@ -56,6 +58,8 @@ HISTORY_LIMIT = MAX_LIMIT
 
 STATUSES: tuple[str, ...] = ("in_use", "in_storage", "maintenance", "retired")
 DEFAULT_STATUS = STATUSES[0]
+
+_UNSET: Any = object()
 
 FIELD_LIMITS: dict[str, int] = {
     "quick_code": 32,
@@ -75,7 +79,12 @@ FIELD_LIMITS: dict[str, int] = {
 
 # Fields the service accepts on create/update; cost and technical are validated
 # by dedicated normalizers, everything else is bounded text.
-ASSET_FIELDS: tuple[str, ...] = (*FIELD_LIMITS, "cost", "technical")
+ASSET_FIELDS: tuple[str, ...] = (
+    *FIELD_LIMITS,
+    "cost",
+    "technical",
+    *organization.ORGANIZATION_FIELDS,
+)
 
 COST_LIMIT = Decimal("1000000000")
 COST_QUANTUM = Decimal("0.01")
@@ -112,7 +121,18 @@ _HISTORY_FIELDS = (
     "description",
     "cost",
     "technical",
+    "site_id",
+    "location_id",
+    "responsible_person_id",
+    "position_x",
+    "position_y",
 )
+
+
+def _assert_not_archived(asset: Asset) -> None:
+    """Archived assets keep their organization frozen; a return is still allowed."""
+    if asset.archived_at is not None:
+        raise Conflict("archived assets cannot change their organization")
 
 
 def _iso(value: datetime) -> str:
@@ -305,6 +325,10 @@ def _normalize(field: str, value: Any) -> Any:
         return _technical(value)
     if field == "ip":
         return _ip(value)
+    if field in organization.REFERENCE_FIELDS:
+        return organization.reference(value, field)
+    if field in organization.POSITION_FIELDS:
+        return organization.position(value, field)
     return _text(value, field)
 
 
@@ -340,6 +364,12 @@ class AssetView:
     site: str | None
     location: str | None
     responsible: str | None
+    site_id: str | None
+    location_id: str | None
+    responsible_person_id: str | None
+    responsible_label: str | None
+    position_x: str | None
+    position_y: str | None
     status: str
     description: str | None
     cost: Decimal | None
@@ -365,6 +395,12 @@ class AssetView:
             "site": self.site,
             "location": self.location,
             "responsible": self.responsible,
+            "siteId": self.site_id,
+            "locationId": self.location_id,
+            "responsiblePersonId": self.responsible_person_id,
+            "responsibleLabel": self.responsible_label,
+            "positionX": self.position_x,
+            "positionY": self.position_y,
             "status": self.status,
             "description": self.description,
             "cost": _stored_cost(self.cost),
@@ -567,8 +603,32 @@ class InventoryService:
             urls.setdefault(asset_id, {})[role] = self._image_url(asset_id, role)
         return urls
 
-    def _view(self, asset: Asset, images: Mapping[str, str] | None = None) -> AssetView:
+    def _view(
+        self,
+        asset: Asset,
+        images: Mapping[str, str] | None = None,
+        labels: Mapping[str, str] | None = None,
+        places: Mapping[str, str] | None = None,
+    ) -> AssetView:
         stored_images = self._image_urls([asset.id]).get(asset.id, {}) if images is None else images
+        label = None
+        if asset.responsible_person_id is not None:
+            if labels is None:
+                labels = self._person_labels([asset.responsible_person_id])
+            label = labels.get(asset.responsible_person_id)
+        if places is None:
+            places = self._place_names(
+                [item for item in (asset.site_id, asset.location_id) if item]
+            )
+        site = asset.site if asset.site_id is None else places.get(asset.site_id, asset.site)
+        location = (
+            asset.location
+            if asset.location_id is None
+            else places.get(asset.location_id, asset.location)
+        )
+        responsible = asset.responsible
+        if asset.responsible_person_id is not None and label is not None:
+            responsible = label
         return AssetView(
             id=asset.id,
             quick_code=asset.quick_code,
@@ -579,9 +639,15 @@ class InventoryService:
             model=asset.model,
             serial=asset.serial,
             ip=asset.ip,
-            site=asset.site,
-            location=asset.location,
-            responsible=asset.responsible,
+            site=site,
+            location=location,
+            responsible=responsible,
+            site_id=asset.site_id,
+            location_id=asset.location_id,
+            responsible_person_id=asset.responsible_person_id,
+            responsible_label=label,
+            position_x=asset.position_x,
+            position_y=asset.position_y,
             status=asset.status,
             description=asset.description,
             cost=None if asset.cost is None else Decimal(asset.cost),
@@ -594,10 +660,45 @@ class InventoryService:
             updated_at=asset.updated_at,
         )
 
+    def _person_labels(self, person_ids: Sequence[str]) -> dict[str, str]:
+        """Batched canonical labels; the stored text is never the label authority."""
+        optional = [person_id for person_id in dict.fromkeys(person_ids) if person_id]
+        if not optional:
+            return {}
+        from itsm.directory.models import DirectoryPerson
+        from itsm.directory.service import format_person_label
+
+        rows = self._session.execute(
+            select(DirectoryPerson.id, DirectoryPerson.name, DirectoryPerson.job_title).where(
+                DirectoryPerson.id.in_(optional)
+            )
+        ).all()
+        return {row.id: format_person_label(row.name, row.job_title) for row in rows}
+
+    def _place_names(self, location_ids: Sequence[str]) -> dict[str, str]:
+        """Batched current directory names; a read never depends on the active flag."""
+        optional = [location_id for location_id in dict.fromkeys(location_ids) if location_id]
+        if not optional:
+            return {}
+        from itsm.directory.models import DirectoryLocation
+
+        rows = self._session.execute(
+            select(DirectoryLocation.id, DirectoryLocation.name).where(
+                DirectoryLocation.id.in_(optional)
+            )
+        ).all()
+        return {row.id: row.name for row in rows}
+
     def _views(self, assets: Iterable[Asset]) -> tuple[AssetView, ...]:
         stored = list(assets)
         urls = self._image_urls([asset.id for asset in stored])
-        return tuple(self._view(asset, urls.get(asset.id, {})) for asset in stored)
+        labels = self._person_labels(
+            [asset.responsible_person_id for asset in stored if asset.responsible_person_id]
+        )
+        places = self._place_names(
+            [item for asset in stored for item in (asset.site_id, asset.location_id) if item]
+        )
+        return tuple(self._view(asset, urls.get(asset.id, {}), labels, places) for asset in stored)
 
     def _views_by_ids(self, asset_ids: Sequence[str]) -> dict[str, AssetView]:
         """Batched projection for bounded graph queries; never one lookup per id."""
@@ -610,7 +711,9 @@ class InventoryService:
         return {asset.id: view for asset, view in zip(stored, self._views(stored), strict=True)}
 
     # ------------------------------------------------------------ validation
-    def _prepare_create(self, values: Mapping[str, Any]) -> dict[str, Any]:
+    def _prepare_create(
+        self, values: Mapping[str, Any], *, principal: Principal | None = None
+    ) -> dict[str, Any]:
         if not isinstance(values, Mapping):
             raise ValidationFailed("asset payload must be an object")
         unknown = sorted(set(values) - set(ASSET_FIELDS))
@@ -625,6 +728,8 @@ class InventoryService:
                 if field == "status"
                 else _normalize(field, values[field])
             )
+        if principal is not None:
+            self._organize(prepared, stored={}, principal=principal)
         requested = prepared.get("quick_code")
         prepared["quick_code"] = (
             allocate(self, prepared, requested=requested) or self._generate_quick_code()
@@ -638,7 +743,13 @@ class InventoryService:
                 prepared["technical"] = validated
         return prepared
 
-    def _prepare_changes(self, changes: Mapping[str, Any]) -> dict[str, Any]:
+    def _prepare_changes(
+        self,
+        asset: Asset,
+        changes: Mapping[str, Any],
+        *,
+        principal: Principal | None = None,
+    ) -> dict[str, Any]:
         if not isinstance(changes, Mapping):
             raise ValidationFailed("asset payload must be an object")
         if "id" in changes:
@@ -660,7 +771,38 @@ class InventoryService:
                 prepared[field] = _normalize(field, value)
         if not prepared:
             raise ValidationFailed("at least one field must be provided")
+        if principal is not None:
+            self._organize(prepared, stored=self._snapshot(asset), principal=principal)
         return prepared
+
+    def _directory(self) -> Any:
+        """One DirectoryService over the same session/identity; it never commits here."""
+        from itsm.directory.service import DirectoryService
+
+        return DirectoryService(self._session, self._settings, identity=self._identity)
+
+    def _organize(
+        self,
+        prepared: dict[str, Any],
+        *,
+        stored: Mapping[str, Any],
+        principal: Principal,
+    ) -> None:
+        """Resolve canonical references, mirrored labels and the optional position."""
+        if not any(field in prepared for field in organization.RESOLVED_FIELDS):
+            return
+        resolved = organization.resolve(
+            prepared,
+            stored=stored,
+            directory=self._directory(),
+            principal=principal,
+        )
+        prepared.update(resolved)
+        effective_location = prepared.get("location_id", stored.get("location_id"))
+        if effective_location is None and stored.get("position_x") is not None:
+            prepared.setdefault("position_x", None)
+            prepared.setdefault("position_y", None)
+        organization.check_position(prepared, location_id=effective_location)
 
     def _assert_quick_code_free(self, quick_code: str, *, exclude_id: str | None) -> None:
         statement = select(Asset.id).where(Asset.quick_code_key == quick_code.strip().lower())
@@ -698,8 +840,8 @@ class InventoryService:
     def create(self, principal: Principal, values: Mapping[str, Any]) -> AssetView:
         """Register one asset; a colliding numeric quick code advances, never a merge."""
         self._identity.authorize(principal, "assets.edit", resource="inventory:assets")
-        prepared = self._prepare_create(values)
-        if "responsible" in prepared:
+        prepared = self._prepare_create(values, principal=principal)
+        if "responsible" in prepared or "responsible_person_id" in prepared:
             self._identity.authorize(
                 principal, "assets.assign", resource=f"asset:{prepared['quick_code']}"
             )
@@ -717,11 +859,14 @@ class InventoryService:
         """Apply an explicit field patch; the asset id never changes."""
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
-        prepared = self._prepare_changes(changes)
+        prepared = self._prepare_changes(asset, changes, principal=principal)
         self._catalog_changes(asset, prepared)
         if "quick_code" in prepared:
             self._assert_quick_code_free(prepared["quick_code"], exclude_id=asset.id)
-        if "responsible" in prepared and prepared["responsible"] != asset.responsible:
+        if any(
+            field in prepared and prepared[field] != getattr(asset, field)
+            for field in ("responsible", "responsible_person_id")
+        ):
             self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
         before = self._snapshot(asset)
         self._apply(asset, prepared)
@@ -729,6 +874,140 @@ class InventoryService:
         self._record_history(principal, asset, "updated", before=before)
         self._identity.record_operation(
             principal, action="inventory.asset_updated", resource=f"asset:{asset.id}"
+        )
+        return self._view(asset)
+
+    @serialized
+    def assign_responsible(
+        self,
+        principal: Principal,
+        asset_id: Any,
+        person_id: Any,
+        *,
+        reason: Any = None,
+        notes: Any = None,
+        effective_at: Any = None,
+    ) -> AssetView:
+        """Assign one active directory person; asset, label, history and audit commit once."""
+        asset = self._asset(asset_id)
+        self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
+        _assert_not_archived(asset)
+        checked = organization.reference(person_id, "personId")
+        if checked is None:
+            raise ValidationFailed("personId is required")
+        try:
+            label = self._directory().person_label(principal, checked, require_active=True)
+        except Conflict as error:
+            raise ValidationFailed(str(error)) from None
+        note = _reason(reason, required=False)
+        observations = _notes(notes)
+        effective = _effective_at(effective_at)
+        if asset.responsible_person_id == checked and asset.responsible == label:
+            raise Conflict("the person is already responsible for this asset")
+        before = self._snapshot(asset)
+        asset.responsible_person_id = checked
+        asset.responsible = label
+        asset.updated_at = utcnow()
+        self._flush_or_conflict()
+        self._record_history(
+            principal,
+            asset,
+            "assigned",
+            before=before,
+            reason=note,
+            notes=observations,
+            effective_at=effective,
+        )
+        self._identity.record_operation(
+            principal, action="inventory.responsible_assigned", resource=f"asset:{asset.id}"
+        )
+        return self._view(asset)
+
+    @serialized
+    def return_responsible(
+        self,
+        principal: Principal,
+        asset_id: Any,
+        *,
+        reason: Any = None,
+        notes: Any = None,
+        effective_at: Any = None,
+    ) -> AssetView:
+        """Return the asset: both the reference and its mirrored legacy text are cleared."""
+        asset = self._asset(asset_id)
+        self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
+        if asset.responsible_person_id is None and asset.responsible is None:
+            raise Conflict("asset has no responsible person")
+        note = _reason(reason, required=False)
+        observations = _notes(notes)
+        effective = _effective_at(effective_at)
+        before = self._snapshot(asset)
+        asset.responsible_person_id = None
+        asset.responsible = None
+        asset.updated_at = utcnow()
+        self._flush_or_conflict()
+        self._record_history(
+            principal,
+            asset,
+            "returned",
+            before=before,
+            reason=note,
+            notes=observations,
+            effective_at=effective,
+        )
+        self._identity.record_operation(
+            principal, action="inventory.responsible_returned", resource=f"asset:{asset.id}"
+        )
+        return self._view(asset)
+
+    @serialized
+    def transfer(
+        self,
+        principal: Principal,
+        asset_id: Any,
+        *,
+        site_id: Any = None,
+        location_id: Any = _UNSET,
+        reason: Any = None,
+        notes: Any = None,
+        effective_at: Any = None,
+    ) -> AssetView:
+        """Move an asset to another site/location; the UUID and technical data stay."""
+        asset = self._asset(asset_id)
+        self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
+        _assert_not_archived(asset)
+        if site_id is None and location_id is _UNSET:
+            raise ValidationFailed("siteId or locationId is required")
+        changes: dict[str, Any] = {}
+        if site_id is not None:
+            changes["site_id"] = site_id
+        if location_id is not _UNSET:
+            changes["location_id"] = location_id
+        prepared = self._prepare_changes(asset, changes, principal=principal)
+        if not any(
+            prepared[field] != getattr(asset, field)
+            for field in prepared
+            if field in _HISTORY_FIELDS
+        ):
+            raise Conflict("asset is already in that location")
+        note = _reason(reason, required=False)
+        observations = _notes(notes)
+        effective = _effective_at(effective_at)
+        self._catalog_changes(asset, prepared)
+        before = self._snapshot(asset)
+        self._apply(asset, prepared)
+        self._flush_or_conflict()
+        self._record_history(
+            principal,
+            asset,
+            "transferred",
+            before=before,
+            reason=note,
+            notes=observations,
+            effective_at=effective,
+        )
+        self._identity.record_operation(
+            principal, action="inventory.asset_transferred", resource=f"asset:{asset.id}"
         )
         return self._view(asset)
 
@@ -747,6 +1026,9 @@ class InventoryService:
         status: str | None = None,
         quick_code: str | None = None,
         asset_id: str | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
         archived: bool | None = None,
         limit: int = DEFAULT_LIMIT,
         offset: int = 0,
@@ -778,6 +1060,16 @@ class InventoryService:
         site_value = _text(site, "site")
         if site_value:
             filters.append(Asset.site.ilike(_escape_like(site_value), escape="\\"))
+        site_reference = organization.reference(site_id, "siteId")
+        if site_reference is not None:
+            filters.append(Asset.site_id == site_reference)
+        location_reference = organization.reference(location_id, "locationId")
+        if location_reference is not None:
+            subtree = organization.descendant_ids(self._session, location_reference)
+            filters.append(Asset.location_id.in_(subtree))
+        person_reference = organization.reference(responsible_person_id, "responsiblePersonId")
+        if person_reference is not None:
+            filters.append(Asset.responsible_person_id == person_reference)
         if status is not None:
             filters.append(Asset.status == _status(status))
         quick_code_value = _quick_code(quick_code, required=False)
@@ -807,6 +1099,76 @@ class InventoryService:
             offset=offset,
         )
 
+    def map(
+        self,
+        principal: Principal,
+        *,
+        site_id: str | None = None,
+        limit: int = DEFAULT_LIMIT,
+        offset: int = 0,
+    ) -> AssetMap:
+        """Bounded organizational map: sites plus the assets that declare a position."""
+        self._identity.authorize(principal, "assets.view", resource="inventory:assets")
+        if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
+            raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+        if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
+            raise ValidationFailed("offset must be zero or greater")
+        directory = self._directory()
+        checked = organization.reference(site_id, "siteId")
+        site_total = 0
+        if checked is not None:
+            view = directory.get_location(principal, checked)
+            if view.level != "site":
+                raise ValidationFailed("siteId must reference a site")
+            sites: tuple[Any, ...] = (view,)
+            site_total = 1
+        else:
+            page = directory.list_locations(
+                principal, level="site", active=True, limit=MAX_LIMIT, offset=0
+            )
+            sites = page.items
+            site_total = page.total
+
+        filters: list[ColumnElement[bool]] = [Asset.position_x.is_not(None)]
+        if checked is not None:
+            filters.append(Asset.site_id == checked)
+        rows = list(
+            self._session.execute(
+                select(Asset)
+                .where(*filters)
+                .order_by(Asset.updated_at.desc(), Asset.id.asc())
+                .limit(limit + 1)
+                .offset(offset)
+            ).scalars()
+        )
+        positions = tuple(
+            MapPosition(
+                asset_id=asset.id,
+                quick_code=asset.quick_code,
+                name=asset.name,
+                site_id=asset.site_id or "",
+                location_id=asset.location_id or "",
+                x=organization.number(asset.position_x),
+                y=organization.number(asset.position_y),
+            )
+            for asset in rows[:limit]
+        )
+        return AssetMap(
+            sites=tuple(
+                MapSite(
+                    id=view.id,
+                    name=view.name,
+                    latitude=view.latitude,
+                    longitude=view.longitude,
+                )
+                for view in sites
+            ),
+            positions=positions,
+            limit=limit,
+            offset=offset,
+            truncated=len(rows) > limit or site_total > len(sites),
+        )
+
     @serialized
     def batch(
         self,
@@ -831,14 +1193,14 @@ class InventoryService:
                 raise ValidationFailed("each update must be an object")
             asset = self._asset(changes.get("id"))
             self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
-            if "responsible" in changes:
+            if "responsible" in changes or "responsible_person_id" in changes:
                 self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
 
         prepared_creates: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
         for values in creates:
-            prepared = self._prepare_create(values)
-            if "responsible" in prepared:
+            prepared = self._prepare_create(values, principal=principal)
+            if "responsible" in prepared or "responsible_person_id" in prepared:
                 self._identity.authorize(
                     principal, "assets.assign", resource=f"asset:{prepared['quick_code']}"
                 )
@@ -853,7 +1215,9 @@ class InventoryService:
         for changes in updates:
             asset = self._asset(changes.get("id"))
             prepared = self._prepare_changes(
-                {key: value for key, value in changes.items() if key != "id"}
+                asset,
+                {key: value for key, value in changes.items() if key != "id"},
+                principal=principal,
             )
             self._catalog_changes(asset, prepared)
             if "quick_code" in prepared:
@@ -910,6 +1274,10 @@ class InventoryService:
             field: getattr(source, field)
             for field in _HISTORY_FIELDS
             if getattr(source, field) is not None
+            and not (
+                field in organization.LEGACY_FIELDS
+                and getattr(source, organization.MIRROR_IDS[field]) is not None
+            )
         }
         if changes is not None:
             if not isinstance(changes, Mapping):
@@ -920,8 +1288,8 @@ class InventoryService:
             if unknown:
                 raise ValidationFailed(f"unsupported asset fields: {', '.join(unknown)}")
             values.update(changes)
-        prepared = self._prepare_create(values)
-        if "responsible" in prepared:
+        prepared = self._prepare_create(values, principal=principal)
+        if "responsible" in prepared or "responsible_person_id" in prepared:
             self._identity.authorize(
                 principal, "assets.assign", resource=f"asset:{prepared['quick_code']}"
             )
@@ -956,12 +1324,13 @@ class InventoryService:
 
     @serialized
     def restore(self, principal: Principal, asset_id: Any) -> AssetView:
-        """Remove only the archive flag; every other stored value stays as it was."""
+        """Clear the archive flag after revalidating every effective reference."""
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if asset.archived_at is None:
             raise Conflict("asset is not archived")
         before = self._snapshot(asset)
+        organization.validate_stored(before, directory=self._directory(), principal=principal)
         asset.archived_at = None
         asset.archived_by = None
         asset.updated_at = utcnow()
@@ -981,12 +1350,13 @@ class InventoryService:
         assert note is not None
         if asset.status == "retired":
             raise Conflict("asset is already retired")
-        if asset.responsible is not None:
+        if asset.responsible is not None or asset.responsible_person_id is not None:
             self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
         before = self._snapshot(asset)
         self._catalog.validate_transition(asset.category, asset.status, "retired")
         asset.status = "retired"
         asset.responsible = None
+        asset.responsible_person_id = None
         asset.updated_at = utcnow()
         self._flush_or_conflict()
         self._record_history(principal, asset, "retired", before=before, reason=note)
@@ -1395,6 +1765,7 @@ __all__ = [
     "REASON_MAX",
     "REASON_MIN",
     "STATUSES",
+    "AssetMap",
     "AssetView",
     "BatchResult",
     "HistoryPage",

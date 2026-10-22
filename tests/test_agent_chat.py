@@ -240,15 +240,25 @@ def test_chat_tool_registry_is_bounded_to_inventory_operations(
     assert response.status_code == 200
     assert seen["tools"] == [
         "archive_asset",
+        "assign_asset",
         "batch_update_assets",
         "clone_asset",
         "create_asset",
+        "create_relationship",
         "get_asset",
         "get_asset_history",
+        "get_asset_map",
+        "get_asset_relations",
         "get_inventory_config",
+        "move_host",
+        "remove_relationship",
         "restore_asset",
         "retire_asset",
+        "return_asset",
         "search_assets",
+        "search_locations",
+        "search_people",
+        "transfer_asset",
         "update_asset",
     ]
     forbidden = ("shell", "exec", "sql", "file", "http", "browser", "python")

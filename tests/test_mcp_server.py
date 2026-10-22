@@ -32,6 +32,16 @@ TOOL_NAMES = {
     "retire_asset",
     "get_asset_history",
     "get_inventory_config",
+    "search_locations",
+    "search_people",
+    "assign_asset",
+    "return_asset",
+    "transfer_asset",
+    "get_asset_relations",
+    "create_relationship",
+    "remove_relationship",
+    "move_host",
+    "get_asset_map",
 }
 
 

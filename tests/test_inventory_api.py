@@ -72,6 +72,12 @@ def test_create_read_and_search_return_the_same_asset(
         "archivedBy",
         "images",
         "createdAt",
+        "locationId",
+        "responsiblePersonId",
+        "responsibleLabel",
+        "positionX",
+        "positionY",
+        "siteId",
         "updatedAt",
     }
 

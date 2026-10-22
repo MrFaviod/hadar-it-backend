@@ -12,8 +12,10 @@ from pydantic import BaseModel, ConfigDict, Field
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import AuthContext, IdentityService
 from itsm.relationships.service import (
+    BULK_LIMIT,
     DEFAULT_GRAPH_DEPTH,
     DEFAULT_LIMIT,
+    RelationshipPage,
     RelationshipService,
 )
 
@@ -102,6 +104,55 @@ _RELATION_ALIASES = {"typeKey": "type_key", "effectiveAt": "effective_at"}
 
 def _changes(payload: BaseModel, aliases: dict[str, str]) -> dict[str, Any]:
     return {aliases.get(name, name): getattr(payload, name) for name in payload.model_fields_set}
+
+
+class AssetRelationsInput(BaseModel):
+    """Bulk relation lookup by permanent asset ids, bounded by the service limit."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assetIds: list[str] = Field(min_length=1, max_length=BULK_LIMIT)
+    typeKey: str | None = Field(default=None, max_length=32)
+    direction: str = "both"
+
+
+class AssetRelationsPayload(BaseModel):
+    """One asset's edges; an edge names both endpoints without embedding nodes."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    assetId: str
+    outgoing: list[dict[str, Any]]
+    incoming: list[dict[str, Any]]
+    truncated: bool
+
+
+class AssetRelationsPagePayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    items: list[AssetRelationsPayload]
+    truncated: bool
+
+
+def _grouped(page: RelationshipPage, asset_ids: list[str]) -> dict[str, dict[str, Any]]:
+    """Group one bounded edge page per asset; the truncation flag is page level."""
+    truncated = page.total > len(page.items)
+    grouped: dict[str, dict[str, Any]] = {
+        asset_id: {
+            "assetId": asset_id,
+            "outgoing": [],
+            "incoming": [],
+            "truncated": truncated,
+        }
+        for asset_id in asset_ids
+    }
+    for edge in page.items:
+        payload = edge.as_payload()
+        if edge.direction == "incoming":
+            grouped[edge.target_id]["incoming"].append(payload)
+        else:
+            grouped[edge.source_id]["outgoing"].append(payload)
+    return grouped
 
 
 def create_relationship_router() -> APIRouter:
@@ -220,6 +271,48 @@ def create_relationship_router() -> APIRouter:
         values = {} if payload is None else _changes(payload, _RELATION_ALIASES)
         return service.remove(context.principal, relationship_id, **values).as_payload()
 
+    @router.get("/assets/{asset_id}/relations")
+    def read_asset_relations(
+        asset_id: str,
+        service: RelationshipDependency,
+        context: AuthDependency,
+        typeKey: str | None = None,
+        direction: str = "both",
+        limit: int = DEFAULT_LIMIT,
+    ) -> dict[str, Any]:
+        page = service.list(
+            context.principal,
+            asset_ids=[asset_id],
+            type_key=typeKey,
+            direction=direction,
+            limit=limit,
+            offset=0,
+        )
+        grouped = _grouped(page, [asset_id])[asset_id]
+        return AssetRelationsPayload.model_validate(grouped).model_dump()
+
+    @router.post("/assets/relations")
+    def read_assets_relations(
+        payload: AssetRelationsInput,
+        service: RelationshipDependency,
+        context: AuthDependency,
+    ) -> dict[str, Any]:
+        page = service.list(
+            context.principal,
+            asset_ids=payload.assetIds,
+            type_key=payload.typeKey,
+            direction=payload.direction,
+            limit=DEFAULT_LIMIT,
+            offset=0,
+        )
+        grouped = _grouped(page, payload.assetIds)
+        return AssetRelationsPagePayload.model_validate(
+            {
+                "items": [grouped[asset_id] for asset_id in payload.assetIds],
+                "truncated": any(item["truncated"] for item in grouped.values()),
+            }
+        ).model_dump()
+
     @router.get("/infrastructure/graph")
     def read_infrastructure_graph(
         service: RelationshipDependency,
@@ -247,6 +340,9 @@ def create_relationship_router() -> APIRouter:
 
 
 __all__ = [
+    "AssetRelationsInput",
+    "AssetRelationsPagePayload",
+    "AssetRelationsPayload",
     "create_relationship_router",
     "get_relationship_service",
 ]

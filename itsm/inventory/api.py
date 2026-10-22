@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Iterator
+from datetime import datetime
 from decimal import Decimal
 from typing import Annotated, Any
 
@@ -10,9 +11,10 @@ from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
 from itsm.identity.api import authenticated_actor, mutation_guard
-from itsm.identity.service import AuthContext, IdentityService
+from itsm.identity.service import AuthContext, IdentityService, ValidationFailed
 from itsm.inventory.media import MAX_IMAGE_BYTES
 from itsm.inventory.service import (
+    _UNSET,
     BATCH_LIMIT,
     DEFAULT_LIMIT,
     FIELD_LIMITS,
@@ -23,7 +25,17 @@ from itsm.inventory.service import (
     InventoryService,
 )
 
-_ASSET_ALIASES = {"quickCode": "quick_code"}
+_ASSET_ALIASES = {
+    "quickCode": "quick_code",
+    "siteId": "site_id",
+    "locationId": "location_id",
+    "responsiblePersonId": "responsible_person_id",
+    "positionX": "position_x",
+    "positionY": "position_y",
+}
+
+_REFERENCE_MAX = 36
+_POSITION_MAX = 16
 
 
 class AssetInput(BaseModel):
@@ -42,6 +54,11 @@ class AssetInput(BaseModel):
     site: str | None = Field(default=None, max_length=FIELD_LIMITS["site"])
     location: str | None = Field(default=None, max_length=FIELD_LIMITS["location"])
     responsible: str | None = Field(default=None, max_length=FIELD_LIMITS["responsible"])
+    siteId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    locationId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    responsiblePersonId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    positionX: str | None = Field(default=None, max_length=_POSITION_MAX)
+    positionY: str | None = Field(default=None, max_length=_POSITION_MAX)
     status: str | None = Field(default=None, max_length=FIELD_LIMITS["status"])
     description: str | None = Field(default=None, max_length=FIELD_LIMITS["description"])
     cost: Decimal | None = None
@@ -64,6 +81,11 @@ class AssetUpdate(BaseModel):
     site: str | None = Field(default=None, max_length=FIELD_LIMITS["site"])
     location: str | None = Field(default=None, max_length=FIELD_LIMITS["location"])
     responsible: str | None = Field(default=None, max_length=FIELD_LIMITS["responsible"])
+    siteId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    locationId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    responsiblePersonId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    positionX: str | None = Field(default=None, max_length=_POSITION_MAX)
+    positionY: str | None = Field(default=None, max_length=_POSITION_MAX)
     status: str | None = Field(default=None, max_length=FIELD_LIMITS["status"])
     description: str | None = Field(default=None, max_length=FIELD_LIMITS["description"])
     cost: Decimal | None = None
@@ -100,6 +122,12 @@ class AssetPayload(BaseModel):
     site: str | None
     location: str | None
     responsible: str | None
+    siteId: str | None
+    locationId: str | None
+    responsiblePersonId: str | None
+    responsibleLabel: str | None
+    positionX: str | None
+    positionY: str | None
     status: str
     description: str | None
     cost: str | None
@@ -144,6 +172,11 @@ class AssetHistoryPayload(BaseModel):
     actorId: str | None
     actorUsername: str | None
     createdAt: str
+    source: str
+    entityType: str
+    entityId: str
+    effectiveAt: str | None
+    notes: str | None
 
 
 class AssetHistoryPagePayload(BaseModel):
@@ -201,6 +234,49 @@ class AssetImageRemovedPayload(BaseModel):
     role: str
 
 
+class AssetAssignInput(BaseModel):
+    """Assignment body; ``source`` and the actor are never accepted from a client."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    personId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    reason: str | None = Field(default=None, max_length=REASON_MAX)
+    notes: str | None = Field(default=None, max_length=REASON_MAX)
+    effectiveAt: datetime | None = None
+
+
+class AssetReturnInput(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    reason: str | None = Field(default=None, max_length=REASON_MAX)
+    notes: str | None = Field(default=None, max_length=REASON_MAX)
+    effectiveAt: datetime | None = None
+
+
+class AssetTransferInput(BaseModel):
+    """Move body: at least one of ``siteId``/``locationId`` must be meaningful."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    siteId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    locationId: str | None = Field(default=None, max_length=_REFERENCE_MAX)
+    reason: str | None = Field(default=None, max_length=REASON_MAX)
+    notes: str | None = Field(default=None, max_length=REASON_MAX)
+    effectiveAt: datetime | None = None
+
+
+class AssetMapPayload(BaseModel):
+    """Organizational map: sites with coordinates plus bounded asset positions."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    sites: list[dict[str, Any]]
+    positions: list[dict[str, Any]]
+    limit: int
+    offset: int
+    truncated: bool
+
+
 def asset_payload(view: AssetView) -> dict[str, Any]:
     """Serialize one service view into the announced public DTO."""
     return view.as_payload()
@@ -230,7 +306,11 @@ def get_inventory_service(request: Request) -> Iterator[InventoryService]:
     session = request.app.state.session_factory()
     try:
         identity = IdentityService(session, request.app.state.settings)
-        yield InventoryService(session, request.app.state.settings, identity=identity)
+        request.state.session = session
+        request.state.identity = identity
+        yield InventoryService(
+            session, request.app.state.settings, identity=identity, source="rest"
+        )
     finally:
         session.close()
 
@@ -250,6 +330,9 @@ def _search(
     status: str | None,
     quick_code: str | None,
     asset_id: str | None,
+    site_id: str | None,
+    location_id: str | None,
+    responsible_person_id: str | None,
     archived: bool | None,
     limit: int,
     offset: int,
@@ -262,11 +345,22 @@ def _search(
         status=status,
         quick_code=quick_code,
         asset_id=asset_id,
+        site_id=site_id,
+        location_id=location_id,
+        responsible_person_id=responsible_person_id,
         archived=archived,
         limit=limit,
         offset=offset,
     )
     return AssetPagePayload.model_validate(page.as_payload()).model_dump()
+
+
+def _directory(request: Request) -> Any:
+    from itsm.directory.service import DirectoryService
+
+    return DirectoryService(
+        request.state.session, request.app.state.settings, identity=request.state.identity
+    )
 
 
 def create_inventory_router() -> APIRouter:
@@ -283,6 +377,9 @@ def create_inventory_router() -> APIRouter:
         status: str | None = None,
         quick_code: Annotated[str | None, Query(alias="quickCode")] = None,
         asset_id: Annotated[str | None, Query(alias="id")] = None,
+        site_id: Annotated[str | None, Query(alias="siteId")] = None,
+        location_id: Annotated[str | None, Query(alias="locationId")] = None,
+        responsible_person_id: Annotated[str | None, Query(alias="responsiblePersonId")] = None,
         archived: bool | None = None,
         limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -296,6 +393,9 @@ def create_inventory_router() -> APIRouter:
             status=status,
             quick_code=quick_code,
             asset_id=asset_id,
+            site_id=site_id,
+            location_id=location_id,
+            responsible_person_id=responsible_person_id,
             archived=archived,
             limit=limit,
             offset=offset,
@@ -311,6 +411,9 @@ def create_inventory_router() -> APIRouter:
         status: str | None = None,
         quick_code: Annotated[str | None, Query(alias="quickCode")] = None,
         asset_id: Annotated[str | None, Query(alias="id")] = None,
+        site_id: Annotated[str | None, Query(alias="siteId")] = None,
+        location_id: Annotated[str | None, Query(alias="locationId")] = None,
+        responsible_person_id: Annotated[str | None, Query(alias="responsiblePersonId")] = None,
         archived: bool | None = None,
         limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
         offset: Annotated[int, Query(ge=0)] = 0,
@@ -324,10 +427,72 @@ def create_inventory_router() -> APIRouter:
             status=status,
             quick_code=quick_code,
             asset_id=asset_id,
+            site_id=site_id,
+            location_id=location_id,
+            responsible_person_id=responsible_person_id,
             archived=archived,
             limit=limit,
             offset=offset,
         )
+
+    @router.get("/map")
+    def read_map(
+        service: InventoryDependency,
+        context: AuthDependency,
+        site_id: Annotated[str | None, Query(alias="siteId")] = None,
+        limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, Any]:
+        mapped = service.map(context.principal, site_id=site_id, limit=limit, offset=offset)
+        return AssetMapPayload.model_validate(mapped.as_payload()).model_dump()
+
+    @router.get("/people/{person_id}/assets")
+    def read_person_assets(
+        person_id: str,
+        request: Request,
+        service: InventoryDependency,
+        context: AuthDependency,
+        limit: Annotated[int, Query(ge=1, le=MAX_LIMIT)] = DEFAULT_LIMIT,
+        offset: Annotated[int, Query(ge=0)] = 0,
+    ) -> dict[str, Any]:
+        # The person must exist; archived assignments stay visible through the filter.
+        _directory(request).get_person(context.principal, person_id)
+        return _search(
+            service,
+            context,
+            query=None,
+            category=None,
+            site=None,
+            status=None,
+            quick_code=None,
+            asset_id=None,
+            site_id=None,
+            location_id=None,
+            responsible_person_id=person_id,
+            archived=None,
+            limit=limit,
+            offset=offset,
+        )
+
+    @router.post("/people/{person_id}/assets/{asset_id}/assign")
+    def assign_from_person(
+        person_id: str,
+        asset_id: str,
+        payload: AssetAssignInput,
+        service: InventoryDependency,
+        context: MutationDependency,
+    ) -> dict[str, Any]:
+        if payload.personId is not None and payload.personId != person_id:
+            raise ValidationFailed("personId does not match the person in the path")
+        assigned = service.assign_responsible(
+            context.principal,
+            asset_id,
+            person_id,
+            reason=payload.reason,
+            notes=payload.notes,
+            effective_at=payload.effectiveAt,
+        )
+        return asset_payload(assigned)
 
     @router.post("/assets", status_code=201)
     def create_asset(
@@ -424,6 +589,61 @@ def create_inventory_router() -> APIRouter:
         )
         return result.as_payload()
 
+    @router.post("/assets/{asset_id}/assign")
+    def assign_asset(
+        asset_id: str,
+        payload: AssetAssignInput,
+        service: InventoryDependency,
+        context: MutationDependency,
+    ) -> dict[str, Any]:
+        if payload.personId is None:
+            raise ValidationFailed("personId is required")
+        assigned = service.assign_responsible(
+            context.principal,
+            asset_id,
+            payload.personId,
+            reason=payload.reason,
+            notes=payload.notes,
+            effective_at=payload.effectiveAt,
+        )
+        return asset_payload(assigned)
+
+    @router.post("/assets/{asset_id}/return")
+    def return_asset(
+        asset_id: str,
+        service: InventoryDependency,
+        context: MutationDependency,
+        payload: AssetReturnInput | None = None,
+    ) -> dict[str, Any]:
+        returned = service.return_responsible(
+            context.principal,
+            asset_id,
+            reason=None if payload is None else payload.reason,
+            notes=None if payload is None else payload.notes,
+            effective_at=None if payload is None else payload.effectiveAt,
+        )
+        return asset_payload(returned)
+
+    @router.post("/assets/{asset_id}/transfer")
+    def transfer_asset(
+        asset_id: str,
+        payload: AssetTransferInput,
+        service: InventoryDependency,
+        context: MutationDependency,
+    ) -> dict[str, Any]:
+        transferred = service.transfer(
+            context.principal,
+            asset_id,
+            site_id=payload.siteId,
+            location_id=(
+                payload.locationId if "locationId" in payload.model_fields_set else _UNSET
+            ),
+            reason=payload.reason,
+            notes=payload.notes,
+            effective_at=payload.effectiveAt,
+        )
+        return asset_payload(transferred)
+
     @router.get("/assets/{asset_id}/history")
     def read_asset_history(
         asset_id: str,
@@ -433,7 +653,16 @@ def create_inventory_router() -> APIRouter:
         offset: Annotated[int, Query(ge=0)] = 0,
     ) -> dict[str, Any]:
         page = service.history(context.principal, asset_id, limit=limit, offset=offset)
-        return AssetHistoryPagePayload.model_validate(page.as_payload()).model_dump()
+        return {
+            "assetId": page.asset_id,
+            "items": [
+                AssetHistoryPayload.model_validate(item.structured_payload()).model_dump()
+                for item in page.items
+            ],
+            "total": page.total,
+            "limit": page.limit,
+            "offset": page.offset,
+        }
 
     @router.get("/assets/{asset_id}/images/{role}")
     def read_asset_image(
@@ -479,6 +708,7 @@ def create_inventory_router() -> APIRouter:
 
 __all__ = [
     "AssetArchiveInput",
+    "AssetAssignInput",
     "AssetBatchPayload",
     "AssetBatchRequest",
     "AssetCloneInput",
@@ -487,10 +717,13 @@ __all__ = [
     "AssetImagePayload",
     "AssetImageRemovedPayload",
     "AssetInput",
+    "AssetMapPayload",
     "AssetPagePayload",
     "AssetPayload",
     "AssetPurgeInput",
     "AssetRetireInput",
+    "AssetReturnInput",
+    "AssetTransferInput",
     "AssetUpdate",
     "asset_payload",
     "create_inventory_router",

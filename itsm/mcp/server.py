@@ -1,9 +1,11 @@
-"""Selected inventory tools exposed over MCP for external agents.
+"""Selected inventory, directory and relationship tools exposed over MCP.
 
 The server is mounted inside the existing FastAPI application. Every request is
 authenticated by the same persisted bearer credential as the REST API, and each
 tool re-validates that credential immediately before touching the database, so a
-revoked machine identity cannot keep using an open MCP session.
+revoked machine identity cannot keep using an open MCP session. Tools never
+accept an actor, a source or a permission from their arguments: the principal
+comes from the trusted bearer transport and history source is always ``mcp``.
 """
 
 from __future__ import annotations
@@ -18,6 +20,7 @@ from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_http_headers
 from itsm.config import Settings
+from itsm.directory.service import DirectoryService
 from itsm.identity.service import (
     AuthenticationFailed,
     Conflict,
@@ -28,8 +31,10 @@ from itsm.identity.service import (
     ValidationFailed,
 )
 from itsm.inventory.catalog import InventoryCatalog
-from itsm.inventory.projection import project, validate_fields
+from itsm.inventory.organization import moment
+from itsm.inventory.projection import history_payload, project, validate_fields
 from itsm.inventory.service import BATCH_LIMIT, AssetView, InventoryService
+from itsm.relationships.service import RelationshipService
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -47,6 +52,16 @@ TOOL_NAMES: tuple[str, ...] = (
     "retire_asset",
     "get_asset_history",
     "get_inventory_config",
+    "search_locations",
+    "search_people",
+    "assign_asset",
+    "return_asset",
+    "transfer_asset",
+    "get_asset_relations",
+    "create_relationship",
+    "remove_relationship",
+    "move_host",
+    "get_asset_map",
 )
 
 INSTRUCTIONS = """\
@@ -112,6 +127,11 @@ class BatchUpdateInput(BaseModel):
     description: str | None = None
     cost: str | float | None = None
     technical: dict[str, Any] | None = None
+    site_id: str | None = None
+    location_id: str | None = None
+    responsible_person_id: str | None = None
+    position_x: str | None = None
+    position_y: str | None = None
 
 
 def _bearer_token() -> str:
@@ -163,6 +183,47 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             raise
         except Exception as exc:
             raise _translate(exc) from None
+
+    def run_with(
+        factory: Callable[
+            [],
+            Any,
+        ],
+        operation: Callable[[Any, Principal], Any],
+    ) -> Any:
+        """Run one tool against another canonical service with the same bearer principal."""
+        try:
+            with factory() as (service, principal):
+                return operation(service, principal)
+        except ToolError:
+            raise
+        except Exception as exc:
+            raise _translate(exc) from None
+
+    @contextmanager
+    def directory() -> Iterator[tuple[DirectoryService, Principal]]:
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield DirectoryService(session, settings, identity=identity), context.principal
+
+    @contextmanager
+    def relations() -> Iterator[tuple[RelationshipService, Principal]]:
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield (
+                RelationshipService(session, settings, identity=identity, source="mcp"),
+                context.principal,
+            )
 
     @server.tool
     def search_assets(
@@ -218,6 +279,11 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         description: str | None = None,
         cost: str | float | None = None,
         technical: dict[str, Any] | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
+        position_x: str | None = None,
+        position_y: str | None = None,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Register a new asset; the server generates the permanent id."""
@@ -237,6 +303,11 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             "description": description,
             "cost": cost,
             "technical": technical,
+            "site_id": site_id,
+            "location_id": location_id,
+            "responsible_person_id": responsible_person_id,
+            "position_x": position_x,
+            "position_y": position_y,
         }
 
         def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
@@ -269,6 +340,11 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         description: str | None = None,
         cost: str | float | None = None,
         technical: dict[str, Any] | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
+        position_x: str | None = None,
+        position_y: str | None = None,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Update selected fields of one asset; its permanent id never changes."""
@@ -288,6 +364,11 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             "description": description,
             "cost": cost,
             "technical": technical,
+            "site_id": site_id,
+            "location_id": location_id,
+            "responsible_person_id": responsible_person_id,
+            "position_x": position_x,
+            "position_y": position_y,
         }
         changes = {key: value for key, value in values.items() if value is not None}
 
@@ -357,9 +438,9 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
     def get_asset_history(asset_id: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
         """Read bounded immutable history, including retained history after purge."""
         return run(
-            lambda service, principal: service.history(
-                principal, asset_id, limit=limit, offset=offset
-            ).as_payload()
+            lambda service, principal: history_payload(
+                service.history(principal, asset_id, limit=limit, offset=offset)
+            )
         )
 
     @server.tool
@@ -368,6 +449,267 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         return run(
             lambda service, principal: InventoryCatalog(service._session, settings).get(principal)
         )
+
+    @server.tool
+    def search_locations(
+        query: str | None = None,
+        level: str | None = None,
+        parent_id: str | None = None,
+        active: bool | None = True,
+        tree: bool = False,
+        depth: int = 2,
+        max_nodes: int = 50,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search sites, buildings, floors or rooms; tree mode returns a bounded hierarchy."""
+
+        def operation(service: DirectoryService, principal: Principal) -> dict[str, Any]:
+            if tree:
+                built = service.location_tree(
+                    principal, root_id=parent_id, depth=depth, max_nodes=max_nodes
+                )
+                return {
+                    "routes": [node.location.as_payload() for node in built.roots],
+                    "nodeCount": built.node_count,
+                    "depth": built.depth,
+                    "truncated": built.truncated,
+                }
+            page = service.list_locations(
+                principal,
+                query=query,
+                level=level,
+                parent_id=parent_id,
+                active=active,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "items": [item.as_payload() for item in page.items],
+            }
+
+        return run_with(directory, operation)
+
+    @server.tool
+    def search_people(
+        query: str | None = None,
+        status: str | None = None,
+        department_id: str | None = None,
+        site_id: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search responsible people by text, status, department or site."""
+
+        def operation(service: DirectoryService, principal: Principal) -> dict[str, Any]:
+            page = service.list_people(
+                principal,
+                query=query,
+                status=status,
+                department_id=department_id,
+                site_id=site_id,
+                limit=limit,
+                offset=offset,
+            )
+            return {
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "items": [item.as_payload() for item in page.items],
+            }
+
+        return run_with(directory, operation)
+
+    @server.tool
+    def assign_asset(
+        asset_id: str,
+        person_id: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Assign one asset to an active directory person."""
+
+        def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
+            return compact(
+                service.assign_responsible(
+                    principal,
+                    asset_id,
+                    person_id,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                ),
+                fields,
+            )
+
+        return run(operation)
+
+    @server.tool
+    def return_asset(
+        asset_id: str,
+        reason: str,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Record the return of an assigned asset and clear its responsible person."""
+
+        def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
+            return compact(
+                service.return_responsible(
+                    principal,
+                    asset_id,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                ),
+                fields,
+            )
+
+        return run(operation)
+
+    @server.tool
+    def transfer_asset(
+        asset_id: str,
+        reason: str,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Transfer an asset to another site or location without changing its id."""
+
+        def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            validate_fields(fields)
+            return compact(
+                service.transfer(
+                    principal,
+                    asset_id,
+                    site_id=site_id,
+                    location_id=location_id,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                ),
+                fields,
+            )
+
+        return run(operation)
+
+    @server.tool
+    def get_asset_relations(
+        asset_ids: list[str],
+        type_key: str | None = None,
+        direction: str = "both",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Read the relations of several assets in one bounded call."""
+
+        def operation(service: RelationshipService, principal: Principal) -> dict[str, Any]:
+            page = service.list(
+                principal,
+                asset_ids=asset_ids,
+                type_key=type_key,
+                direction=direction,
+                limit=limit,
+            )
+            return {
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "items": [item.as_payload() for item in page.items],
+            }
+
+        return run_with(relations, operation)
+
+    @server.tool
+    def create_relationship(
+        source_id: str,
+        target_id: str,
+        type_key: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Create one directed typed relation between two existing assets."""
+
+        def operation(service: RelationshipService, principal: Principal) -> dict[str, Any]:
+            view = service.create(
+                principal,
+                source_id=source_id,
+                target_id=target_id,
+                type_key=type_key,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            )
+            return view.as_payload()
+
+        return run_with(relations, operation)
+
+    @server.tool
+    def remove_relationship(
+        relationship_id: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Remove one relation, keeping the history of both assets."""
+
+        def operation(service: RelationshipService, principal: Principal) -> dict[str, Any]:
+            view = service.remove(
+                principal,
+                relationship_id,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            )
+            return view.as_payload()
+
+        return run_with(relations, operation)
+
+    @server.tool
+    def move_host(
+        child_id: str,
+        new_host_id: str,
+        reason: str,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Move a virtual asset to another host without losing its permanent id."""
+
+        def operation(service: RelationshipService, principal: Principal) -> dict[str, Any]:
+            return service.move_host(
+                principal,
+                child_id,
+                new_host_id,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            ).as_payload()
+
+        return run_with(relations, operation)
+
+    @server.tool
+    def get_asset_map(
+        site_id: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Read bounded organizational map data: sites and plan positions."""
+
+        def operation(service: InventoryService, principal: Principal) -> dict[str, Any]:
+            return service.map(principal, site_id=site_id, limit=limit, offset=offset).as_payload()
+
+        return run(operation)
 
     return server
 

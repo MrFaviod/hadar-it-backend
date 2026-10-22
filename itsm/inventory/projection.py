@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from itsm.identity.service import ValidationFailed
-from itsm.inventory.service import AssetView
+from itsm.inventory.service import AssetView, HistoryPage
 
 COMPACT_FIELDS = (
     "id",
@@ -25,8 +25,26 @@ PUBLIC_FIELDS = frozenset(AssetView.__dataclass_fields__) | {
     "archivedBy",
     "createdAt",
     "updatedAt",
+    "siteId",
+    "locationId",
+    "responsiblePersonId",
+    "responsibleLabel",
+    "positionX",
+    "positionY",
 }
-PUBLIC_FIELDS -= {"quick_code", "archived_at", "archived_by", "created_at", "updated_at"}
+PUBLIC_FIELDS -= {
+    "quick_code",
+    "archived_at",
+    "archived_by",
+    "created_at",
+    "updated_at",
+    "site_id",
+    "location_id",
+    "responsible_person_id",
+    "responsible_label",
+    "position_x",
+    "position_y",
+}
 
 
 def validate_fields(fields: list[str] | None) -> tuple[str, ...]:
@@ -45,3 +63,14 @@ def project(view: AssetView, fields: list[str] | None = None) -> dict[str, Any]:
     selected = validate_fields(fields)
     payload = view.as_payload()
     return {name: payload[name] for name in selected}
+
+
+def history_payload(page: HistoryPage) -> dict[str, Any]:
+    """Structured history page: every legacy key plus the additive phase-5 fields."""
+    return {
+        "assetId": page.asset_id,
+        "items": [item.structured_payload() for item in page.items],
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+    }

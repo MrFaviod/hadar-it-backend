@@ -9,9 +9,7 @@ from fastapi.testclient import TestClient
 from itsm.config import Settings
 from itsm.inventory.service import InventoryService
 from itsm.main import create_app
-from itsm.relationships.api import create_relationship_router
 from itsm.relationships.service import RelationshipService
-from starlette.routing import Mount
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME
 from tests.inventory_support import (
     MACHINE_PASSWORD,
@@ -50,17 +48,10 @@ def catalog(settings_factory: SettingsFactory) -> Catalog:
 
 @pytest.fixture
 def api(catalog: Catalog) -> Iterator[tuple[TestClient, dict[str, str], TestClient]]:
-    # T3 mounts this router in create_app. Until then the test adds it explicitly,
-    # ahead of the MCP mount at the same prefix so the mount cannot shadow it.
+    # create_app registers the relationship router before the MCP mount at the same
+    # prefix, so these routes must answer without any test-side route surgery.
     app = create_app(catalog.settings)
-    app.include_router(create_relationship_router(), prefix=catalog.settings.api_prefix)
-    included = app.router.routes.pop()
-    mount_index = next(
-        index
-        for index, route in enumerate(app.router.routes)
-        if isinstance(route, Mount) and route.path == catalog.settings.api_prefix
-    )
-    app.router.routes.insert(mount_index, included)
+    assert f"{catalog.settings.api_prefix}/relationships" in app.openapi()["paths"]
     with TestClient(app) as client:
         auth = sign_in_as(client, catalog.settings, ADMIN_USERNAME, ADMIN_PASSWORD)
         yield client, auth, TestClient(app)

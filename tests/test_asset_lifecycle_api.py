@@ -38,6 +38,12 @@ ASSET_KEYS = {
     "archivedBy",
     "images",
     "createdAt",
+    "locationId",
+    "responsiblePersonId",
+    "responsibleLabel",
+    "positionX",
+    "positionY",
+    "siteId",
     "updatedAt",
 }
 

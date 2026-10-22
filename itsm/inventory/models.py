@@ -10,6 +10,13 @@ case-normalized uniqueness key of the independent, editable quick code.
   technical fields.
 * History and tombstone rows are deliberately not linked by a foreign key: they
   must outlive a permanent purge so an asset id is never reused.
+* The canonical organization references (``site_id``, ``location_id``,
+  ``responsible_person_id``) are portable plain columns without a database
+  foreign key, deliberately: adding a constraint to an existing table is not
+  portable across the supported engines. Referential integrity is owned by
+  ``InventoryService`` together with ``DirectoryService`` and covered by tests.
+* ``position_x``/``position_y`` are canonical decimal strings in the relative
+  ``0..1`` band, so no engine turns a plan position into a binary float.
 * Media rows keep small, already validated raster images in portable SQL blobs.
 """
 
@@ -51,9 +58,17 @@ class Asset(InventoryBase):
     model: Mapped[str | None] = mapped_column(String(80), nullable=True)
     serial: Mapped[str | None] = mapped_column(String(80), nullable=True)
     ip: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    # Legacy free text, kept for callers that predate the directory. When a
+    # canonical reference is bound the text mirrors its label; the reference is
+    # the authority and the text is never matched back to a directory row.
     site: Mapped[str | None] = mapped_column(String(120), nullable=True, index=True)
     location: Mapped[str | None] = mapped_column(String(120), nullable=True)
     responsible: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    site_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    location_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    responsible_person_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    position_x: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    position_y: Mapped[str | None] = mapped_column(String(16), nullable=True)
     status: Mapped[str] = mapped_column(String(24), nullable=False, default="in_use", index=True)
     description: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     cost: Mapped[str | None] = mapped_column(String(16), nullable=True)

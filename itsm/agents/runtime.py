@@ -1,9 +1,10 @@
 """Conversational inventory assistant built on a real Pydantic AI agent.
 
-The agent is deliberately narrow: eleven typed inventory tools over the canonical
-service, a server-configured provider/model and bounded steps, history, input
-and output. It has no shell, SQL, filesystem or HTTP tool, and untrusted chat
-text cannot grant permissions or supply a principal.
+The agent is deliberately narrow: typed inventory, directory and relationship
+tools over the canonical services, a server-configured provider/model and
+bounded steps, history, input and output. It has no shell, SQL, filesystem or
+HTTP tool, and untrusted chat text cannot grant permissions, supply a principal,
+forge history metadata or choose a service source.
 """
 
 from __future__ import annotations
@@ -15,22 +16,26 @@ from dataclasses import dataclass, field
 from typing import Any, Literal
 
 from itsm.config import Settings
+from itsm.directory.service import DirectoryService
 from itsm.identity.service import (
     Conflict,
     IdentityError,
+    IdentityService,
     NotFound,
     PermissionDenied,
     Principal,
     ValidationFailed,
 )
 from itsm.inventory.catalog import InventoryCatalog
-from itsm.inventory.projection import project, validate_fields
+from itsm.inventory.organization import moment
+from itsm.inventory.projection import history_payload, project, validate_fields
 from itsm.inventory.service import (
     AssetView,
     BatchResult,
     InventoryPage,
     InventoryService,
 )
+from itsm.relationships.service import RelationshipService
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
@@ -59,6 +64,16 @@ TOOL_NAMES: tuple[str, ...] = (
     "retire_asset",
     "get_asset_history",
     "get_inventory_config",
+    "search_locations",
+    "search_people",
+    "assign_asset",
+    "return_asset",
+    "transfer_asset",
+    "get_asset_relations",
+    "create_relationship",
+    "remove_relationship",
+    "move_host",
+    "get_asset_map",
 )
 MAX_RESULTS = 50
 
@@ -163,13 +178,43 @@ class BatchUpdateArg(BaseModel):
     description: str | None = None
     cost: str | float | None = None
     technical: dict[str, Any] | None = None
+    site_id: str | None = None
+    location_id: str | None = None
+    responsible_person_id: str | None = None
+    position_x: str | None = None
+    position_y: str | None = None
 
 
 @contextmanager
 def _service(deps: AgentDeps) -> Iterator[InventoryService]:
     session = deps.session_factory()
     try:
-        yield InventoryService(session, deps.settings)
+        yield InventoryService(session, deps.settings, source="agent")
+    finally:
+        session.close()
+
+
+@contextmanager
+def _directory(deps: AgentDeps) -> Iterator[DirectoryService]:
+    session = deps.session_factory()
+    try:
+        yield DirectoryService(
+            session, deps.settings, identity=IdentityService(session, deps.settings)
+        )
+    finally:
+        session.close()
+
+
+@contextmanager
+def _relations(deps: AgentDeps) -> Iterator[RelationshipService]:
+    session = deps.session_factory()
+    try:
+        yield RelationshipService(
+            session,
+            deps.settings,
+            identity=IdentityService(session, deps.settings),
+            source="agent",
+        )
     finally:
         session.close()
 
@@ -194,6 +239,36 @@ def _failure(
     return {"ok": False, "message": message}
 
 
+def _failed(deps: AgentDeps, tool: str, exc: Exception) -> dict[str, Any]:
+    """Map one service error to a compact, factual tool failure."""
+    if isinstance(exc, PermissionDenied):
+        return _failure(deps, tool, "denied", "La identidad no tiene permiso para esta operación.")
+    if isinstance(exc, Conflict):
+        return _failure(deps, tool, "failed", str(exc))
+    if isinstance(exc, NotFound):
+        return _failure(deps, tool, "failed", str(exc))
+    if isinstance(exc, ValidationFailed):
+        return _failure(deps, tool, "failed", str(exc))
+    logger.warning("agent tool identity error", exc_info=exc)
+    return _failure(deps, tool, "failed", "La operación no pudo completarse.")
+
+
+def _collect(
+    deps: AgentDeps,
+    tool: str,
+    operation: Callable[[], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run a query or write that renders its own compact payload."""
+    try:
+        payload = operation()
+    except IdentityError as exc:
+        return _failed(deps, tool, exc)
+    _record(deps, tool, "completed")
+    if len(deps.results) < MAX_RESULTS:
+        deps.results.append(payload)
+    return {"ok": True, **payload}
+
+
 def _execute(
     deps: AgentDeps,
     tool: str,
@@ -205,17 +280,8 @@ def _execute(
         validate_fields(fields)
         with _service(deps) as inventory:
             result = operation(inventory)
-    except PermissionDenied:
-        return _failure(deps, tool, "denied", "La identidad no tiene permiso para esta operación.")
-    except Conflict as exc:
-        return _failure(deps, tool, "failed", str(exc))
-    except NotFound as exc:
-        return _failure(deps, tool, "failed", str(exc))
-    except ValidationFailed as exc:
-        return _failure(deps, tool, "failed", str(exc))
-    except IdentityError as exc:  # pragma: no cover - defensive, still factual
-        logger.warning("agent tool identity error", exc_info=exc)
-        return _failure(deps, tool, "failed", "La operación no pudo completarse.")
+    except IdentityError as exc:
+        return _failed(deps, tool, exc)
 
     if isinstance(result, AssetView):
         _record(deps, tool, "completed", (result,), fields)
@@ -297,6 +363,11 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         description: str | None = None,
         cost: str | float | None = None,
         technical: dict[str, Any] | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
+        position_x: str | None = None,
+        position_y: str | None = None,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Registrar un activo nuevo con los datos que aportó la persona."""
@@ -316,6 +387,11 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "description": description,
             "cost": cost,
             "technical": technical,
+            "site_id": site_id,
+            "location_id": location_id,
+            "responsible_person_id": responsible_person_id,
+            "position_x": position_x,
+            "position_y": position_y,
         }
         return _execute(
             ctx.deps,
@@ -346,6 +422,11 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         description: str | None = None,
         cost: str | float | None = None,
         technical: dict[str, Any] | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
+        position_x: str | None = None,
+        position_y: str | None = None,
         fields: list[str] | None = None,
     ) -> dict[str, Any]:
         """Actualizar campos concretos de un activo existente; nunca su id."""
@@ -365,6 +446,11 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "description": description,
             "cost": cost,
             "technical": technical,
+            "site_id": site_id,
+            "location_id": location_id,
+            "responsible_person_id": responsible_person_id,
+            "position_x": position_x,
+            "position_y": position_y,
         }
         changes = {key: value for key, value in values.items() if value is not None}
         return _execute(
@@ -439,13 +525,13 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
     def get_asset_history(
         ctx: RunContext[AgentDeps], asset_id: str, limit: int = 20, offset: int = 0
     ) -> dict[str, Any]:
-        """Consultar historial acotado por UUID permanente."""
+        """Consultar historial acotado por UUID permanente, con origen y fecha efectiva."""
         return _execute(
             ctx.deps,
             "get_asset_history",
-            lambda service: service.history(
-                ctx.deps.principal, asset_id, limit=limit, offset=offset
-            ).as_payload(),
+            lambda service: history_payload(
+                service.history(ctx.deps.principal, asset_id, limit=limit, offset=offset)
+            ),
         )
 
     @agent.tool
@@ -458,6 +544,279 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
                 ctx.deps.principal
             ),
         )
+
+    @agent.tool
+    def search_locations(
+        ctx: RunContext[AgentDeps],
+        query: str | None = None,
+        level: str | None = None,
+        parent_id: str | None = None,
+        active: bool | None = True,
+        tree: bool = False,
+        depth: int = 2,
+        max_nodes: int = 50,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Buscar sedes, edificios, pisos o salas; con tree=True devuelve la jerarquía acotada."""
+
+        def operation() -> dict[str, Any]:
+            with _directory(ctx.deps) as directory:
+                if tree:
+                    built = directory.location_tree(
+                        ctx.deps.principal, root_id=parent_id, depth=depth, max_nodes=max_nodes
+                    )
+                    return {
+                        "routes": [node.location.as_payload() for node in built.roots],
+                        "nodeCount": built.node_count,
+                        "depth": built.depth,
+                        "truncated": built.truncated,
+                    }
+                page = directory.list_locations(
+                    ctx.deps.principal,
+                    query=query,
+                    level=level,
+                    parent_id=parent_id,
+                    active=active,
+                    limit=limit,
+                    offset=offset,
+                )
+                return {
+                    "total": page.total,
+                    "limit": page.limit,
+                    "offset": page.offset,
+                    "items": [item.as_payload() for item in page.items],
+                }
+
+        return _collect(ctx.deps, "search_locations", operation)
+
+    @agent.tool
+    def search_people(
+        ctx: RunContext[AgentDeps],
+        query: str | None = None,
+        status: str | None = None,
+        department_id: str | None = None,
+        site_id: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Buscar personas responsables por texto, estado, departamento o sede."""
+
+        def operation() -> dict[str, Any]:
+            with _directory(ctx.deps) as directory:
+                page = directory.list_people(
+                    ctx.deps.principal,
+                    query=query,
+                    status=status,
+                    department_id=department_id,
+                    site_id=site_id,
+                    limit=limit,
+                    offset=offset,
+                )
+            return {
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "items": [item.as_payload() for item in page.items],
+            }
+
+        return _collect(ctx.deps, "search_people", operation)
+
+    @agent.tool
+    def assign_asset(
+        ctx: RunContext[AgentDeps],
+        asset_id: str,
+        person_id: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Asignar un activo a una persona activa del directorio."""
+        return _execute(
+            ctx.deps,
+            "assign_asset",
+            lambda service: service.assign_responsible(
+                ctx.deps.principal,
+                asset_id,
+                person_id,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            ),
+            fields,
+        )
+
+    @agent.tool
+    def return_asset(
+        ctx: RunContext[AgentDeps],
+        asset_id: str,
+        reason: str,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Registrar la devolución del activo y liberar el responsable."""
+        return _execute(
+            ctx.deps,
+            "return_asset",
+            lambda service: service.return_responsible(
+                ctx.deps.principal,
+                asset_id,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            ),
+            fields,
+        )
+
+    @agent.tool
+    def transfer_asset(
+        ctx: RunContext[AgentDeps],
+        asset_id: str,
+        reason: str,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+        fields: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Transferir el activo a otra sede o ubicación sin cambiar su id."""
+        return _execute(
+            ctx.deps,
+            "transfer_asset",
+            lambda service: service.transfer(
+                ctx.deps.principal,
+                asset_id,
+                site_id=site_id,
+                location_id=location_id,
+                reason=reason,
+                notes=notes,
+                effective_at=moment(effective_at),
+            ),
+            fields,
+        )
+
+    @agent.tool
+    def get_asset_relations(
+        ctx: RunContext[AgentDeps],
+        asset_ids: list[str],
+        type_key: str | None = None,
+        direction: str = "both",
+        limit: int = 20,
+    ) -> dict[str, Any]:
+        """Consultar en una sola operación las relaciones de varios activos."""
+
+        def operation() -> dict[str, Any]:
+            with _relations(ctx.deps) as relationships:
+                page = relationships.list(
+                    ctx.deps.principal,
+                    asset_ids=asset_ids,
+                    type_key=type_key,
+                    direction=direction,
+                    limit=limit,
+                )
+            return {
+                "total": page.total,
+                "limit": page.limit,
+                "offset": page.offset,
+                "items": [item.as_payload() for item in page.items],
+            }
+
+        return _collect(ctx.deps, "get_asset_relations", operation)
+
+    @agent.tool
+    def create_relationship(
+        ctx: RunContext[AgentDeps],
+        source_id: str,
+        target_id: str,
+        type_key: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Crear una relación dirigida tipada entre dos activos existentes."""
+
+        def operation() -> dict[str, Any]:
+            with _relations(ctx.deps) as relationships:
+                view = relationships.create(
+                    ctx.deps.principal,
+                    source_id=source_id,
+                    target_id=target_id,
+                    type_key=type_key,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                )
+            return {"relationship": view.as_payload()}
+
+        return _collect(ctx.deps, "create_relationship", operation)
+
+    @agent.tool
+    def remove_relationship(
+        ctx: RunContext[AgentDeps],
+        relationship_id: str,
+        reason: str | None = None,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Eliminar una relación existente conservando el historial de ambos activos."""
+
+        def operation() -> dict[str, Any]:
+            with _relations(ctx.deps) as relationships:
+                view = relationships.remove(
+                    ctx.deps.principal,
+                    relationship_id,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                )
+            return {"removed": view.as_payload()}
+
+        return _collect(ctx.deps, "remove_relationship", operation)
+
+    @agent.tool
+    def move_host(
+        ctx: RunContext[AgentDeps],
+        child_id: str,
+        new_host_id: str,
+        reason: str,
+        notes: str | None = None,
+        effective_at: str | None = None,
+    ) -> dict[str, Any]:
+        """Mover una VM o contenedor a otro host sin perder su identidad."""
+
+        def operation() -> dict[str, Any]:
+            with _relations(ctx.deps) as relationships:
+                result = relationships.move_host(
+                    ctx.deps.principal,
+                    child_id,
+                    new_host_id,
+                    reason=reason,
+                    notes=notes,
+                    effective_at=moment(effective_at),
+                )
+            return result.as_payload()
+
+        return _collect(ctx.deps, "move_host", operation)
+
+    @agent.tool
+    def get_asset_map(
+        ctx: RunContext[AgentDeps],
+        site_id: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Consultar sedes y posiciones de plano acotadas para el mapa."""
+
+        def operation() -> dict[str, Any]:
+            with _service(ctx.deps) as inventory:
+                mapped = inventory.map(
+                    ctx.deps.principal, site_id=site_id, limit=limit, offset=offset
+                )
+            return mapped.as_payload()
+
+        return _collect(ctx.deps, "get_asset_map", operation)
 
 
 def resolve_model(settings: Settings) -> Model:
