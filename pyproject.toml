@@ -27,6 +27,8 @@ dependencies = [
     "et-xmlfile==2.0.0",
     "defusedxml==0.7.1",
     "apprise==2.0.1",
+    "WeasyPrint==70.0",
+    "segno==1.6.6",
 ]
 
 [project.optional-dependencies]

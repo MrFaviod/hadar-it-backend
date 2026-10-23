@@ -20,3 +20,17 @@ apprise==2.0.1
 Markdown==3.11.2
 oauthlib==4.0.0
 requests-oauthlib==2.0.0
+
+# Installed document rendering closure, matching requirements.txt.
+WeasyPrint==70.0
+segno==1.6.6
+brotli==1.2.1
+cssselect2==0.10.1
+fonttools==4.67.0
+Pillow==13.0.0
+pydyf==0.13.0
+Pyphen==0.18.1
+tinycss2==1.5.1
+tinyhtml5==2.1.0
+webencodings==0.6.1
+zopfli==0.4.3

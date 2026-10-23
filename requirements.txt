@@ -105,3 +105,17 @@ openpyxl==3.1.5
 et_xmlfile==2.0.0
 
 defusedxml==0.7.1
+
+# Phase 9 document rendering and maintained QR encoder.
+WeasyPrint==70.0
+segno==1.6.6
+brotli==1.2.1
+cssselect2==0.10.1
+fonttools==4.67.0
+Pillow==13.0.0
+pydyf==0.13.0
+Pyphen==0.18.1
+tinycss2==1.5.1
+tinyhtml5==2.1.0
+webencodings==0.6.1
+zopfli==0.4.3
