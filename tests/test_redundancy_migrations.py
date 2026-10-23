@@ -14,7 +14,6 @@ ASSET_ID = "44444444-4444-4444-8444-444444444444"
 HOST_ID = "55555555-5555-4555-8555-555555555555"
 RELATIONSHIP_ID = "66666666-6666-4666-8666-666666666666"
 PRE_REDUNDANCY = "0009_asset_directory"
-HEAD = "0012_workflows"
 
 
 def alembic(settings: Settings, *arguments: str) -> object:
@@ -157,7 +156,7 @@ def test_single_head_and_repeated_upgrade_is_a_no_op(settings_factory: SettingsF
     settings = settings_factory()
     heads = alembic(settings, "heads")
     assert heads.returncode == 0, heads.stderr
-    assert heads.stdout.strip().split()[0] == HEAD
+    assert len(heads.stdout.strip().splitlines()) == 1
 
     first = run_migrations(settings)
     assert first.returncode == 0, first.stderr

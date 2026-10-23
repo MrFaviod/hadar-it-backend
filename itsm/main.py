@@ -35,9 +35,11 @@ from itsm.identity.api import (
     mutation_guard,
 )
 from itsm.identity.service import AuthContext, IdentityService
+from itsm.interventions.api import create_intervention_router
 from itsm.inventory.api import create_inventory_router
 from itsm.inventory.catalog_api import create_catalog_router
 from itsm.logging import configure_logging, log_event
+from itsm.maintenance.api import create_maintenance_router
 from itsm.mcp.server import create_mcp_server
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
@@ -281,6 +283,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_workflow_router())
     api.include_router(create_inventory_router())
     api.include_router(create_attachment_router())
+    api.include_router(create_maintenance_router())
+    api.include_router(create_intervention_router())
     # Relationship and directory routes must be registered before the MCP mount:
     # a mount on the same prefix would otherwise shadow them.
     api.include_router(create_relationship_router())

@@ -12,7 +12,6 @@ SettingsFactory = Callable[..., Settings]
 
 ASSET_ID = "33333333-3333-3333-3333-333333333333"
 PRE_PHASE5 = "0008_directory_relationships"
-HEAD = "0012_workflows"
 
 ORGANIZATION_COLUMNS = {
     "site_id",
@@ -110,7 +109,7 @@ def test_single_head_and_repeated_upgrade_is_a_no_op(settings_factory: SettingsF
     settings = settings_factory()
     heads = alembic(settings, "heads")
     assert heads.returncode == 0, heads.stderr
-    assert heads.stdout.strip().split()[0] == HEAD
+    assert len(heads.stdout.strip().splitlines()) == 1
 
     first = run_migrations(settings)
     assert first.returncode == 0, first.stderr

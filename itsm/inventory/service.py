@@ -1422,6 +1422,17 @@ class InventoryService:
             select(Attachment.id).where(Attachment.asset_id == asset.id).limit(1)
         ):
             raise Conflict("asset has attachments; delete them before a permanent purge")
+        from itsm.interventions.models import Incident, IncidentAsset, Intervention
+        from itsm.maintenance.models import MaintenancePlan
+
+        technical_references = (
+            select(MaintenancePlan.id).where(MaintenancePlan.asset_id == asset.id),
+            select(Intervention.id).where(Intervention.asset_id == asset.id),
+            select(Incident.id).where(Incident.primary_asset_id == asset.id),
+            select(IncidentAsset.incident_id).where(IncidentAsset.asset_id == asset.id),
+        )
+        if any(self._session.scalar(query.limit(1)) for query in technical_references):
+            raise Conflict("asset has technical history or maintenance plans; it cannot be purged")
         self._session.execute(delete(AssetMedia).where(AssetMedia.asset_id == asset.id))
         self._session.add(
             AssetTombstone(

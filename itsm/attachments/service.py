@@ -198,6 +198,14 @@ class AttachmentService:
         warranty = self._session.get(Warranty, asset_id)
         if warranty is not None and warranty.payload.get("receiptId") == row.id:
             raise Conflict("attachment is referenced by the individual warranty")
+        from itsm.interventions.models import InterventionAttachment
+
+        if self._session.scalar(
+            select(InterventionAttachment.intervention_id)
+            .where(InterventionAttachment.attachment_id == row.id)
+            .limit(1)
+        ):
+            raise Conflict("attachment is referenced by a technical intervention")
         if row.deleted_at is None:
             row.deleted_at = utcnow().replace(tzinfo=None)
             self._inventory._record_history(
