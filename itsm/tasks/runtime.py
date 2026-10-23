@@ -45,6 +45,7 @@ class DemoTasks:
 class TaskRuntime:
     huey: Huey
     demo: DemoTasks
+    operation: Any
 
 
 def build_huey(settings: Settings) -> Huey:
@@ -93,26 +94,28 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
         log_event(logger, "task.started", task_id=task.id, task_name=TASK_NAME_FAILURE)
         raise DemoTaskFailure(message)
 
+    # Huey receivers are called as ``receiver(signal, task, *args)``; the signal
+    # name is the first positional argument, not the task.
     @huey.signal(SIGNAL_ERROR)
-    def on_task_error(task: Any, exc: BaseException, *_: Any) -> None:
+    def on_task_error(_signal: str, task: Any, exc: BaseException | None = None, *_: Any) -> None:
         log_event(
             logger,
             "task.failed",
             level=logging.ERROR,
-            task_id=task.id,
+            task_id=_task_id(task),
             task_name=_task_name(task),
-            retries_remaining=task.retries,
+            retries_remaining=getattr(task, "retries", None),
             error=repr(exc),
         )
 
     @huey.signal(SIGNAL_RETRYING)
-    def on_task_retrying(task: Any, *_: Any) -> None:
+    def on_task_retrying(_signal: str, task: Any, *_: Any) -> None:
         log_event(
             logger,
             "task.retrying",
-            task_id=task.id,
+            task_id=_task_id(task),
             task_name=_task_name(task),
-            retries_remaining=task.retries,
+            retries_remaining=getattr(task, "retries", None),
         )
 
     @huey.on_startup()
@@ -147,11 +150,45 @@ def _task_name(task: Any) -> str:
     return getattr(task, "name", None) or type(task).__name__
 
 
+def _task_id(task: Any) -> str:
+    return str(getattr(task, "id", task))
+
+
+def register_operation_task(huey: Huey, settings: Settings):
+    """Register the fixed business task; payload contains only a SQL locator."""
+
+    @huey.task(
+        context=True, retries=settings.task_retries, retry_delay=settings.task_retry_delay_seconds
+    )
+    def inventory_operation(operation_id: str, task: Any = None):
+        from itsm.database import create_engine_from_settings, create_session_factory
+        from itsm.workflows.jobs import execute_job
+
+        engine = create_engine_from_settings(settings)
+        try:
+            write_task_state(huey, task.id, TaskState.RUNNING)
+            with create_session_factory(engine)() as session:
+                result = execute_job(session, settings, operation_id)
+                return {
+                    "state": "complete",
+                    "operationId": operation_id,
+                    "summary": result["summary"],
+                }
+        finally:
+            engine.dispose()
+
+    return inventory_operation
+
+
 def build_runtime(settings: Settings) -> TaskRuntime:
     """Used by the API process; the consumer imports the module-level instance."""
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
     huey = build_huey(settings)
-    return TaskRuntime(huey=huey, demo=register_demo_tasks(huey, settings))
+    return TaskRuntime(
+        huey=huey,
+        demo=register_demo_tasks(huey, settings),
+        operation=register_operation_task(huey, settings),
+    )
 
 
 # Consumer entrypoint: huey_consumer itsm.tasks.runtime.huey -w 1 -k thread
@@ -162,6 +199,7 @@ def _consumer_huey() -> Huey:
     settings = get_settings()
     huey_instance = build_huey(settings)
     register_demo_tasks(huey_instance, settings)
+    register_operation_task(huey_instance, settings)
     return huey_instance
 
 

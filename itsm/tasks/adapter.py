@@ -64,6 +64,9 @@ class TaskQueue(Protocol):
     def submit_demo_failure(self, message: str) -> TaskStatus:
         """Enqueue the bounded failing demo task (dev diagnostics)."""
 
+    def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
+        """Enqueue one approved durable inventory operation."""
+
     def get_status(self, task_id: str) -> TaskStatus | None:
         """Return the stored state without consuming it; ``None`` if unknown."""
 
@@ -147,6 +150,10 @@ class HueyTaskQueue:
     def submit_demo_failure(self, message: str) -> TaskStatus:
         task_id = uuid.uuid4().hex
         task = self.runtime.demo.failure.s(message, id=task_id)
+        return self._enqueue(task, task_id, TaskState.PENDING)
+
+    def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
+        task = self.runtime.operation.s(operation_id, id=task_id)
         return self._enqueue(task, task_id, TaskState.PENDING)
 
     def _enqueue(self, task: Any, task_id: str, state: TaskState) -> TaskStatus:

@@ -49,6 +49,11 @@ TOOL_NAMES = {
     "move_host",
     "get_asset_map",
     "save_redundancy_group",
+    "prepare_inventory_import",
+    "preview_bulk_operation",
+    "get_inventory_operation",
+    "resolve_import_conflict",
+    "apply_inventory_operation",
 }
 
 

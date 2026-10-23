@@ -65,6 +65,9 @@ class Settings(BaseSettings):
     task_retries: int = Field(default=2, ge=0, le=10)
     task_retry_delay_seconds: float = Field(default=1.0, ge=0.0, le=30.0)
 
+    attachment_storage_path: Path = Path("/data/attachments")
+    attachment_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=50 * 1024 * 1024)
+
     demo_message_max_length: int = Field(default=200, ge=1, le=1000)
     demo_max_delay_seconds: int = Field(default=30, ge=0, le=300)
     demo_periodic_minutes: int = Field(default=0, ge=0, le=60)

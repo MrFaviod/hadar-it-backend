@@ -66,6 +66,11 @@ TOOL_NAMES: tuple[str, ...] = (
     "list_redundancy_groups",
     "get_redundancy_group",
     "save_redundancy_group",
+    "prepare_inventory_import",
+    "preview_bulk_operation",
+    "get_inventory_operation",
+    "resolve_import_conflict",
+    "apply_inventory_operation",
 )
 
 INSTRUCTIONS = """\
@@ -828,6 +833,75 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             return {"group": view.as_payload()}
 
         return run_with(redundancy, operation)
+
+    @contextmanager
+    def workflows():
+        from itsm.workflows.service import WorkflowService
+
+        with inventory() as (service, principal):
+            yield (
+                WorkflowService(
+                    service._session,
+                    settings,
+                    identity=IdentityService(service._session, settings),
+                    source="mcp",
+                ),
+                principal,
+            )
+
+    def run_workflow(operation: Callable[[Any, Principal], Any]) -> Any:
+        """Run one workflow tool and keep every row-bearing result compact."""
+        from itsm.workflows.service import compact_operation
+
+        return compact_operation(run_with(workflows, operation))
+
+    @server.tool
+    def prepare_inventory_import(
+        csv_text: str, options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Analyze CSV text; accepts no filesystem or network locator."""
+        return run_workflow(lambda s, p: s.analyze(p, csv_text.encode(), "assets.csv", options))
+
+    @server.tool
+    def preview_bulk_operation(
+        asset_ids: list[str],
+        changes: dict[str, Any],
+        action: str = "update",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Prepare exact targets and changes for separate human approval."""
+        return run_workflow(
+            lambda s, p: s.preview(
+                p, asset_ids=asset_ids, changes=changes, action=action, reason=reason
+            )
+        )
+
+    @server.tool
+    def get_inventory_operation(
+        operation_id: str, offset: int = 0, limit: int = 20
+    ) -> dict[str, Any]:
+        """Read bounded conflicts, progress and receipts."""
+        return run_workflow(
+            lambda s, p: s.get(p, operation_id, offset=offset, limit=min(limit, 50))
+        )
+
+    @server.tool
+    def resolve_import_conflict(
+        operation_id: str,
+        index: int,
+        action: str,
+        asset_id: str | None = None,
+        values: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve a preview row and invalidate previous approval."""
+        return run_workflow(
+            lambda s, p: s.resolve(p, operation_id, index, action, asset_id, values)
+        )
+
+    @server.tool
+    def apply_inventory_operation(operation_id: str) -> dict[str, Any]:
+        """Execute an already human-approved operation with current bearer permissions."""
+        return run_workflow(lambda s, p: s.execute(p, operation_id))
 
     return server
 

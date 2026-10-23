@@ -78,6 +78,11 @@ TOOL_NAMES: tuple[str, ...] = (
     "list_redundancy_groups",
     "get_redundancy_group",
     "save_redundancy_group",
+    "prepare_inventory_import",
+    "preview_bulk_operation",
+    "get_inventory_operation",
+    "resolve_import_conflict",
+    "apply_inventory_operation",
 )
 MAX_RESULTS = 50
 
@@ -943,6 +948,77 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             return {"group": view.as_payload()}
 
         return _collect(ctx.deps, "save_redundancy_group", operation)
+
+    def workflow(ctx, name, call):
+        """Run one workflow tool; every row-bearing result stays compact for the chat."""
+        from itsm.workflows.service import WorkflowService, compact_operation
+
+        def operation():
+            with ctx.deps.session_factory() as session:
+                service = WorkflowService(session, ctx.deps.settings, source="agent")
+                return compact_operation(call(service, ctx.deps.principal))
+
+        return _collect(ctx.deps, name, operation)
+
+    @agent.tool
+    def prepare_inventory_import(
+        ctx: RunContext[AgentDeps], csv_text: str, options: dict[str, Any] | None = None
+    ) -> dict[str, Any]:
+        """Analyze bounded CSV text without changing inventory; no path or URL inputs."""
+        return workflow(
+            ctx,
+            "prepare_inventory_import",
+            lambda s, p: s.analyze(p, csv_text.encode(), "assets.csv", options),
+        )
+
+    @agent.tool
+    def preview_bulk_operation(
+        ctx: RunContext[AgentDeps],
+        asset_ids: list[str],
+        changes: dict[str, Any],
+        action: str = "update",
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Prepare an exact immutable-target preview; human approval is separate."""
+        return workflow(
+            ctx,
+            "preview_bulk_operation",
+            lambda s, p: s.preview(
+                p, asset_ids=asset_ids, changes=changes, action=action, reason=reason
+            ),
+        )
+
+    @agent.tool
+    def get_inventory_operation(
+        ctx: RunContext[AgentDeps], operation_id: str, offset: int = 0, limit: int = 20
+    ) -> dict[str, Any]:
+        """Read compact conflicts, progress and final row receipts."""
+        return workflow(
+            ctx,
+            "get_inventory_operation",
+            lambda s, p: s.get(p, operation_id, offset=offset, limit=min(limit, 50)),
+        )
+
+    @agent.tool
+    def resolve_import_conflict(
+        ctx: RunContext[AgentDeps],
+        operation_id: str,
+        index: int,
+        action: str,
+        asset_id: str | None = None,
+        values: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        """Resolve one row; every change invalidates any previous human approval."""
+        return workflow(
+            ctx,
+            "resolve_import_conflict",
+            lambda s, p: s.resolve(p, operation_id, index, action, asset_id, values),
+        )
+
+    @agent.tool
+    def apply_inventory_operation(ctx: RunContext[AgentDeps], operation_id: str) -> dict[str, Any]:
+        """Apply only a human-approved fixed preview under current permissions."""
+        return workflow(ctx, "apply_inventory_operation", lambda s, p: s.execute(p, operation_id))
 
 
 def resolve_model(settings: Settings) -> Model:

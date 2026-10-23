@@ -14,7 +14,7 @@ ASSET_ID = "44444444-4444-4444-8444-444444444444"
 HOST_ID = "55555555-5555-4555-8555-555555555555"
 RELATIONSHIP_ID = "66666666-6666-4666-8666-666666666666"
 PRE_REDUNDANCY = "0009_asset_directory"
-HEAD = "0010_redundancy"
+HEAD = "0012_workflows"
 
 
 def alembic(settings: Settings, *arguments: str) -> object:

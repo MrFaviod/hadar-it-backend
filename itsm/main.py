@@ -18,6 +18,7 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from itsm import __version__
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
+from itsm.attachments.api import create_attachment_router
 from itsm.config import Settings, get_settings
 from itsm.database import (
     Readiness,
@@ -41,6 +42,7 @@ from itsm.mcp.server import create_mcp_server
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
+from itsm.workflows.api import create_workflow_router
 
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{8,64}$"
 
@@ -276,7 +278,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload["optional_services"] = _optional_services(settings)
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
+    api.include_router(create_workflow_router())
     api.include_router(create_inventory_router())
+    api.include_router(create_attachment_router())
     # Relationship and directory routes must be registered before the MCP mount:
     # a mount on the same prefix would otherwise shadow them.
     api.include_router(create_relationship_router())

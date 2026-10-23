@@ -1413,6 +1413,15 @@ class InventoryService:
         quick_code = asset.quick_code
         self._assert_no_relationships(asset.id)
         self._assert_no_redundancy_membership(asset.id)
+        from itsm.attachments.models import Attachment
+        from itsm.workflows.models import Warranty
+
+        if self._session.get(Warranty, asset.id) is not None:
+            raise Conflict("asset has an individual warranty; remove it before a permanent purge")
+        if self._session.scalar(
+            select(Attachment.id).where(Attachment.asset_id == asset.id).limit(1)
+        ):
+            raise Conflict("asset has attachments; delete them before a permanent purge")
         self._session.execute(delete(AssetMedia).where(AssetMedia.asset_id == asset.id))
         self._session.add(
             AssetTombstone(

@@ -92,7 +92,7 @@ def test_agent_registry_adds_exactly_the_three_group_tools(
     use_model(client, FunctionModel(run))
     chat(client, auth, "¿Qué podés hacer?")
 
-    assert len(seen) == len(set(seen)) == 24
+    assert len(seen) == len(set(seen)) == 29
     assert set(GROUP_TOOLS) <= set(seen)
     assert set(seen) == set(agent_runtime.TOOL_NAMES)
     for name in seen:
@@ -286,7 +286,7 @@ def operator(server: McpServer) -> tuple[str, str]:
 def test_mcp_exposes_the_three_group_tools_and_keeps_the_rest(mcp: McpServer) -> None:
     _, token = operator(mcp)
     tools = list_tools(mcp, token)
-    assert len(tools) == 24
+    assert len(tools) == 29
     assert set(GROUP_TOOLS) <= set(tools)
     with httpx.Client(timeout=10) as client:
         anonymous = client.post(
