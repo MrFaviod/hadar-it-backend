@@ -32,6 +32,7 @@ PERMISSION_CATALOG: Final[tuple[str, ...]] = (
     "assets.assign",
     "assets.purge",
     "assets.remote",
+    "reports.share",
     "people.view",
     "people.create",
     "people.edit",

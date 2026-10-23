@@ -22,6 +22,7 @@ from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_http_headers
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
+from itsm.identity.hashing import hash_token
 from itsm.identity.service import (
     AuthenticationFailed,
     Conflict,
@@ -37,6 +38,7 @@ from itsm.inventory.projection import history_payload, project, validate_fields
 from itsm.inventory.service import BATCH_LIMIT, AssetView, InventoryService
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
+from itsm.reports.schemas import ReportRequest
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -88,6 +90,12 @@ TOOL_NAMES: tuple[str, ...] = (
     "link_alert_incident",
     "acknowledge_alert",
     "prepare_monitoring_maintenance",
+    "list_report_templates",
+    "prepare_report",
+    "generate_report",
+    "report_job_status",
+    "report_documents",
+    "generate_labels",
 )
 
 INSTRUCTIONS = """\
@@ -102,6 +110,9 @@ Monitoring reports Prometheus provenance and the queried period. Missing data or
 an unavailable metrics service is not proof that a device is down. Acknowledging
 never resolves an alert, recovery never closes an incident, and preparing a
 maintenance window does not persist or silence anything.
+Reports and labels accept structured templates, canonical filters and bounded physical
+dimensions, never HTML or shell commands. Preparation does not queue a file. Generation
+returns a durable job; only completed status confirms protected document references.
 """
 
 
@@ -1025,6 +1036,86 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
     def apply_inventory_operation(operation_id: str) -> dict[str, Any]:
         """Execute an already human-approved operation with current bearer permissions."""
         return run_workflow(lambda s, p: s.execute(p, operation_id))
+
+    def run_report(operation: Callable[[Any, Principal, str], Any]) -> dict[str, Any]:
+        from itsm.reports.service import build_report_service
+        from itsm.tasks import create_task_queue
+
+        # Revalidate the transport bearer before the operation. Only its digest
+        # is stored as the job locator; the worker re-checks that exact credential.
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            try:
+                service = build_report_service(
+                    settings, session_factory, task_queue=create_task_queue(settings)
+                )
+                return operation(service, context.principal, hash_token(token))
+            except ToolError:
+                raise
+            except Exception as exc:
+                raise _translate(exc) from None
+
+    @server.tool
+    def list_report_templates() -> dict[str, Any]:
+        """List authorized default and custom structured report templates."""
+        return run_report(lambda service, principal, _digest: service.templates(principal))
+
+    @server.tool
+    def prepare_report(request: ReportRequest) -> dict[str, Any]:
+        """Prepare canonical report data without queuing; return at most twenty rows."""
+
+        def operation(service, principal, _digest):
+            preview = service.preview(principal, request)
+            return {
+                "matched": preview["matched"],
+                "assets": preview["assets"][:20],
+                "rows": preview["rows"][:20],
+                "columns": preview["columns"],
+                "summary": preview["summary"],
+                "hasMore": len(preview["assets"]) > 20 or len(preview["rows"]) > 20,
+            }
+
+        return run_report(operation)
+
+    @server.tool
+    def generate_report(request: ReportRequest) -> dict[str, Any]:
+        """Queue PDF/CSV/Excel generation and return an authorized durable job locator."""
+        return run_report(
+            lambda service, principal, digest: service.generate(
+                principal, request, credential_digest=digest
+            )
+        )
+
+    @server.tool
+    def report_job_status(job_id: str) -> dict[str, Any]:
+        """Read current owned progress, errors and protected document references."""
+        return run_report(lambda service, principal, _digest: service.job(principal, job_id))
+
+    @server.tool
+    def report_documents(job_id: str) -> dict[str, Any]:
+        """Return protected download references, never file bytes or server paths."""
+
+        def operation(service, principal, _digest):
+            job = service.job(principal, job_id)
+            return {"id": job["id"], "status": job["status"], "documents": job["documents"]}
+
+        return run_report(operation)
+
+    @server.tool
+    def generate_labels(request: ReportRequest) -> dict[str, Any]:
+        """Queue physical labels for canonical selected/filter-matched assets."""
+
+        def operation(service, principal, digest):
+            if request.labels is None:
+                raise ValidationFailed("label options are required")
+            return service.generate(principal, request, credential_digest=digest)
+
+        return run_report(operation)
 
     @server.tool
     def search_maintenance(

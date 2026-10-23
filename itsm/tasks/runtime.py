@@ -48,6 +48,7 @@ class TaskRuntime:
     operation: Any
     monitoring: Any
     notifications: Any
+    report: Any
 
 
 def build_huey(settings: Settings) -> Huey:
@@ -249,6 +250,42 @@ def register_notification_task(huey: Huey, settings: Settings):
     return notification_dispatch
 
 
+def register_report_task(huey: Huey, settings: Settings):
+    """Render durable document jobs using only a server-side SQL locator."""
+
+    def report_service(operation):
+        from itsm.database import create_engine_from_settings, create_session_factory
+        from itsm.reports.service import build_report_service
+
+        engine = create_engine_from_settings(settings)
+        try:
+            service = build_report_service(settings, create_session_factory(engine))
+            return operation(service)
+        finally:
+            engine.dispose()
+
+    @huey.task(
+        context=True, retries=settings.task_retries, retry_delay=settings.task_retry_delay_seconds
+    )
+    def report_generate(job_id: str, task: Any = None) -> dict[str, Any]:
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        result = report_service(lambda service: service.execute(job_id))
+        payload = {"state": TaskState.COMPLETE.value, "jobId": job_id, "status": result["status"]}
+        huey.put_result(task.id, payload)
+        return payload
+
+    @huey.periodic_task(
+        crontab(minute="0"),
+        name="report_retention",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+    )
+    def report_retention() -> None:
+        report_service(lambda service: service.cleanup())
+
+    return report_generate
+
+
 def build_runtime(settings: Settings) -> TaskRuntime:
     """Used by the API process; the consumer imports the module-level instance."""
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
@@ -260,6 +297,7 @@ def build_runtime(settings: Settings) -> TaskRuntime:
         operation=register_operation_task(huey, settings),
         monitoring=register_monitoring_task(huey, settings),
         notifications=register_notification_task(huey, settings),
+        report=register_report_task(huey, settings),
     )
 
 
@@ -275,6 +313,7 @@ def _consumer_huey() -> Huey:
     register_maintenance_task(huey_instance, settings)
     register_monitoring_task(huey_instance, settings)
     register_notification_task(huey_instance, settings)
+    register_report_task(huey_instance, settings)
     return huey_instance
 
 

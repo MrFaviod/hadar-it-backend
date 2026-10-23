@@ -7,9 +7,19 @@ import logging
 from fastapi import APIRouter, HTTPException, Request
 from itsm.agents.runtime import AgentRuntime, AgentUnavailable, ChatReply, ChatRequest
 from itsm.identity.api import MutationDependency
+from itsm.identity.hashing import hash_token
 from itsm.logging import log_event
 
 logger = logging.getLogger("itsm.agent")
+
+
+def _bearer_digest(request: Request) -> str | None:
+    """Digest of the trusted transport bearer; cookie sessions carry no digest."""
+    header = request.headers.get("authorization", "")
+    scheme, _, token = header.partition(" ")
+    if scheme.lower() != "bearer" or not token.strip():
+        return None
+    return hash_token(token.strip())
 
 
 def _runtime(request: Request) -> AgentRuntime:
@@ -49,7 +59,11 @@ def create_agent_router() -> APIRouter:
                 ),
             )
         try:
-            reply: ChatReply = runtime.chat(context.principal, payload)
+            reply: ChatReply = runtime.chat(
+                context.principal,
+                payload,
+                credential_digest=_bearer_digest(request),
+            )
         except AgentUnavailable:
             log_event(logger, "agent.unavailable", level=logging.WARNING)
             raise HTTPException(status_code=503, detail="agent model is not configured") from None

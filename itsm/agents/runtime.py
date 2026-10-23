@@ -38,6 +38,7 @@ from itsm.inventory.service import (
 )
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
+from itsm.reports.schemas import ReportRequest
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
@@ -100,6 +101,12 @@ TOOL_NAMES: tuple[str, ...] = (
     "link_alert_incident",
     "acknowledge_alert",
     "prepare_monitoring_maintenance",
+    "list_report_templates",
+    "prepare_report",
+    "generate_report",
+    "report_job_status",
+    "report_documents",
+    "generate_labels",
 )
 MAX_RESULTS = 50
 
@@ -124,6 +131,9 @@ Reglas:
   sin supervisión y servicio no disponible de una caída confirmada.
 - Reconocer una alerta no la resuelve y una recuperación no cierra su incidente.
 - Preparar mantenimiento solo propone una ventana; no cambia la supervisión.
+- Los reportes y etiquetas usan plantillas y filtros estructurados; nunca generes HTML,
+  rutas de servidor ni comandos. Preparar no genera un archivo; generar devuelve un
+  trabajo pendiente y solo su estado final confirma los documentos disponibles.
 """
 
 
@@ -187,6 +197,7 @@ class AgentDeps:
     settings: Settings
     session_factory: Callable[[], Session]
     principal: Principal
+    credential_digest: str | None = None
     actions: list[ChatAction] = field(default_factory=list)
     results: list[dict[str, Any]] = field(default_factory=list)
 
@@ -1499,6 +1510,95 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         """Apply only a human-approved fixed preview under current permissions."""
         return workflow(ctx, "apply_inventory_operation", lambda s, p: s.execute(p, operation_id))
 
+    def reports(
+        ctx: RunContext[AgentDeps],
+        name: str,
+        operation: Callable[[Any, Principal, str | None], dict[str, Any]],
+    ) -> dict[str, Any]:
+        from itsm.reports.service import build_report_service
+        from itsm.tasks import create_task_queue
+
+        def execute() -> dict[str, Any]:
+            service = build_report_service(
+                ctx.deps.settings,
+                ctx.deps.session_factory,
+                task_queue=create_task_queue(ctx.deps.settings),
+            )
+            return operation(service, ctx.deps.principal, ctx.deps.credential_digest)
+
+        return _collect(ctx.deps, name, execute)
+
+    @agent.tool
+    def list_report_templates(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """List authorized default and custom structured report templates."""
+        return reports(
+            ctx,
+            "list_report_templates",
+            lambda service, principal, _digest: service.templates(principal),
+        )
+
+    @agent.tool
+    def prepare_report(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
+        """Preview canonical filters and up to twenty rows, without rendering or queuing."""
+
+        def operation(service, principal, _digest):
+            preview = service.preview(principal, request)
+            return {
+                "matched": preview["matched"],
+                "assets": preview["assets"][:20],
+                "rows": preview["rows"][:20],
+                "columns": preview["columns"],
+                "summary": preview["summary"],
+                "hasMore": len(preview["assets"]) > 20 or len(preview["rows"]) > 20,
+            }
+
+        return reports(ctx, "prepare_report", operation)
+
+    @agent.tool
+    def generate_report(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
+        """Queue a canonical PDF/CSV/Excel report and return its durable job locator."""
+        return reports(
+            ctx,
+            "generate_report",
+            lambda service, principal, digest: service.generate(
+                principal, request, credential_digest=digest
+            ),
+        )
+
+    @agent.tool
+    def report_job_status(ctx: RunContext[AgentDeps], job_id: str) -> dict[str, Any]:
+        """Read current owned job progress, errors and protected document references."""
+        return reports(
+            ctx,
+            "report_job_status",
+            lambda service, principal, _digest: service.job(principal, job_id),
+        )
+
+    @agent.tool
+    def report_documents(ctx: RunContext[AgentDeps], job_id: str) -> dict[str, Any]:
+        """Read protected download references for a job, never server paths or file bytes."""
+
+        def operation(service, principal, _digest):
+            job = service.job(principal, job_id)
+            return {"id": job["id"], "status": job["status"], "documents": job["documents"]}
+
+        return reports(ctx, "report_documents", operation)
+
+    @agent.tool
+    def generate_labels(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
+        """Queue physical labels using explicit structured dimensions and asset filters."""
+        if request.labels is None:
+            return _failed(
+                ctx.deps, "generate_labels", ValidationFailed("label options are required")
+            )
+        return reports(
+            ctx,
+            "generate_labels",
+            lambda service, principal, digest: service.generate(
+                principal, request, credential_digest=digest
+            ),
+        )
+
 
 def resolve_model(settings: Settings) -> Model:
     """Build the configured provider/model; credentials come from the environment."""
@@ -1574,13 +1674,20 @@ class AgentRuntime:
             self._agent = self._build()
         return self._agent
 
-    def chat(self, principal: Principal, request: ChatRequest) -> ChatReply:
+    def chat(
+        self,
+        principal: Principal,
+        request: ChatRequest,
+        *,
+        credential_digest: str | None = None,
+    ) -> ChatReply:
         """Run one bounded turn; tool authorization happens per operation."""
         agent = self._ensure()
         deps = AgentDeps(
             settings=self._settings,
             session_factory=self._session_factory,
             principal=principal,
+            credential_digest=credential_digest,
         )
         prompt = request.message
         if request.assetId:
