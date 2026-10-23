@@ -1,7 +1,7 @@
 """Huey runtime: instance construction, registered tasks and execution logging.
 
-Only this module (and the queue adapter) knows about Huey. Task bodies are
-bounded demo work: no arbitrary callables or task names are accepted.
+Business work uses fixed registered tasks: approved inventory operations and
+periodic maintenance reminder preparation. Arbitrary task names are not accepted.
 """
 
 from __future__ import annotations
@@ -180,10 +180,29 @@ def register_operation_task(huey: Huey, settings: Settings):
     return inventory_operation
 
 
+def register_maintenance_task(huey: Huey, settings: Settings):
+    """Prepare due reminders periodically; domain uniqueness makes retries safe."""
+
+    @huey.periodic_task(
+        crontab(minute="*/5"),
+        name="maintenance_due_scan",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+    )
+    def maintenance_due_scan() -> None:
+        from itsm.maintenance.scheduler import prepare_reminders
+
+        result = prepare_reminders(settings)
+        log_event(logger, "maintenance.reminders_prepared", **result)
+
+    return maintenance_due_scan
+
+
 def build_runtime(settings: Settings) -> TaskRuntime:
     """Used by the API process; the consumer imports the module-level instance."""
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
     huey = build_huey(settings)
+    register_maintenance_task(huey, settings)
     return TaskRuntime(
         huey=huey,
         demo=register_demo_tasks(huey, settings),
@@ -200,6 +219,7 @@ def _consumer_huey() -> Huey:
     huey_instance = build_huey(settings)
     register_demo_tasks(huey_instance, settings)
     register_operation_task(huey_instance, settings)
+    register_maintenance_task(huey_instance, settings)
     return huey_instance
 
 
