@@ -6,6 +6,7 @@ annotated-doc==0.0.5
 annotated-types==0.8.0
 anthropic==2.0.0
 anyio==4.15.1
+apprise==2.0.1
 argon2-cffi==25.1.0
 argon2-cffi-bindings==26.1.0
 attrs==26.1.0
@@ -16,6 +17,7 @@ caio==0.12.9
 casbin==1.43.0
 cffi==2.1.1
 charset-normalizer==3.5.2
+certifi==2026.10.19
 click==8.5.0
 cryptography==50.0.2
 cyclopts==5.2.0
@@ -46,12 +48,14 @@ jsonschema-specifications==2025.9.1
 keyring==25.7.0
 logfire-api==5.2.0
 Mako==1.4.3
+Markdown==3.11.2
 markdown-it-py==4.2.0
 MarkupSafe==3.0.4
 mcp==2.3.0
 mcp-types==2.3.0
 mdurl==0.1.2
 more-itertools==11.2.1
+oauthlib==4.0.0
 openai==3.36.0
 openapi-pydantic==0.6.0
 opentelemetry-api==1.45.1
@@ -76,6 +80,7 @@ redis==8.1.0
 referencing==0.37.0
 regex==2026.9.29
 requests==2.34.2
+requests-oauthlib==2.0.0
 rich==15.0.0
 rich-rst==2.2.0
 rpds-py==2026.9.1
