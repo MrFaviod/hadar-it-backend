@@ -13,6 +13,7 @@ from __future__ import annotations
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from datetime import date
 from typing import Any
 
 from fastmcp import FastMCP
@@ -71,18 +72,68 @@ TOOL_NAMES: tuple[str, ...] = (
     "get_inventory_operation",
     "resolve_import_conflict",
     "apply_inventory_operation",
+    "search_maintenance",
+    "complete_maintenance",
+    "record_intervention",
+    "create_incident",
+    "link_incident_assets",
+    "get_technical_history",
+    "prepare_incident_resolution",
+    "confirm_incident_resolution",
+    "search_incidents",
 )
 
 INSTRUCTIONS = """\
 These tools operate on the ITSM asset inventory with the permissions of the
 authenticated machine identity. IDs are permanent UUIDs; the quick code may
 change. Use search/get before updating, and never assume an asset exists.
+Maintenance completion recalculates the next due date; interventions and
+incidents are recorded in one structured call. Preparing an incident resolution
+never changes its status: only confirming the prepared token, revalidated
+against current authority and state, resolves it.
 """
 
 
 def compact(view: AssetView, fields: list[str] | None = None) -> dict[str, Any]:
     """Project only explicitly allowed public fields."""
     return project(view, fields)
+
+
+MAX_PAGE = 50
+
+
+def _bounded_page(limit: int, offset: int) -> tuple[int, int]:
+    """Clamp one tool page so an external agent cannot request unbounded rows."""
+    return max(1, min(int(limit), MAX_PAGE)), max(0, int(offset))
+
+
+def _page_payload(page: Any) -> dict[str, Any]:
+    return {
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+        "items": [item.as_payload() for item in page.items],
+    }
+
+
+def _bounded_ids(values: list[str] | None, label: str) -> list[str] | None:
+    if values is None:
+        return None
+    if len(values) > MAX_PAGE:
+        raise ValidationFailed(f"{label} must contain at most {MAX_PAGE} ids")
+    return list(values)
+
+
+def _optional_iso_date(value: str | None, label: str) -> date | None:
+    """Parse one optional tool date string; the maintenance service requires real dates."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(value)
+    except TypeError, ValueError:
+        raise ValidationFailed(f"{label} must be an ISO date (YYYY-MM-DD)") from None
 
 
 class DatabaseTokenVerifier(TokenVerifier):
@@ -153,6 +204,16 @@ class BatchUpdateInput(BaseModel):
     position_y: str | None = None
 
 
+class InterventionPartInput(BaseModel):
+    """One consumed part; money uses canonical decimal strings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=160)
+    quantity: int
+    unit_cost: str | None = None
+
+
 def _bearer_token() -> str:
     """Read the raw bearer token from the trusted HTTP transport, never the args."""
     headers = get_http_headers(include={"authorization"})
@@ -176,7 +237,7 @@ def _translate(exc: Exception) -> ToolError:
 
 
 def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]) -> FastMCP:
-    """Build the mounted server with five inventory tools and no REST export."""
+    """Build the mounted server with typed inventory, directory and technical tools."""
     server = FastMCP(
         "itsm-inventory",
         instructions=INSTRUCTIONS,
@@ -255,6 +316,38 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 raise ToolError("authentication required") from None
             yield (
                 RedundancyService(session, settings, identity=identity, source="mcp"),
+                context.principal,
+            )
+
+    @contextmanager
+    def maintenance() -> Iterator[tuple[Any, Principal]]:
+        from itsm.maintenance.service import MaintenanceService
+
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield (
+                MaintenanceService(session, settings, identity=identity, source="mcp"),
+                context.principal,
+            )
+
+    @contextmanager
+    def interventions() -> Iterator[tuple[Any, Principal]]:
+        from itsm.interventions.service import InterventionService
+
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield (
+                InterventionService(session, settings, identity=identity, source="mcp"),
                 context.principal,
             )
 
@@ -902,6 +995,226 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
     def apply_inventory_operation(operation_id: str) -> dict[str, Any]:
         """Execute an already human-approved operation with current bearer permissions."""
         return run_workflow(lambda s, p: s.execute(p, operation_id))
+
+    @server.tool
+    def search_maintenance(
+        state: str | None = None,
+        status: str | None = None,
+        category: str | None = None,
+        site: str | None = None,
+        site_id: str | None = None,
+        asset_id: str | None = None,
+        maintenance_type: str | None = None,
+        due_from: str | None = None,
+        due_to: str | None = None,
+        completed_from: str | None = None,
+        completed_to: str | None = None,
+        upcoming_days: int = 30,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List pending, upcoming or overdue maintenance work in one bounded page."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+        horizon = max(0, min(int(upcoming_days), 365))
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            page = service.list_plans(
+                principal,
+                state=state,
+                status=status,
+                category=category,
+                site=site,
+                site_id=site_id,
+                asset_id=asset_id,
+                maintenance_type=maintenance_type,
+                due_from=_optional_iso_date(due_from, "dueFrom"),
+                due_to=_optional_iso_date(due_to, "dueTo"),
+                completed_from=_optional_iso_date(completed_from, "completedFrom"),
+                completed_to=_optional_iso_date(completed_to, "completedTo"),
+                upcoming_days=horizon,
+                limit=bounded_limit,
+                offset=bounded_offset,
+            )
+            return _page_payload(page)
+
+        return run_with(maintenance, operation)
+
+    @server.tool
+    def complete_maintenance(
+        plan_id: str, completed_on: str | None = None, notes: str | None = None
+    ) -> dict[str, Any]:
+        """Complete authorized preventive work; the service recalculates the next due date."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            completed_value = _optional_iso_date(completed_on, "completedOn")
+            view = service.complete_plan(
+                principal, plan_id, completed_on=completed_value, notes=notes
+            )
+            return {"plan": view.as_payload()}
+
+        return run_with(maintenance, operation)
+
+    @server.tool
+    def record_intervention(
+        asset_id: str,
+        type: str = "corrective",
+        description: str | None = None,
+        technician_person_id: str | None = None,
+        occurred_on: str | None = None,
+        status: str | None = None,
+        notes: str | None = None,
+        parts: list[InterventionPartInput] | None = None,
+        labor_cost: str | None = None,
+        attachment_ids: list[str] | None = None,
+        incident_id: str | None = None,
+        plan_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Record one complete intervention, including parts and attachment ids, in one call."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            values: dict[str, Any] = {"assetId": asset_id, "type": type}
+            optional = {
+                "description": description,
+                "technicianPersonId": technician_person_id,
+                "occurredOn": occurred_on,
+                "status": status,
+                "notes": notes,
+                "laborCost": labor_cost,
+                "incidentId": incident_id,
+                "planId": plan_id,
+            }
+            values.update({key: value for key, value in optional.items() if value is not None})
+            if parts is not None:
+                values["parts"] = [
+                    {
+                        key: value
+                        for key, value in {
+                            "name": part.name,
+                            "quantity": part.quantity,
+                            "unitCost": part.unit_cost,
+                        }.items()
+                        if value is not None
+                    }
+                    for part in parts
+                ]
+            attachments = _bounded_ids(attachment_ids, "attachmentIds")
+            if attachments is not None:
+                values["attachmentIds"] = attachments
+            view = service.create(principal, values)
+            return {"intervention": view.as_payload()}
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def create_incident(
+        primary_asset_id: str,
+        description: str,
+        priority: str = "normal",
+        affected_asset_ids: list[str] | None = None,
+        responsible_person_id: str | None = None,
+        opened_on: str | None = None,
+    ) -> dict[str, Any]:
+        """Create an incident with its primary asset and every affected asset in one call."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            values: dict[str, Any] = {
+                "primaryAssetId": primary_asset_id,
+                "description": description,
+                "priority": priority,
+            }
+            affected = _bounded_ids(affected_asset_ids, "affectedAssetIds")
+            if affected is not None:
+                values["affectedAssetIds"] = affected
+            if responsible_person_id is not None:
+                values["responsiblePersonId"] = responsible_person_id
+            if opened_on is not None:
+                values["openedOn"] = opened_on
+            view = service.create_incident(principal, values)
+            return {"incident": view.as_payload()}
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def link_incident_assets(incident_id: str, affected_asset_ids: list[str]) -> dict[str, Any]:
+        """Replace the unique affected-asset set of an existing incident."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            affected = _bounded_ids(affected_asset_ids, "affectedAssetIds") or []
+            view = service.update_incident_assets(principal, incident_id, affected)
+            return {"incident": view.as_payload()}
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def get_technical_history(asset_id: str, limit: int = 20, offset: int = 0) -> dict[str, Any]:
+        """Read persisted intervention/incident history for one asset."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            page = service.asset_technical_history(
+                principal, asset_id, limit=bounded_limit, offset=bounded_offset
+            )
+            return page.as_payload()
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def prepare_incident_resolution(incident_id: str, note: str | None = None) -> dict[str, Any]:
+        """Prepare a resolution suggestion; it never resolves the incident by itself."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            suggestion = service.prepare_resolution(principal, incident_id, note=note)
+            return {"resolution": suggestion.as_payload()}
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def confirm_incident_resolution(
+        incident_id: str, token: str, note: str | None = None
+    ) -> dict[str, Any]:
+        """Confirm a prepared resolution; authority and current state are revalidated now."""
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            view = service.confirm_resolution(principal, incident_id, token, note=note)
+            return {"incident": view.as_payload()}
+
+        return run_with(interventions, operation)
+
+    @server.tool
+    def search_incidents(
+        active: bool | None = None,
+        status: str | None = None,
+        priority: str | None = None,
+        category: str | None = None,
+        site: str | None = None,
+        asset_id: str | None = None,
+        responsible_person_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """List incidents by state, priority, asset, responsible person or period."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            page = service.list_incidents(
+                principal,
+                active=active,
+                status=status,
+                priority=priority,
+                category=category,
+                site=site,
+                asset_id=asset_id,
+                responsible_person_id=responsible_person_id,
+                from_date=from_date,
+                to_date=to_date,
+                limit=bounded_limit,
+                offset=bounded_offset,
+            )
+            return _page_payload(page)
+
+        return run_with(interventions, operation)
 
     return server
 

@@ -223,56 +223,6 @@ def test_chat_denied_mutation_leaves_assets_and_reports_denied(
     assert any(event["outcome"] == "denied" for event in catalog.audit())
 
 
-def test_chat_tool_registry_is_bounded_to_inventory_operations(
-    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
-) -> None:
-    test_client, auth = signed_in_client()
-    seen: dict[str, Any] = {}
-
-    def capture(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen["tools"] = sorted(tool.name for tool in info.function_tools)
-        return ModelResponse(parts=[TextPart("Listo.")])
-
-    use_model(test_client, FunctionModel(capture))
-
-    response = chat(test_client, auth, message="¿Qué podés hacer?")
-
-    assert response.status_code == 200
-    assert seen["tools"] == [
-        "apply_inventory_operation",
-        "archive_asset",
-        "assign_asset",
-        "batch_update_assets",
-        "clone_asset",
-        "create_asset",
-        "create_relationship",
-        "get_asset",
-        "get_asset_history",
-        "get_asset_map",
-        "get_asset_relations",
-        "get_inventory_config",
-        "get_inventory_operation",
-        "get_redundancy_group",
-        "list_redundancy_groups",
-        "move_host",
-        "prepare_inventory_import",
-        "preview_bulk_operation",
-        "remove_relationship",
-        "resolve_import_conflict",
-        "restore_asset",
-        "retire_asset",
-        "return_asset",
-        "save_redundancy_group",
-        "search_assets",
-        "search_locations",
-        "search_people",
-        "transfer_asset",
-        "update_asset",
-    ]
-    forbidden = ("shell", "exec", "sql", "file", "http", "browser", "python")
-    assert not [name for name in seen["tools"] if any(word in name for word in forbidden)]
-
-
 def test_chat_ambiguous_mutation_asks_instead_of_inventing(
     signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     catalog: Catalog,

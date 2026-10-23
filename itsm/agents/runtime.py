@@ -13,6 +13,7 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import date
 from typing import Any, Literal
 
 from itsm.config import Settings
@@ -83,6 +84,15 @@ TOOL_NAMES: tuple[str, ...] = (
     "get_inventory_operation",
     "resolve_import_conflict",
     "apply_inventory_operation",
+    "search_maintenance",
+    "complete_maintenance",
+    "record_intervention",
+    "create_incident",
+    "link_incident_assets",
+    "get_technical_history",
+    "prepare_incident_resolution",
+    "confirm_incident_resolution",
+    "search_incidents",
 )
 MAX_RESULTS = 50
 
@@ -99,6 +109,10 @@ Reglas:
 - No afirmes permisos que no ejercitaste: si una herramienta devuelve un error de
   permiso, explicalo sin inventar alternativas.
 - No menciones detalles internos de configuración, tokens ni rutas del servidor.
+- Los mantenimientos y las intervenciones se registran con las herramientas técnicas;
+  completar un mantenimiento recalcula su próximo vencimiento.
+- Preparar una resolución de incidente no lo resuelve: solo la confirmación con el
+  token preparado y la autoridad vigente lo cambia de estado.
 """
 
 
@@ -242,6 +256,74 @@ def _redundancy(deps: AgentDeps) -> Iterator[RedundancyService]:
         session.close()
 
 
+@contextmanager
+def _maintenance(deps: AgentDeps) -> Iterator[Any]:
+    """Open the canonical preventive service for one tool operation."""
+    from itsm.maintenance.service import MaintenanceService
+
+    session = deps.session_factory()
+    try:
+        yield MaintenanceService(
+            session,
+            deps.settings,
+            identity=IdentityService(session, deps.settings),
+            source="agent",
+        )
+    finally:
+        session.close()
+
+
+@contextmanager
+def _interventions(deps: AgentDeps) -> Iterator[Any]:
+    """Open the canonical intervention/incident service for one tool operation."""
+    from itsm.interventions.service import InterventionService
+
+    session = deps.session_factory()
+    try:
+        yield InterventionService(
+            session,
+            deps.settings,
+            identity=IdentityService(session, deps.settings),
+            source="agent",
+        )
+    finally:
+        session.close()
+
+
+def _bounded_page(limit: int, offset: int) -> tuple[int, int]:
+    """Clamp one tool page so a model cannot request unbounded rows."""
+    return max(1, min(int(limit), MAX_RESULTS)), max(0, int(offset))
+
+
+def _page_payload(page: Any) -> dict[str, Any]:
+    return {
+        "total": page.total,
+        "limit": page.limit,
+        "offset": page.offset,
+        "items": [item.as_payload() for item in page.items],
+    }
+
+
+def _bounded_ids(values: list[str] | None, label: str) -> list[str] | None:
+    if values is None:
+        return None
+    if len(values) > MAX_RESULTS:
+        raise ValidationFailed(f"{label} must contain at most {MAX_RESULTS} ids")
+    return list(values)
+
+
+def _optional_iso_date(value: str | None, label: str) -> date | None:
+    """Parse one optional tool date string; the maintenance service requires real dates."""
+    if value is None:
+        return None
+    if isinstance(value, date):
+        return value
+    try:
+        return date.fromisoformat(value)
+    except TypeError, ValueError:
+        raise ValidationFailed(f"{label} must be an ISO date (YYYY-MM-DD)") from None
+
+
 class RedundancyMemberArg(BaseModel):
     """One member of a group; the asset id must be an existing permanent UUID."""
 
@@ -250,6 +332,16 @@ class RedundancyMemberArg(BaseModel):
     asset_id: str = Field(min_length=1, max_length=36)
     role: str | None = None
     share: Any = None
+
+
+class InterventionPartArg(BaseModel):
+    """One consumed part; money uses canonical decimal strings."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    name: str = Field(min_length=1, max_length=160)
+    quantity: int
+    unit_cost: str | None = None
 
 
 def _record(
@@ -949,6 +1041,257 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "save_redundancy_group", operation)
 
+    @agent.tool
+    def search_maintenance(
+        ctx: RunContext[AgentDeps],
+        state: str | None = None,
+        status: str | None = None,
+        category: str | None = None,
+        site: str | None = None,
+        site_id: str | None = None,
+        asset_id: str | None = None,
+        maintenance_type: str | None = None,
+        due_from: str | None = None,
+        due_to: str | None = None,
+        completed_from: str | None = None,
+        completed_to: str | None = None,
+        upcoming_days: int = 30,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Consultar mantenimientos pendientes, próximos o atrasados, acotado por página."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+        horizon = max(0, min(int(upcoming_days), 365))
+
+        def operation() -> dict[str, Any]:
+            with _maintenance(ctx.deps) as maintenance:
+                page = maintenance.list_plans(
+                    ctx.deps.principal,
+                    state=state,
+                    status=status,
+                    category=category,
+                    site=site,
+                    site_id=site_id,
+                    asset_id=asset_id,
+                    maintenance_type=maintenance_type,
+                    due_from=_optional_iso_date(due_from, "dueFrom"),
+                    due_to=_optional_iso_date(due_to, "dueTo"),
+                    completed_from=_optional_iso_date(completed_from, "completedFrom"),
+                    completed_to=_optional_iso_date(completed_to, "completedTo"),
+                    upcoming_days=horizon,
+                    limit=bounded_limit,
+                    offset=bounded_offset,
+                )
+                return _page_payload(page)
+
+        return _collect(ctx.deps, "search_maintenance", operation)
+
+    @agent.tool
+    def complete_maintenance(
+        ctx: RunContext[AgentDeps],
+        plan_id: str,
+        completed_on: str | None = None,
+        notes: str | None = None,
+    ) -> dict[str, Any]:
+        """Completar un mantenimiento autorizado; el servicio calcula el próximo vencimiento."""
+
+        def operation() -> dict[str, Any]:
+            completed_value = _optional_iso_date(completed_on, "completedOn")
+            with _maintenance(ctx.deps) as maintenance:
+                view = maintenance.complete_plan(
+                    ctx.deps.principal, plan_id, completed_on=completed_value, notes=notes
+                )
+                return {"plan": view.as_payload()}
+
+        return _collect(ctx.deps, "complete_maintenance", operation)
+
+    @agent.tool
+    def record_intervention(
+        ctx: RunContext[AgentDeps],
+        asset_id: str,
+        type: str = "corrective",
+        description: str | None = None,
+        technician_person_id: str | None = None,
+        occurred_on: str | None = None,
+        status: str | None = None,
+        notes: str | None = None,
+        parts: list[InterventionPartArg] | None = None,
+        labor_cost: str | None = None,
+        attachment_ids: list[str] | None = None,
+        incident_id: str | None = None,
+        plan_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Registrar una intervención completa en una sola llamada, con repuestos y adjuntos."""
+
+        def operation() -> dict[str, Any]:
+            values: dict[str, Any] = {"assetId": asset_id, "type": type}
+            optional = {
+                "description": description,
+                "technicianPersonId": technician_person_id,
+                "occurredOn": occurred_on,
+                "status": status,
+                "notes": notes,
+                "laborCost": labor_cost,
+                "incidentId": incident_id,
+                "planId": plan_id,
+            }
+            values.update({key: value for key, value in optional.items() if value is not None})
+            if parts is not None:
+                values["parts"] = [
+                    {
+                        key: value
+                        for key, value in {
+                            "name": part.name,
+                            "quantity": part.quantity,
+                            "unitCost": part.unit_cost,
+                        }.items()
+                        if value is not None
+                    }
+                    for part in parts
+                ]
+            attachments = _bounded_ids(attachment_ids, "attachmentIds")
+            if attachments is not None:
+                values["attachmentIds"] = attachments
+            with _interventions(ctx.deps) as interventions:
+                view = interventions.create(ctx.deps.principal, values)
+                return {"intervention": view.as_payload()}
+
+        return _collect(ctx.deps, "record_intervention", operation)
+
+    @agent.tool
+    def create_incident(
+        ctx: RunContext[AgentDeps],
+        primary_asset_id: str,
+        description: str,
+        priority: str = "normal",
+        affected_asset_ids: list[str] | None = None,
+        responsible_person_id: str | None = None,
+        opened_on: str | None = None,
+    ) -> dict[str, Any]:
+        """Crear un incidente con su activo principal y todos los afectados en una sola llamada."""
+
+        def operation() -> dict[str, Any]:
+            values: dict[str, Any] = {
+                "primaryAssetId": primary_asset_id,
+                "description": description,
+                "priority": priority,
+            }
+            affected = _bounded_ids(affected_asset_ids, "affectedAssetIds")
+            if affected is not None:
+                values["affectedAssetIds"] = affected
+            if responsible_person_id is not None:
+                values["responsiblePersonId"] = responsible_person_id
+            if opened_on is not None:
+                values["openedOn"] = opened_on
+            with _interventions(ctx.deps) as interventions:
+                view = interventions.create_incident(ctx.deps.principal, values)
+                return {"incident": view.as_payload()}
+
+        return _collect(ctx.deps, "create_incident", operation)
+
+    @agent.tool
+    def link_incident_assets(
+        ctx: RunContext[AgentDeps], incident_id: str, affected_asset_ids: list[str]
+    ) -> dict[str, Any]:
+        """Reemplazar el conjunto de activos afectados de un incidente existente."""
+
+        def operation() -> dict[str, Any]:
+            affected = _bounded_ids(affected_asset_ids, "affectedAssetIds") or []
+            with _interventions(ctx.deps) as interventions:
+                view = interventions.update_incident_assets(
+                    ctx.deps.principal, incident_id, affected
+                )
+                return {"incident": view.as_payload()}
+
+        return _collect(ctx.deps, "link_incident_assets", operation)
+
+    @agent.tool
+    def get_technical_history(
+        ctx: RunContext[AgentDeps], asset_id: str, limit: int = 20, offset: int = 0
+    ) -> dict[str, Any]:
+        """Consultar el historial técnico real de un activo: intervenciones e incidentes."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+
+        def operation() -> dict[str, Any]:
+            with _interventions(ctx.deps) as interventions:
+                page = interventions.asset_technical_history(
+                    ctx.deps.principal, asset_id, limit=bounded_limit, offset=bounded_offset
+                )
+                return page.as_payload()
+
+        return _collect(ctx.deps, "get_technical_history", operation)
+
+    @agent.tool
+    def prepare_incident_resolution(
+        ctx: RunContext[AgentDeps], incident_id: str, note: str | None = None
+    ) -> dict[str, Any]:
+        """Preparar la resolución de un incidente; devuelve un token que no resuelve nada aún."""
+
+        def operation() -> dict[str, Any]:
+            with _interventions(ctx.deps) as interventions:
+                suggestion = interventions.prepare_resolution(
+                    ctx.deps.principal, incident_id, note=note
+                )
+                return {"resolution": suggestion.as_payload()}
+
+        return _collect(ctx.deps, "prepare_incident_resolution", operation)
+
+    @agent.tool
+    def confirm_incident_resolution(
+        ctx: RunContext[AgentDeps],
+        incident_id: str,
+        token: str,
+        note: str | None = None,
+    ) -> dict[str, Any]:
+        """Confirmar una resolución preparada; la autoridad y el estado se revalidan ahora."""
+
+        def operation() -> dict[str, Any]:
+            with _interventions(ctx.deps) as interventions:
+                view = interventions.confirm_resolution(
+                    ctx.deps.principal, incident_id, token, note=note
+                )
+                return {"incident": view.as_payload()}
+
+        return _collect(ctx.deps, "confirm_incident_resolution", operation)
+
+    @agent.tool
+    def search_incidents(
+        ctx: RunContext[AgentDeps],
+        active: bool | None = None,
+        status: str | None = None,
+        priority: str | None = None,
+        category: str | None = None,
+        site: str | None = None,
+        asset_id: str | None = None,
+        responsible_person_id: str | None = None,
+        from_date: str | None = None,
+        to_date: str | None = None,
+        limit: int = 10,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Consultar incidentes por estado, prioridad, activo, responsable o período."""
+        bounded_limit, bounded_offset = _bounded_page(limit, offset)
+
+        def operation() -> dict[str, Any]:
+            with _interventions(ctx.deps) as interventions:
+                page = interventions.list_incidents(
+                    ctx.deps.principal,
+                    active=active,
+                    status=status,
+                    priority=priority,
+                    category=category,
+                    site=site,
+                    asset_id=asset_id,
+                    responsible_person_id=responsible_person_id,
+                    from_date=from_date,
+                    to_date=to_date,
+                    limit=bounded_limit,
+                    offset=bounded_offset,
+                )
+                return _page_payload(page)
+
+        return _collect(ctx.deps, "search_incidents", operation)
+
     def workflow(ctx, name, call):
         """Run one workflow tool; every row-bearing result stays compact for the chat."""
         from itsm.workflows.service import WorkflowService, compact_operation
@@ -1134,5 +1477,6 @@ __all__ = [
     "ChatReply",
     "ChatRequest",
     "ConversationTurn",
+    "InterventionPartArg",
     "resolve_model",
 ]

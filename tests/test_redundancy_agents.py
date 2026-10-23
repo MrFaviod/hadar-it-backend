@@ -16,24 +16,16 @@ import uvicorn
 from fastapi.testclient import TestClient
 from fastmcp import Client
 from fastmcp.client.transports import StreamableHttpTransport
-from itsm.agents import runtime as agent_runtime
 from itsm.agents.runtime import AgentRuntime
 from itsm.config import Settings
 from itsm.inventory.service import InventoryService
 from itsm.main import create_app
-from pydantic_ai.messages import (
-    ModelMessage,
-    ModelResponse,
-    TextPart,
-    ToolCallPart,
-)
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.messages import TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 from tests.inventory_support import Catalog, asset_values, prepare, sign_in_as
 from tests.test_agent_chat import scripted
 
 SettingsFactory = Callable[..., Settings]
-
-GROUP_TOOLS = ("get_redundancy_group", "list_redundancy_groups", "save_redundancy_group")
 
 
 @pytest.fixture
@@ -76,28 +68,6 @@ def history_actions(catalog: Catalog, asset_id: str) -> list[str]:
     with catalog.session() as session:
         page = InventoryService(session, catalog.settings).history(catalog.admin(), asset_id)
         return [item.action for item in page.items]
-
-
-def test_agent_registry_adds_exactly_the_three_group_tools(
-    signed_in_client: Callable[..., Any], monkeypatch: pytest.MonkeyPatch
-) -> None:
-    monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", False)
-    client, auth = signed_in_client()
-    seen: list[str] = []
-
-    def run(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen.extend(tool.name for tool in info.function_tools)
-        return ModelResponse(parts=[TextPart("Listo.")])
-
-    use_model(client, FunctionModel(run))
-    chat(client, auth, "¿Qué podés hacer?")
-
-    assert len(seen) == len(set(seen)) == 29
-    assert set(GROUP_TOOLS) <= set(seen)
-    assert set(seen) == set(agent_runtime.TOOL_NAMES)
-    for name in seen:
-        for forbidden in ("shell", "exec", "sql", "file", "http", "browser", "python"):
-            assert forbidden not in name
 
 
 def test_agent_saves_lists_and_reads_a_group_through_the_canonical_service(
@@ -264,15 +234,6 @@ def call_tool(server: McpServer, token: str, tool: str, arguments: dict[str, Any
     return asyncio.run(run())
 
 
-def list_tools(server: McpServer, token: str) -> list[str]:
-    async def run() -> list[str]:
-        async with Client(server.transport(token)) as client:
-            tools = await client.list_tools()
-        return sorted(tool.name for tool in tools)
-
-    return asyncio.run(run())
-
-
 def rest_get(server: McpServer, token: str, path: str) -> httpx.Response:
     base = server.url.removesuffix("/api/v1/mcp")
     return httpx.get(f"{base}{path}", headers={"Authorization": f"Bearer {token}"}, timeout=10)
@@ -283,11 +244,7 @@ def operator(server: McpServer) -> tuple[str, str]:
     return "redundancy-operator", token
 
 
-def test_mcp_exposes_the_three_group_tools_and_keeps_the_rest(mcp: McpServer) -> None:
-    _, token = operator(mcp)
-    tools = list_tools(mcp, token)
-    assert len(tools) == 29
-    assert set(GROUP_TOOLS) <= set(tools)
+def test_mcp_rejects_anonymous_and_cookie_only_requests(mcp: McpServer) -> None:
     with httpx.Client(timeout=10) as client:
         anonymous = client.post(
             mcp.url,

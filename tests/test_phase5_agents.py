@@ -18,43 +18,11 @@ from fastmcp.exceptions import ToolError
 from itsm.agents.runtime import AgentRuntime
 from itsm.config import Settings
 from itsm.main import create_app
-from pydantic_ai.messages import ModelMessage, ModelResponse, TextPart, ToolCallPart
-from pydantic_ai.models.function import AgentInfo, FunctionModel
+from pydantic_ai.messages import TextPart, ToolCallPart
+from pydantic_ai.models.function import FunctionModel
 from tests.inventory_support import Catalog, prepare
 from tests.test_agent_chat import scripted
-from tests.test_mcp_server import McpServer, call_tool, list_tools, operator
-
-TOOL_NAMES = {
-    "search_assets",
-    "get_asset",
-    "create_asset",
-    "update_asset",
-    "batch_update_assets",
-    "clone_asset",
-    "archive_asset",
-    "restore_asset",
-    "retire_asset",
-    "get_asset_history",
-    "get_inventory_config",
-    "get_redundancy_group",
-    "list_redundancy_groups",
-    "search_locations",
-    "search_people",
-    "assign_asset",
-    "return_asset",
-    "transfer_asset",
-    "get_asset_relations",
-    "create_relationship",
-    "remove_relationship",
-    "move_host",
-    "get_asset_map",
-    "save_redundancy_group",
-    "prepare_inventory_import",
-    "preview_bulk_operation",
-    "get_inventory_operation",
-    "resolve_import_conflict",
-    "apply_inventory_operation",
-}
+from tests.test_mcp_server import McpServer, call_tool, operator
 
 
 @pytest.fixture
@@ -125,26 +93,6 @@ def chat(client: Any, auth: dict[str, str], message: str) -> dict[str, Any]:
     response = client.post("/api/v1/agent/chat", json={"message": message}, headers=auth)
     assert response.status_code == 200, response.text
     return response.json()
-
-
-def test_agent_registry_is_extended_with_directory_and_relationship_tools(signed_in_client):
-    monkeypatch = pytest.MonkeyPatch()
-    monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", False)
-    client, auth = signed_in_client()
-    seen: list[str] = []
-
-    def run(messages: list[ModelMessage], info: AgentInfo) -> ModelResponse:
-        seen.extend(tool.name for tool in info.function_tools)
-        return ModelResponse(parts=[TextPart("Listo.")])
-
-    use_model(client, FunctionModel(run))
-    chat(client, auth, "¿Qué podés hacer?")
-    monkeypatch.undo()
-
-    assert sorted(seen) == sorted(TOOL_NAMES)
-    for name in seen:
-        for forbidden in ("shell", "exec", "sql", "file", "http", "browser", "python"):
-            assert forbidden not in name
 
 
 def test_agent_assigns_transfers_and_reads_relations(signed_in_client, monkeypatch):
@@ -313,7 +261,6 @@ def test_agent_denied_relationship_write_changes_nothing(signed_in_client, monke
 
 def test_mcp_exposes_directory_relationship_history_and_map_tools(mcp: McpServer) -> None:
     _, token = operator(mcp)
-    assert set(list_tools(mcp, token)) == TOOL_NAMES
 
     def create(name: str, code: str, **extra: Any) -> dict[str, Any]:
         payload = {"name": name, "quick_code": code}

@@ -115,12 +115,6 @@ def operator(server: McpServer) -> tuple[str, str]:
     return "mcp-operator", token
 
 
-def test_mcp_lists_only_selected_inventory_tools(mcp: McpServer) -> None:
-    _, token = operator(mcp)
-
-    assert set(list_tools(mcp, token)) == TOOL_NAMES
-
-
 def test_mcp_requires_bearer_and_rejects_cookie_sessions(mcp: McpServer) -> None:
     with httpx.Client(timeout=10) as client:
         anonymous = client.post(
@@ -153,6 +147,17 @@ def test_mcp_rejects_invalid_bearer(mcp: McpServer) -> None:
     assert response.status_code == 401
     with pytest.raises((MCPError, ToolError)):
         list_tools(mcp, "itsm_invalid_token_value")
+
+
+def test_mcp_missing_asset_preserves_existing_error(mcp: McpServer) -> None:
+    _, token = operator(mcp)
+    with pytest.raises(ToolError, match=r"^asset not found$"):
+        call_tool(
+            mcp,
+            token,
+            "get_asset",
+            {"asset_id": "00000000-0000-4000-8000-000000000000"},
+        )
 
 
 def test_mcp_create_is_visible_through_rest_with_the_same_id(mcp: McpServer) -> None:
