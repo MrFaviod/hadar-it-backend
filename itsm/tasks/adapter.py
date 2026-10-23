@@ -67,6 +67,12 @@ class TaskQueue(Protocol):
     def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
         """Enqueue one approved durable inventory operation."""
 
+    def submit_monitoring(self) -> TaskStatus:
+        """Enqueue one configured native-monitoring synchronization."""
+
+    def submit_notifications(self) -> TaskStatus:
+        """Enqueue one SQL-backed notification dispatch pass."""
+
     def get_status(self, task_id: str) -> TaskStatus | None:
         """Return the stored state without consuming it; ``None`` if unknown."""
 
@@ -155,6 +161,14 @@ class HueyTaskQueue:
     def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
         task = self.runtime.operation.s(operation_id, id=task_id)
         return self._enqueue(task, task_id, TaskState.PENDING)
+
+    def submit_monitoring(self) -> TaskStatus:
+        task_id = uuid.uuid4().hex
+        return self._enqueue(self.runtime.monitoring.s(id=task_id), task_id, TaskState.PENDING)
+
+    def submit_notifications(self) -> TaskStatus:
+        task_id = uuid.uuid4().hex
+        return self._enqueue(self.runtime.notifications.s(id=task_id), task_id, TaskState.PENDING)
 
     def _enqueue(self, task: Any, task_id: str, state: TaskState) -> TaskStatus:
         runtime = self.runtime

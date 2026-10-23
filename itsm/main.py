@@ -41,6 +41,9 @@ from itsm.inventory.catalog_api import create_catalog_router
 from itsm.logging import configure_logging, log_event
 from itsm.maintenance.api import create_maintenance_router
 from itsm.mcp.server import create_mcp_server
+from itsm.monitoring.api import create_monitoring_router
+from itsm.notifications.api import create_notification_router
+from itsm.notifications.service import record_alert_event
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
@@ -285,6 +288,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_attachment_router())
     api.include_router(create_maintenance_router())
     api.include_router(create_intervention_router())
+    api.include_router(create_monitoring_router(notifier=record_alert_event))
+    api.include_router(create_notification_router())
     # Relationship and directory routes must be registered before the MCP mount:
     # a mount on the same prefix would otherwise shadow them.
     api.include_router(create_relationship_router())

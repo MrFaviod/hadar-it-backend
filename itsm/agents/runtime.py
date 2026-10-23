@@ -93,6 +93,13 @@ TOOL_NAMES: tuple[str, ...] = (
     "prepare_incident_resolution",
     "confirm_incident_resolution",
     "search_incidents",
+    "get_asset_availability",
+    "investigate_outage",
+    "get_asset_metrics",
+    "list_active_alerts",
+    "link_alert_incident",
+    "acknowledge_alert",
+    "prepare_monitoring_maintenance",
 )
 MAX_RESULTS = 50
 
@@ -113,6 +120,10 @@ Reglas:
   completar un mantenimiento recalcula su próximo vencimiento.
 - Preparar una resolución de incidente no lo resuelve: solo la confirmación con el
   token preparado y la autoridad vigente lo cambia de estado.
+- Las métricas proceden de Prometheus; indicá el período y distinguí sin datos,
+  sin supervisión y servicio no disponible de una caída confirmada.
+- Reconocer una alerta no la resuelve y una recuperación no cierra su incidente.
+- Preparar mantenimiento solo propone una ventana; no cambia la supervisión.
 """
 
 
@@ -288,6 +299,22 @@ def _interventions(deps: AgentDeps) -> Iterator[Any]:
         )
     finally:
         session.close()
+
+
+@contextmanager
+def _monitoring(deps: AgentDeps) -> Iterator[Any]:
+    """Open the canonical monitoring service with the current trusted principal."""
+    from itsm.monitoring.service import MonitoringService
+    from itsm.notifications.service import record_alert_event
+
+    with deps.session_factory() as session:
+        yield MonitoringService(
+            session,
+            deps.settings,
+            identity=IdentityService(session, deps.settings),
+            source="agent",
+            notifier=record_alert_event,
+        )
 
 
 def _bounded_page(limit: int, offset: int) -> tuple[int, int]:
@@ -1291,6 +1318,115 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
                 return _page_payload(page)
 
         return _collect(ctx.deps, "search_incidents", operation)
+
+    @agent.tool
+    def get_asset_availability(
+        ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
+    ) -> dict[str, Any]:
+        """Consultar disponibilidad real, procedencia y período; nunca inferir una caída."""
+        from itsm.monitoring.projection import summarize_device
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                return summarize_device(service.get_device(ctx.deps.principal, asset_id, period))
+
+        return _collect(ctx.deps, "get_asset_availability", operation)
+
+    @agent.tool
+    def get_asset_metrics(
+        ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
+    ) -> dict[str, Any]:
+        """Consultar métricas históricas acotadas con período y procedencia de Prometheus."""
+        from itsm.monitoring.projection import summarize_device
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                return summarize_device(
+                    service.get_device(ctx.deps.principal, asset_id, period), include_series=True
+                )
+
+        return _collect(ctx.deps, "get_asset_metrics", operation)
+
+    @agent.tool
+    def investigate_outage(
+        ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
+    ) -> dict[str, Any]:
+        """Investigar disponibilidad y alertas persistidas.
+
+        No inventar causas ni recuperaciones.
+        """
+        from itsm.monitoring.projection import summarize_alert, summarize_device
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                result = summarize_device(service.get_device(ctx.deps.principal, asset_id, period))
+                alerts = service.list_alerts(ctx.deps.principal, asset_id=asset_id, limit=10)
+                result["alerts"] = {
+                    **alerts,
+                    "items": [summarize_alert(item) for item in alerts["items"]],
+                }
+                return result
+
+        return _collect(ctx.deps, "investigate_outage", operation)
+
+    @agent.tool
+    def list_active_alerts(
+        ctx: RunContext[AgentDeps], asset_id: str | None = None, limit: int = 10, offset: int = 0
+    ) -> dict[str, Any]:
+        """Consultar una página acotada de alertas activas autorizadas."""
+        from itsm.monitoring.projection import summarize_alert
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                bounded_limit, bounded_offset = _bounded_page(limit, offset)
+                page = service.list_alerts(
+                    ctx.deps.principal,
+                    limit=bounded_limit,
+                    offset=bounded_offset,
+                    state="firing",
+                    asset_id=asset_id,
+                )
+                return {**page, "items": [summarize_alert(item) for item in page["items"]]}
+
+        return _collect(ctx.deps, "list_active_alerts", operation)
+
+    @agent.tool
+    def acknowledge_alert(
+        ctx: RunContext[AgentDeps], alert_id: str, notes: str = ""
+    ) -> dict[str, Any]:
+        """Reconocer una alerta autorizada sin resolverla ni cerrar su incidente."""
+        from itsm.monitoring.projection import summarize_alert
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                return summarize_alert(service.acknowledge(ctx.deps.principal, alert_id, notes))
+
+        return _collect(ctx.deps, "acknowledge_alert", operation)
+
+    @agent.tool
+    def link_alert_incident(
+        ctx: RunContext[AgentDeps], alert_id: str, incident_id: str | None = None
+    ) -> dict[str, Any]:
+        """Vincular un incidente existente o crear uno canónico, con autorización vigente."""
+        from itsm.monitoring.projection import summarize_alert
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                return summarize_alert(
+                    service.link_incident(ctx.deps.principal, alert_id, incident_id)
+                )
+
+        return _collect(ctx.deps, "link_alert_incident", operation)
+
+    @agent.tool
+    def prepare_monitoring_maintenance(ctx: RunContext[AgentDeps], alert_id: str) -> dict[str, Any]:
+        """Preparar una ventana de mantenimiento sugerida, sin guardarla ni silenciar."""
+
+        def operation() -> dict[str, Any]:
+            with _monitoring(ctx.deps) as service:
+                return service.prepare_maintenance(ctx.deps.principal, alert_id)
+
+        return _collect(ctx.deps, "prepare_monitoring_maintenance", operation)
 
     def workflow(ctx, name, call):
         """Run one workflow tool; every row-bearing result stays compact for the chat."""

@@ -81,6 +81,13 @@ TOOL_NAMES: tuple[str, ...] = (
     "prepare_incident_resolution",
     "confirm_incident_resolution",
     "search_incidents",
+    "get_asset_availability",
+    "investigate_outage",
+    "get_asset_metrics",
+    "list_active_alerts",
+    "link_alert_incident",
+    "acknowledge_alert",
+    "prepare_monitoring_maintenance",
 )
 
 INSTRUCTIONS = """\
@@ -91,6 +98,10 @@ Maintenance completion recalculates the next due date; interventions and
 incidents are recorded in one structured call. Preparing an incident resolution
 never changes its status: only confirming the prepared token, revalidated
 against current authority and state, resolves it.
+Monitoring reports Prometheus provenance and the queried period. Missing data or
+an unavailable metrics service is not proof that a device is down. Acknowledging
+never resolves an alert, recovery never closes an incident, and preparing a
+maintenance window does not persist or silence anything.
 """
 
 
@@ -348,6 +359,25 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 raise ToolError("authentication required") from None
             yield (
                 InterventionService(session, settings, identity=identity, source="mcp"),
+                context.principal,
+            )
+
+    @contextmanager
+    def monitoring() -> Iterator[tuple[Any, Principal]]:
+        from itsm.monitoring.service import MonitoringService
+        from itsm.notifications.service import record_alert_event
+
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield (
+                MonitoringService(
+                    session, settings, identity=identity, source="mcp", notifier=record_alert_event
+                ),
                 context.principal,
             )
 
@@ -1215,6 +1245,97 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
             return _page_payload(page)
 
         return run_with(interventions, operation)
+
+    @server.tool
+    def get_asset_availability(asset_id: str, period: str = "24h") -> dict[str, Any]:
+        """Read measured availability with explicit missing states, period and provenance."""
+        from itsm.monitoring.projection import summarize_device
+
+        return run_with(
+            monitoring,
+            lambda service, principal: summarize_device(
+                service.get_device(principal, asset_id, period)
+            ),
+        )
+
+    @server.tool
+    def get_asset_metrics(asset_id: str, period: str = "24h") -> dict[str, Any]:
+        """Read bounded historical Prometheus metrics, not arbitrary PromQL or URLs."""
+        from itsm.monitoring.projection import summarize_device
+
+        return run_with(
+            monitoring,
+            lambda service, principal: summarize_device(
+                service.get_device(principal, asset_id, period), include_series=True
+            ),
+        )
+
+    @server.tool
+    def investigate_outage(asset_id: str, period: str = "24h") -> dict[str, Any]:
+        """Read real availability and persisted alerts without inventing root causes."""
+        from itsm.monitoring.projection import summarize_alert, summarize_device
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            result = summarize_device(service.get_device(principal, asset_id, period))
+            alerts = service.list_alerts(principal, asset_id=asset_id, limit=10)
+            result["alerts"] = {
+                **alerts,
+                "items": [summarize_alert(item) for item in alerts["items"]],
+            }
+            return result
+
+        return run_with(monitoring, operation)
+
+    @server.tool
+    def list_active_alerts(
+        asset_id: str | None = None, limit: int = 10, offset: int = 0
+    ) -> dict[str, Any]:
+        """Read one bounded page of authorized firing alerts."""
+        from itsm.monitoring.projection import summarize_alert
+
+        def operation(service: Any, principal: Principal) -> dict[str, Any]:
+            bounded_limit, bounded_offset = _bounded_page(limit, offset)
+            page = service.list_alerts(
+                principal,
+                limit=bounded_limit,
+                offset=bounded_offset,
+                state="firing",
+                asset_id=asset_id,
+            )
+            return {**page, "items": [summarize_alert(item) for item in page["items"]]}
+
+        return run_with(monitoring, operation)
+
+    @server.tool
+    def acknowledge_alert(alert_id: str, notes: str = "") -> dict[str, Any]:
+        """Acknowledge under current authority without resolving or closing an incident."""
+        from itsm.monitoring.projection import summarize_alert
+
+        return run_with(
+            monitoring,
+            lambda service, principal: summarize_alert(
+                service.acknowledge(principal, alert_id, notes)
+            ),
+        )
+
+    @server.tool
+    def link_alert_incident(alert_id: str, incident_id: str | None = None) -> dict[str, Any]:
+        """Link an existing incident or create one atomically through the canonical service."""
+        from itsm.monitoring.projection import summarize_alert
+
+        return run_with(
+            monitoring,
+            lambda service, principal: summarize_alert(
+                service.link_incident(principal, alert_id, incident_id)
+            ),
+        )
+
+    @server.tool
+    def prepare_monitoring_maintenance(alert_id: str) -> dict[str, Any]:
+        """Prepare a maintenance suggestion; it never saves a window or creates a silence."""
+        return run_with(
+            monitoring, lambda service, principal: service.prepare_maintenance(principal, alert_id)
+        )
 
     return server
 

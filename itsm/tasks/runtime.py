@@ -46,6 +46,8 @@ class TaskRuntime:
     huey: Huey
     demo: DemoTasks
     operation: Any
+    monitoring: Any
+    notifications: Any
 
 
 def build_huey(settings: Settings) -> Huey:
@@ -198,6 +200,55 @@ def register_maintenance_task(huey: Huey, settings: Settings):
     return maintenance_due_scan
 
 
+def register_monitoring_task(huey: Huey, settings: Settings):
+    """Sync native alerts and window occurrences; Prometheus remains the metrics engine."""
+
+    @huey.periodic_task(
+        lambda timestamp: (
+            int(timestamp.timestamp() // 60) % ((settings.monitoring_poll_seconds + 59) // 60) == 0
+        ),
+        name="monitoring_sync",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+        context=True,
+    )
+    def monitoring_sync(task: Any = None) -> dict[str, Any]:
+        from itsm.monitoring.scheduler import sync_from_prometheus
+        from itsm.notifications.service import record_alert_event
+
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        result = sync_from_prometheus(settings, notifier=record_alert_event)
+        log_event(logger, "monitoring.synchronized", **result)
+        payload = {"state": TaskState.COMPLETE.value, "summary": result}
+        huey.put_result(task.id, payload)
+        return payload
+
+    return monitoring_sync
+
+
+def register_notification_task(huey: Huey, settings: Settings):
+    """Dispatch SQL-backed deliveries/retries/escalation and retention through Huey."""
+
+    @huey.periodic_task(
+        crontab(minute="*"),
+        name="notification_dispatch",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+        context=True,
+    )
+    def notification_dispatch(task: Any = None) -> dict[str, Any]:
+        from itsm.notifications.service import process_notifications
+
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        result = process_notifications(settings)
+        log_event(logger, "notifications.processed", **result)
+        payload = {"state": TaskState.COMPLETE.value, "summary": result}
+        huey.put_result(task.id, payload)
+        return payload
+
+    return notification_dispatch
+
+
 def build_runtime(settings: Settings) -> TaskRuntime:
     """Used by the API process; the consumer imports the module-level instance."""
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
@@ -207,6 +258,8 @@ def build_runtime(settings: Settings) -> TaskRuntime:
         huey=huey,
         demo=register_demo_tasks(huey, settings),
         operation=register_operation_task(huey, settings),
+        monitoring=register_monitoring_task(huey, settings),
+        notifications=register_notification_task(huey, settings),
     )
 
 
@@ -220,6 +273,8 @@ def _consumer_huey() -> Huey:
     register_demo_tasks(huey_instance, settings)
     register_operation_task(huey_instance, settings)
     register_maintenance_task(huey_instance, settings)
+    register_monitoring_task(huey_instance, settings)
+    register_notification_task(huey_instance, settings)
     return huey_instance
 
 
