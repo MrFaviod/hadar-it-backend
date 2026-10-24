@@ -49,6 +49,8 @@ class TaskRuntime:
     monitoring: Any
     notifications: Any
     report: Any
+    search_sync: Any
+    search_rebuild: Any
 
 
 def build_huey(settings: Settings) -> Huey:
@@ -286,11 +288,54 @@ def register_report_task(huey: Huey, settings: Settings):
     return report_generate
 
 
+def register_search_tasks(huey: Huey, settings: Settings) -> tuple[Any, Any]:
+    """Run committed outbox synchronization and explicit atomic rebuilds."""
+    from itsm.search.indexer import (
+        install_search_sync,
+        process_search_rebuild,
+        process_search_sync,
+    )
+
+    install_search_sync(settings)
+
+    @huey.periodic_task(
+        crontab(minute="*"),
+        name="search_sync",
+        context=True,
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+    )
+    def search_sync(task: Any = None) -> dict[str, Any]:
+        if task is not None:
+            write_task_state(huey, task.id, TaskState.RUNNING)
+        result = process_search_sync(settings)
+        if task is not None:
+            huey.put_result(task.id, {"state": TaskState.COMPLETE.value, "result": result})
+        return result
+
+    @huey.task(
+        name="search_rebuild",
+        context=True,
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+    )
+    def search_rebuild(task: Any = None) -> dict[str, Any]:
+        if task is not None:
+            write_task_state(huey, task.id, TaskState.RUNNING)
+        result = process_search_rebuild(settings)
+        if task is not None:
+            huey.put_result(task.id, {"state": TaskState.COMPLETE.value, "result": result})
+        return result
+
+    return search_sync, search_rebuild
+
+
 def build_runtime(settings: Settings) -> TaskRuntime:
     """Used by the API process; the consumer imports the module-level instance."""
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
     huey = build_huey(settings)
     register_maintenance_task(huey, settings)
+    search_sync, search_rebuild = register_search_tasks(huey, settings)
     return TaskRuntime(
         huey=huey,
         demo=register_demo_tasks(huey, settings),
@@ -298,6 +343,8 @@ def build_runtime(settings: Settings) -> TaskRuntime:
         monitoring=register_monitoring_task(huey, settings),
         notifications=register_notification_task(huey, settings),
         report=register_report_task(huey, settings),
+        search_sync=search_sync,
+        search_rebuild=search_rebuild,
     )
 
 
@@ -314,6 +361,7 @@ def _consumer_huey() -> Huey:
     register_monitoring_task(huey_instance, settings)
     register_notification_task(huey_instance, settings)
     register_report_task(huey_instance, settings)
+    register_search_tasks(huey_instance, settings)
     return huey_instance
 
 

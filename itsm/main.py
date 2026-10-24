@@ -18,8 +18,10 @@ from starlette.exceptions import HTTPException as StarletteHTTPException
 from itsm import __version__
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
+from itsm.appearance import build_appearance_service, create_appearance_router
 from itsm.attachments.api import create_attachment_router
 from itsm.config import Settings, get_settings
+from itsm.dashboard.api import create_dashboard_router
 from itsm.database import (
     Readiness,
     check_readiness,
@@ -27,6 +29,7 @@ from itsm.database import (
     create_session_factory,
 )
 from itsm.directory.api import create_directory_router
+from itsm.directory.media_api import create_directory_media_router
 from itsm.identity.api import (
     authenticated_actor,
     create_identity_router,
@@ -48,6 +51,8 @@ from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
 from itsm.reports.api import create_reports_router
 from itsm.reports.service import build_report_service
+from itsm.search.api import create_search_router
+from itsm.search.indexer import install_search_sync
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
 from itsm.workflows.api import create_workflow_router
 
@@ -131,11 +136,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.engine = engine
         app.state.session_factory = factory
+        install_search_sync(settings)
         app.state.task_queue = create_task_queue(settings)
         app.state.agent_runtime = AgentRuntime(settings, app.state.session_factory)
         app.state.reports_service = build_report_service(
             settings, factory, task_queue=app.state.task_queue
         )
+        app.state.appearance_service = build_appearance_service(settings, factory)
         log_event(
             logger,
             "app.started",
@@ -296,12 +303,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_monitoring_router(notifier=record_alert_event))
     api.include_router(create_notification_router())
     api.include_router(create_reports_router())
+    api.include_router(create_dashboard_router())
+    api.include_router(create_appearance_router())
+    api.include_router(
+        create_search_router(
+            sync_task=lambda: app.state.task_queue.submit_search_sync(),
+            rebuild_task=lambda: app.state.task_queue.submit_search_rebuild(),
+        )
+    )
     # Relationship and directory routes must be registered before the MCP mount:
     # a mount on the same prefix would otherwise shadow them.
     api.include_router(create_relationship_router())
     api.include_router(create_redundancy_router())
     api.include_router(create_catalog_router())
     api.include_router(create_directory_router())
+    api.include_router(create_directory_media_router())
     api.include_router(create_agent_router())
     api.include_router(create_identity_router())
     app.include_router(api)

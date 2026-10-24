@@ -190,6 +190,12 @@ class InventoryCatalog:
         existing = dict(previous or {})
         result = dict(existing)
         for key, value in values.items():
+            if key in {"anydeskId", "rmmAgentId"}:
+                pattern = r"[0-9]{5,12}" if key == "anydeskId" else r"[A-Za-z0-9._-]{3,64}"
+                if not isinstance(value, str) or (value and re.fullmatch(pattern, value) is None):
+                    raise ValidationFailed(f"technical.{key} is not a valid remote identifier")
+                result[key] = value
+                continue
             if key in existing and value == existing[key]:
                 result[key] = deepcopy(value)
                 continue

@@ -114,6 +114,10 @@ class Settings(BaseSettings):
     monitoring_poll_seconds: int = Field(default=60, ge=60, le=3600)
     notification_retention_days: int = Field(default=90, ge=1, le=3650)
     meilisearch_url: str | None = None
+    meilisearch_api_key: SecretStr | None = None
+    meilisearch_http_timeout_seconds: int = Field(default=5, ge=1, le=60)
+    search_index_name: str = Field(default="itsm_entities", pattern=r"^[A-Za-z0-9_-]{1,64}$")
+    search_sync_batch_size: int = Field(default=100, ge=1, le=500)
     service_redis_url: str | None = None
 
     @field_validator("report_base_url")
@@ -145,7 +149,9 @@ class Settings(BaseSettings):
             )
         return normalized
 
-    @field_validator("prometheus_url", "alertmanager_url", "monitoring_public_url")
+    @field_validator(
+        "prometheus_url", "alertmanager_url", "monitoring_public_url", "meilisearch_url"
+    )
     @classmethod
     def _validate_monitoring_endpoint(cls, value: str | None, info: ValidationInfo) -> str | None:
         if value is None:
@@ -178,6 +184,7 @@ class Settings(BaseSettings):
         "alertmanager_token",
         "monitoring_ingest_token",
         "monitoring_discovery_token",
+        "meilisearch_api_key",
         mode="before",
     )
     @classmethod
@@ -317,6 +324,7 @@ class Settings(BaseSettings):
             self.alertmanager_token,
             self.monitoring_ingest_token,
             self.monitoring_discovery_token,
+            self.meilisearch_api_key,
             *self.monitoring_secrets.values(),
         ):
             if secret is not None:
