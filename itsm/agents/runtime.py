@@ -36,6 +36,7 @@ from itsm.inventory.service import (
     InventoryPage,
     InventoryService,
 )
+from itsm.operations import tools as operations_tools
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from itsm.reports.schemas import ReportRequest
@@ -107,6 +108,10 @@ TOOL_NAMES: tuple[str, ...] = (
     "report_job_status",
     "report_documents",
     "generate_labels",
+    "get_operational_summary",
+    "search_everything",
+    "query_relationships",
+    "list_saved_views",
 )
 MAX_RESULTS = 50
 
@@ -134,6 +139,10 @@ Reglas:
 - Los reportes y etiquetas usan plantillas y filtros estructurados; nunca generes HTML,
   rutas de servidor ni comandos. Preparar no genera un archivo; generar devuelve un
   trabajo pendiente y solo su estado final confirma los documentos disponibles.
+- El resumen operativo y la búsqueda global respetan el período, el motor y los permisos
+  vigentes; no supongas que una coincidencia existe si la herramienta no la devuelve.
+- Las relaciones se consultan desde un activo concreto o de forma paginada; no recorras
+  todo el grafo para responder por un solo equipo.
 """
 
 
@@ -331,6 +340,20 @@ def _monitoring(deps: AgentDeps) -> Iterator[Any]:
 def _bounded_page(limit: int, offset: int) -> tuple[int, int]:
     """Clamp one tool page so a model cannot request unbounded rows."""
     return max(1, min(int(limit), MAX_RESULTS)), max(0, int(offset))
+
+
+def _operational(
+    deps: AgentDeps,
+    tool: str,
+    operation: Callable[[Session, IdentityService], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one shared operational query under the current trusted principal."""
+
+    def call() -> dict[str, Any]:
+        with deps.session_factory() as session:
+            return operation(session, IdentityService(session, deps.settings))
+
+    return _collect(deps, tool, call)
 
 
 def _page_payload(page: Any) -> dict[str, Any]:
@@ -1596,6 +1619,94 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "generate_labels",
             lambda service, principal, digest: service.generate(
                 principal, request, credential_digest=digest
+            ),
+        )
+
+    @agent.tool
+    def get_operational_summary(
+        ctx: RunContext[AgentDeps],
+        period: str = "24h",
+        category: str | None = None,
+        site_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Resumir disponibilidad, alertas, incidentes y actividad del período indicado."""
+        return _operational(
+            ctx.deps,
+            "get_operational_summary",
+            lambda session, identity: operations_tools.operational_summary(
+                session,
+                identity,
+                ctx.deps.settings,
+                ctx.deps.principal,
+                source="agent",
+                period=period,
+                category=category,
+                site_id=site_id,
+            ),
+        )
+
+    @agent.tool
+    def search_everything(
+        ctx: RunContext[AgentDeps],
+        query: str,
+        kinds: list[str] | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Buscar entidades canónicas por texto con tipos y página acotados."""
+        return _operational(
+            ctx.deps,
+            "search_everything",
+            lambda session, identity: operations_tools.search_everything(
+                session,
+                identity,
+                ctx.deps.settings,
+                ctx.deps.principal,
+                source="agent",
+                query=query,
+                kinds=kinds,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+
+    @agent.tool
+    def query_relationships(
+        ctx: RunContext[AgentDeps],
+        asset_id: str | None = None,
+        depth: int = 2,
+        direction: str = "both",
+        type_key: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Recorrer relaciones desde un activo o paginar el grafo global persistido."""
+        return _operational(
+            ctx.deps,
+            "query_relationships",
+            lambda session, identity: operations_tools.query_relationships(
+                session,
+                identity,
+                ctx.deps.settings,
+                ctx.deps.principal,
+                source="agent",
+                asset_id=asset_id,
+                depth=depth,
+                direction=direction,
+                type_key=type_key,
+                limit=limit,
+                offset=offset,
+            ),
+        )
+
+    @agent.tool
+    def list_saved_views(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Leer las vistas, favoritos y accesos guardados de la identidad actual."""
+        return _operational(
+            ctx.deps,
+            "list_saved_views",
+            lambda session, identity: operations_tools.list_saved_views(
+                session, identity, ctx.deps.principal, source="agent"
             ),
         )
 
