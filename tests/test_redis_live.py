@@ -25,14 +25,14 @@ pytestmark = pytest.mark.skipif(
 
 
 def test_redis_task_storage_runs_the_echo_task(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
     tmp_path: Path,
 ) -> None:
     settings = settings_factory(task_storage="redis", task_redis_url=REDIS_URL)
-    api = client(settings)
+    api, auth = signed_in_client(settings)
 
-    submitted = api.post("/api/v1/tasks/demo", json={"message": "redis"})
+    submitted = api.post("/api/v1/tasks/demo", json={"message": "redis"}, headers=auth)
 
     assert submitted.status_code == 202, submitted.text
     task_id = submitted.json()["task_id"]

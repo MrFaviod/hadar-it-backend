@@ -64,7 +64,7 @@ def test_postgres_migrations_and_readiness(
 
 
 def test_postgres_huey_storage_runs_the_echo_task(
-    client: Callable[..., TestClient],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
     settings_factory: Callable[..., Settings],
     tmp_path: Path,
 ) -> None:
@@ -75,9 +75,9 @@ def test_postgres_huey_storage_runs_the_echo_task(
     )
     migration = run_migrations(settings)
     assert migration.returncode == 0, migration.stderr
-    test_client = client(settings)
+    test_client, auth = signed_in_client(settings)
 
-    submitted = test_client.post("/api/v1/tasks/demo", json={"message": "postgres"})
+    submitted = test_client.post("/api/v1/tasks/demo", json={"message": "postgres"}, headers=auth)
     assert submitted.status_code == 202, submitted.text
 
     with running_worker(settings, log_path=tmp_path / "worker-postgres.log"):
