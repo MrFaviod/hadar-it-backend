@@ -458,7 +458,10 @@ class WorkflowService:
         return self.get(principal, operation.id, limit=5000)
 
     def _row_permissions(self, principal, rows):
-        self._auth(principal)
+        for permission in self._required_permissions(rows):
+            self._auth(principal, permission)
+
+    def _required_permissions(self, rows):
         if any(
             any(
                 k in row.payload.get("values", {}) for k in ("responsible", "responsible_person_id")
@@ -466,7 +469,8 @@ class WorkflowService:
             or row.payload.get("action") in {"assign", "return"}
             for row in rows
         ):
-            self._auth(principal, "assets.assign")
+            return ("assets.edit", "assets.assign")
+        return ("assets.edit",)
 
     @serialized
     def approve(self, principal, operation_id):
@@ -490,49 +494,67 @@ class WorkflowService:
         )
         return self.get(principal, operation.id, limit=5000)
 
-    def _approval(self, operation, principal):
+    def _approval(self, operation, principal, permissions=None):
         if not operation.approver_id:
             raise Conflict("human approval of the exact preview is required")
         stored = self._session.get(Identity, operation.approver_id)
         if stored is None or stored.actor_kind != "human":
             raise PermissionDenied("approval is no longer valid")
         approver = self.identity._principal(stored)
+        if permissions is None:
+            permissions = self._required_permissions(self._rows(operation.id))
+        for permission in permissions:
+            self._auth(principal, permission)
+            self._auth(approver, permission)
+
+    @serialized
+    def _start_execution(self, principal, operation_id):
+        self._session.expire_all()
+        operation = self._operation(principal, operation_id, "assets.edit")
         rows = self._rows(operation.id)
-        self._row_permissions(principal, rows)
-        self._row_permissions(approver, rows)
+        permissions = self._required_permissions(rows)
+        self._approval(operation, principal, permissions)
+        indexes = [
+            row.index
+            for row in rows
+            if row.payload.get("result") not in {"created", "modified", "omitted"}
+        ]
+        # Freeze the approved preview before reusing its permission projection.
+        # Each row still revalidates current executor and approver authority.
+        if operation.state != "complete":
+            operation.state = "running"
+        self._session.commit()
+        return indexes, permissions
 
     def execute(self, principal, operation_id):
-        operation = self._operation(principal, operation_id, "assets.edit")
-        self._approval(operation, principal)
-        for row in self._rows(operation.id):
-            if row.payload.get("result") in {"created", "modified", "omitted"}:
-                continue
+        indexes, permissions = self._start_execution(principal, operation_id)
+        for index in indexes:
             try:
-                self._apply_row(principal, operation.id, row.index)
+                self._apply_row(principal, operation_id, index, permissions)
             except PermissionDenied:
                 raise
             except IdentityError as exc:
-                self._fail_row(principal, operation.id, row.index, str(exc))
+                self._fail_row(principal, operation_id, index, str(exc), permissions)
         operation = self._session.get(Operation, operation_id)
         operation.state = "complete"
         self._session.commit()
         return self.get(principal, operation_id, limit=5000)
 
     @serialized
-    def _fail_row(self, principal, operation_id, index, message):
+    def _fail_row(self, principal, operation_id, index, message, permissions):
         self._session.expire_all()
         operation = self._session.get(Operation, operation_id)
-        self._approval(operation, principal)
+        self._approval(operation, principal, permissions)
         row = self._session.get(OperationRow, (operation_id, index))
         if row.payload.get("result") not in {"created", "modified", "omitted"}:
             row.payload = {**row.payload, "result": "failed", "error": message}
             self._session.commit()
 
     @serialized
-    def _apply_row(self, principal, operation_id, index):
+    def _apply_row(self, principal, operation_id, index, permissions):
         self._session.expire_all()
         operation = self._session.get(Operation, operation_id)
-        self._approval(operation, principal)
+        self._approval(operation, principal, permissions)
         row = self._session.get(OperationRow, (operation_id, index))
         payload = dict(row.payload)
         if payload.get("result") in {"created", "modified", "omitted"}:
