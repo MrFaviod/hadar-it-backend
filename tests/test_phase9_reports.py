@@ -7,7 +7,7 @@ import csv
 import io
 import shutil
 import subprocess
-from datetime import date, timedelta
+from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -174,9 +174,16 @@ def test_history_family_lists_changes_and_intersects(catalog: Catalog) -> None:
     assert preview["rows"][0]["statusNew"] == "maintenance"
 
 
-def test_history_family_includes_interventions_and_incidents(catalog: Catalog) -> None:
+def test_history_family_includes_interventions_and_incidents(
+    catalog: Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Fixed UTC clock: the recorded instant and the filter dates derived from its
+    # calendar date keep this independent of the host timezone and of today().
+    recorded_at = datetime(2026, 10, 24, 12, 0, tzinfo=UTC)
+    today = recorded_at.date().isoformat()
+    monkeypatch.setattr("itsm.interventions.service.utcnow", lambda: recorded_at)
+    monkeypatch.setattr("itsm.inventory.service.utcnow", lambda: recorded_at)
     asset_id = seed(catalog, asset_values(quick_code="HIS-001", name="Con técnicos"))
-    today = date.today().isoformat()
     with catalog.session() as session:
         identity = IdentityService(session, catalog.settings)
         interventions = InterventionService(
@@ -221,6 +228,88 @@ def test_history_family_includes_interventions_and_incidents(catalog: Catalog) -
     # Each technical entry is merged once, never double-counted from inventory history.
     assert len(technical) == 2
     assert preview["summary"]["total"] >= 2
+
+
+def test_history_utc_day_filter_includes_rows_recorded_after_utc_midnight(
+    catalog: Catalog, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """The history family filters recorded instants by UTC calendar day.
+
+    Both rows carry an Oct 24 business date, while the persisted history entries
+    are stamped just after UTC midnight: still Oct 24 in a negative-offset zone
+    such as America/Argentina/Buenos_Aires, already Oct 25 in UTC. The established
+    contract compares the UTC date, so the Oct 25 filter must include both rows
+    exactly once and the Oct 24 business date must not select them.
+    """
+    asset_id = seed(catalog, asset_values(quick_code="HIS-UTC", name="Cambio de turno"))
+    recorded_at = datetime(2026, 10, 25, 0, 32, 48, tzinfo=UTC)
+    # The business row and the history entry appended by the inventory recorder
+    # both read the shared UTC clock, so the persisted instant is the patched one.
+    monkeypatch.setattr("itsm.interventions.service.utcnow", lambda: recorded_at)
+    monkeypatch.setattr("itsm.inventory.service.utcnow", lambda: recorded_at)
+    with catalog.session() as session:
+        identity = IdentityService(session, catalog.settings)
+        interventions = InterventionService(
+            session, catalog.settings, identity=identity, source="internal"
+        )
+        intervention = interventions.create(
+            catalog.admin(),
+            {
+                "assetId": asset_id,
+                "type": "corrective",
+                "description": "Cambio de fuente",
+                "occurredOn": "2026-10-24",
+                "status": "completed",
+            },
+        )
+        incident = interventions.create_incident(
+            catalog.admin(),
+            {
+                "primaryAssetId": asset_id,
+                "description": "Sin red",
+                "priority": "normal",
+                "openedOn": "2026-10-24",
+            },
+        )
+        session.commit()
+    assert intervention.occurred_on.isoformat() == "2026-10-24"
+    assert incident.opened_on.isoformat() == "2026-10-24"
+    service = reports(catalog)
+    expected = [("incident", incident.id), ("intervention", intervention.id)]
+
+    def preview(filters: dict[str, Any]) -> dict[str, Any]:
+        return service.preview(
+            catalog.admin(),
+            ReportRequest(
+                family="history",
+                assetIds=[asset_id],
+                filters=filters,
+                fields=["action", "actor", "changes", "entityType", "entityId", "effectiveAt"],
+            ),
+        )
+
+    def technical(result: dict[str, Any]) -> list[dict[str, Any]]:
+        return [row for row in result["rows"] if row["entityType"] in {"intervention", "incident"}]
+
+    def keys(result: dict[str, Any]) -> list[tuple[str, str]]:
+        return sorted((row["entityType"], row["entityId"]) for row in technical(result))
+
+    utc_day = preview({"from": "2026-10-25", "to": "2026-10-25"})
+    recorded = technical(utc_day)
+    assert keys(utc_day) == expected
+    assert {row["action"] for row in recorded} == {"incident_opened", "intervention_logged"}
+    assert all(row["actor"] == ADMIN_USERNAME for row in recorded)
+    assert all(row["changes"] for row in recorded)
+    assert all(str(row["effectiveAt"]).startswith("2026-10-25T00:32:48") for row in recorded)
+    assert (utc_day["summary"]["from"], utc_day["summary"]["to"]) == ("2026-10-25", "2026-10-25")
+
+    business_day = preview({"from": "2026-10-24", "to": "2026-10-24"})
+    assert technical(business_day) == []
+    assert {row.get("entityId") for row in business_day["rows"]}.isdisjoint(
+        {intervention.id, incident.id}
+    )
+
+    assert keys(preview({})) == expected
 
 
 def test_family_fields_and_stable_grouping(catalog: Catalog) -> None:
