@@ -265,7 +265,7 @@ def test_machine_bearer_identity_is_authorized_and_audited(
     _, operator_token = catalog.add_machine(
         "hermes-operator", "Hermes Operator", role_id="operator"
     )
-    _, reader_token = catalog.add_machine(*MACHINE, role_id="reader")
+    _, reader_token = catalog.add_machine(*MACHINE, role_id="user")
     machine = client(catalog.settings)
 
     denied = machine.post(

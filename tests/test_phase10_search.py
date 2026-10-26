@@ -360,7 +360,7 @@ def test_effective_permission_change_hides_results(settings_factory: Any) -> Non
     catalog = _catalog(settings_factory)
     asset_id = _asset(catalog)
     extra = _extra_entities(catalog, asset_id)
-    reader = catalog.add_user("reader-user", "Reader User", "reader")
+    reader = catalog.add_user("reader-user", "Reader User", "user")
 
     assert f"person:{extra['person']}" in _keys(_search(catalog, reader, "camila"))
     assert f"asset:{asset_id}" in _keys(_search(catalog, reader, "aruba"))
@@ -590,7 +590,7 @@ def test_search_router_returns_contract_and_guards_actions(
         denied = client.post(f"{settings.api_prefix}/search/rebuild")
         assert denied.status_code == 403
 
-        catalog.add_user("status-reader", "Status Reader", "reader")
+        catalog.add_user("status-reader", "Status Reader", "user")
         with TestClient(app) as reader:
             login = reader.post(
                 f"{settings.api_prefix}/auth/login",

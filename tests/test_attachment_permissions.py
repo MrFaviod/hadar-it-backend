@@ -16,7 +16,7 @@ def test_reader_can_download_but_cannot_upload_delete_or_forge_csrf(
     item = upload(client, auth, asset["id"]).json()
     catalog = Catalog(settings, create_engine_from_settings(settings))
     try:
-        catalog.add_user("document-reader", "Document Reader", "reader")
+        catalog.add_user("document-reader", "Document Reader", "user")
     finally:
         catalog.engine.dispose()
     before = client.get(f"/api/v1/assets/{asset['id']}/history").json()

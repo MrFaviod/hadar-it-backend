@@ -223,14 +223,14 @@ ADMIN_NAME = "Ana Admin"
 ADMIN_PASSWORD = "installer-password-2026"
 
 
-def bootstrap_admin(settings: Settings) -> None:
-    """Create the installation administrator through the identity service."""
+def bootstrap_superadmin(settings: Settings) -> None:
+    """Create the installation owner through the identity service."""
     from itsm.database import create_engine_from_settings, create_session_factory
     from itsm.identity.service import BootstrapRefused, IdentityService
 
     session = create_session_factory(create_engine_from_settings(settings))()
     try:
-        IdentityService(session, settings).bootstrap_admin(
+        IdentityService(session, settings).bootstrap_superadmin(
             ADMIN_USERNAME, ADMIN_NAME, ADMIN_PASSWORD
         )
     except BootstrapRefused:
@@ -267,7 +267,7 @@ def signed_in_client(
 
         resolved = settings if settings is not None else settings_factory()
         assert run_migrations(resolved).returncode == 0
-        bootstrap_admin(resolved)
+        bootstrap_superadmin(resolved)
         test_client = TestClient(create_app(resolved))
         test_client.__enter__()
         opened.append(test_client)

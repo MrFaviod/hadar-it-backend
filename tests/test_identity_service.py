@@ -8,11 +8,14 @@ record.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta
+from threading import Barrier
 
 import pytest
 from itsm.config import Settings
-from itsm.identity.hashing import hash_token, verify_password
+from itsm.database import create_engine_from_settings, create_session_factory
+from itsm.identity.hashing import hash_password, hash_token, verify_password
 from itsm.identity.permissions import PERMISSION_CATALOG
 from itsm.identity.service import (
     AccountThrottled,
@@ -20,10 +23,24 @@ from itsm.identity.service import (
     BootstrapRefused,
     Conflict,
     IdentityService,
+    NotFound,
     PermissionDenied,
     ValidationFailed,
 )
 from tests.identity_support import PASSWORD, Harness, make_harness
+
+SYSTEM_PERMISSIONS = frozenset(
+    {
+        "system.view",
+        "system.providers",
+        "system.modules",
+        "system.configure",
+        "system.backup",
+        "system.update",
+    }
+)
+OWNER_PERMISSIONS = frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
+ADMIN_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS
 
 
 @pytest.fixture
@@ -35,18 +52,18 @@ def harness(settings_factory: Callable[..., Settings]) -> Iterator[Harness]:
         created.close()
 
 
-def bootstrap_admin(harness: Harness) -> IdentityService:
+def bootstrap_superadmin(harness: Harness) -> IdentityService:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
     return service
 
 
-def test_bootstrap_admin_creates_the_first_human_administrator(harness: Harness) -> None:
+def test_bootstrap_superadmin_creates_the_first_human_owner(harness: Harness) -> None:
     with harness.service() as service:
-        created = service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        created = service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
 
         assert created.username == "ana.admin"
-        assert created.role_id == "admin"
+        assert created.role_id == "superadmin"
         assert created.actor_kind == "human"
         assert created.active is True
 
@@ -63,29 +80,31 @@ def test_bootstrap_admin_creates_the_first_human_administrator(harness: Harness)
     assert harness.scalar("SELECT COUNT(*) FROM identity_login_attempts") == 0
 
 
-def test_bootstrap_admin_refuses_when_a_human_identity_already_exists(harness: Harness) -> None:
+def test_bootstrap_superadmin_refuses_when_a_human_identity_already_exists(
+    harness: Harness,
+) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         with pytest.raises(BootstrapRefused):
-            service.bootstrap_admin("other.admin", "Other Admin", PASSWORD)
+            service.bootstrap_superadmin("other.admin", "Other Admin", PASSWORD)
 
     assert harness.scalar("SELECT COUNT(*) FROM identity_identities") == 1
 
 
-def test_bootstrap_admin_enforces_the_password_policy(harness: Harness) -> None:
+def test_bootstrap_superadmin_enforces_the_password_policy(harness: Harness) -> None:
     with harness.service() as service, pytest.raises(ValidationFailed):
-        service.bootstrap_admin("ana.admin", "Ana Admin", "short")
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", "short")
 
 
 def test_login_returns_effective_permissions_and_stores_only_the_token_digest(
     harness: Harness,
 ) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
 
     with harness.service() as service:
         grant = service.login("ana.admin", PASSWORD)
 
-    assert grant.permissions == frozenset(PERMISSION_CATALOG)
+    assert grant.permissions == frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
     assert grant.session_minutes == 480
     assert grant.expires_at == harness.now() + timedelta(minutes=480)
     assert grant.csrf_token and len(grant.csrf_token) >= 32
@@ -104,7 +123,7 @@ def test_login_returns_effective_permissions_and_stores_only_the_token_digest(
 def test_login_rejects_wrong_password_and_unknown_user_with_the_same_generic_error(
     harness: Harness,
 ) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
     messages: set[str] = set()
 
     with harness.service() as service:
@@ -122,13 +141,13 @@ def test_login_rejects_wrong_password_and_unknown_user_with_the_same_generic_err
 
 def test_login_rejects_disabled_human_and_machine_identities_generically(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         disabled = service.create_user(
             admin.principal,
             username="luis.disabled",
             name="Luis",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         service.set_active(admin.principal, disabled.id, active=False)
@@ -154,7 +173,7 @@ def test_login_rejects_disabled_human_and_machine_identities_generically(harness
 def test_repeated_failures_throttle_login_durably_and_expire_with_the_window(
     harness: Harness,
 ) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
 
     with harness.service() as service:
         for _ in range(5):
@@ -172,12 +191,12 @@ def test_repeated_failures_throttle_login_durably_and_expire_with_the_window(
     harness.tick(16)
     with harness.service() as service:
         grant = service.login("ana.admin", PASSWORD)
-    assert grant.permissions == frozenset(PERMISSION_CATALOG)
+    assert grant.permissions == frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
     assert harness.scalar("SELECT COUNT(*) FROM identity_login_attempts WHERE successful = 0") == 0
 
 
 def test_successful_login_resets_the_failure_budget(harness: Harness) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
 
     with harness.service() as service:
         for _ in range(4):
@@ -191,11 +210,11 @@ def test_successful_login_resets_the_failure_budget(harness: Harness) -> None:
 
 
 def test_session_expiry_is_enforced_on_every_request(harness: Harness) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
     with harness.service() as service:
         grant = service.login("ana.admin", PASSWORD)
         context = service.authenticate_session(grant.token)
-        assert context.permissions == frozenset(PERMISSION_CATALOG)
+        assert context.permissions == frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
 
     harness.tick(479)
     with harness.service() as service:
@@ -207,7 +226,7 @@ def test_session_expiry_is_enforced_on_every_request(harness: Harness) -> None:
 
 
 def test_logout_revokes_the_session_immediately(harness: Harness) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
     with harness.service() as service:
         grant = service.login("ana.admin", PASSWORD)
         service.logout(grant.principal)
@@ -225,13 +244,13 @@ def test_logout_revokes_the_session_immediately(harness: Harness) -> None:
 
 def test_deactivation_blocks_an_existing_session_and_revokes_it(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         reader = service.create_user(
             admin.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         reader_grant = service.login("rita.reader", PASSWORD)
@@ -246,13 +265,13 @@ def test_deactivation_blocks_an_existing_session_and_revokes_it(harness: Harness
 
 def test_password_and_role_changes_revoke_existing_sessions(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         user = service.create_user(
             admin.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         first = service.login("rita.reader", PASSWORD)
@@ -278,7 +297,7 @@ def test_password_and_role_changes_revoke_existing_sessions(harness: Harness) ->
 
 
 def test_last_access_is_recorded_on_the_identity_and_the_session(harness: Harness) -> None:
-    bootstrap_admin(harness)
+    bootstrap_superadmin(harness)
     with harness.service() as service:
         grant = service.login("ana.admin", PASSWORD)
         harness.tick(5)
@@ -299,13 +318,13 @@ def test_last_access_is_recorded_on_the_identity_and_the_session(harness: Harnes
 
 def test_services_enforce_permissions_response_independently_of_http(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         service.create_user(
             admin.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         service.create_user(
@@ -331,7 +350,7 @@ def test_services_enforce_permissions_response_independently_of_http(harness: Ha
 
 def test_operator_holds_assets_remote_and_reader_does_not(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         service.create_user(
             admin.principal,
@@ -348,7 +367,7 @@ def test_operator_holds_assets_remote_and_reader_does_not(harness: Harness) -> N
 
 def test_denied_operation_is_audited_and_leaves_target_data_unchanged(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         service.create_user(
             admin.principal,
@@ -379,7 +398,7 @@ def test_denied_operation_is_audited_and_leaves_target_data_unchanged(harness: H
 
 def test_machine_identity_cannot_receive_the_administrator_role(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         with pytest.raises(ValidationFailed):
             service.create_user(
@@ -413,13 +432,13 @@ def test_machine_identity_cannot_receive_the_administrator_role(harness: Harness
 
 def test_agent_delegation_is_limited_to_the_intersection_with_the_human(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         human = service.create_user(
             admin.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         custom = service.create_role(
@@ -458,20 +477,20 @@ def test_agent_delegation_is_limited_to_the_intersection_with_the_human(harness:
 
 def test_delegation_is_denied_when_the_delegating_human_is_inactive(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         human = service.create_user(
             admin.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         service.create_user(
             admin.principal,
             username="agent.field",
             name="Field agent",
-            role_id="reader",
+            role_id="user",
             actor_kind="internal_agent",
             delegated_by_id=human.id,
         )
@@ -488,7 +507,7 @@ def test_sensitive_machine_permission_requires_an_explicit_approval_reference(
     harness: Harness,
 ) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         service.create_user(
             admin.principal,
@@ -511,13 +530,13 @@ def test_sensitive_machine_permission_requires_an_explicit_approval_reference(
 
 def test_programmatic_actor_resolution_never_self_asserts_a_role(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         admin = service.login("ana.admin", PASSWORD)
         agent = service.create_user(
             admin.principal,
             username="agent.ops",
             name="Ops agent",
-            role_id="reader",
+            role_id="user",
             actor_kind="internal_agent",
         )
 
@@ -525,7 +544,7 @@ def test_programmatic_actor_resolution_never_self_asserts_a_role(harness: Harnes
         principal = service.resolve_actor(
             agent.id, execution_id="exec-9", authorization_ref="approval-3"
         )
-        assert principal.role_id == "reader"
+        assert principal.role_id == "user"
         service.authorize(principal, "assets.view")
         with pytest.raises(PermissionDenied):
             service.authorize(principal, "assets.edit")
@@ -533,45 +552,52 @@ def test_programmatic_actor_resolution_never_self_asserts_a_role(harness: Harnes
             service.resolve_actor("unknown-identity")
 
 
-def test_last_active_administrator_cannot_be_deactivated_or_demoted(harness: Harness) -> None:
+def test_last_active_superadmin_cannot_be_deactivated_or_demoted(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
-        admin = service.login("ana.admin", PASSWORD)
-        admin_id = admin.principal.actor_id
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        owner_id = owner.principal.actor_id
         with pytest.raises(Conflict):
-            service.set_active(admin.principal, admin_id, active=False)
+            service.set_active(owner.principal, owner_id, active=False)
         with pytest.raises(PermissionDenied):
-            service.update_user(admin.principal, admin_id, role_id="reader")
+            service.update_user(owner.principal, owner_id, role_id="admin")
 
     assert (
         harness.scalar(
-            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'admin'"
+            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'superadmin'"
         )
         == 1
     )
 
 
-def test_a_second_administrator_allows_demoting_the_first(harness: Harness) -> None:
+def test_a_second_superadmin_allows_deactivating_the_first(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
-        admin = service.login("ana.admin", PASSWORD)
-        second = service.create_user(
-            admin.principal,
-            username="beto.admin",
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        service.create_user(
+            owner.principal,
+            username="beto.owner",
             name="Beto",
-            role_id="admin",
+            role_id="superadmin",
             password=PASSWORD,
         )
-        second_grant = service.login("beto.admin", PASSWORD)
-        service.update_user(admin.principal, second.id, role_id="reader")
+        second_grant = service.login("beto.owner", PASSWORD)
+        service.set_active(owner.principal, owner.principal.actor_id, active=False)
         with pytest.raises(AuthenticationFailed):
-            service.authenticate_session(second_grant.token)
-        assert service.me(admin).permissions == frozenset(PERMISSION_CATALOG)
+            service.authenticate_session(owner.token)
+        assert service.me(second_grant).permissions == OWNER_PERMISSIONS
+
+    assert (
+        harness.scalar(
+            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'superadmin'"
+        )
+        == 1
+    )
 
 
 def test_password_storage_uses_argon2id_and_never_keeps_the_plain_value(harness: Harness) -> None:
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
 
     stored = harness.scalar(
         "SELECT password_hash FROM identity_identities WHERE username = 'ana.admin'"
@@ -579,3 +605,434 @@ def test_password_storage_uses_argon2id_and_never_keeps_the_plain_value(harness:
     assert verify_password(stored, PASSWORD) is True
     assert verify_password(stored, PASSWORD + "x") is False
     assert verify_password(stored, "") is False
+
+
+def _insert_legacy_admin(harness: Harness, username: str = "legacy.admin") -> str:
+    identity_id = "legacy-" + username
+    now = harness.now()
+    harness.execute(
+        "INSERT INTO identity_identities ("
+        "id, username, name, actor_kind, active, password_hash, role_id, created_at, updated_at"
+        ") VALUES (:id, :username, 'Legacy Admin', 'human', 1, :password, 'admin', :now, :now)",
+        {
+            "id": identity_id,
+            "username": username,
+            "password": hash_password(PASSWORD),
+            "now": now,
+        },
+    )
+    return identity_id
+
+
+def test_adopt_superadmin_claims_an_existing_installation_once(harness: Harness) -> None:
+    _insert_legacy_admin(harness)
+
+    with harness.service() as service:
+        adopted = service.adopt_superadmin("legacy.admin")
+        assert adopted.role_id == "superadmin"
+        grant = service.login("legacy.admin", PASSWORD)
+        assert grant.permissions == OWNER_PERMISSIONS
+        with pytest.raises(BootstrapRefused):
+            service.adopt_superadmin("legacy.admin")
+
+    assert (
+        harness.scalar(
+            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'superadmin'"
+        )
+        == 1
+    )
+    audit = harness.sql(
+        "SELECT outcome, actor_kind FROM identity_audit_events "
+        "WHERE action = 'identity.superadmin_adopted' ORDER BY id DESC LIMIT 1"
+    )[0]
+    assert tuple(audit) == ("success", "system")
+
+
+def test_adopt_superadmin_rejects_unknown_inactive_and_machine_identities(
+    harness: Harness,
+) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        machine = service.create_user(
+            owner.principal,
+            username="agent.ops",
+            name="Agent",
+            role_id="operator",
+            actor_kind="internal_agent",
+        )
+        inactive = service.create_user(
+            owner.principal,
+            username="rita.user",
+            name="Rita",
+            role_id="user",
+            password=PASSWORD,
+        )
+        service.set_active(owner.principal, inactive.id, active=False)
+        with pytest.raises(NotFound):
+            service.adopt_superadmin("ghost")
+        with pytest.raises(ValidationFailed):
+            service.adopt_superadmin(machine.username)
+        with pytest.raises(ValidationFailed):
+            service.adopt_superadmin(inactive.username)
+
+
+def test_admin_profile_has_business_authority_but_no_installation_authority(
+    harness: Harness,
+) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        owner_id = owner.principal.actor_id
+        owner_hash = harness.scalar(
+            "SELECT password_hash FROM identity_identities WHERE username = 'ana.admin'"
+        )
+        admin = service.create_user(
+            owner.principal,
+            username="beto.admin",
+            name="Beto",
+            role_id="admin",
+            password=PASSWORD,
+        )
+        custom = service.create_role(
+            owner.principal,
+            name="Nodo reservado",
+            permissions=["assets.view", "system.view"],
+        )
+        grant = service.login("beto.admin", PASSWORD)
+        assert grant.permissions == ADMIN_PERMISSIONS
+        assert not grant.permissions & SYSTEM_PERMISSIONS
+
+        with pytest.raises(PermissionDenied):
+            service.create_user(
+                grant.principal,
+                username="intruder.owner",
+                name="Intruder",
+                role_id="superadmin",
+                password=PASSWORD,
+            )
+        with pytest.raises(PermissionDenied):
+            service.create_role(
+                grant.principal,
+                name="Fake owner",
+                permissions=["assets.view", "system.view"],
+            )
+        with pytest.raises(PermissionDenied):
+            service.update_role(grant.principal, custom.id, permissions=["assets.view"])
+        with pytest.raises(PermissionDenied):
+            service.update_user(grant.principal, owner_id, role_id="admin")
+        with pytest.raises(PermissionDenied):
+            service.update_user(grant.principal, owner_id, password="another-password-value")
+        with pytest.raises(PermissionDenied):
+            service.set_active(grant.principal, owner_id, active=False)
+        with pytest.raises(PermissionDenied):
+            service.update_user(grant.principal, admin.id, role_id="superadmin")
+
+        service.authorize(grant.principal, "config.integrations", resource="integration:1")
+        service.authorize(grant.principal, "assets.purge", resource="asset:1")
+        with pytest.raises(PermissionDenied):
+            service.authorize(grant.principal, "system.view", resource="system")
+
+    assert harness.scalar("SELECT COUNT(*) FROM identity_identities") == 2
+    owner_row = harness.sql(
+        "SELECT role_id, active, password_hash FROM identity_identities "
+        "WHERE username = 'ana.admin'"
+    )[0]
+    assert tuple(owner_row) == ("superadmin", 1, owner_hash)
+    assert (
+        harness.scalar(
+            "SELECT COUNT(*) FROM identity_role_policies "
+            "WHERE role_id = 'admin' AND resource = 'system'"
+        )
+        == 0
+    )
+
+
+def test_user_profile_is_read_only_until_a_business_grant_is_assigned(
+    harness: Harness,
+) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        rita = service.create_user(
+            owner.principal,
+            username="rita.user",
+            name="Rita",
+            role_id="user",
+            password=PASSWORD,
+        )
+        grant = service.login("rita.user", PASSWORD)
+        assert grant.permissions == {"assets.view", "people.view"}
+        service.authorize(grant.principal, "assets.view", resource="asset:1")
+        service.authorize(grant.principal, "people.view", resource="person:1")
+        for denied in ("assets.edit", "users.view", "system.view"):
+            with pytest.raises(PermissionDenied):
+                service.authorize(grant.principal, denied)
+
+        campo = service.create_role(
+            owner.principal,
+            name="Campo",
+            permissions=["assets.view", "assets.edit"],
+        )
+        service.update_user(owner.principal, rita.id, role_id=campo.id)
+
+    with harness.service() as service:
+        refreshed = service.login("rita.user", PASSWORD)
+        assert refreshed.permissions == {"assets.view", "assets.edit"}
+        service.authorize(refreshed.principal, "assets.edit", resource="asset:1")
+        with pytest.raises(PermissionDenied):
+            service.authorize(refreshed.principal, "system.view")
+
+
+def test_human_custom_role_with_reserved_grants_never_gains_owner_authority(
+    harness: Harness,
+) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        fake = service.create_role(
+            owner.principal,
+            name="Superadministrador falso",
+            permissions=sorted(OWNER_PERMISSIONS),
+        )
+        user = service.create_user(
+            owner.principal,
+            username="rita.user",
+            name="Rita",
+            role_id="user",
+            password=PASSWORD,
+        )
+        with pytest.raises(ValidationFailed):
+            service.create_user(
+                owner.principal,
+                username="fake.owner",
+                name="Fake",
+                role_id=fake.id,
+                password=PASSWORD,
+            )
+        assert harness.scalar("SELECT COUNT(*) FROM identity_identities") == 2
+        harness.execute(
+            "UPDATE identity_identities SET role_id = :role WHERE id = :id",
+            {"role": fake.id, "id": user.id},
+        )
+        grant = service.login("rita.user", PASSWORD)
+        assert "assets.view" in grant.permissions
+        assert not grant.permissions & SYSTEM_PERMISSIONS
+        with pytest.raises(PermissionDenied):
+            service.authorize(grant.principal, "system.view", resource="system")
+
+
+def test_machine_reserved_grants_require_a_live_owner_delegator(harness: Harness) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        owner_id = owner.principal.actor_id
+        reserved = service.create_role(
+            owner.principal,
+            name="Nodo sistema",
+            permissions=["assets.view", "system.view", "system.backup"],
+        )
+        with pytest.raises(ValidationFailed):
+            service.create_user(
+                owner.principal,
+                username="agent.undelegated",
+                name="Agent",
+                role_id=reserved.id,
+                actor_kind="internal_agent",
+            )
+        for administrator in ("admin", "superadmin"):
+            with pytest.raises(ValidationFailed):
+                service.create_user(
+                    owner.principal,
+                    username="agent." + administrator,
+                    name="Agent",
+                    role_id=administrator,
+                    actor_kind="internal_agent",
+                    delegated_by_id=owner_id,
+                )
+        agent = service.create_user(
+            owner.principal,
+            username="agent.owner",
+            name="Agent",
+            role_id=reserved.id,
+            actor_kind="internal_agent",
+            delegated_by_id=owner_id,
+        )
+        credential = service.issue_machine_credential(agent.username)
+        assert (
+            harness.scalar(
+                "SELECT role_owner FROM identity_identities WHERE username = 'agent.owner'"
+            )
+            == "superadmin"
+        )
+
+    with harness.service() as service:
+        context = service.authenticate_token(credential.token)
+        service.authorize(context.principal, "system.view")
+        service.authorize(context.principal, "assets.view", resource="asset:1")
+
+    with harness.service() as service:
+        second = service.create_user(
+            owner.principal,
+            username="beto.owner",
+            name="Beto",
+            role_id="superadmin",
+            password=PASSWORD,
+        )
+        second_grant = service.login("beto.owner", PASSWORD)
+        second_agent = service.create_user(
+            second_grant.principal,
+            username="agent.second",
+            name="Agent",
+            role_id=reserved.id,
+            actor_kind="internal_agent",
+            delegated_by_id=second.id,
+        )
+        second_credential = service.issue_machine_credential(second_agent.username)
+
+    with harness.service() as service:
+        service.update_user(second_grant.principal, owner_id, role_id="admin")
+        # The same bearer loses reserved authority as soon as the live
+        # delegator stops being the owner, while business grants remain.
+        demoted = service.authenticate_token(credential.token)
+        with pytest.raises(PermissionDenied):
+            service.authorize(demoted.principal, "system.view")
+        service.authorize(demoted.principal, "assets.view", resource="asset:1")
+
+        service.update_role(second_grant.principal, reserved.id, permissions=["assets.view"])
+        revoked = service.authenticate_token(second_credential.token)
+        with pytest.raises(PermissionDenied):
+            service.authorize(revoked.principal, "system.view")
+        service.authorize(revoked.principal, "assets.view", resource="asset:1")
+
+
+def test_role_grant_change_applies_to_the_same_machine_bearer(harness: Harness) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        owner = service.login("ana.admin", PASSWORD)
+        reserved = service.create_role(
+            owner.principal,
+            name="Nodo sistema",
+            permissions=["assets.view", "system.view"],
+        )
+        machine = service.create_user(
+            owner.principal,
+            username="agent.cache",
+            name="Agent Cache",
+            role_id=reserved.id,
+            actor_kind="internal_agent",
+            delegated_by_id=owner.principal.actor_id,
+        )
+        credential = service.issue_machine_credential(machine.username)
+
+    with harness.service() as service:
+        first = service.authenticate_token(credential.token)
+        service.authorize(first.principal, "system.view")
+
+        service.update_role(owner.principal, reserved.id, permissions=["assets.view"])
+
+        # No re-login, credential reissue or process restart: the same bearer
+        # token must observe the persisted grant change on its next request.
+        second = service.authenticate_token(credential.token)
+        with pytest.raises(PermissionDenied):
+            service.authorize(second.principal, "system.view")
+        service.authorize(second.principal, "assets.view", resource="asset:1")
+
+
+def _bootstrap_attempt(
+    settings: Settings, username: str, barrier: Barrier, results: list[str]
+) -> None:
+    barrier.wait()
+    engine = create_engine_from_settings(settings)
+    session = create_session_factory(engine)()
+    try:
+        IdentityService(session, settings).bootstrap_superadmin(username, username, PASSWORD)
+        results.append("created")
+    except BootstrapRefused:
+        results.append("refused")
+    except Exception as exc:  # pragma: no cover - only a regression signal
+        results.append(f"{type(exc).__name__}:{exc}")
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_concurrent_first_owner_creation_creates_exactly_one_owner(harness: Harness) -> None:
+    barrier = Barrier(2)
+    results: list[str] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(_bootstrap_attempt, harness.settings, username, barrier, results)
+            for username in ("ana.owner", "beto.owner")
+        ]
+        for future in futures:
+            future.result()
+
+    assert sorted(results) == ["created", "refused"]
+    assert harness.scalar("SELECT COUNT(*) FROM identity_identities") == 1
+    assert (
+        harness.scalar(
+            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'superadmin'"
+        )
+        == 1
+    )
+
+
+def _deactivate_other(
+    settings: Settings,
+    principal: object,
+    target_id: str,
+    barrier: Barrier,
+    results: list[str],
+) -> None:
+    barrier.wait()
+    engine = create_engine_from_settings(settings)
+    session = create_session_factory(engine)()
+    try:
+        IdentityService(session, settings).set_active(principal, target_id, active=False)  # type: ignore[arg-type]
+        results.append("deactivated")
+    except Conflict, PermissionDenied:
+        results.append("refused")
+    except Exception as exc:  # pragma: no cover - only a regression signal
+        results.append(f"{type(exc).__name__}:{exc}")
+    finally:
+        session.close()
+        engine.dispose()
+
+
+def test_concurrent_owner_deactivation_never_removes_every_owner(harness: Harness) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        first = service.login("ana.admin", PASSWORD)
+        second_identity = service.create_user(
+            first.principal,
+            username="beto.owner",
+            name="Beto",
+            role_id="superadmin",
+            password=PASSWORD,
+        )
+        second = service.login("beto.owner", PASSWORD)
+    first_id = first.principal.actor_id
+    second_id = second_identity.id
+
+    barrier = Barrier(2)
+    results: list[str] = []
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        futures = [
+            pool.submit(
+                _deactivate_other, harness.settings, first.principal, second_id, barrier, results
+            ),
+            pool.submit(
+                _deactivate_other, harness.settings, second.principal, first_id, barrier, results
+            ),
+        ]
+        for future in futures:
+            future.result()
+
+    assert sorted(results) == ["deactivated", "refused"]
+    assert (
+        harness.scalar(
+            "SELECT COUNT(*) FROM identity_identities WHERE active = 1 AND role_id = 'superadmin'"
+        )
+        == 1
+    )

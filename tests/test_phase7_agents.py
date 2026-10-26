@@ -242,7 +242,7 @@ def test_agent_denied_incident_write_changes_nothing(
     client, auth = signed_in_client()
     settings = client.app.state.settings
     catalog = Catalog(settings=settings, engine=create_engine_from_settings(settings))
-    catalog.add_user("reader-phase7", "Reader Phase 7", "reader")
+    catalog.add_user("reader-phase7", "Reader Phase 7", "user")
     asset = create_asset(client, auth, "Impresora de planta")
     reader_auth = sign_in_as(client, settings, "reader-phase7")
 
@@ -413,7 +413,7 @@ def test_mcp_revoked_bearer_cannot_confirm_prepared_resolution(mcp: McpServer) -
 
 def test_mcp_denied_phase7_writes_change_nothing(mcp: McpServer) -> None:
     _, token = operator(mcp)
-    _, reader_token = mcp.catalog.add_machine("mcp-reader-phase7", "MCP Reader 7", "reader")
+    _, reader_token = mcp.catalog.add_machine("mcp-reader-phase7", "MCP Reader 7", "user")
     asset = mcp_asset(mcp, token, "Impresora fiscal", "MCP-PRN-1")
     created = rest_post(
         mcp,

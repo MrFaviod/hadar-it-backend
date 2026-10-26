@@ -214,7 +214,7 @@ def test_mcp_revoked_bearer_is_revalidated_per_operation(mcp: McpServer) -> None
 
 def test_mcp_validation_and_denied_mutation_leave_assets_unchanged(mcp: McpServer) -> None:
     _, token = operator(mcp)
-    _, reader_token = mcp.catalog.add_machine("mcp-reader", "MCP Reader", "reader")
+    _, reader_token = mcp.catalog.add_machine("mcp-reader", "MCP Reader", "user")
 
     with pytest.raises(ToolError):
         call_tool(mcp, token, "create_asset", {"name": "Switch", "custom": "nope"})

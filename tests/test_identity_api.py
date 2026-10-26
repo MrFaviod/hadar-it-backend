@@ -25,7 +25,7 @@ def env(settings_factory: Callable[..., Settings]) -> Iterator[tuple[TestClient,
     assert applied.returncode == 0, applied.stderr
     harness = Harness(settings=settings, engine=create_engine_from_settings(settings))
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
     with TestClient(create_app(settings)) as client:
         try:
             yield client, harness
@@ -95,7 +95,7 @@ def test_login_sets_a_hardened_cookie_and_returns_the_identity_envelope(env) -> 
         "actorKind",
     }
     assert user["username"] == "ana.admin"
-    assert user["roleId"] == "admin"
+    assert user["roleId"] == "superadmin"
     assert "password" not in str(payload).lower()
     assert PASSWORD not in str(payload)
 
@@ -208,7 +208,7 @@ def test_cookie_mutations_require_csrf_and_leave_no_side_effect(env) -> None:
         "username": "rita.reader",
         "name": "Rita",
         "email": "rita@example.test",
-        "roleId": "reader",
+        "roleId": "user",
         "password": PASSWORD,
     }
 
@@ -239,7 +239,7 @@ def test_state_returns_authorized_subsets_for_every_authenticated_actor(env) -> 
         json={
             "username": "rita.reader",
             "name": "Rita",
-            "roleId": "reader",
+            "roleId": "user",
             "password": PASSWORD,
         },
         headers=csrf_headers(admin["csrfToken"]),
@@ -248,9 +248,14 @@ def test_state_returns_authorized_subsets_for_every_authenticated_actor(env) -> 
 
     admin_state = client.get(f"{API}/identity/state").json()
     assert {user["username"] for user in admin_state["users"]} == {"ana.admin", "rita.reader"}
-    assert {role["id"] for role in admin_state["roles"]} == {"admin", "operator", "reader"}
+    assert {role["id"] for role in admin_state["roles"]} == {
+        "admin",
+        "operator",
+        "superadmin",
+        "user",
+    }
     assert admin_state["sessionMinutes"] == 480
-    role = next(entry for entry in admin_state["roles"] if entry["id"] == "reader")
+    role = next(entry for entry in admin_state["roles"] if entry["id"] == "user")
     assert role["permissions"] == ["assets.view", "people.view"]
     assert role["builtIn"] is True
 
@@ -284,12 +289,12 @@ def test_user_lifecycle_over_http(env) -> None:
 
     updated = client.put(
         f"{API}/identity/users/{user_id}",
-        json={"name": "Omar Actualizado", "roleId": "reader"},
+        json={"name": "Omar Actualizado", "roleId": "user"},
         headers=headers,
     )
     assert updated.status_code == 200
     assert updated.json()["name"] == "Omar Actualizado"
-    assert updated.json()["roleId"] == "reader"
+    assert updated.json()["roleId"] == "user"
 
     deactivated = client.patch(
         f"{API}/identity/users/{user_id}/active", json={"active": False}, headers=headers
@@ -305,7 +310,12 @@ def test_user_lifecycle_over_http(env) -> None:
     assert rejected_login.status_code == 401
 
     roles = client.get(f"{API}/identity/state").json()["roles"]
-    assert {entry["id"] for entry in roles} == {"admin", "operator", "reader"}
+    assert {entry["id"] for entry in roles} == {
+        "admin",
+        "operator",
+        "superadmin",
+        "user",
+    }
 
 
 def test_role_endpoints_manage_custom_roles_only(env) -> None:
@@ -432,7 +442,7 @@ def test_machine_bearer_tokens_authenticate_without_csrf_but_never_administer(en
 
     denied = client.post(
         f"{API}/identity/users",
-        json={"username": "agent.two", "name": "Two", "roleId": "reader"},
+        json={"username": "agent.two", "name": "Two", "roleId": "user"},
         headers=bearer,
     )
     assert denied.status_code == 403
@@ -499,7 +509,7 @@ def test_limited_user_administrator_cannot_escalate_over_http(env) -> None:
         json={
             "username": "intruso.http",
             "name": "Intruso",
-            "roleId": "admin",
+            "roleId": "superadmin",
             "password": PASSWORD,
         },
         headers=csrf_headers(manager["csrfToken"]),

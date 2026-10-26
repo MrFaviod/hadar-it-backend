@@ -74,6 +74,10 @@ class Identity(IdentityBase):
         ForeignKey("identity_identities.id", ondelete="SET NULL"),
         nullable=True,
     )
+    # Role held by the delegating human when the delegation was recorded.
+    # Reserved machine grants additionally require this to stay ``superadmin``,
+    # so a changed delegator cannot silently broaden a machine's authority.
+    role_owner: Mapped[str | None] = mapped_column(String(32), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

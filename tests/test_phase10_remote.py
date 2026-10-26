@@ -29,7 +29,7 @@ def test_remote_ids_persist_across_sessions_and_preserve_catalog_boundary(settin
                 )
             with pytest.raises(ValidationFailed):
                 service.update(catalog.admin(), asset.id, {"technical": {"anydeskId": "bad/id"}})
-        reader = catalog.add_user("remote.reader", "Remote reader", "reader")
+        reader = catalog.add_user("remote.reader", "Remote reader", "user")
         with catalog.session() as session, pytest.raises(PermissionDenied):
             InventoryService(session, catalog.settings).update(
                 reader, asset.id, {"technical": {"anydeskId": "987654321"}}

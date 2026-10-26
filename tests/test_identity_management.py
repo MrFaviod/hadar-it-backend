@@ -28,7 +28,7 @@ def harness(settings_factory: Callable[..., Settings]) -> Iterator[Harness]:
 
 def admin_grant(harness: Harness):
     with harness.service() as service:
-        service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
         return service.login("ana.admin", PASSWORD)
 
 
@@ -70,7 +70,7 @@ def test_user_creation_rejects_duplicates_unknown_roles_and_missing_passwords(
             grant.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         with pytest.raises(Conflict):
@@ -78,7 +78,7 @@ def test_user_creation_rejects_duplicates_unknown_roles_and_missing_passwords(
                 grant.principal,
                 username="rita.reader",
                 name="Rita",
-                role_id="reader",
+                role_id="user",
                 password=PASSWORD,
             )
         with pytest.raises(ValidationFailed):
@@ -90,15 +90,13 @@ def test_user_creation_rejects_duplicates_unknown_roles_and_missing_passwords(
                 password=PASSWORD,
             )
         with pytest.raises(ValidationFailed):
-            service.create_user(
-                grant.principal, username="no.pass", name="No pass", role_id="reader"
-            )
+            service.create_user(grant.principal, username="no.pass", name="No pass", role_id="user")
         with pytest.raises(ValidationFailed):
             service.create_user(
                 grant.principal,
                 username="machine.pass",
                 name="Machine",
-                role_id="reader",
+                role_id="user",
                 actor_kind="external_agent",
                 password=PASSWORD,
             )
@@ -107,7 +105,7 @@ def test_user_creation_rejects_duplicates_unknown_roles_and_missing_passwords(
                 grant.principal,
                 username="machine.bad-kind",
                 name="Machine",
-                role_id="reader",
+                role_id="user",
                 actor_kind="robot",
             )
 
@@ -120,13 +118,13 @@ def test_user_update_leaves_omitted_fields_and_password_unchanged(harness: Harne
             username="rita.reader",
             name="Rita",
             email="rita@example.test",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         updated = service.update_user(grant.principal, user.id, name="Rita Actualizada")
         assert updated.name == "Rita Actualizada"
         assert updated.email == "rita@example.test"
-        assert updated.role_id == "reader"
+        assert updated.role_id == "user"
         # The stored password still works because it was not replaced.
         service.login("rita.reader", PASSWORD)
 
@@ -182,14 +180,14 @@ def test_built_in_roles_are_immutable_and_only_roles_manage_can_edit_roles(
         with pytest.raises(Conflict):
             service.update_role(grant.principal, "admin", permissions=["assets.view"])
         with pytest.raises(Conflict):
-            service.update_role(grant.principal, "reader", name="Lectores")
+            service.update_role(grant.principal, "user", name="Usuarios")
         with pytest.raises(NotFound):
             service.update_role(grant.principal, "role-missing", permissions=[])
         service.create_user(
             grant.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         reader = service.login("rita.reader", PASSWORD)
@@ -279,7 +277,7 @@ def test_state_returns_authorized_subsets_for_any_authenticated_actor(harness: H
             grant.principal,
             username="rita.reader",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
         service.create_user(
@@ -301,7 +299,12 @@ def test_state_returns_authorized_subsets_for_any_authenticated_actor(harness: H
             "omar.operator",
             "rita.reader",
         }
-        assert {role.id for role in admin_state.roles} == {"admin", "operator", "reader"}
+        assert {role.id for role in admin_state.roles} == {
+            "admin",
+            "operator",
+            "superadmin",
+            "user",
+        }
 
         roles_only = service.create_role(
             grant.principal, name="Gestor", permissions=["roles.manage"]
@@ -319,7 +322,8 @@ def test_state_returns_authorized_subsets_for_any_authenticated_actor(harness: H
         assert {role.id for role in gestor_state.roles} == {
             "admin",
             "operator",
-            "reader",
+            "superadmin",
+            "user",
             roles_only.id,
         }
 
@@ -331,7 +335,7 @@ def test_machine_state_never_exposes_identity_administration(harness: Harness) -
             grant.principal,
             username="agent.ops",
             name="Ops agent",
-            role_id="reader",
+            role_id="user",
             actor_kind="internal_agent",
         )
         credential = service.issue_machine_credential("agent.ops")
@@ -510,12 +514,12 @@ def test_limited_user_manager_can_administer_permissions_it_holds(harness: Harne
 
         created = service.create_user(
             manager.principal,
-            username="rita.reader",
+            username="rita.user",
             name="Rita",
-            role_id="reader",
+            role_id="user",
             password=PASSWORD,
         )
-        assert created.role_id == "reader"
+        assert created.role_id == "user"
 
         with pytest.raises(PermissionDenied):
             service.create_user(

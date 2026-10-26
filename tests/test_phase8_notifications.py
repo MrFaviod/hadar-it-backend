@@ -27,7 +27,7 @@ from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.identity.clock import utcnow
 from itsm.identity.models import Identity, IdentityRole
-from itsm.identity.permissions import ROLE_OPERATOR, ROLE_READER
+from itsm.identity.permissions import ROLE_OPERATOR, ROLE_USER
 from itsm.identity.service import (
     IdentityService,
     NotFound,
@@ -53,7 +53,7 @@ from sqlalchemy import Engine, func, select, update
 from sqlalchemy.orm import Session
 from tests.conftest import (
     ADMIN_USERNAME,
-    bootstrap_admin,
+    bootstrap_superadmin,
     run_migrations,
     sign_in,
 )
@@ -99,7 +99,7 @@ class Harness:
 
 
 def _seed_users(engine: Engine, settings: Settings) -> None:
-    bootstrap_admin(settings)
+    bootstrap_superadmin(settings)
     with Session(engine) as session:
         now = utcnow()
         session.add(IdentityRole(id="empty", name="Sin acceso", built_in=False, created_at=now))
@@ -117,7 +117,7 @@ def _seed_users(engine: Engine, settings: Settings) -> None:
         service = IdentityService(session, settings)
         for username, name, role_id, password in (
             ("operator", "Olga Operator", ROLE_OPERATOR, OPERATOR_PASSWORD),
-            ("reader", "Rita Reader", ROLE_READER, READER_PASSWORD),
+            ("reader", "Rita Reader", ROLE_USER, READER_PASSWORD),
             ("empty", "Eva Empty", "empty", EMPTY_PASSWORD),
         ):
             service.create_user(

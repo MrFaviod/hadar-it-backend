@@ -91,7 +91,7 @@ def _bootstrap(settings: Settings) -> None:
     engine = create_engine_from_settings(settings)
     session = create_session_factory(engine)()
     try:
-        IdentityService(session, settings).bootstrap_admin(
+        IdentityService(session, settings).bootstrap_superadmin(
             ADMIN_USERNAME, ADMIN_NAME, ADMIN_PASSWORD
         )
     finally:
@@ -785,9 +785,9 @@ def test_current_authorization_denies_writes_and_confirmation_without_mutation(a
             username="reader.one",
             name="Reader One",
             password=READER_PASSWORD,
-            role_id="reader",
+            role_id="user",
         )
-        service.bootstrap_machine("reader.machine", "Reader Machine", "external_client", "reader")
+        service.bootstrap_machine("reader.machine", "Reader Machine", "external_client", "user")
         machine_token = service.issue_machine_credential("reader.machine").token
     finally:
         session.close()

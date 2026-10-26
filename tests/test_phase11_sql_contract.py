@@ -11,7 +11,7 @@ from fastapi.testclient import TestClient
 from itsm.database import create_engine_from_settings
 from itsm.main import create_app
 from sqlalchemy import inspect
-from tests.conftest import bootstrap_admin, run_migrations, sign_in
+from tests.conftest import bootstrap_superadmin, run_migrations, sign_in
 from tests.test_inventory_api import api_values
 
 
@@ -33,7 +33,7 @@ def test_portable_install_transactions_retries_and_reopen(variable, settings_fac
     settings = settings_factory(attachment_storage_path=tmp_path / "blobs", **overrides)
     migrated = run_migrations(settings)
     assert migrated.returncode == 0, migrated.stderr
-    bootstrap_admin(settings)
+    bootstrap_superadmin(settings)
     suffix = uuid4().hex[:12]
     with TestClient(create_app(settings)) as client:
         auth = sign_in(client, settings)

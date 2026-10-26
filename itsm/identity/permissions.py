@@ -1,9 +1,14 @@
-"""The permission catalog, actor kinds and the built-in role templates.
+"""The permission catalog, actor kinds and the built-in profile templates.
 
 This module is the single authority for permission codes. Roles are stored as
 resource/operation policy rows and evaluated by Casbin; nothing here grants a
-permission implicitly, with the deliberate exception of the built-in role
-templates that the migration seeds.
+permission implicitly, with the deliberate exception of the built-in profile
+templates that the 0021 migration seeds.
+
+Three persisted profiles own the product: ``superadmin`` owns the installation,
+``admin`` administers ITSM business functions and ``user`` is read-only until a
+custom business grant is assigned. ``operator`` is preserved as an ordinary
+(not built-in) business role from earlier installations.
 """
 
 from __future__ import annotations
@@ -24,6 +29,21 @@ HUMAN_ACTOR_KIND: Final[ActorKind] = "human"
 
 MACHINE_ACTOR_KINDS: Final[frozenset[str]] = frozenset(
     {"internal_agent", "external_agent", "external_client"}
+)
+
+# Reserved installation authority. These codes exist in the Casbin catalog so
+# every transport can be denied by the same policy engine, but the identity
+# service additionally requires a persisted human superadmin (or an explicitly
+# delegated machine whose delegator is an active human superadmin).
+SYSTEM_PERMISSIONS: Final[frozenset[str]] = frozenset(
+    {
+        "system.view",
+        "system.providers",
+        "system.modules",
+        "system.configure",
+        "system.backup",
+        "system.update",
+    }
 )
 
 # Stable UI/API codes: ``resource.operation``.
@@ -47,20 +67,27 @@ PERMISSION_CATALOG: Final[tuple[str, ...]] = (
     "users.edit",
     "roles.manage",
     "sessions.manage",
+    "system.view",
+    "system.providers",
+    "system.modules",
+    "system.configure",
+    "system.backup",
+    "system.update",
 )
 
 PERMISSION_CODES: Final[frozenset[str]] = frozenset(PERMISSION_CATALOG)
 
+ROLE_SUPERADMIN: Final[str] = "superadmin"
 ROLE_ADMIN: Final[str] = "admin"
 ROLE_OPERATOR: Final[str] = "operator"
-ROLE_READER: Final[str] = "reader"
+ROLE_USER: Final[str] = "user"
 
-BUILT_IN_ROLE_IDS: Final[tuple[str, ...]] = (ROLE_ADMIN, ROLE_OPERATOR, ROLE_READER)
+BUILT_IN_ROLE_IDS: Final[tuple[str, ...]] = (ROLE_SUPERADMIN, ROLE_ADMIN, ROLE_USER)
 
 BUILT_IN_ROLE_NAMES: Final[dict[str, str]] = {
+    ROLE_SUPERADMIN: "Superadministrador",
     ROLE_ADMIN: "Administrador",
-    ROLE_OPERATOR: "Operador",
-    ROLE_READER: "Lector",
+    ROLE_USER: "Usuario",
 }
 
 _OPERATOR_PERMISSIONS: Final[frozenset[str]] = frozenset(
@@ -75,18 +102,18 @@ _OPERATOR_PERMISSIONS: Final[frozenset[str]] = frozenset(
     }
 )
 
-_READER_PERMISSIONS: Final[frozenset[str]] = frozenset({"assets.view", "people.view"})
+_USER_PERMISSIONS: Final[frozenset[str]] = frozenset({"assets.view", "people.view"})
 
 BUILT_IN_ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
-    ROLE_ADMIN: PERMISSION_CODES,
-    ROLE_OPERATOR: _OPERATOR_PERMISSIONS,
-    ROLE_READER: _READER_PERMISSIONS,
+    ROLE_SUPERADMIN: PERMISSION_CODES,
+    ROLE_ADMIN: PERMISSION_CODES - SYSTEM_PERMISSIONS,
+    ROLE_USER: _USER_PERMISSIONS,
 }
 
 # Machines never receive identity/policy administration, even when a role that
-# contains those codes is assigned to them, and never inherit the admin role.
-# Permanent asset purge is human-only: the service refuses it for any machine
-# actor and the permission itself is never effective for a machine identity.
+# contains those codes is assigned to them, and never inherit the superadmin or
+# admin role. Permanent asset purge is human-only: the service refuses it for
+# any machine actor and the permission itself is never effective there.
 MACHINE_FORBIDDEN_PERMISSIONS: Final[frozenset[str]] = frozenset(
     {
         "users.view",
@@ -116,5 +143,10 @@ def is_known_permission(code: str) -> bool:
 
 
 def is_full_administrator(grants: Iterable[tuple[str, str]]) -> bool:
-    """True only when the persisted policy grants every known permission."""
+    """True only when the persisted policy grants every known permission.
+
+    The catalog now includes installation-only codes, so only the superadmin
+    profile qualifies as a full administrator. Business administration must use
+    the concrete business grants instead of this helper.
+    """
     return {f"{resource}.{operation}" for resource, operation in grants} >= PERMISSION_CODES
