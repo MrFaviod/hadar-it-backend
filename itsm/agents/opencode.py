@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import math
 import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -99,7 +100,7 @@ class OpenCodeEngine(_HTTPEngine):
             if item.get("enabled") is False:
                 continue
             public_id = f"{provider}/{model_id}"
-            free = _v2_free(provider, item.get("cost"))
+            free = _v2_free(item.get("cost"))
             models.append(
                 EngineModel(
                     id=public_id,
@@ -161,7 +162,7 @@ class OpenCodeEngine(_HTTPEngine):
                         id=public_id,
                         name=name if isinstance(name, str) and name else key,
                         provider=provider_id,
-                        free=_v1_free(provider_id, cost),
+                        free=_v1_free(cost),
                     )
                 )
                 refs[public_id] = (provider_id, key)
@@ -812,15 +813,52 @@ class OpenCodeEngine(_HTTPEngine):
             return
 
 
-def _v1_free(provider: str, cost: object) -> bool | None:
-    if provider not in {"opencode", "opencode-go"}:
-        return False
+def _price(value: object) -> float | int | None:
+    price = _money(value)
+    if price is None or not math.isfinite(price) or price < 0:
+        return None
+    return price
+
+
+def _cost_free(cost: Mapping[str, object], *, require_cache: bool) -> bool | None:
+    """Classify a cost record without assuming provider or free tiers.
+
+    Required input and output prices must be present. v2 requires cache read
+    and write prices; v1 treats cache as optional. Any explicit reasoning price
+    is included when the record carries one. Missing or malformed required
+    metadata is unknown; any positive reported price is paid; all zero is free.
+    """
+    prices: list[float | int] = []
+    for key in ("input", "output"):
+        price = _price(cost.get(key))
+        if price is None:
+            return None
+        prices.append(price)
+    cache = cost.get("cache")
+    if cache is None:
+        if require_cache:
+            return None
+    elif not isinstance(cache, Mapping):
+        return None
+    else:
+        for key in ("read", "write"):
+            price = _price(cache.get(key))
+            if price is None:
+                return None
+            prices.append(price)
+    reasoning = cost.get("reasoning")
+    if reasoning is not None:
+        price = _price(reasoning)
+        if price is None:
+            return None
+        prices.append(price)
+    return not any(price > 0 for price in prices)
+
+
+def _v1_free(cost: object) -> bool | None:
     if not isinstance(cost, Mapping):
         return None
-    value = cost.get("input")
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return value == 0
+    return _cost_free(cost, require_cache=False)
 
 
 def _v1_final_text(result: Mapping[str, Any]) -> str:
@@ -836,22 +874,23 @@ def _v1_final_text(result: Mapping[str, Any]) -> str:
     return "".join(pieces)
 
 
-def _v2_free(provider: str, costs: object) -> bool | None:
-    if provider not in {"opencode", "opencode-go"}:
-        return False
+def _v2_free(costs: object) -> bool | None:
     if not isinstance(costs, list) or not costs:
         return None
-    seen = False
+    any_positive = False
+    metadata_complete = True
     for cost in costs:
         if not isinstance(cost, Mapping):
-            return None
-        value = cost.get("input")
-        if isinstance(value, bool) or not isinstance(value, (int, float)):
-            return None
-        seen = True
-        if value != 0:
-            return False
-    return True if seen else None
+            metadata_complete = False
+            continue
+        entry = _cost_free(cost, require_cache=True)
+        if entry is False:
+            any_positive = True
+        elif entry is None:
+            metadata_complete = False
+    if any_positive:
+        return False
+    return True if metadata_complete else None
 
 
 def _tool_name(data: Mapping[str, Any]) -> str | None:

@@ -81,6 +81,9 @@ def _v2_model(
     provider: str = "opencode",
     *,
     input_cost: float = 0,
+    output_cost: float = 0,
+    cache_read: float = 0,
+    cache_write: float = 0,
     enabled: bool = True,
 ) -> dict[str, Any]:
     return {
@@ -88,7 +91,13 @@ def _v2_model(
         "modelID": model_id,
         "providerID": provider,
         "name": model_id.replace("-", " ").title(),
-        "cost": [{"input": input_cost, "output": 0, "cache": {"read": 0, "write": 0}}],
+        "cost": [
+            {
+                "input": input_cost,
+                "output": output_cost,
+                "cache": {"read": cache_read, "write": cache_write},
+            }
+        ],
         "status": "active",
         "enabled": enabled,
     }
@@ -166,6 +175,107 @@ def test_v2_discovery_uses_live_schema_and_never_treats_spa_as_connected() -> No
         assert "<html" not in failed.value.message
 
     asyncio.run(scenario())
+
+
+def test_model_free_uses_all_reported_prices_without_provider_allowlist() -> None:
+    async def v2_models() -> dict[str, bool | None]:
+        unknown = _v2_model("unknown")
+        unknown["cost"] = [{"input": 0}]
+        missing_cache = _v2_model("missing-cache")
+        missing_cache["cost"] = [{"input": 0, "output": 0}]
+        paid_reasoning = _v2_model("paid-reasoning", "fourth")
+        paid_reasoning["cost"][0]["reasoning"] = 1
+        data = [
+            _v2_model("zero-other", "custom"),
+            _v2_model("paid-output", "opencode", output_cost=2),
+            _v2_model("paid-cache", "third-party", cache_write=1),
+            paid_reasoning,
+            unknown,
+            missing_cache,
+        ]
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/info":
+                return httpx.Response(200, json={"version": "2.1.2"})
+            if request.url.path == "/api/model":
+                return httpx.Response(200, json={"location": {}, "data": data})
+            raise AssertionError(f"unexpected request {request.url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE), client=client)
+            info = await engine.discover()
+        return {model.id: model.free for model in info.models}
+
+    async def v1_models() -> dict[str, bool | None]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/info":
+                return httpx.Response(404, json={"error": "not found"})
+            if path == "/global/health":
+                return httpx.Response(200, json={"healthy": True, "version": "1.15.0"})
+            if path == "/config/providers":
+                return httpx.Response(
+                    200,
+                    json={
+                        "providers": [
+                            {
+                                "id": "custom",
+                                "models": {
+                                    "zero": {
+                                        "name": "Zero",
+                                        "cost": {"input": 0, "output": 0},
+                                    },
+                                    "paid-output": {
+                                        "name": "Paid Output",
+                                        "cost": {"input": 0, "output": 3},
+                                    },
+                                    "paid-cache": {
+                                        "name": "Paid Cache",
+                                        "cost": {
+                                            "input": 0,
+                                            "output": 0,
+                                            "cache": {"read": 0, "write": 1},
+                                        },
+                                    },
+                                    "paid-reasoning": {
+                                        "name": "Paid Reasoning",
+                                        "cost": {
+                                            "input": 0,
+                                            "output": 0,
+                                            "reasoning": 1,
+                                        },
+                                    },
+                                    "unknown": {
+                                        "name": "Unknown",
+                                        "cost": {"input": 0},
+                                    },
+                                },
+                            }
+                        ]
+                    },
+                )
+            raise AssertionError(f"unexpected request {request.url}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE), client=client)
+            info = await engine.discover()
+        return {model.id: model.free for model in info.models}
+
+    assert asyncio.run(v2_models()) == {
+        "custom/zero-other": True,
+        "opencode/paid-output": False,
+        "third-party/paid-cache": False,
+        "fourth/paid-reasoning": False,
+        "opencode/unknown": None,
+        "opencode/missing-cache": None,
+    }
+    assert asyncio.run(v1_models()) == {
+        "custom/zero": True,
+        "custom/paid-output": False,
+        "custom/paid-cache": False,
+        "custom/paid-reasoning": False,
+        "custom/unknown": None,
+    }
 
 
 def test_v2_stream_is_cumulative_session_isolated_and_reports_engine_usage() -> None:
