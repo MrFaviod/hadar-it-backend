@@ -23,9 +23,9 @@ from typing import Any
 import pytest
 import uvicorn
 from itsm.agent_integrations.installer import (
+    InstallerError,
     IntegrationInstaller,
     IntegrationTarget,
-    InstallerError,
     build_request,
     validate_receipt,
     verify_connection,
@@ -207,9 +207,7 @@ def mcp_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, A
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
     app = create_app(settings)
-    server = uvicorn.Server(
-        uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
-    )
+    server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
     thread.start()
     deadline = time.monotonic() + 15
@@ -494,9 +492,7 @@ def test_hermes_conflicts_preserve_preexisting_and_customized_entries(
     assert not (disabled_home / "skills").exists()
 
     other_target, other_home = hermes_target(tmp_path / "other-toolsets")
-    (other_home / "config.yaml").write_text(
-        "platform_toolsets:\n  api_server: [hermes, web]\n"
-    )
+    (other_home / "config.yaml").write_text("platform_toolsets:\n  api_server: [hermes, web]\n")
     other = run(
         installer.apply(
             other_target,
@@ -617,6 +613,9 @@ def test_opencode_v2_install_uses_restricted_agent_and_preserves_comments(
     itsm = parsed["mcp"]["servers"]["itsm"]
     assert itsm["type"] == "remote"
     assert itsm["url"] == mcp_server["url"]
+    assert itsm["disabled"] is False
+    assert itsm["codemode"] is False
+    assert "enabled" not in itsm
     assert itsm["oauth"] is False
     assert itsm["headers"]["Authorization"] == f"Bearer {{env:{TOKEN_ENV}}}"
     agent = parsed["agents"]["itsm"]
@@ -640,6 +639,85 @@ def test_opencode_v2_install_uses_restricted_agent_and_preserves_comments(
     assert (workspace / ".opencode" / "skills" / "itsm-inventory" / "SKILL.md").is_file()
     assert mcp_server["token"] not in text
     assert mcp_server["token"] not in json.dumps(receipt)
+
+
+def test_opencode_v2_disable_uses_canonical_mcp_state(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, workspace = opencode_target(tmp_path)
+    assert (
+        run(
+            installer.apply(
+                target,
+                mcp=mcp_spec(mcp_server),
+                skills=["itsm-inventory"],
+                operation="install",
+            )
+        )["status"]
+        == "configured"
+    )
+    disabled = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="disable",
+        )
+    )
+    assert disabled["status"] == "disabled"
+    entry = json_config(workspace / "opencode.json")["mcp"]["servers"]["itsm"]
+    assert entry["disabled"] is True
+    assert entry["codemode"] is False
+    assert "enabled" not in entry
+
+
+def test_opencode_v2_fresh_install_is_byte_idempotent(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, workspace = opencode_target(tmp_path)
+    first = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    assert first["status"] == "configured"
+    assert first["mcpVerified"] is True
+    before = {
+        path.relative_to(workspace).as_posix(): path.read_bytes()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    }
+    assert json_config(workspace / ".itsm-agent" / "manifest.json")["config"][
+        "existsBefore"
+    ] is False
+    second = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    assert second["status"] == "configured"
+    assert second["mcpVerified"] is True
+    after = {
+        path.relative_to(workspace).as_posix(): path.read_bytes()
+        for path in workspace.rglob("*")
+        if path.is_file()
+    }
+    assert after == before
+    assert json_config(workspace / ".itsm-agent" / "manifest.json")["config"][
+        "existsBefore"
+    ] is False
 
 
 def opencode_runtime_evidence(
@@ -677,6 +755,64 @@ def opencode_runtime_evidence(
     }
 
 
+def evidence_inspector(evidence: dict[str, Any] | None) -> Any:
+    async def inspect(**_: Any) -> dict[str, Any] | None:
+        return evidence
+
+    return inspect
+
+
+def test_opencode_runtime_effective_permissions_follow_last_match(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, workspace = opencode_target(tmp_path)
+    installed = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    actual_rules = [
+        {"action": "*", "resource": "*", "effect": "allow"},
+        {"action": "read", "resource": "*.env", "effect": "ask"},
+        {"action": "read", "resource": "*.env.*", "effect": "ask"},
+        {"action": "read", "resource": "*.env.example", "effect": "allow"},
+        {"action": "*", "resource": "*", "effect": "deny"},
+        {"action": "itsm_*", "resource": "*", "effect": "allow"},
+        {"action": "skill", "resource": "*", "effect": "deny"},
+        {"action": "skill", "resource": "itsm-inventory", "effect": "allow"},
+        {"action": "browser", "resource": "*", "effect": "deny"},
+    ]
+    evidence = opencode_runtime_evidence(
+        installed,
+        workspace,
+        permissions=actual_rules,
+        saved=[
+            {"action": "bash", "resource": "*", "effect": "deny"},
+            {"action": "skill", "resource": "other", "effect": "deny"},
+        ],
+    )
+    projected = json.loads(json.dumps(evidence))
+    projected["agent"].pop("name")
+    projected["config"][1].pop("path")
+    verified = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(projected),
+        )
+    )
+    assert verified["status"] == "verified"
+    assert verified["profileSafetyVerified"] is True
+
+
 def test_opencode_runtime_evidence_is_required_and_validated(
     tmp_path: Path,
     installer: IntegrationInstaller,
@@ -694,19 +830,30 @@ def test_opencode_runtime_evidence_is_required_and_validated(
     )
     assert installed["status"] == "configured"
     evidence = opencode_runtime_evidence(installed, workspace)
+    captured: dict[str, Any] = {}
+
+    async def inspector(**kwargs: Any) -> dict[str, Any]:
+        captured.update(kwargs)
+        return evidence
+
     verified = run(
         installer.apply(
             target,
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=evidence,
+            profile_inspector=inspector,
         )
     )
     assert verified["status"] == "verified"
     assert verified["verified"] is True
     assert verified["profileSafetyVerified"] is True
     assert checks(verified)["profile.safety"] == "pass"
+    assert captured["target"] == target
+    assert captured["mcp"] == mcp_spec(mcp_server)
+    assert captured["skills"] == ("itsm-inventory",)
+    assert captured["config_digest"] == installed["configDigest"]
+    assert mcp_server["token"] not in json.dumps(verified)
 
     unsafe_rules = json.loads(json.dumps(evidence))
     unsafe_rules["agent"]["permissions"].append(
@@ -718,7 +865,7 @@ def test_opencode_runtime_evidence_is_required_and_validated(
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=unsafe_rules,
+            profile_inspector=evidence_inspector(unsafe_rules),
         )
     )
     assert unsafe["status"] == "configured"
@@ -728,7 +875,7 @@ def test_opencode_runtime_evidence_is_required_and_validated(
     saved_override = opencode_runtime_evidence(
         installed,
         workspace,
-        saved=[{"action": "bash", "resource": "git status"}],
+        saved=[{"action": "bash", "resource": "git status", "effect": "allow"}],
     )
     overridden = run(
         installer.apply(
@@ -736,11 +883,28 @@ def test_opencode_runtime_evidence_is_required_and_validated(
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=saved_override,
+            profile_inspector=evidence_inspector(saved_override),
         )
     )
     assert overridden["status"] == "configured"
     assert overridden["profileSafetyVerified"] is False
+
+    saved_ask = opencode_runtime_evidence(
+        installed,
+        workspace,
+        saved=[{"action": "bash", "resource": "git status", "effect": "ask"}],
+    )
+    approval = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(saved_ask),
+        )
+    )
+    assert approval["status"] == "configured"
+    assert approval["profileSafetyVerified"] is False
 
     wrong_workspace = opencode_runtime_evidence(
         installed, workspace, directory=str(tmp_path / "elsewhere")
@@ -751,11 +915,112 @@ def test_opencode_runtime_evidence_is_required_and_validated(
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=wrong_workspace,
+            profile_inspector=evidence_inspector(wrong_workspace),
         )
     )
     assert mismatch["status"] == "configured"
     assert mismatch["profileSafetyVerified"] is False
+
+    unavailable = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(None),
+        )
+    )
+    assert unavailable["status"] == "configured"
+    assert unavailable["verified"] is False
+    assert checks(unavailable)["profile.safety"] == "fail"
+
+    async def broken(**_: Any) -> dict[str, Any]:
+        raise RuntimeError("engine unavailable")
+
+    failed = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=broken,
+        )
+    )
+    assert failed["status"] == "configured"
+    assert failed["verified"] is False
+    assert failed["profileSafetyVerified"] is False
+    assert checks(failed)["profile.safety"] == "fail"
+
+
+def test_caller_supplied_profile_safety_cannot_verify(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, workspace = opencode_target(tmp_path)
+    installed = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    forged = opencode_runtime_evidence(installed, workspace)
+    forged["source"] = "opencode:forged"
+    result = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_safety=forged,
+        )
+    )
+    assert result["status"] == "configured"
+    assert result["verified"] is False
+    assert result["profileSafetyVerified"] is False
+    assert checks(result)["profile.safety"] == "fail"
+    detail = next(item["detail"] for item in result["checks"] if item["name"] == "profile.safety")
+    assert "untrusted" in detail
+
+
+def test_initial_install_can_verify_with_trusted_inspector(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, workspace = opencode_target(tmp_path)
+    calls: list[tuple[IntegrationTarget, str]] = []
+
+    async def inspector(
+        *, target: IntegrationTarget, mcp: Any, skills: Any, config_digest: str
+    ) -> dict[str, Any]:
+        calls.append((target, config_digest))
+        assert target.path == str(workspace)
+        assert mcp["url"] == mcp_spec(mcp_server)["url"]
+        assert skills == ("itsm-inventory",)
+        assert (workspace / "opencode.json").is_file()
+        assert (workspace / ".opencode" / "skills" / "itsm-inventory" / "SKILL.md").is_file()
+        return opencode_runtime_evidence({"configDigest": config_digest}, workspace)
+
+    receipt = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+            profile_inspector=inspector,
+        )
+    )
+    assert receipt["status"] == "verified"
+    assert receipt["verified"] is True
+    assert receipt["profileSafetyVerified"] is True
+    assert [digest for _, digest in calls] == [receipt["configDigest"]]
+    assert calls[0][0].path == str(workspace)
+    assert checks(receipt)["profile.safety"] == "pass"
 
 
 def test_hermes_runtime_evidence_requires_live_profile_binding(
@@ -792,7 +1057,7 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=evidence,
+            profile_inspector=evidence_inspector(evidence),
         )
     )
     assert verified["status"] == "verified"
@@ -806,11 +1071,24 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_safety=yaml_only,
+            profile_inspector=evidence_inspector(yaml_only),
         )
     )
     assert unproven["status"] == "configured"
     assert unproven["profileSafetyVerified"] is False
+
+    raw_evidence = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_safety=evidence,
+        )
+    )
+    assert raw_evidence["status"] == "configured"
+    assert raw_evidence["verified"] is False
+    assert raw_evidence["profileSafetyVerified"] is False
 
 
 def test_duplicate_jsonc_keys_fail_before_any_write(
@@ -946,9 +1224,7 @@ def test_opencode_v2_tamper_conflicts_and_uninstall_preserves_user_sections(
     final_text = (workspace / "opencode.json").read_text()
     assert "// user comment" in final_text
     final = json_config(workspace / "opencode.json")
-    assert final["permissions"] == [
-        {"action": "webfetch", "resource": "*", "effect": "allow"}
-    ]
+    assert final["permissions"] == [{"action": "webfetch", "resource": "*", "effect": "allow"}]
     assert final["mcp"]["servers"]["other"]["url"] == "http://example.invalid/mcp"
     assert "itsm" not in final["mcp"]["servers"]
     assert "itsm" not in final.get("agents", {})
@@ -992,6 +1268,9 @@ def test_opencode_v1_install_shapes_and_uninstall_preserve_user_resources(
     parsed = json_config(workspace / "opencode.json")
     assert parsed["permission"] == {"edit": "allow"}
     assert parsed["mcp"]["other"]["url"] == "http://example.invalid/mcp"
+    assert parsed["mcp"]["itsm"]["enabled"] is True
+    assert "disabled" not in parsed["mcp"]["itsm"]
+    assert "codemode" not in parsed["mcp"]["itsm"]
     assert parsed["mcp"]["itsm"]["headers"]["Authorization"] == f"Bearer {{env:{TOKEN_ENV}}}"
     assert "servers" not in parsed["mcp"]
     permission = parsed["agent"]["itsm"]["permission"]
@@ -1276,9 +1555,7 @@ def test_remote_helper_rejects_request_tamper_and_expected_manifest_mismatch(
     assert not (home / "opencode.json").exists()
 
 
-def test_cli_rejects_malformed_request_file(
-    tmp_path: Path, mcp_server: dict[str, Any]
-) -> None:
+def test_cli_rejects_malformed_request_file(tmp_path: Path, mcp_server: dict[str, Any]) -> None:
     broken = tmp_path / "broken.json"
     broken.write_text("{not json")
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ITSM_")}

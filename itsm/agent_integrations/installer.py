@@ -10,16 +10,22 @@ reference, and the token is resolved from the process environment for proof only
 
 from __future__ import annotations
 
+import contextlib
+import fnmatch
 import hashlib
 import hmac
 import json
 import os
 import re
 import tempfile
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
+from inspect import isawaitable
 from pathlib import Path, PurePosixPath
-from typing import Any, Mapping, Sequence
+from typing import Any
 from urllib.parse import urlsplit
+
+ProfileInspector = Callable[..., Awaitable[Mapping[str, Any] | None]]
 
 SCHEMA_VERSION = 1
 MANIFEST_RELATIVE = ".itsm-agent/manifest.json"
@@ -113,9 +119,9 @@ def sha256_text(value: str) -> str:
 
 
 def _canonical(value: Any) -> bytes:
-    return json.dumps(
-        value, ensure_ascii=False, sort_keys=True, separators=(",", ":")
-    ).encode("utf-8")
+    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode(
+        "utf-8"
+    )
 
 
 def request_digest(request: Mapping[str, Any]) -> str:
@@ -223,9 +229,7 @@ def _ensure_dir(root: Path, path: Path, created: list[str]) -> None:
 
 
 def _atomic_write(path: Path, data: bytes, *, mode: int | None = None) -> None:
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".itsm-", suffix=".tmp", dir=str(path.parent)
-    )
+    descriptor, temporary = tempfile.mkstemp(prefix=".itsm-", suffix=".tmp", dir=str(path.parent))
     temporary_path = Path(temporary)
     try:
         with os.fdopen(descriptor, "wb") as handle:
@@ -300,10 +304,8 @@ class _Transaction:
             else:
                 path.unlink(missing_ok=True)
         for relative in reversed(self.created_dirs):
-            try:
+            with contextlib.suppress(OSError):
                 (self.root / relative).rmdir()
-            except OSError:
-                pass
 
 
 # --------------------------------------------------------------------------- JSONC
@@ -313,7 +315,7 @@ class _Transaction:
 class _JsonMember:
     key: str
     key_start: int
-    value: "_JsonNode"
+    value: _JsonNode
     comma: int | None = None
 
 
@@ -324,7 +326,7 @@ class _JsonNode:
     end: int
     value: Any
     members: list[_JsonMember] = field(default_factory=list)
-    elements: list["_JsonNode"] = field(default_factory=list)
+    elements: list[_JsonNode] = field(default_factory=list)
     trailing_comma: bool = False
 
 
@@ -402,10 +404,14 @@ class _JsoncParser:
                 try:
                     value = json.loads(raw)
                 except json.JSONDecodeError as exc:
-                    raise InstallerError("config_invalid", "configuration string is invalid") from exc
+                    raise InstallerError(
+                        "config_invalid", "configuration string is invalid"
+                    ) from exc
                 return _JsonNode("string", start, self.index, value)
             if ord(char) < 0x20:
-                raise InstallerError("config_invalid", "configuration string has a control character")
+                raise InstallerError(
+                    "config_invalid", "configuration string has a control character"
+                )
             self.index += 1
         raise InstallerError("config_invalid", "unterminated string")
 
@@ -612,11 +618,11 @@ def _jsonc_set(text: str, path: Sequence[str], value: Any) -> str:
             updated, _ = _jsonc_insert_member(current_text, current, key, nested)
             return updated
         if member.value.kind != "object":
-            raise InstallerError(
-                "config_invalid", "configuration section has an incompatible type"
-            )
+            raise InstallerError("config_invalid", "configuration section has an incompatible type")
         current = member.value
-    raise InstallerError("config_invalid", "configuration path could not be applied")  # pragma: no cover
+    raise InstallerError(
+        "config_invalid", "configuration path could not be applied"
+    )  # pragma: no cover
 
 
 def _jsonc_empty_after(text: str) -> bool:
@@ -721,9 +727,7 @@ def _hermes_set_entry(text: str, mcp: Mapping[str, Any], enabled: bool) -> tuple
     start, end = parent
     inline = _inline_value(lines[start])
     if inline and inline not in {"{}", "null", "~"}:
-        raise InstallerError(
-            "config_invalid", "inline mcp_servers mapping is not safely editable"
-        )
+        raise InstallerError("config_invalid", "inline mcp_servers mapping is not safely editable")
     child = _find_block(lines, "itsm", 2, start + 1, end)
     if inline in {"{}", "null", "~"}:
         header = lines[start].split("#", 1)[0].rstrip()
@@ -827,9 +831,7 @@ class _CatalogView:
         try:
             from itsm.agent_integrations.catalog import SkillCatalog
         except ImportError as exc:  # pragma: no cover - sibling integration state
-            raise InstallerError(
-                "catalog_unavailable", "skill catalog is not available"
-            ) from exc
+            raise InstallerError("catalog_unavailable", "skill catalog is not available") from exc
         self.catalog = SkillCatalog()
         return self.catalog
 
@@ -869,9 +871,10 @@ class _CatalogView:
                 clean[relative] = data
             digest = _package_digest(clean)
             declared = payload.get("digest")
-            if declared is not None and _normalize_digest(
-                str(declared), "catalog_invalid"
-            ) != digest:
+            if (
+                declared is not None
+                and _normalize_digest(str(declared), "catalog_invalid") != digest
+            ):
                 raise InstallerError(
                     "catalog_invalid", f"skill {name!r} digest does not match its files"
                 )
@@ -907,7 +910,9 @@ def _opencode_format(version: str) -> str:
         return "v1"
     if major == 2:
         return "v2"
-    raise InstallerError("unsupported_version", "OpenCode version is not supported (v1/v2 required)")
+    raise InstallerError(
+        "unsupported_version", "OpenCode version is not supported (v1/v2 required)"
+    )
 
 
 def _opencode_config_path(root: Path) -> tuple[Path, bool]:
@@ -948,9 +953,7 @@ def _opencode_markers(data: Mapping[str, Any]) -> set[str]:
 
 def _detect_opencode(target: IntegrationTarget, root: Path) -> _TargetState:
     config_path, exists = _opencode_config_path(root)
-    config_text = (
-        _read_bounded(config_path).decode("utf-8") if exists else None
-    )
+    config_text = _read_bounded(config_path).decode("utf-8") if exists else None
     data: dict[str, Any] | None = None
     if config_text is not None:
         if _jsonc_only_comments(config_text):
@@ -1006,7 +1009,8 @@ def _detect_opencode(target: IntegrationTarget, root: Path) -> _TargetState:
 def _detect_hermes(target: IntegrationTarget, root: Path) -> _TargetState:
     if not target.version:
         raise InstallerError(
-            "version_required", "Hermes version is required and must support MCP header interpolation"
+            "version_required",
+            "Hermes version is required and must support MCP header interpolation",
         )
     version = _normalized_version(target.version)
     if _parse_version(version) < (0, 16, 0):
@@ -1168,7 +1172,9 @@ def _conflict(resource: str, reason: str) -> dict[str, str]:
     return {"resource": resource, "reason": reason}
 
 
-def _skill_destinations(state: _TargetState, skills: Sequence[_Skill]) -> dict[str, dict[str, Path]]:
+def _skill_destinations(
+    state: _TargetState, skills: Sequence[_Skill]
+) -> dict[str, dict[str, Path]]:
     destinations: dict[str, dict[str, Path]] = {}
     base = state.root.joinpath(*PurePosixPath(state.skills_relative).parts)
     for skill in skills:
@@ -1228,9 +1234,7 @@ def _preflight_opencode(
             _conflict("default_agent", "a different default agent is already configured")
         )
     for skill in skills:
-        base = state.root.joinpath(
-            *PurePosixPath(state.skills_relative).parts
-        ) / skill.name
+        base = state.root.joinpath(*PurePosixPath(state.skills_relative).parts) / skill.name
         if base.is_symlink():
             raise InstallerError("unsafe_path", "skill destination traverses a symbolic link")
         if _exists_foreign_skill(state, manifest, skill):
@@ -1247,7 +1251,10 @@ def _preflight_opencode(
 
 
 def _preflight_hermes(
-    state: _TargetState, skills: Sequence[_Skill], manifest: Mapping[str, Any] | None, mcp: Mapping[str, Any]
+    state: _TargetState,
+    skills: Sequence[_Skill],
+    manifest: Mapping[str, Any] | None,
+    mcp: Mapping[str, Any],
 ) -> None:
     data = state.config_data or {}
     conflicts: list[dict[str, str]] = []
@@ -1260,14 +1267,17 @@ def _preflight_hermes(
     if toolsets is not None and not isinstance(toolsets, Mapping):
         raise InstallerError("config_invalid", "platform_toolsets section must be a mapping")
     expected = ["itsm"] + (["skills"] if skills else [])
-    if isinstance(toolsets, Mapping) and "api_server" in toolsets:
-        if toolsets["api_server"] != expected:
-            conflicts.append(
-                _conflict(
-                    "platform_toolsets.api_server",
-                    "existing API server toolset allowlist differs from the safe ITSM allowlist",
-                )
+    if (
+        isinstance(toolsets, Mapping)
+        and "api_server" in toolsets
+        and toolsets["api_server"] != expected
+    ):
+        conflicts.append(
+            _conflict(
+                "platform_toolsets.api_server",
+                "existing API server toolset allowlist differs from the safe ITSM allowlist",
             )
+        )
     agent = data.get("agent")
     if agent is not None and not isinstance(agent, Mapping):
         raise InstallerError("config_invalid", "agent section must be a mapping")
@@ -1314,6 +1324,17 @@ def _preflight(
 
 
 def _opencode_mcp(mcp: Mapping[str, Any], enabled: bool) -> dict[str, Any]:
+    return {
+        "type": "remote",
+        "url": mcp["url"],
+        "disabled": not enabled,
+        "codemode": False,
+        "oauth": False,
+        "headers": {"Authorization": f"Bearer {{env:{mcp['secretRef']}}}"},
+    }
+
+
+def _opencode_v1_mcp(mcp: Mapping[str, Any], enabled: bool) -> dict[str, Any]:
     return {
         "type": "remote",
         "url": mcp["url"],
@@ -1365,7 +1386,7 @@ def _opencode_install_text(
         set_value(["mcp", "servers", "itsm"], _opencode_mcp(mcp, enabled))
         set_value(["agents", "itsm"], _opencode_agent(skill_names if enabled else []))
     else:
-        set_value(["mcp", "itsm"], _opencode_mcp(mcp, enabled))
+        set_value(["mcp", "itsm"], _opencode_v1_mcp(mcp, enabled))
         set_value(["agent", "itsm"], _opencode_v1_agent(skill_names if enabled else []))
     if enabled:
         set_value(["default_agent"], DEFAULT_AGENT)
@@ -1447,9 +1468,7 @@ def _hermes_uninstall_text(state: _TargetState, manifest: Mapping[str, Any]) -> 
     text = state.config_text or ""
     created_keys = set(manifest.get("config", {}).get("createdKeys", []))
     text, _ = _hermes_remove_entry(text, remove_parent="mcp_servers" in created_keys)
-    text = _hermes_remove_api_server(
-        text, remove_parent="platform_toolsets" in created_keys
-    )
+    text = _hermes_remove_api_server(text, remove_parent="platform_toolsets" in created_keys)
     return text
 
 
@@ -1457,7 +1476,11 @@ def _hermes_uninstall_text(state: _TargetState, manifest: Mapping[str, Any]) -> 
 
 
 def _profile_config_check(
-    state: _TargetState, text: str, mcp: Mapping[str, Any], skill_names: Sequence[str], enabled: bool
+    state: _TargetState,
+    text: str,
+    mcp: Mapping[str, Any],
+    skill_names: Sequence[str],
+    enabled: bool,
 ) -> tuple[bool, str]:
     if state.engine == "hermes":
         return _hermes_profile_config_check(state, text, mcp, skill_names, enabled)
@@ -1530,10 +1553,7 @@ def _opencode_runtime_safety(
     permissions = agent.get("permissions")
     if not isinstance(permissions, list) or not permissions:
         return False, "runtime ITSM agent effective permissions are missing"
-    deny_everything = False
-    itsm_allow = False
-    allowed_skills: set[str] = set()
-    requested_skills = set(skill_names)
+    rules: list[tuple[str, str, str]] = []
     for permission in permissions:
         if not isinstance(permission, Mapping):
             return False, "runtime ITSM permission rule is invalid"
@@ -1548,9 +1568,21 @@ def _opencode_runtime_safety(
             or effect not in {"allow", "deny", "ask"}
         ):
             return False, "runtime ITSM permission rule is invalid"
+        rules.append((action, resource, effect))
+    deny_index: int | None = None
+    for index, (action, resource, effect) in enumerate(rules):
+        if action == "*" and resource == "*" and effect == "deny":
+            deny_index = index
+    if deny_index is None:
+        return False, "runtime ITSM agent does not deny actions outside the ITSM allowlist"
+    itsm_allow = False
+    allowed_skills: set[str] = set()
+    requested_skills = set(skill_names)
+    # OpenCode evaluates rules with last-match-wins. The last wildcard deny
+    # shadows every earlier built-in default and user rule; any later allow or
+    # ask must itself stay inside the managed authority.
+    for action, resource, effect in rules[deny_index + 1 :]:
         if effect == "deny":
-            if action == "*" and resource == "*":
-                deny_everything = True
             continue
         if effect == "ask":
             return False, "runtime ITSM agent can ask for an unapproved action"
@@ -1561,12 +1593,13 @@ def _opencode_runtime_safety(
             allowed_skills.add(resource)
             continue
         return False, f"runtime ITSM agent allows unmanaged action {action!r}"
-    if not deny_everything:
-        return False, "runtime ITSM agent does not deny actions outside the ITSM allowlist"
-    if not itsm_allow:
+    if not itsm_allow or _last_effect(rules, "itsm_search_assets", "*") != "allow":
         return False, "runtime ITSM agent does not allow ITSM MCP tools"
     if allowed_skills != requested_skills:
         return False, "runtime ITSM agent does not allow exactly the selected skills"
+    for skill in requested_skills:
+        if _last_effect(rules, "skill", skill) != "allow":
+            return False, "runtime ITSM agent does not allow exactly the selected skills"
     config_entries = evidence.get("config")
     if not isinstance(config_entries, list) or not config_entries:
         return False, "runtime configuration documents were not inspected"
@@ -1600,28 +1633,53 @@ def _opencode_runtime_safety(
     saved = evidence.get("savedPermissions")
     if not isinstance(saved, list):
         return False, "saved runtime permissions were not inspected"
+    saved_rules: list[tuple[str, str, str]] = []
     for permission in saved:
         if not isinstance(permission, Mapping):
             return False, "saved runtime permission entry is invalid"
         action = permission.get("action")
         resource = permission.get("resource")
-        if not isinstance(action, str) or not isinstance(resource, str):
+        effect = permission.get("effect")
+        if (
+            not isinstance(action, str)
+            or not isinstance(resource, str)
+            or not isinstance(effect, str)
+            or effect not in {"allow", "deny", "ask"}
+        ):
             return False, "saved runtime permission entry is invalid"
-        if _opencode_itsm_allow(action):
-            continue
-        if action == "skill" and resource in requested_skills:
-            continue
-        return False, "saved runtime permission overrides the restricted ITSM allowlist"
+        if effect == "ask":
+            return False, "saved runtime permission requires approval"
+        if (
+            effect == "allow"
+            and not _opencode_itsm_allow(action)
+            and (action != "skill" or resource not in requested_skills)
+        ):
+            return False, "saved runtime permission overrides the restricted ITSM allowlist"
+        saved_rules.append((action, resource, effect))
+    combined = rules + saved_rules
+    if not itsm_allow or _last_effect(combined, "itsm_search_assets", "*") != "allow":
+        return False, "runtime ITSM agent does not allow ITSM MCP tools"
+    for skill in requested_skills:
+        if _last_effect(combined, "skill", skill) != "allow":
+            return False, "runtime ITSM agent does not allow exactly the selected skills"
     return True, "runtime agent, workspace, effective rules, and saved permissions are restricted"
 
 
+def _last_effect(rules: Sequence[tuple[str, str, str]], action: str, resource: str) -> str | None:
+    effect: str | None = None
+    for rule_action, rule_resource, rule_effect in rules:
+        if fnmatch.fnmatchcase(action, rule_action) and fnmatch.fnmatchcase(
+            resource, rule_resource
+        ):
+            effect = rule_effect
+    return effect
+
+
 def _opencode_itsm_allow(action: str) -> bool:
-    return action in {"itsm", "itsm_*"} or action.startswith(("itsm_", "itsm."))
+    return action.startswith("itsm_")
 
 
-def _hermes_runtime_safety(
-    evidence: Mapping[str, Any], state: _TargetState
-) -> tuple[bool, str]:
+def _hermes_runtime_safety(evidence: Mapping[str, Any], state: _TargetState) -> tuple[bool, str]:
     runtime = evidence.get("runtime")
     if not isinstance(runtime, Mapping):
         return False, "Hermes runtime profile binding was not inspected"
@@ -1636,7 +1694,11 @@ def _hermes_runtime_safety(
 
 
 def _hermes_profile_config_check(
-    state: _TargetState, text: str, mcp: Mapping[str, Any], skill_names: Sequence[str], enabled: bool
+    state: _TargetState,
+    text: str,
+    mcp: Mapping[str, Any],
+    skill_names: Sequence[str],
+    enabled: bool,
 ) -> tuple[bool, str]:
     try:
         data = _yaml_load(text)
@@ -1644,7 +1706,11 @@ def _hermes_profile_config_check(
         return False, "configuration could not be parsed for profile safety"
     if not isinstance(data, Mapping):
         return False, "configuration root is not a mapping"
-    entry = (data.get("mcp_servers") or {}).get("itsm") if isinstance(data.get("mcp_servers"), Mapping) else None
+    entry = (
+        (data.get("mcp_servers") or {}).get("itsm")
+        if isinstance(data.get("mcp_servers"), Mapping)
+        else None
+    )
     if not isinstance(entry, Mapping):
         return False, "managed MCP entry is missing"
     if entry.get("enabled") is not enabled:
@@ -1682,16 +1748,22 @@ def _opencode_profile_config_check(
             if isinstance(data.get("mcp"), Mapping)
             else None
         )
-        agent = data.get("agents", {}).get("itsm") if isinstance(data.get("agents"), Mapping) else None
+        expected_entry = _opencode_mcp(mcp, enabled)
+        agent = (
+            data.get("agents", {}).get("itsm") if isinstance(data.get("agents"), Mapping) else None
+        )
         expected_permissions = _opencode_agent(skill_names if enabled else [])["permissions"]
         permissions = agent.get("permissions") if isinstance(agent, Mapping) else None
     else:
         entry = data.get("mcp", {}).get("itsm") if isinstance(data.get("mcp"), Mapping) else None
-        agent = data.get("agent", {}).get("itsm") if isinstance(data.get("agent"), Mapping) else None
+        expected_entry = _opencode_v1_mcp(mcp, enabled)
+        agent = (
+            data.get("agent", {}).get("itsm") if isinstance(data.get("agent"), Mapping) else None
+        )
         expected_permissions = _opencode_v1_agent(skill_names if enabled else [])["permission"]
         permissions = agent.get("permission") if isinstance(agent, Mapping) else None
-    if not isinstance(entry, Mapping) or entry.get("enabled") is not enabled:
-        return False, "managed MCP entry is missing or has an unexpected state"
+    if not isinstance(entry, Mapping) or dict(entry) != expected_entry:
+        return False, "managed MCP entry differs from the required schema and state"
     if data.get("default_agent") != DEFAULT_AGENT:
         return False, "the restricted ITSM agent is not the default agent"
     if permissions != expected_permissions:
@@ -1756,9 +1828,7 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
             spec["url"], headers={"Authorization": f"Bearer {secret}"}
         )
         async with Client(transport, timeout=15.0) as client:
-            checks.append(
-                {"name": "mcp.handshake", "status": "pass", "detail": "initialized"}
-            )
+            checks.append({"name": "mcp.handshake", "status": "pass", "detail": "initialized"})
             tools = await client.list_tools()
             names = {tool.name for tool in tools}
             if "search_assets" not in names:
@@ -1769,9 +1839,7 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
                         "detail": "authorized tool list does not include search_assets",
                     }
                 )
-                checks.append(
-                    {"name": "mcp.query", "status": "skip", "detail": "not attempted"}
-                )
+                checks.append({"name": "mcp.query", "status": "skip", "detail": "not attempted"})
                 return {"verified": False, "checks": checks, "toolCount": len(names)}
             checks.append(
                 {
@@ -1794,21 +1862,13 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
         detail = _public_error(exc, secret)
         existing = {check["name"] for check in checks}
         if "mcp.handshake" not in existing:
-            checks.append(
-                {"name": "mcp.handshake", "status": "fail", "detail": detail}
-            )
+            checks.append({"name": "mcp.handshake", "status": "fail", "detail": detail})
         else:
-            checks.append(
-                {"name": "mcp.query", "status": "fail", "detail": detail}
-            )
+            checks.append({"name": "mcp.query", "status": "fail", "detail": detail})
         if "mcp.tools" not in {check["name"] for check in checks}:
-            checks.append(
-                {"name": "mcp.tools", "status": "skip", "detail": "handshake failed"}
-            )
+            checks.append({"name": "mcp.tools", "status": "skip", "detail": "handshake failed"})
         if "mcp.query" not in {check["name"] for check in checks}:
-            checks.append(
-                {"name": "mcp.query", "status": "skip", "detail": "not attempted"}
-            )
+            checks.append({"name": "mcp.query", "status": "skip", "detail": "not attempted"})
         return {"verified": False, "checks": checks, "toolCount": 0}
 
 
@@ -1843,6 +1903,7 @@ class IntegrationInstaller:
         skills: Sequence[str],
         operation: str = "install",
         profile_safety: Mapping[str, Any] | None = None,
+        profile_inspector: ProfileInspector | None = None,
     ) -> dict[str, Any]:
         operation = _validate_operation(operation)
         names = _validate_skill_names(list(skills))
@@ -1869,9 +1930,15 @@ class IntegrationInstaller:
             )
             catalog_skills = self.catalog.skills(names)
             manifest, manifest_digest = _load_manifest(state.root)
-            if profile_safety is not None and not isinstance(profile_safety, Mapping):
-                raise InstallerError("invalid_evidence", "profile_safety must be an object")
-            if operation in {"update", "repair", "verify", "disable", "uninstall"} and manifest is None:
+            # ``profile_safety`` is retained for compatibility only. A raw caller
+            # mapping is never proof: trusted evidence can only come from an
+            # in-process inspector invoked below after the managed write.
+            if profile_inspector is not None and not callable(profile_inspector):
+                raise InstallerError("invalid_evidence", "profile_inspector must be callable")
+            if (
+                operation in {"update", "repair", "verify", "disable", "uninstall"}
+                and manifest is None
+            ):
                 raise InstallerError(
                     "not_installed", "no managed installation exists for the selected target"
                 )
@@ -1884,6 +1951,7 @@ class IntegrationInstaller:
                     manifest,
                     _validate_manifest_config(state, manifest, manifest_digest),
                     profile_safety,
+                    profile_inspector,
                     base,
                 )
             if operation in {"install"}:
@@ -1896,6 +1964,7 @@ class IntegrationInstaller:
                         manifest,
                         _validate_manifest_config(state, manifest, manifest_digest),
                         profile_safety,
+                        profile_inspector,
                         base,
                     )
                 _preflight(state, catalog_skills, None, spec)
@@ -1907,6 +1976,7 @@ class IntegrationInstaller:
                     None,
                     None,
                     profile_safety,
+                    profile_inspector,
                     base,
                 )
             if operation == "verify":
@@ -1917,6 +1987,7 @@ class IntegrationInstaller:
                     manifest,
                     _validate_manifest_config(state, manifest, manifest_digest),
                     profile_safety,
+                    profile_inspector,
                     base,
                 )
             if operation == "disable":
@@ -1952,6 +2023,7 @@ class IntegrationInstaller:
         manifest: Mapping[str, Any] | None,
         manifest_digest: str | None,
         profile_safety: Mapping[str, Any] | None,
+        profile_inspector: ProfileInspector | None,
         base: dict[str, Any],
     ) -> dict[str, Any]:
         if manifest is not None:
@@ -1965,19 +2037,14 @@ class IntegrationInstaller:
         enabled = operation != "disable"
         skill_names = [skill.name for skill in catalog_skills] if enabled else []
         if state.engine == "opencode":
-            text, created_keys = _opencode_install_text(
-                state, mcp, skill_names, enabled=enabled
-            )
+            text, created_keys = _opencode_install_text(state, mcp, skill_names, enabled=enabled)
         else:
-            text, created_keys = _hermes_install_text(
-                state, mcp, skill_names, enabled=enabled
-            )
+            text, created_keys = _hermes_install_text(state, mcp, skill_names, enabled=enabled)
         config_digest = sha256_text(text)
         existing_created = list((manifest or {}).get("config", {}).get("createdKeys", []))
+        prior_config = (manifest or {}).get("config")
         created_keys_all = sorted(set(existing_created) | set(created_keys))
-        state.config_data = (
-            _jsonc_value(text) if state.engine == "opencode" else _yaml_load(text)
-        )
+        state.config_data = _jsonc_value(text) if state.engine == "opencode" else _yaml_load(text)
         if state.engine == "opencode" and state.config_data is not None:
             state.config_data["_itsmCreatedKeys"] = created_keys_all
         skill_payloads, destinations = _skill_manifest(state, catalog_skills)
@@ -1990,6 +2057,10 @@ class IntegrationInstaller:
             config_digest,
             enabled=True,
         )
+        if isinstance(prior_config, Mapping) and isinstance(
+            prior_config.get("existsBefore"), bool
+        ):
+            manifest_payload["config"]["existsBefore"] = prior_config["existsBefore"]
         transaction = _Transaction(state.root)
         try:
             if text != (state.config_text or "") or not state.config_exists:
@@ -2010,9 +2081,12 @@ class IntegrationInstaller:
             for relative in stale:
                 path = _path_from_relative(state.root, relative)
                 transaction.remove(path)
-            manifest_data = json.dumps(
-                manifest_payload, indent=2, sort_keys=True, ensure_ascii=False
-            ).encode("utf-8") + b"\n"
+            manifest_data = (
+                json.dumps(manifest_payload, indent=2, sort_keys=True, ensure_ascii=False).encode(
+                    "utf-8"
+                )
+                + b"\n"
+            )
             transaction.write(_manifest_path(state.root), manifest_data, mode=0o600)
             manifest_digest_after = _sha256_bytes(manifest_data)
         except BaseException:
@@ -2027,6 +2101,7 @@ class IntegrationInstaller:
             manifest_payload,
             manifest_digest_after,
             profile_safety,
+            profile_inspector,
             base,
             skill_names,
         )
@@ -2039,6 +2114,7 @@ class IntegrationInstaller:
         manifest: Mapping[str, Any],
         manifest_digest: str | None,
         profile_safety: Mapping[str, Any] | None,
+        profile_inspector: ProfileInspector | None,
         base: dict[str, Any],
     ) -> dict[str, Any]:
         _assert_managed_skills(state, manifest, allow_missing=manifest.get("state") == "disabled")
@@ -2048,7 +2124,13 @@ class IntegrationInstaller:
                 manifest,
                 "disabled",
                 base,
-                checks=[{"name": "state.disabled", "status": "pass", "detail": "installation is disabled"}],
+                checks=[
+                    {
+                        "name": "state.disabled",
+                        "status": "pass",
+                        "detail": "installation is disabled",
+                    }
+                ],
             )
         if [skill.name for skill in catalog_skills] != sorted(manifest.get("skills", {})):
             raise InstallerError(
@@ -2062,7 +2144,9 @@ class IntegrationInstaller:
                 raise InstallerError(
                     "conflict",
                     "requested MCP configuration differs from the managed installation",
-                    details=[_conflict(f"mcp.{key}", "verification input does not match the manifest")],
+                    details=[
+                        _conflict(f"mcp.{key}", "verification input does not match the manifest")
+                    ],
                 )
         assert state.config_text is not None
         return await self._finish(
@@ -2072,9 +2156,9 @@ class IntegrationInstaller:
             "verify",
             state.config_text,
             manifest,
-            _manifest_path(state.root).read_bytes()
-            and _file_digest(_manifest_path(state.root)),
+            _manifest_path(state.root).read_bytes() and _file_digest(_manifest_path(state.root)),
             profile_safety,
+            profile_inspector,
             base,
             [skill.name for skill in catalog_skills],
             verify_only=True,
@@ -2118,8 +2202,8 @@ class IntegrationInstaller:
         try:
             if text != (state.config_text or ""):
                 transaction.write(state.config_path, text.encode("utf-8"))
-            for name, payload in skills_payload.items():
-                for relative in (payload.get("files") or {}):
+            for _name, payload in skills_payload.items():
+                for relative in payload.get("files") or {}:
                     path = _path_from_relative(state.root, relative)
                     if path.exists():
                         if path.is_symlink():
@@ -2127,9 +2211,12 @@ class IntegrationInstaller:
                                 "unsafe_path", "managed skill path traverses a symbolic link"
                             )
                         transaction.remove(path)
-            manifest_data = json.dumps(
-                disabled_manifest, indent=2, sort_keys=True, ensure_ascii=False
-            ).encode("utf-8") + b"\n"
+            manifest_data = (
+                json.dumps(disabled_manifest, indent=2, sort_keys=True, ensure_ascii=False).encode(
+                    "utf-8"
+                )
+                + b"\n"
+            )
             transaction.write(_manifest_path(state.root), manifest_data, mode=0o600)
         except BaseException:
             transaction.rollback()
@@ -2140,8 +2227,16 @@ class IntegrationInstaller:
             "disabled",
             base,
             checks=[
-                {"name": "state.disabled", "status": "pass", "detail": "MCP disabled and skills removed"},
-                {"name": "mcp.handshake", "status": "skip", "detail": "disabled installation is not verified"},
+                {
+                    "name": "state.disabled",
+                    "status": "pass",
+                    "detail": "MCP disabled and skills removed",
+                },
+                {
+                    "name": "mcp.handshake",
+                    "status": "skip",
+                    "detail": "disabled installation is not verified",
+                },
             ],
         )
 
@@ -2169,7 +2264,7 @@ class IntegrationInstaller:
             elif text != (state.config_text or ""):
                 transaction.write(state.config_path, text.encode("utf-8"))
             for payload in manifest.get("skills", {}).values():
-                for relative in (payload.get("files") or {}):
+                for relative in payload.get("files") or {}:
                     path = _path_from_relative(state.root, relative)
                     if path.exists():
                         if path.is_symlink():
@@ -2181,15 +2276,11 @@ class IntegrationInstaller:
             for relative in sorted(manifest.get("createdDirs", []), reverse=True):
                 directory = _path_from_relative(state.root, relative)
                 if directory.exists() and directory.is_dir():
-                    try:
+                    with contextlib.suppress(OSError):
                         directory.rmdir()
-                    except OSError:
-                        pass
             if _manifest_path(state.root).parent.exists():
-                try:
+                with contextlib.suppress(OSError):
                     _manifest_path(state.root).parent.rmdir()
-                except OSError:
-                    pass
         except BaseException:
             transaction.rollback()
             raise
@@ -2215,6 +2306,7 @@ class IntegrationInstaller:
         manifest: Mapping[str, Any],
         manifest_digest: str,
         profile_safety: Mapping[str, Any] | None,
+        profile_inspector: ProfileInspector | None,
         base: dict[str, Any],
         skill_names: Sequence[str],
         *,
@@ -2223,19 +2315,55 @@ class IntegrationInstaller:
         mcp_result = await verify_connection(mcp)
         mcp_verified = bool(mcp_result["verified"])
         config_digest = sha256_text(config_text)
-        config_ok, config_detail = _profile_config_check(
-            state, config_text, mcp, skill_names, True
-        )
-        if config_ok:
-            safety_status, profile_ok, profile_detail = _runtime_evidence(
-                profile_safety,
-                engine=state.engine,
-                config_digest=config_digest,
-                state=state,
-                skill_names=skill_names,
+        config_ok, config_detail = _profile_config_check(state, config_text, mcp, skill_names, True)
+        profile_evidence: Mapping[str, Any] | None = None
+        if not config_ok:
+            safety_status, profile_ok, profile_detail = "fail", False, config_detail
+        elif profile_inspector is None:
+            safety_status, profile_ok, profile_detail = (
+                "fail",
+                False,
+                (
+                    "caller-supplied profile evidence is untrusted; "
+                    "live engine inspection is required"
+                    if profile_safety is not None
+                    else "trusted engine profile inspection is not available"
+                ),
             )
         else:
-            safety_status, profile_ok, profile_detail = "fail", False, config_detail
+            target = IntegrationTarget(state.engine, str(state.root), state.profile, state.version)
+            try:
+                inspected = profile_inspector(
+                    target=target,
+                    mcp=dict(mcp),
+                    skills=tuple(skill_names),
+                    config_digest=config_digest,
+                )
+                if isawaitable(inspected):
+                    profile_evidence = await inspected
+                else:
+                    profile_evidence = None
+            except Exception:
+                safety_status, profile_ok, profile_detail = (
+                    "fail",
+                    False,
+                    "trusted engine profile inspection failed",
+                )
+            else:
+                if profile_evidence is None:
+                    safety_status, profile_ok, profile_detail = (
+                        "fail",
+                        False,
+                        "trusted engine profile inspection returned no evidence",
+                    )
+                else:
+                    safety_status, profile_ok, profile_detail = _runtime_evidence(
+                        profile_evidence,
+                        engine=state.engine,
+                        config_digest=config_digest,
+                        state=state,
+                        skill_names=skill_names,
+                    )
         checks = list(mcp_result["checks"])
         checks.append(
             {
@@ -2259,10 +2387,11 @@ class IntegrationInstaller:
             receipt["limitations"].append("MCP proof did not pass; installation is not verified.")
         if not profile_ok:
             receipt["limitations"].append(
-                "Selected engine profile/runtime binding was not proven; installation is not verified."
+                "Selected engine profile/runtime binding was not proven; "
+                "installation is not verified."
             )
-        if profile_ok:
-            source = profile_safety.get("source") if profile_safety else None
+        if profile_ok and profile_evidence is not None:
+            source = profile_evidence.get("source")
             receipt["limitations"].append(f"Profile safety evidence source: {source}")
         return _finalize_receipt(receipt, state, manifest)
 
@@ -2301,7 +2430,9 @@ class IntegrationInstaller:
             "verified": False,
             "mcpVerified": False,
             "profileSafetyVerified": False,
-            "conflicts": exc.details if status == "conflict" and isinstance(exc.details, list) else [],
+            "conflicts": exc.details
+            if status == "conflict" and isinstance(exc.details, list)
+            else [],
             "checks": [],
             "managedFiles": [],
             "fileDigests": {},
@@ -2340,7 +2471,9 @@ def _validate_manifest_config(
 ) -> str | None:
     config = manifest.get("config")
     if not isinstance(config, Mapping) or config.get("path") != state.config_relative:
-        raise InstallerError("manifest_invalid", "managed manifest config path does not match target")
+        raise InstallerError(
+            "manifest_invalid", "managed manifest config path does not match target"
+        )
     current = sha256_text(state.config_text or "") if state.config_text is not None else None
     if state.config_text is None:
         raise InstallerError("manifest_invalid", "managed configuration file is missing")
@@ -2348,7 +2481,9 @@ def _validate_manifest_config(
         raise InstallerError(
             "conflict",
             "managed configuration was modified outside the installer",
-            details=[_conflict(state.config_relative, "configuration digest differs from manifest")],
+            details=[
+                _conflict(state.config_relative, "configuration digest differs from manifest")
+            ],
         )
     if manifest_digest is None:  # pragma: no cover - caller loaded it
         manifest_digest = _file_digest(_manifest_path(state.root))
@@ -2378,14 +2513,10 @@ def _assert_managed_skills(
             if not allow_modified and _file_digest(path) != expected:
                 conflicts.append(_conflict(relative, "managed skill file was modified"))
     if conflicts:
-        raise InstallerError(
-            "conflict", "managed skill files were modified", details=conflicts
-        )
+        raise InstallerError("conflict", "managed skill files were modified", details=conflicts)
 
 
-def _stale_skill_files(
-    manifest: Mapping[str, Any] | None, skills: Sequence[_Skill]
-) -> list[str]:
+def _stale_skill_files(manifest: Mapping[str, Any] | None, skills: Sequence[_Skill]) -> list[str]:
     if manifest is None:
         return []
     desired: set[str] = set()
@@ -2394,7 +2525,7 @@ def _stale_skill_files(
             desired.add(f"{_state_skills_prefix(manifest)}{skill.name}/{relative}")
     stale: list[str] = []
     for payload in (manifest.get("skills") or {}).values():
-        for relative in (payload.get("files") or {}):
+        for relative in payload.get("files") or {}:
             if relative not in desired:
                 stale.append(relative)
     return stale
@@ -2420,9 +2551,7 @@ def _skill_manifest(
         for relative, data in skill.files.items():
             path = base / skill.name / Path(*PurePosixPath(relative).parts)
             file_digest = _sha256_bytes(data)
-            file_map[
-                path.relative_to(state.root).as_posix()
-            ] = file_digest
+            file_map[path.relative_to(state.root).as_posix()] = file_digest
             paths[relative] = path
         payloads[skill.name] = {
             "version": skill.version,
@@ -2491,9 +2620,7 @@ def _base_finished_receipt(
         "identityId": manifest.get("mcp", {}).get("identityId", base.get("identityId")),
         "configDigest": sha256_text(config_text),
         "manifestVersion": manifest.get("schemaVersion", SCHEMA_VERSION),
-        "skillDigests": {
-            name: payload.get("digest") for name, payload in sorted(skills.items())
-        },
+        "skillDigests": {name: payload.get("digest") for name, payload in sorted(skills.items())},
         "skills": [
             {
                 "name": name,
@@ -2550,15 +2677,16 @@ def build_request(
         raise InstallerError("unsupported_engine", "installer engine is not supported")
     root = Path(target.path)
     if not root.is_absolute() or any(part == ".." for part in root.parts):
-        raise InstallerError("target_path_invalid", "target path must be absolute without traversal")
+        raise InstallerError(
+            "target_path_invalid", "target path must be absolute without traversal"
+        )
     if target.version:
         version = _normalized_version(target.version)
-        fmt = "hermes" if target.engine == "hermes" else _opencode_format(version)
+        "hermes" if target.engine == "hermes" else _opencode_format(version)
         profile = target.profile or (root.name if target.engine == "hermes" else None)
     else:
         state = _target_state(target)
         version = state.version
-        fmt = state.format
         profile = state.profile
     if target.engine == "hermes" and _parse_version(version) < (0, 16, 0):
         raise InstallerError(
@@ -2582,9 +2710,7 @@ def build_request(
         if manifest is not None:
             expected["configDigest"] = manifest.get("config", {}).get("digest")
     if manifest_digest is not None:
-        expected["manifestDigest"] = _normalize_digest(
-            manifest_digest, "invalid_expected_manifest"
-        )
+        expected["manifestDigest"] = _normalize_digest(manifest_digest, "invalid_expected_manifest")
     request: dict[str, Any] = {
         "schemaVersion": SCHEMA_VERSION,
         "kind": "itsm-agent-installer-request",
@@ -2700,9 +2826,12 @@ def validate_receipt(
         if not isinstance(receipt.get("skillDigests"), Mapping):
             errors.append("verified receipt lacks skill digests")
         checks = receipt.get("checks")
-        if not isinstance(checks, list) or not checks or any(
-            not isinstance(check, Mapping) or check.get("status") != "pass"
-            for check in checks
+        if (
+            not isinstance(checks, list)
+            or not checks
+            or any(
+                not isinstance(check, Mapping) or check.get("status") != "pass" for check in checks
+            )
         ):
             errors.append("verified receipt has failing or missing checks")
     if request is not None:
@@ -2851,7 +2980,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         receipt["requestDigest"] = payload.get("requestDigest")
         receipt["receiptDigest"] = receipt_digest(receipt)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
-        return 0 if receipt.get("status") in {"verified", "configured", "disabled", "removed"} else 1
+        return (
+            0 if receipt.get("status") in {"verified", "configured", "disabled", "removed"} else 1
+        )
     except InstallerError as exc:
         receipt = _helper_failure(payload, exc, request_digest_value)
         print(json.dumps(receipt, ensure_ascii=False, sort_keys=True))
