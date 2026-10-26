@@ -1248,7 +1248,7 @@ def test_run_concurrency_cancel_and_model_switch_are_owner_scoped(app_client, mo
         with pytest.raises(Conflict):
             service.prepare_turn(principal, session_id, "dos", None)
         with pytest.raises(Conflict):
-            await service.update_session_model(principal, session_id, "fake/model-a")
+            await service.update_session(principal, session_id, {"model": "fake/model-a"})
         cancelled = await service.cancel_session(principal, session_id)
         assert cancelled["cancelled"] is True
         rest = [event async for event in stream]
@@ -1258,7 +1258,7 @@ def test_run_concurrency_cancel_and_model_switch_are_owner_scoped(app_client, mo
         idle = await service.cancel_session(principal, session_id)
         assert idle == {"cancelled": False, "reason": "no active run"}
 
-        changed = await service.update_session_model(principal, session_id, "fake/model-a")
+        changed = await service.update_session(principal, session_id, {"model": "fake/model-a"})
         assert changed["model"] == "fake/model-a"
 
     asyncio.run(scenario())
@@ -1686,11 +1686,38 @@ def test_local_install_uses_trusted_inspector_and_never_caller_evidence(
             "configDigest": digest,
             "targetPath": target.path,
             "location": {"directory": target.path},
-            "agent": {"id": "itsm", "mode": "primary", "permissions": permissions},
+            "agent": {
+                "id": "itsm",
+                "mode": "primary",
+                "hidden": False,
+                "permissions": permissions,
+            },
             "config": [
-                {"type": "directory", "path": target.path},
-                {"type": "document", "info": {"default_agent": "itsm"}},
+                {"type": "directory", "path": f"{target.path}/.opencode"},
+                {
+                    "type": "document",
+                    "path": f"{target.path}/opencode.json",
+                    "info": {"default_agent": "itsm"},
+                },
             ],
+            "skills": {
+                "location": {"directory": target.path},
+                "data": [
+                    {
+                        "id": skill,
+                        "name": skill,
+                        "path": f"{target.path}/.opencode/skills/{skill}/SKILL.md",
+                    }
+                    for skill in skills
+                ]
+                + [
+                    {
+                        "id": "opencode.skill",
+                        "name": "opencode",
+                        "path": "/builtin/opencode.md",
+                    }
+                ],
+            },
             "savedPermissions": [],
             "checks": [{"name": "inspection.config", "status": "pass"}],
         }
@@ -1742,6 +1769,8 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
     seen: list[tuple[str, str | None]] = []
     state: dict[str, Any] = {"agent_ready": True, "session": None}
     agent_permissions = [
+        {"action": "*", "resource": "*", "effect": "allow"},
+        {"action": "read", "resource": "*.env", "effect": "ask"},
         {"action": "*", "resource": "*", "effect": "deny"},
         {"action": "itsm_*", "resource": "*", "effect": "allow"},
         {"action": "skill", "resource": "*", "effect": "deny"},
@@ -1759,9 +1788,10 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
             return httpx.Response(
                 200,
                 json=[
-                    {"type": "directory", "path": "/srv/opencode/itsm"},
+                    {"type": "directory", "path": "/srv/opencode/itsm/.opencode"},
                     {
                         "type": "document",
+                        "path": "/srv/opencode/itsm/opencode.json",
                         "info": {
                             "mcp": {
                                 "servers": {
@@ -1775,12 +1805,34 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
                                     }
                                 }
                             },
-                            "skills": ["itsm-inventory"],
                             "default_agent": "itsm",
                             "provider": {"apiKey": "provider-secret"},
                         },
                     },
                 ],
+            )
+        if request.url.path == "/api/skill":
+            assert request.url.params["location[directory]"] == "/srv/opencode/itsm"
+            return httpx.Response(
+                200,
+                json={
+                    "location": {"directory": "/srv/opencode/itsm"},
+                    "data": [
+                        {
+                            "id": "itsm-inventory",
+                            "name": "itsm-inventory",
+                            "path": (
+                                "/srv/opencode/itsm/.opencode/skills/"
+                                "itsm-inventory/SKILL.md"
+                            ),
+                        },
+                        {
+                            "id": "opencode.skill",
+                            "name": "opencode",
+                            "path": "/builtin/opencode.md",
+                        },
+                    ],
+                },
             )
         if request.url.path == "/api/agent/itsm":
             if not state["agent_ready"]:
@@ -1791,6 +1843,7 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
                     "data": {
                         "id": "itsm",
                         "mode": "primary",
+                        "hidden": False,
                         "system": "provider-secret instructions",
                         "request": {"headers": {"Authorization": "Bearer provider-secret"}},
                         "permissions": agent_permissions,
@@ -1854,16 +1907,37 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
     assert evidence["agent"] == {
         "id": "itsm",
         "mode": "primary",
+        "hidden": False,
         "permissions": agent_permissions,
     }
     assert evidence["config"] == [
-        {"type": "directory", "path": "/srv/opencode/itsm"},
-        {"type": "document", "info": {"default_agent": "itsm"}},
+        {"type": "directory", "path": "/srv/opencode/itsm/.opencode"},
+        {
+            "type": "document",
+            "path": "/srv/opencode/itsm/opencode.json",
+            "info": {"default_agent": "itsm"},
+        },
     ]
+    assert evidence["skills"] == {
+        "location": {"directory": "/srv/opencode/itsm"},
+        "data": [
+            {
+                "id": "itsm-inventory",
+                "name": "itsm-inventory",
+                "path": "/srv/opencode/itsm/.opencode/skills/itsm-inventory/SKILL.md",
+            },
+            {
+                "id": "opencode.skill",
+                "name": "opencode",
+                "path": "/builtin/opencode.md",
+            },
+        ],
+    }
     assert seen == [
         ("/api/config", expected),
         ("/api/agent/itsm", expected),
         ("/api/permission/saved", expected),
+        ("/api/skill", expected),
     ]
 
     state["agent_ready"] = False
@@ -1880,16 +1954,35 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
         ("/api/agent/itsm", expected),
         ("/api/session/ses_itsm_inspection", expected),
         ("/api/permission/saved", expected),
+        ("/api/skill", expected),
     ]
 
     # An uppercase server/action grant is not the installer's managed contract.
-    agent_permissions[1] = {"action": "ITSM_*", "resource": "*", "effect": "allow"}
+    agent_permissions[3] = {"action": "ITSM_*", "resource": "*", "effect": "allow"}
     assert (
         asyncio.run(
             service._opencode_profile_safety(instance, target, mcp, ["itsm-inventory"], receipt)
         )
         is None
     )
+
+    # Grants or asks added after the final deny-all are effective and rejected.
+    agent_permissions[3] = {"action": "itsm_*", "resource": "*", "effect": "allow"}
+    for later in (
+        {"action": "read", "resource": "*", "effect": "allow"},
+        {"action": "read", "resource": "*.env", "effect": "ask"},
+        {"action": "skill", "resource": "other-skill", "effect": "allow"},
+    ):
+        agent_permissions.append(later)
+        assert (
+            asyncio.run(
+                service._opencode_profile_safety(
+                    instance, target, mcp, ["itsm-inventory"], receipt
+                )
+            )
+            is None
+        ), later
+        agent_permissions.pop()
 
 
 def test_opencode_engine_composition_uses_server_basic_auth(app_client, monkeypatch) -> None:

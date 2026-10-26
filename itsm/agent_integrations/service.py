@@ -23,7 +23,7 @@ from typing import Any
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
 
-from sqlalchemy import inspect, select
+from sqlalchemy import inspect, select, update
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session
 
@@ -34,8 +34,19 @@ from itsm.agent_integrations.models import (
     AgentInstance,
     AgentModuleState,
     AgentPreference,
+    AgentProvider,
     AgentRun,
     AgentSession,
+)
+from itsm.agent_integrations.providers import (
+    CredentialInvalid,
+    CredentialUnavailable,
+    ProviderEndpointError,
+    ProviderModelSelection,
+    credential_storage_available,
+    seal_credential,
+    unseal_credential,
+    validate_provider_endpoint,
 )
 from itsm.agents.runtime import (
     AgentUnavailable,
@@ -48,6 +59,7 @@ from itsm.identity.clock import utcnow
 from itsm.identity.permissions import (
     HUMAN_ACTOR_KIND,
     MACHINE_ACTOR_KINDS,
+    PERSONAL_PROVIDER_PERMISSION,
     ROLE_ADMIN,
     ROLE_SUPERADMIN,
 )
@@ -73,6 +85,9 @@ INSTALL_STATUSES = frozenset(
     {"verified", "configured", "conflict", "disabled", "removed", "failed"}
 )
 INSTALLATION_PREFERENCE_ID = "installation"
+PROVIDER_SCOPES = frozenset({"global", "personal"})
+_MAX_PROVIDER_MODELS = 50
+_KEYLESS_GLOBAL_CREDENTIAL = "local"
 SECRET_REF_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MAX_TEXT = 4000
 _MAX_MESSAGE = 20000
@@ -129,6 +144,7 @@ class InstanceSnapshot:
     enabled: bool
     default_model: str | None
     integration_identity_id: str | None
+    scope: str | None = None
 
 
 @dataclass
@@ -156,6 +172,7 @@ class Turn:
     asset_id: str | None
     engine: Any = None
     external_session_id: str | None = None
+    provider_selection: ProviderModelSelection | None = None
     cancel_sent: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -247,6 +264,59 @@ def _http_url(value: Any, field_name: str) -> str:
     except ValueError:
         raise ValidationFailed(f"{field_name} must use a valid port") from None
     return text.rstrip("/")
+
+
+def _provider_values(
+    payload: Mapping[str, Any], *, scope: str
+) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    if "name" in payload:
+        name = _label(payload["name"], limit=120)
+        if name is None:
+            raise ValidationFailed("provider name is required")
+        values["name"] = name
+    if "baseUrl" in payload:
+        try:
+            values["base_url"] = validate_provider_endpoint(payload["baseUrl"], scope=scope)
+        except ProviderEndpointError as exc:
+            raise ValidationFailed(str(exc)) from None
+    if "models" in payload:
+        raw = payload["models"]
+        if not isinstance(raw, list):
+            raise ValidationFailed("models must be a list")
+        models: list[str] = []
+        for item in raw:
+            model = _label(item, limit=200)
+            if model is None:
+                raise ValidationFailed("provider models must be non-empty identifiers")
+            if model not in models:
+                models.append(model)
+        if len(models) > _MAX_PROVIDER_MODELS:
+            raise ValidationFailed("provider models exceed the configured limit")
+        values["models"] = models
+    if "enabled" in payload:
+        enabled = payload["enabled"]
+        if not isinstance(enabled, bool):
+            raise ValidationFailed("enabled must be a boolean")
+        values["enabled"] = enabled
+    return values
+
+
+def _provider_api_key(payload: Mapping[str, Any]) -> str | None:
+    api_key = payload.get("apiKey")
+    if api_key is None:
+        return None
+    unwrap = getattr(api_key, "get_secret_value", None)
+    if callable(unwrap):
+        api_key = unwrap()
+    if not isinstance(api_key, str):
+        raise ValidationFailed("apiKey must be text")
+    key = api_key.strip()
+    if not key:
+        raise ValidationFailed("apiKey must not be empty")
+    if len(key) > 2048 or any(ord(char) < 32 for char in key):
+        raise ValidationFailed("apiKey is not a valid credential")
+    return key
 
 
 def _absolute_path(value: Any, field_name: str) -> str:
@@ -468,6 +538,128 @@ class AgentIntegrationService:
             raise IntegrationUnavailable("the engine credential is not configured")
         return value
 
+    @staticmethod
+    def _provider_snapshot(row: AgentProvider) -> InstanceSnapshot:
+        return InstanceSnapshot(
+            id=row.id,
+            name=row.name,
+            engine=PYDANTIC_ENGINE,
+            base_url=row.base_url,
+            secret_ref=None,
+            username=None,
+            profile=None,
+            directory=None,
+            enabled=bool(row.enabled),
+            default_model=None,
+            integration_identity_id=None,
+            scope=row.scope,
+        )
+
+    @staticmethod
+    def _provider_models(row: AgentProvider) -> list[str]:
+        value = row.models if isinstance(row.models, list) else []
+        return [
+            item
+            for item in value
+            if isinstance(item, str) and item.strip()
+        ][:_MAX_PROVIDER_MODELS]
+
+    @staticmethod
+    def _provider_visible(row: AgentProvider, principal: Principal) -> bool:
+        if row.scope == "global":
+            return True
+        return row.scope == "personal" and row.owner_id == principal.actor_id
+
+    def _resolve_instance(
+        self, db: Session, principal: Principal, instance_id: str
+    ) -> tuple[InstanceSnapshot, AgentProvider | None]:
+        instance = db.get(AgentInstance, instance_id)
+        if instance is not None:
+            return self._snapshot(instance), None
+        provider = db.get(AgentProvider, instance_id)
+        if provider is None or not self._provider_visible(provider, principal):
+            raise NotFound("agent instance not found")
+        return self._provider_snapshot(provider), provider
+
+    @staticmethod
+    def _provider_dto(row: AgentProvider) -> dict[str, Any]:
+        return {
+            "id": row.id,
+            "name": row.name,
+            "scope": row.scope,
+            "baseUrl": row.base_url,
+            "models": list(row.models or []),
+            "credentialConfigured": bool(row.api_key_ciphertext),
+            "enabled": bool(row.enabled),
+        }
+
+    def _provider_row(self, db: Session, provider_id: str) -> AgentProvider:
+        row = db.get(AgentProvider, provider_id)
+        if row is None:
+            raise NotFound("provider not found")
+        return row
+
+    def _require_personal_provider(
+        self, db: Session, principal: Principal
+    ) -> IdentityService:
+        if principal.kind != HUMAN_ACTOR_KIND:
+            raise PermissionDenied("personal providers require a signed-in person")
+        identity = IdentityService(db, self._settings)
+        identity.authorize(
+            principal, PERSONAL_PROVIDER_PERMISSION, resource="agent:providers"
+        )
+        return identity
+
+    def _can_manage_global(self, db: Session, principal: Principal) -> bool:
+        if principal.kind != HUMAN_ACTOR_KIND:
+            return False
+        identity = IdentityService(db, self._settings)
+        return "system.providers" in identity._persisted_permissions(principal)
+
+    def _seal_credential(self, value: str) -> str:
+        try:
+            return seal_credential(self._settings, value)
+        except CredentialUnavailable:
+            raise IntegrationUnavailable("credential storage is not configured") from None
+
+    def _provider_credential(self, row: AgentProvider) -> str:
+        if row.api_key_ciphertext:
+            try:
+                return unseal_credential(self._settings, row.api_key_ciphertext)
+            except CredentialUnavailable:
+                raise IntegrationUnavailable("credential storage is not configured") from None
+            except CredentialInvalid:
+                raise IntegrationUnavailable(
+                    "the stored provider credential cannot be read"
+                ) from None
+        if row.scope == "personal":
+            raise IntegrationUnavailable("the provider credential is not configured")
+        return _KEYLESS_GLOBAL_CREDENTIAL
+
+    def _validate_provider_model(self, row: AgentProvider, model: str) -> str:
+        value = _label(model, limit=200)
+        if value is None or value not in self._provider_models(row):
+            raise ValidationFailed("the selected model is not configured on this provider")
+        return value
+
+    def _provider_selection(
+        self,
+        db: Session,
+        principal: Principal,
+        row: AgentProvider,
+        model: str,
+    ) -> ProviderModelSelection:
+        value = self._validate_provider_model(row, model)
+        if row.scope == "personal":
+            self._require_personal_provider(db, principal)
+        credential = self._provider_credential(row)
+        return ProviderModelSelection(
+            base_url=row.base_url,
+            model=value,
+            api_key=credential,
+            allow_private=row.scope != "personal",
+        )
+
     def _admin_instance(self, row: AgentInstance) -> dict[str, Any]:
         return {
             "id": row.id,
@@ -488,7 +680,7 @@ class AgentIntegrationService:
 
     def _public_instance(
         self,
-        row: AgentInstance,
+        row: AgentInstance | InstanceSnapshot,
         *,
         models: list[dict[str, Any]],
         version: str | None,
@@ -534,13 +726,24 @@ class AgentIntegrationService:
                 f"the {row.engine} engine adapter is not available"
             ) from None
 
-    def _redact(self, value: str, row: InstanceSnapshot) -> str:
+    def _redact(
+        self, value: str, row: InstanceSnapshot, *, secret: str | None = None
+    ) -> str:
         text = value
         if row.base_url:
             text = text.replace(row.base_url, _REDACTED)
-        secret = os.environ.get(row.secret_ref) if row.secret_ref else None
+        engine_secret = os.environ.get(row.secret_ref) if row.secret_ref else None
+        if engine_secret:
+            text = text.replace(engine_secret, _REDACTED)
         if secret:
             text = text.replace(secret, _REDACTED)
+        master = (
+            self._settings.ai_credential_key.get_secret_value()
+            if self._settings.ai_credential_key
+            else None
+        )
+        if master:
+            text = text.replace(master, _REDACTED)
         text = re.sub(r"Bearer\s+\S+", "Bearer " + _REDACTED, text)
         text = re.sub(
             r"(?i)\b(token|secret|password|api[_-]?key)\b\s*[:=]?\s+[^\s,;]+",
@@ -654,6 +857,13 @@ class AgentIntegrationService:
                 row = db.get(AgentInstance, candidate.instance_id)
                 if row is not None and row.enabled:
                     return candidate.instance_id, candidate.model
+                provider = db.get(AgentProvider, candidate.instance_id)
+                if (
+                    provider is not None
+                    and provider.enabled
+                    and self._provider_visible(provider, principal)
+                ):
+                    return candidate.instance_id, candidate.model
         return None, None
 
     def _budget(self, db: Session, principal: Principal) -> dict[str, Any]:
@@ -684,6 +894,17 @@ class AgentIntegrationService:
             self._ensure_builtin(db)
             rows = db.execute(select(AgentInstance).order_by(AgentInstance.created_at)).scalars()
             snapshots = [self._snapshot(row) for row in rows]
+            provider_rows = [
+                row
+                for row in db.execute(
+                    select(AgentProvider).order_by(AgentProvider.created_at)
+                ).scalars()
+                if self._provider_visible(row, principal)
+            ]
+            provider_snapshots = [
+                (self._provider_snapshot(row), self._provider_models(row))
+                for row in provider_rows
+            ]
             preference = self._effective_preference(db, principal)
             budget = self._budget(db, principal)
         instances: list[dict[str, Any]] = []
@@ -709,6 +930,35 @@ class AgentIntegrationService:
                     error=info.get("error"),
                 )
             )
+        for snapshot, models in provider_snapshots:
+            if not snapshot.enabled:
+                instances.append(
+                    self._public_instance(
+                        snapshot,
+                        models=[],
+                        version=None,
+                        capabilities={},
+                        error=None,
+                    )
+                )
+                continue
+            instances.append(
+                self._public_instance(
+                    snapshot,
+                    models=[
+                        {
+                            "id": model,
+                            "name": model,
+                            "provider": "openai-compatible",
+                            "free": None,
+                        }
+                        for model in models
+                    ],
+                    version=_package_version("pydantic-ai-slim"),
+                    capabilities=self._session_capabilities(PYDANTIC_ENGINE, None),
+                    error=None,
+                )
+            )
         return {
             "instances": instances,
             "preference": {"instanceId": preference[0], "model": preference[1]},
@@ -728,17 +978,27 @@ class AgentIntegrationService:
         with self._session() as db:
             self._ensure_builtin(db)
             row = db.get(AgentInstance, instance_id)
+            provider = None
             if row is None:
-                raise ValidationFailed("unknown instance")
-            if not row.enabled:
-                raise ValidationFailed("the selected instance is disabled")
-            snapshot = self._snapshot(row)
+                provider = db.get(AgentProvider, instance_id)
+                if provider is None or not self._provider_visible(provider, principal):
+                    raise ValidationFailed("unknown instance")
+                if not provider.enabled:
+                    raise ValidationFailed("the selected instance is disabled")
+                snapshot = self._provider_snapshot(provider)
+            else:
+                if not row.enabled:
+                    raise ValidationFailed("the selected instance is disabled")
+                snapshot = self._snapshot(row)
         value: str | None = None
         if model is not None:
             if snapshot.engine == PYDANTIC_ENGINE:
-                if model != self._settings.agent_model:
+                if provider is not None:
+                    value = self._validate_provider_model(provider, model)
+                elif model != self._settings.agent_model:
                     raise ValidationFailed("the built-in instance uses the server-configured model")
-                value = str(model)
+                else:
+                    value = str(model)
             else:
                 value = await self._validate_model(snapshot, model)
         with self._session() as db:
@@ -751,6 +1011,101 @@ class AgentIntegrationService:
             preference.updated_at = utcnow()
             db.commit()
         return {"instanceId": instance_id, "model": value}
+
+    # --------------------------------------------------------------- providers
+    def providers(self, principal: Principal) -> dict[str, Any]:
+        self._require_human(principal)
+        with self._session() as db:
+            rows = list(
+                db.execute(select(AgentProvider).order_by(AgentProvider.created_at)).scalars()
+            )
+            visible = [row for row in rows if self._provider_visible(row, principal)]
+            can_manage_global = self._can_manage_global(db, principal)
+            identity = IdentityService(db, self._settings)
+            can_manage_personal = (
+                principal.kind == HUMAN_ACTOR_KIND
+                and PERSONAL_PROVIDER_PERMISSION in identity._persisted_permissions(principal)
+            )
+        visible.sort(key=lambda row: (row.scope != "global", row.created_at))
+        return {
+            "items": [self._provider_dto(row) for row in visible],
+            "canManageGlobal": can_manage_global,
+            "canManagePersonal": can_manage_personal,
+            "credentialStorageAvailable": credential_storage_available(self._settings),
+        }
+
+    def create_provider(
+        self, principal: Principal, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require_human(principal)
+        scope = payload.get("scope")
+        if scope not in PROVIDER_SCOPES:
+            raise ValidationFailed("scope must be global or personal")
+        api_key = _provider_api_key(payload)
+        with self._session() as db:
+            self._ensure_builtin(db)
+            if scope == "global":
+                self._require_admin(db, principal, "agent:providers", human_only=True)
+            else:
+                self._require_personal_provider(db, principal)
+            values = _provider_values(payload, scope=scope)
+            if "name" not in values:
+                raise ValidationFailed("provider name is required")
+            if "base_url" not in values:
+                raise ValidationFailed("provider base URL is required")
+            values.setdefault("models", [])
+            values.setdefault("enabled", True)
+            row = AgentProvider(
+                id=str(uuid4()),
+                scope=scope,
+                owner_id=principal.actor_id if scope == "personal" else None,
+                api_key_ciphertext=self._seal_credential(api_key) if api_key else None,
+                **values,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+            return self._provider_dto(row)
+
+    def update_provider(
+        self, principal: Principal, provider_id: str, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        self._require_human(principal)
+        api_key = _provider_api_key(payload)
+        with self._session() as db:
+            row = self._provider_row(db, provider_id)
+            if row.scope == "personal":
+                if row.owner_id != principal.actor_id:
+                    raise NotFound("provider not found")
+                self._require_personal_provider(db, principal)
+            else:
+                self._require_admin(db, principal, "agent:providers", human_only=True)
+            requested_scope = payload.get("scope")
+            if requested_scope is not None and requested_scope != row.scope:
+                raise ValidationFailed("provider scope cannot be changed")
+            values = _provider_values(payload, scope=row.scope)
+            for name, value in values.items():
+                setattr(row, name, value)
+            if api_key:
+                row.api_key_ciphertext = self._seal_credential(api_key)
+            row.updated_at = utcnow()
+            db.commit()
+            db.refresh(row)
+            return self._provider_dto(row)
+
+    def delete_provider(self, principal: Principal, provider_id: str) -> dict[str, Any]:
+        self._require_human(principal)
+        with self._session() as db:
+            row = self._provider_row(db, provider_id)
+            if row.scope == "personal":
+                if row.owner_id != principal.actor_id:
+                    raise NotFound("provider not found")
+                self._require_personal_provider(db, principal)
+            else:
+                self._require_admin(db, principal, "agent:providers", human_only=True)
+            db.delete(row)
+            db.commit()
+        return {"id": provider_id, "deleted": True}
 
     # -------------------------------------------------------------- admin: instances
     def admin_snapshot(self, principal: Principal) -> dict[str, Any]:
@@ -1139,22 +1494,28 @@ class AgentIntegrationService:
 
         with self._session() as db:
             self._ensure_builtin(db)
-            row = self._instance(db, instance_id)
-            if not row.enabled:
+            snapshot, provider = self._resolve_instance(db, principal, instance_id)
+            if not snapshot.enabled:
                 raise ValidationFailed("the selected instance is disabled")
-            identity = IdentityService(db, self._settings)
-            if row.engine != PYDANTIC_ENGINE:
-                self._assert_binding_ceiling(db, identity, principal, row)
-                self._require_verified_profile(db, row)
-            snapshot = self._snapshot(row)
-        capabilities: dict[str, bool] = self._session_capabilities(row.engine, None)
+            if snapshot.engine != PYDANTIC_ENGINE:
+                instance = self._instance(db, instance_id)
+                identity = IdentityService(db, self._settings)
+                self._assert_binding_ceiling(db, identity, principal, instance)
+                self._require_verified_profile(db, instance)
+            elif provider is not None:
+                self._validate_provider_model(provider, model)
+                if provider.scope == "personal":
+                    self._require_personal_provider(db, principal)
+            else:
+                if not self._runtime_configured():
+                    raise IntegrationUnavailable("agent model is not configured")
+                if model != self._settings.agent_model:
+                    raise ValidationFailed(
+                        "the built-in instance uses the server-configured model"
+                    )
+        capabilities: dict[str, bool] = self._session_capabilities(snapshot.engine, None)
         external_session_id: str | None = None
-        if snapshot.engine == PYDANTIC_ENGINE:
-            if not self._runtime_configured():
-                raise IntegrationUnavailable("agent model is not configured")
-            if model != self._settings.agent_model:
-                raise ValidationFailed("the built-in instance uses the server-configured model")
-        else:
+        if snapshot.engine != PYDANTIC_ENGINE:
             info = await self._discover(snapshot)
             available = {item["id"] for item in info["models"]}
             if model not in available:
@@ -1176,9 +1537,13 @@ class AgentIntegrationService:
                 raise IntegrationUnavailable("the engine did not create a session")
 
         with self._session() as db:
-            current = db.get(AgentInstance, instance_id)
-            if current is None or not current.enabled:
+            current, current_provider = self._resolve_instance(db, principal, instance_id)
+            if not current.enabled:
                 raise Conflict("the selected instance changed while starting the session")
+            if provider is not None and current_provider is None:
+                raise Conflict("the selected provider changed while starting the session")
+            if provider is not None and provider.scope == "personal":
+                self._require_personal_provider(db, principal)
             row = AgentSession(
                 id=str(uuid4()),
                 owner_id=principal.actor_id,
@@ -1205,34 +1570,110 @@ class AgentIntegrationService:
             return bool(getattr(self._runtime, "configured", True))
         return bool(self._settings.agent_model)
 
-    async def update_session_model(
-        self, principal: Principal, session_id: str, model: Any
+    async def update_session(
+        self, principal: Principal, session_id: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         self._require_human(principal)
-        value = _label(model, limit=200)
-        if value is None:
-            raise ValidationFailed("model is required")
+        requested_model = _label(payload.get("model"), limit=200)
+        instance_id = _label(payload.get("instanceId"), limit=36)
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
                 raise Conflict("a response is already running in this session")
-            instance = self._instance(db, row.instance_id)
-            snapshot = self._snapshot(instance)
-        capabilities = self._session_capabilities(row.engine, None)
-        if row.engine != PYDANTIC_ENGINE and not capabilities.get("model_switch", True):
-            raise Conflict("the selected engine does not support changing models")
-        if snapshot.engine == PYDANTIC_ENGINE:
-            if value != self._settings.agent_model:
-                raise ValidationFailed("the built-in instance uses the server-configured model")
-        else:
-            value = await self._validate_model(snapshot, value)
+            original_updated_at = row.updated_at
+            current_model = row.model
+            target_id = instance_id or row.instance_id
+            snapshot, provider = self._resolve_instance(db, principal, target_id)
+            if not snapshot.enabled:
+                raise ValidationFailed("the selected instance is disabled")
+            if snapshot.engine != PYDANTIC_ENGINE:
+                instance = self._instance(db, target_id)
+                identity = IdentityService(db, self._settings)
+                self._assert_binding_ceiling(db, identity, principal, instance)
+                self._require_verified_profile(db, instance)
+                value = requested_model
+            elif provider is not None:
+                configured = self._provider_models(provider)
+                if requested_model is not None:
+                    value = self._validate_provider_model(provider, requested_model)
+                elif not configured:
+                    raise ValidationFailed("the selected provider has no configured models")
+                else:
+                    value = current_model if current_model in configured else configured[0]
+                if provider.scope == "personal":
+                    self._require_personal_provider(db, principal)
+            else:
+                if requested_model is not None and requested_model != self._settings.agent_model:
+                    raise ValidationFailed(
+                        "the built-in instance uses the server-configured model"
+                    )
+                value = self._settings.agent_model
+                if value is None:
+                    raise IntegrationUnavailable("agent model is not configured")
+        capabilities = self._session_capabilities(snapshot.engine, None)
+        if snapshot.engine != PYDANTIC_ENGINE:
+            if not capabilities.get("model_switch", True):
+                raise Conflict("the selected engine does not support changing models")
+            info = await self._discover(snapshot)
+            model_ids = [item["id"] for item in info["models"]]
+            available = set(model_ids)
+            if requested_model is not None:
+                value = requested_model
+            elif snapshot.default_model in available:
+                value = snapshot.default_model
+            elif current_model in available:
+                value = current_model
+            elif model_ids:
+                value = model_ids[0]
+            else:
+                raise ValidationFailed("the selected instance exposes no models")
+            if value not in available:
+                raise ValidationFailed("the selected model is not available on this instance")
+            capabilities = self._session_capabilities(snapshot.engine, info)
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
                 raise Conflict("a response is already running in this session")
-            row.model = value
-            row.updated_at = utcnow()
+            target, provider = self._resolve_instance(db, principal, target_id)
+            if not target.enabled:
+                raise Conflict("the selected instance changed while switching engines")
+            if target.engine != PYDANTIC_ENGINE:
+                instance = self._instance(db, target_id)
+                identity = IdentityService(db, self._settings)
+                self._assert_binding_ceiling(db, identity, principal, instance)
+                self._require_verified_profile(db, instance)
+            elif provider is not None:
+                self._validate_provider_model(provider, value)
+                if provider.scope == "personal":
+                    self._require_personal_provider(db, principal)
+            elif value != self._settings.agent_model:
+                raise Conflict("the built-in instance uses the server-configured model")
+            values: dict[str, Any] = {"model": value, "updated_at": utcnow()}
+            if target_id != row.instance_id:
+                values.update(
+                    instance_id=target_id,
+                    engine=target.engine,
+                    external_session_id=None,
+                    capabilities=capabilities,
+                )
+            claimed = db.execute(
+                update(AgentSession)
+                .where(
+                    AgentSession.id == session_id,
+                    AgentSession.owner_id == principal.actor_id,
+                    AgentSession.status == "idle",
+                    AgentSession.instance_id == row.instance_id,
+                    AgentSession.model == row.model,
+                    AgentSession.updated_at == original_updated_at,
+                )
+                .values(**values)
+                .execution_options(synchronize_session=False)
+            )
             db.commit()
+            if claimed.rowcount != 1:
+                raise Conflict("the session changed while switching engines")
+            row = self._owned(db, principal, session_id)
+            db.refresh(row)
             return self._session_dto(row)
 
     async def cancel_session(self, principal: Principal, session_id: str) -> dict[str, Any]:
@@ -1300,26 +1741,50 @@ class AgentIntegrationService:
         now = utcnow()
         with self._session() as db:
             row = self._owned(db, principal, session_id)
-            instance = self._instance(db, row.instance_id)
+            instance, provider = self._resolve_instance(db, principal, row.instance_id)
             if not instance.enabled:
                 raise Conflict("the selected instance is disabled")
-            identity = IdentityService(db, self._settings)
-            if row.engine != PYDANTIC_ENGINE:
-                self._assert_binding_ceiling(db, identity, principal, instance)
-                self._require_verified_profile(db, instance)
+            provider_selection: ProviderModelSelection | None = None
+            if instance.engine != PYDANTIC_ENGINE:
+                identity = IdentityService(db, self._settings)
+                instance_row = self._instance(db, row.instance_id)
+                self._assert_binding_ceiling(db, identity, principal, instance_row)
+                self._require_verified_profile(db, instance_row)
+            elif provider is not None:
+                provider_selection = self._provider_selection(
+                    db, principal, provider, row.model
+                )
             elif not self._runtime_configured():
                 raise IntegrationUnavailable("agent model is not configured")
             self._check_budget(db, principal)
             self._recover_stale(db, now)
             if row.status == "running":
                 raise Conflict("a response is already running in this session")
+            original_updated_at = row.updated_at
             messages = list(row.messages or [])
             messages.append({"role": "user", "content": message})
-            row.messages = messages
-            row.status = "running"
-            row.cancel_requested = False
-            row.asset_id = asset_id
-            row.updated_at = now
+            claimed = db.execute(
+                update(AgentSession)
+                .where(
+                    AgentSession.id == session_id,
+                    AgentSession.owner_id == principal.actor_id,
+                    AgentSession.status == "idle",
+                    AgentSession.instance_id == row.instance_id,
+                    AgentSession.model == row.model,
+                    AgentSession.updated_at == original_updated_at,
+                )
+                .values(
+                    messages=messages,
+                    status="running",
+                    cancel_requested=False,
+                    asset_id=asset_id,
+                    updated_at=now,
+                )
+                .execution_options(synchronize_session=False)
+            )
+            if claimed.rowcount != 1:
+                db.rollback()
+                raise Conflict("the session changed while starting the turn")
             db.add(
                 AgentRun(
                     id=str(uuid4()),
@@ -1341,7 +1806,7 @@ class AgentIntegrationService:
                 capabilities=dict(row.capabilities or {}),
                 asset_id=asset_id,
             )
-            instance_snapshot = self._snapshot(instance)
+            instance_snapshot = instance
         turn = Turn(
             service=self,
             principal=principal,
@@ -1350,6 +1815,7 @@ class AgentIntegrationService:
             message=message,
             asset_id=asset_id,
             external_session_id=snapshot.external_session_id,
+            provider_selection=provider_selection,
         )
         with self._active_lock:
             self._active[session_id] = turn
@@ -1394,7 +1860,7 @@ class AgentIntegrationService:
             await self._cancel_engine_quietly(turn)
             raise
         except Exception as exc:
-            error_seen = self._exception_event(exc, turn.instance)
+            error_seen = self._exception_event(exc, turn)
             yield error_seen
         finally:
             runtime_usage = getattr(turn, "_usage", None)
@@ -1407,17 +1873,25 @@ class AgentIntegrationService:
                         await self._cancel_engine_quietly(turn)
                 except Exception:
                     pass
-            self._finish(
-                turn,
-                text=text,
-                actions=actions,
-                results=results,
-                approval=approval,
-                measured=measured,
-                reported=reported,
-                cancelled=cancelled or not completed,
-                failed=error_seen is not None,
-            )
+            try:
+                self._finish(
+                    turn,
+                    text=text,
+                    actions=actions,
+                    results=results,
+                    approval=approval,
+                    measured=measured,
+                    reported=reported,
+                    cancelled=cancelled or not completed,
+                    failed=error_seen is not None,
+                )
+            finally:
+                owned_runtime = getattr(turn, "_owned_runtime", None)
+                if owned_runtime is not None:
+                    try:
+                        await owned_runtime.aclose()
+                    except Exception:
+                        logger.warning("agent provider client could not be closed")
         done: dict[str, Any] = {"type": "done", "cancelled": cancelled}
         if turn.session.engine == PYDANTIC_ENGINE:
             reply = getattr(turn, "_reply", None)
@@ -1444,6 +1918,7 @@ class AgentIntegrationService:
             from itsm.agents.runtime import AgentRuntime
 
             runtime = AgentRuntime(self._settings, self._session_factory)
+            turn._owned_runtime = runtime  # type: ignore[attr-defined]
         history = [
             ConversationTurn(role=item["role"], content=item["content"][:8000])
             for item in turn.session.messages[:-1]
@@ -1461,19 +1936,28 @@ class AgentIntegrationService:
             remaining = self._budget_remaining(db, turn.principal)
         usage = AgentUsage()
         if hasattr(runtime, "chat_with_usage"):
+            options: dict[str, Any] = {
+                "credential_digest": None,
+                "usage": usage,
+                "token_limit": remaining,
+            }
+            if turn.provider_selection is not None:
+                options["provider_selection"] = turn.provider_selection
             try:
                 reply, usage = await asyncio.to_thread(
                     runtime.chat_with_usage,
                     turn.principal,
                     request,
-                    credential_digest=None,
-                    usage=usage,
-                    token_limit=remaining,
+                    **options,
                 )
             except BaseException:
                 turn._usage = usage  # type: ignore[attr-defined]
                 raise
         else:
+            if turn.provider_selection is not None:
+                raise IntegrationUnavailable(
+                    "the configured runtime cannot execute provider selections"
+                )
             reply = await asyncio.to_thread(runtime.chat, turn.principal, request)
         turn._usage = usage  # type: ignore[attr-defined]
         turn._reply = reply  # type: ignore[attr-defined]
@@ -1610,7 +2094,9 @@ class AgentIntegrationService:
             message = _clean(raw.get("message"), 1000)
             if message is None:
                 message = "the engine reported an error"
-            message = self._redact(message, turn.instance)
+            message = self._redact(
+                message, turn.instance, secret=self._turn_secret(turn)
+            )
             retryable = raw.get("retryable")
             return {
                 "type": "error",
@@ -1626,9 +2112,16 @@ class AgentIntegrationService:
             }
         return None
 
-    def _exception_event(self, exc: BaseException, instance: InstanceSnapshot) -> dict[str, Any]:
+    @staticmethod
+    def _turn_secret(turn: Turn) -> str | None:
+        selection = turn.provider_selection
+        return selection.api_key if selection is not None else None
+
+    def _exception_event(self, exc: BaseException, turn: Turn) -> dict[str, Any]:
         import asyncio as _asyncio
 
+        instance = turn.instance
+        secret = self._turn_secret(turn)
         if isinstance(exc, AgentUnavailable):
             return {
                 "type": "error",
@@ -1640,7 +2133,7 @@ class AgentIntegrationService:
             return {
                 "type": "error",
                 "code": "unavailable",
-                "message": self._redact(str(exc), instance),
+                "message": self._redact(str(exc), instance, secret=secret),
                 "retryable": True,
             }
         public = _engine_error(exc)
@@ -1648,7 +2141,7 @@ class AgentIntegrationService:
             return {
                 "type": "error",
                 "code": public[0],
-                "message": self._redact(public[1], instance),
+                "message": self._redact(public[1], instance, secret=secret),
                 "retryable": public[2],
             }
         if exc.__class__.__name__ == "UsageLimitExceeded":
@@ -2353,24 +2846,28 @@ class AgentIntegrationService:
                                 deleted.status_code,
                             )
                 grants_response = await client.get("/api/permission/saved")
+                skills_response = await client.get("/api/skill", params=params)
         except Exception as exc:
             logger.warning("OpenCode runtime inspection failed: %s", type(exc).__name__)
             return None
         if any(
             response.status_code != 200
-            for response in (config_response, agent_response, grants_response)
+            for response in (config_response, agent_response, grants_response, skills_response)
         ):
             return None
         try:
             entries = config_response.json()
             agent_payload = agent_response.json()
             grants = grants_response.json()
+            skill_payload = skills_response.json()
         except ValueError:
             return None
-        effective = _effective_config(entries)
-        if effective is None:
+        binding = _config_profile_entries(entries, target.path)
+        if binding is None:
             return None
-        if not _config_selects_directory(entries, target.path):
+        directory_entry, document_entries = binding
+        effective = _effective_config(document_entries)
+        if effective is None:
             return None
         server = (effective.get("mcp") or {}).get("servers", {}).get("itsm")
         if not isinstance(server, Mapping) or server.get("type") != "remote":
@@ -2389,18 +2886,14 @@ class AgentIntegrationService:
             expected_headers.add(f"Bearer {mcp_secret}")
         if authorization not in expected_headers:
             return None
-        configured_skills = {
-            str(item) for item in effective.get("skills") or [] if isinstance(item, str)
-        }
-        missing = [name for name in skills if name not in configured_skills]
-        if missing:
-            return None
         if effective.get("default_agent") != "itsm":
             return None
         agent_info = agent_payload.get("data") if isinstance(agent_payload, Mapping) else None
         if not isinstance(agent_info, Mapping) or agent_info.get("id") != "itsm":
             return None
         if agent_info.get("mode") not in {"primary", "all"}:
+            return None
+        if agent_info.get("hidden") is not False:
             return None
         permissions = agent_info.get("permissions")
         if not _restrictive_permissions(permissions, skills):
@@ -2410,6 +2903,47 @@ class AgentIntegrationService:
             return None
         if any(_broad_grant(item, skills) for item in grant_items):
             return None
+        if not isinstance(skill_payload, Mapping):
+            return None
+        if set(skill_payload) != {"location", "data"}:
+            return None
+        skill_location = skill_payload.get("location")
+        if not isinstance(skill_location, Mapping) or os.path.realpath(
+            str(skill_location.get("directory") or "")
+        ) != os.path.realpath(target.path):
+            return None
+        skill_items = skill_payload.get("data")
+        if not isinstance(skill_items, list):
+            return None
+        projected_skills: list[dict[str, str]] = []
+        seen_skills: set[str] = set()
+        for item in skill_items:
+            if not isinstance(item, Mapping):
+                return None
+            skill_id = item.get("id")
+            skill_name = item.get("name")
+            skill_path = item.get("path")
+            if (
+                not isinstance(skill_id, str)
+                or not skill_id
+                or not isinstance(skill_name, str)
+                or not skill_name
+                or not isinstance(skill_path, str)
+                or not os.path.isabs(skill_path)
+            ):
+                return None
+            if skill_id in seen_skills:
+                return None
+            seen_skills.add(skill_id)
+            if skill_id in skills and os.path.realpath(skill_path) != os.path.realpath(
+                os.path.join(target.path, ".opencode", "skills", skill_id, "SKILL.md")
+            ):
+                return None
+            projected_skills.append(
+                {"id": skill_id, "name": skill_name, "path": skill_path}
+            )
+        if not set(skills).issubset(seen_skills):
+            return None
         discovered = await self._discover(instance)
         observed_version = discovered.get("version")
         if target.version and observed_version and target.version != observed_version:
@@ -2418,7 +2952,7 @@ class AgentIntegrationService:
             {
                 "name": "inspection.config",
                 "status": "pass",
-                "detail": "effective mcp/skills/default_agent",
+                "detail": "selected Config.Entry sources and effective mcp/default_agent",
             },
             {
                 "name": "inspection.agent",
@@ -2431,28 +2965,28 @@ class AgentIntegrationService:
                 "detail": "no broad saved permission grants",
             },
             {
+                "name": "inspection.skills",
+                "status": "pass",
+                "detail": "selected profile skill inventory inspected",
+            },
+            {
                 "name": "inspection.version",
                 "status": "pass",
                 "detail": observed_version or "unreported",
             },
         ]
-        projected_config: list[dict[str, Any]] = []
-        for entry in entries:
-            if not isinstance(entry, Mapping):
-                continue
-            if entry.get("type") == "directory" and isinstance(entry.get("path"), str):
-                projected_config.append({"type": "directory", "path": entry["path"]})
-            elif entry.get("type") == "document":
-                info = entry.get("info")
-                projected: dict[str, Any] = {"type": "document"}
-                if isinstance(entry.get("path"), str):
-                    projected["path"] = entry["path"]
-                if isinstance(info, Mapping) and "default_agent" in info:
-                    projected["info"] = {"default_agent": info["default_agent"]}
-                projected_config.append(projected)
+        projected_config: list[dict[str, Any]] = [
+            {"type": "directory", "path": directory_entry["path"]},
+            {
+                "type": "document",
+                "path": document_entries[0]["path"],
+                "info": {"default_agent": effective.get("default_agent")},
+            },
+        ]
         projected_agent = {
             "id": agent_info.get("id"),
             "mode": agent_info.get("mode"),
+            "hidden": agent_info.get("hidden"),
             "permissions": [
                 {
                     "action": rule.get("action"),
@@ -2480,6 +3014,7 @@ class AgentIntegrationService:
             "location": {"directory": target.path},
             "agent": projected_agent,
             "config": projected_config,
+            "skills": {"location": {"directory": target.path}, "data": projected_skills},
             "savedPermissions": projected_grants,
             "checks": checks,
         }
@@ -2731,26 +3266,81 @@ def _effective_config(entries: Any) -> dict[str, Any] | None:
     return effective or None
 
 
-def _config_selects_directory(entries: Any, directory: str) -> bool:
-    """Require the inspected config to include the exact selected workspace root."""
-    if not isinstance(entries, list) or not isinstance(directory, str) or not directory:
-        return False
-    expected = os.path.realpath(directory)
+def _config_profile_entries(
+    entries: Any, directory: str
+) -> tuple[Mapping[str, Any], list[Mapping[str, Any]]] | None:
+    """Require actual Config.Entry sources bound to one selected profile.
+
+    OpenCode 2.1.2 reports the selected ``<workspace>/.opencode`` directory and
+    one ``<workspace>/opencode.json(c)`` document.  System, global, ancestor,
+    Claude, or content sources would broaden the inspected authority.
+    """
+    if not isinstance(entries, list) or not entries or not isinstance(directory, str):
+        return None
+    expected_directory = os.path.realpath(os.path.join(directory, ".opencode"))
+    expected_documents = {
+        os.path.realpath(os.path.join(directory, "opencode.json")),
+        os.path.realpath(os.path.join(directory, "opencode.jsonc")),
+    }
+    directory_entries: list[Mapping[str, Any]] = []
+    document_entries: list[Mapping[str, Any]] = []
     for entry in entries:
-        if (
-            isinstance(entry, Mapping)
-            and entry.get("type") == "directory"
-            and isinstance(entry.get("path"), str)
-            and os.path.realpath(entry["path"]) == expected
-        ):
-            return True
-    return False
+        if not isinstance(entry, Mapping) or set(entry) - {"type", "path", "info"}:
+            return None
+        path = entry.get("path")
+        if not isinstance(path, str) or not os.path.isabs(path):
+            return None
+        if entry.get("type") == "directory":
+            directory_entries.append(entry)
+        elif entry.get("type") == "document":
+            if not isinstance(entry.get("info"), Mapping):
+                return None
+            document_entries.append(entry)
+        else:
+            return None
+    if len(directory_entries) != 1:
+        return None
+    if os.path.realpath(str(directory_entries[0]["path"])) != expected_directory:
+        return None
+    if len(document_entries) != 1:
+        return None
+    if os.path.realpath(str(document_entries[0]["path"])) not in expected_documents:
+        return None
+    return directory_entries[0], document_entries
 
 
 def _restrictive_permissions(permissions: Any, skills: list[str]) -> bool:
-    """Require deny-all then only ITSM tools and exactly the selected skills."""
+    """Require a final deny-all and only approved overrides after it.
+
+    OpenCode evaluates an ordered rule list with last-match-wins semantics and
+    appends agent rules after lower-priority builtins. Rules before the last
+    exact ``*``/``*`` deny are therefore fully shadowed for every request, so
+    they cannot widen the effective policy. Only the suffix beginning at that
+    deny is policy-relevant and must satisfy the strict whitelist below.
+    """
     if not isinstance(permissions, list) or not permissions:
         return False
+    boundary: int | None = None
+    for index, rule in enumerate(permissions):
+        if not isinstance(rule, Mapping):
+            return False
+        action = rule.get("action")
+        resource = rule.get("resource")
+        if not isinstance(action, str) or not action:
+            return False
+        if not isinstance(resource, str) or not resource:
+            return False
+        if rule.get("effect") not in {"allow", "ask", "deny"}:
+            return False
+        if action == "*" and resource == "*" and rule.get("effect") == "deny":
+            boundary = index
+    if boundary is None:
+        return False
+    return _strict_permission_suffix(permissions[boundary:], skills)
+
+
+def _strict_permission_suffix(permissions: list[Any], skills: list[str]) -> bool:
+    """Validate only the rules that can still win after the final deny-all."""
     deny_all = False
     itsm_allow = False
     allowed_skills: set[str] = set()
@@ -2758,10 +3348,12 @@ def _restrictive_permissions(permissions: Any, skills: list[str]) -> bool:
     for rule in permissions:
         if not isinstance(rule, Mapping):
             return False
-        action = str(rule.get("action") or "")
-        resource = str(rule.get("resource") or "*")
+        action = rule.get("action")
+        resource = rule.get("resource")
         effect = rule.get("effect")
-        if not action:
+        if not isinstance(action, str) or not action:
+            return False
+        if not isinstance(resource, str) or not resource:
             return False
         if effect == "deny":
             if action == "*" and resource == "*":

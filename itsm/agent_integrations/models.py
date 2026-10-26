@@ -168,6 +168,31 @@ class AgentModuleState(InventoryBase):
     )
 
 
+class AgentProvider(InventoryBase):
+    """Global or personal OpenAI-compatible provider selectable as a Pydantic engine.
+
+    The record never stores raw credentials: ``api_key_ciphertext`` is a Fernet
+    token sealed with the externally supplied process key.
+    """
+
+    __tablename__ = "agent_providers"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    name: Mapped[str] = mapped_column(String(120), nullable=False)
+    scope: Mapped[str] = mapped_column(String(16), nullable=False)
+    owner_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    base_url: Mapped[str] = mapped_column(String(500), nullable=False)
+    models: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
+    api_key_ciphertext: Mapped[str | None] = mapped_column(String(4096), nullable=True)
+    enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+
 __all__ = [
     "AgentDailyUsage",
     "AgentInstallation",
@@ -175,6 +200,7 @@ __all__ = [
     "AgentInstance",
     "AgentModuleState",
     "AgentPreference",
+    "AgentProvider",
     "AgentRun",
     "AgentSession",
 ]

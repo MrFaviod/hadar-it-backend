@@ -7,7 +7,7 @@ from typing import Any, Literal
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from itsm.agent_integrations.service import (
     AgentIntegrationService,
@@ -109,10 +109,28 @@ class SessionMessagePayload(BaseModel):
     assetId: str | None = Field(default=None, max_length=36)
 
 
-class ModelPayload(BaseModel):
+class SessionUpdatePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    model: str = Field(min_length=1, max_length=200)
+    model: str | None = Field(default=None, min_length=1, max_length=200)
+    instanceId: str | None = Field(default=None, min_length=1, max_length=36)
+
+    @model_validator(mode="after")
+    def _require_change(self) -> SessionUpdatePayload:
+        if self.model is None and self.instanceId is None:
+            raise ValueError("model or instanceId is required")
+        return self
+
+
+class ProviderPayload(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    scope: Literal["global", "personal"] | None = None
+    name: str | None = Field(default=None, max_length=120)
+    baseUrl: str | None = Field(default=None, max_length=2048)
+    models: list[str] | None = Field(default=None, max_length=50)
+    apiKey: SecretStr | None = Field(default=None, max_length=2048)
+    enabled: bool | None = None
 
 
 def _service(request: Request) -> AgentIntegrationService:
@@ -165,12 +183,12 @@ def create_agent_integrations_router() -> APIRouter:
     @router.patch("/agent/sessions/{session_id}")
     async def update_session(
         session_id: str,
-        payload: ModelPayload,
+        payload: SessionUpdatePayload,
         request: Request,
         context: MutationDependency,
     ) -> dict[str, Any]:
-        return await _service(request).update_session_model(
-            context.principal, session_id, payload.model
+        return await _service(request).update_session(
+            context.principal, session_id, payload.model_dump(exclude_unset=True)
         )
 
     @router.post("/agent/sessions/{session_id}/messages")
@@ -198,6 +216,38 @@ def create_agent_integrations_router() -> APIRouter:
         session_id: str, request: Request, context: MutationDependency
     ) -> dict[str, Any]:
         return await _service(request).cancel_session(context.principal, session_id)
+
+    # ---------------------------------------------------------------- providers
+    @router.get("/agent/providers")
+    def list_providers(request: Request, context: AuthDependency) -> dict[str, Any]:
+        return _service(request).providers(context.principal)
+
+    @router.post("/agent/providers", status_code=201)
+    def create_provider(
+        payload: ProviderPayload,
+        request: Request,
+        context: MutationDependency,
+    ) -> dict[str, Any]:
+        return _service(request).create_provider(
+            context.principal, payload.model_dump(exclude_unset=True)
+        )
+
+    @router.patch("/agent/providers/{provider_id}")
+    def update_provider(
+        provider_id: str,
+        payload: ProviderPayload,
+        request: Request,
+        context: MutationDependency,
+    ) -> dict[str, Any]:
+        return _service(request).update_provider(
+            context.principal, provider_id, payload.model_dump(exclude_unset=True)
+        )
+
+    @router.delete("/agent/providers/{provider_id}")
+    def delete_provider(
+        provider_id: str, request: Request, context: MutationDependency
+    ) -> dict[str, Any]:
+        return _service(request).delete_provider(context.principal, provider_id)
 
     # -------------------------------------------------------------- admin surface
     @router.get("/agent/integrations")

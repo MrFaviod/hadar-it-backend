@@ -9,13 +9,21 @@ forge history metadata or choose a service source.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
-from typing import Any, Literal
+from typing import Any, Literal, cast
 
+from itsm.agent_integrations.providers import (
+    ProviderModelSelection,
+    build_provider_model,
+)
+from itsm.agent_integrations.providers import (
+    provider_http_client as build_provider_http_client,
+)
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
 from itsm.identity.service import (
@@ -1830,8 +1838,15 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
         )
 
 
-def resolve_model(settings: Settings, selection: Any = None) -> Model:
+def resolve_model(
+    settings: Settings,
+    selection: Any = None,
+    *,
+    http_client: Any = None,
+) -> Model:
     """Build the selected provider/model; credentials come from the environment."""
+    if isinstance(selection, ProviderModelSelection):
+        return cast(Model, build_provider_model(selection, http_client=http_client))
     if selection is not None:
         provider_name, model_name = selection.provider, selection.model
     else:
@@ -1863,6 +1878,7 @@ def _history(conversation: list[ConversationTurn]) -> list[ModelMessage]:
 class AgentRuntime:
     """Lazily built agent bound to one settings snapshot and session factory."""
 
+
     def __init__(
         self,
         settings: Settings,
@@ -1870,13 +1886,29 @@ class AgentRuntime:
         *,
         model: Model | None = None,
         system: Any = None,
+        provider_http_client: Any = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._model = model
         self._system = system
+        self._provider_http_client = provider_http_client
+        self._owns_provider_client = provider_http_client is None
         self._agent: Agent[AgentDeps, str] | None = None
         self._selection_key: tuple[str, str] | None = None
+
+    async def aclose(self) -> None:
+        """Close the provider transport this runtime created, if any."""
+        client = self._provider_http_client
+        self._agent = None
+        self._selection_key = None
+        if client is None or not self._owns_provider_client:
+            return
+        self._provider_http_client = None
+        self._owns_provider_client = False
+        close = getattr(client, "aclose", None)
+        if close is not None:
+            await close()
 
     def attach_system(self, system: Any) -> None:
         """Use the application's canonical system service for typed system tools."""
@@ -1901,18 +1933,7 @@ class AgentRuntime:
             logger.warning("provider selection could not be read: %s", type(exc).__name__)
             return None
 
-    def _build(self, selection: Any = None) -> Agent[AgentDeps, str]:
-        model = self._model
-        if model is None:
-            if selection is None:
-                raise AgentUnavailable()
-            try:
-                model = resolve_model(self._settings, selection)
-            except AgentUnavailable:
-                raise
-            except Exception as exc:  # provider construction must stay explicit
-                logger.warning("agent model could not be configured: %s", type(exc).__name__)
-                raise AgentUnavailable() from None
+    def _compose(self, model: Model) -> Agent[AgentDeps, str]:
         agent: Agent[AgentDeps, str] = Agent(
             model,
             deps_type=AgentDeps,
@@ -1924,7 +1945,62 @@ class AgentRuntime:
         _register_tools(agent)
         return agent
 
-    def _ensure(self) -> Agent[AgentDeps, str]:
+    def _build(
+        self,
+        selection: Any = None,
+        provider_selection: ProviderModelSelection | None = None,
+        *,
+        http_client: Any = None,
+    ) -> Agent[AgentDeps, str]:
+        model = self._model
+        if model is None:
+            if provider_selection is not None:
+                client = http_client or self._provider_http_client
+                if client is None:
+                    client = build_provider_http_client(
+                        allow_private=provider_selection.allow_private
+                    )
+                    self._provider_http_client = client
+                    self._owns_provider_client = True
+                try:
+                    model = resolve_model(
+                        self._settings,
+                        provider_selection,
+                        http_client=client,
+                    )
+                except AgentUnavailable:
+                    raise
+                except Exception as exc:  # provider construction must stay explicit
+                    logger.warning(
+                        "agent provider could not be configured: %s", type(exc).__name__
+                    )
+                    raise AgentUnavailable() from None
+            elif selection is None:
+                raise AgentUnavailable()
+            else:
+                try:
+                    model = resolve_model(self._settings, selection)
+                except AgentUnavailable:
+                    raise
+                except Exception as exc:  # provider construction must stay explicit
+                    logger.warning(
+                        "agent model could not be configured: %s", type(exc).__name__
+                    )
+                    raise AgentUnavailable() from None
+        return self._compose(model)
+
+    def _ensure(
+        self,
+        provider_selection: ProviderModelSelection | None = None,
+        *,
+        http_client: Any = None,
+    ) -> Agent[AgentDeps, str]:
+        if provider_selection is not None:
+            # Provider records can change between turns; never reuse a model
+            # built for a previous endpoint or credential.
+            return self._build(
+                provider_selection=provider_selection, http_client=http_client
+            )
         if self._model is not None:
             if self._agent is None:
                 self._agent = self._build()
@@ -1942,9 +2018,15 @@ class AgentRuntime:
         request: ChatRequest,
         *,
         credential_digest: str | None = None,
+        provider_selection: ProviderModelSelection | None = None,
     ) -> ChatReply:
         """Run one bounded turn; tool authorization happens per operation."""
-        reply, _ = self.chat_with_usage(principal, request, credential_digest=credential_digest)
+        reply, _ = self.chat_with_usage(
+            principal,
+            request,
+            credential_digest=credential_digest,
+            provider_selection=provider_selection,
+        )
         return reply
 
     def chat_with_usage(
@@ -1955,53 +2037,108 @@ class AgentRuntime:
         credential_digest: str | None = None,
         usage: AgentUsage | None = None,
         token_limit: int | None = None,
+        provider_selection: ProviderModelSelection | None = None,
     ) -> tuple[ChatReply, AgentUsage]:
         """Shared run that also returns real usage, including on failure."""
-        agent = self._ensure()
-        deps = AgentDeps(
-            settings=self._settings,
-            session_factory=self._session_factory,
-            principal=principal,
-            credential_digest=credential_digest,
-            system=self._system,
-        )
-        prompt = request.message
-        if request.assetId:
-            prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
-        tokens = usage if usage is not None else AgentUsage()
-        run_usage = RunUsage()
-        limits = UsageLimits(
-            request_limit=self._settings.agent_max_steps,
-            tool_calls_limit=self._settings.agent_max_steps * 4,
-        )
-        if token_limit is not None and token_limit > 0:
+        turn_client = None
+        if provider_selection is not None and self._provider_http_client is None:
+            # A guarded client is scoped to this turn: a global provider's
+            # unrestricted pool must never be reused for a personal one.
+            turn_client = build_provider_http_client(
+                allow_private=provider_selection.allow_private
+            )
+        try:
+            agent = self._ensure(provider_selection, http_client=turn_client)
+            deps = AgentDeps(
+                settings=self._settings,
+                session_factory=self._session_factory,
+                principal=principal,
+                credential_digest=credential_digest,
+                system=self._system,
+            )
+            prompt = request.message
+            if request.assetId:
+                prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
+            tokens = usage if usage is not None else AgentUsage()
+            run_usage = RunUsage()
             limits = UsageLimits(
                 request_limit=self._settings.agent_max_steps,
                 tool_calls_limit=self._settings.agent_max_steps * 4,
-                total_tokens_limit=token_limit,
             )
+            if token_limit is not None and token_limit > 0:
+                limits = UsageLimits(
+                    request_limit=self._settings.agent_max_steps,
+                    tool_calls_limit=self._settings.agent_max_steps * 4,
+                    total_tokens_limit=token_limit,
+                )
+            try:
+                if turn_client is None:
+                    result = agent.run_sync(
+                        prompt,
+                        deps=deps,
+                        message_history=_history(request.conversation),
+                        usage_limits=limits,
+                        usage=run_usage,
+                    )
+                else:
+                    transport = turn_client
+                    turn_client = None
+                    result = asyncio.run(
+                        self._run_provider_turn(
+                            agent,
+                            prompt,
+                            deps,
+                            request,
+                            limits,
+                            run_usage,
+                            transport,
+                        )
+                    )
+            except BaseException:
+                self._apply_usage(tokens, run_usage)
+                raise
+            self._apply_usage(tokens, run_usage)
+            message = result.output.strip() or "No pude completar la solicitud."
+            return (
+                ChatReply(
+                    message=message[:4000],
+                    actions=deps.actions,
+                    results=deps.results,
+                    approvalPending=False,
+                ),
+                tokens,
+            )
+        finally:
+            if turn_client is not None:
+                try:
+                    asyncio.run(turn_client.aclose())
+                except Exception:
+                    logger.warning("provider transport could not be closed")
+
+    async def _run_provider_turn(
+        self,
+        agent: Agent[AgentDeps, str],
+        prompt: str,
+        deps: AgentDeps,
+        request: ChatRequest,
+        limits: UsageLimits,
+        run_usage: RunUsage,
+        transport: Any,
+    ) -> Any:
+        """Run provider inference and close its transport on the same loop."""
         try:
-            result = agent.run_sync(
+            return await agent.run(
                 prompt,
                 deps=deps,
                 message_history=_history(request.conversation),
                 usage_limits=limits,
                 usage=run_usage,
             )
-        except BaseException:
-            self._apply_usage(tokens, run_usage)
-            raise
-        self._apply_usage(tokens, run_usage)
-        message = result.output.strip() or "No pude completar la solicitud."
-        return (
-            ChatReply(
-                message=message[:4000],
-                actions=deps.actions,
-                results=deps.results,
-                approvalPending=False,
-            ),
-            tokens,
-        )
+        finally:
+            try:
+                await transport.aclose()
+            except Exception:
+                logger.warning("provider transport could not be closed")
 
     @staticmethod
     def _apply_usage(target: AgentUsage, source: RunUsage) -> None:
@@ -2022,5 +2159,6 @@ __all__ = [
     "ChatRequest",
     "ConversationTurn",
     "InterventionPartArg",
+    "ProviderModelSelection",
     "resolve_model",
 ]

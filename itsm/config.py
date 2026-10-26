@@ -107,6 +107,10 @@ class Settings(BaseSettings):
     agent_daily_token_budget: int = Field(default=200_000, ge=0, le=100_000_000)
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
+    # Externally supplied Fernet key for provider credentials. Absent or blank
+    # means credential writing is honestly unavailable; the process never
+    # generates a key or stores it in the database.
+    ai_credential_key: SecretStr | None = None
 
     # Operator-configured external executor. ITSM never receives host, shell or
     # container authority; it only calls fixed actions on this trusted endpoint.
@@ -268,6 +272,13 @@ class Settings(BaseSettings):
             raise ValueError("agent_openai_base_url must be an http(s) URL")
         return normalized
 
+    @field_validator("ai_credential_key")
+    @classmethod
+    def _normalize_ai_credential_key(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        return value if value.get_secret_value().strip() else None
+
     @field_validator("system_executor_url")
     @classmethod
     def _validate_system_executor_url(cls, value: str) -> str:
@@ -362,6 +373,7 @@ class Settings(BaseSettings):
             self.monitoring_discovery_token,
             self.system_executor_token,
             self.meilisearch_api_key,
+            self.ai_credential_key,
             *self.monitoring_secrets.values(),
         ):
             if secret is not None:

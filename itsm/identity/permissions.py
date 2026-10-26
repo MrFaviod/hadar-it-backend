@@ -48,6 +48,7 @@ SYSTEM_PERMISSIONS: Final[frozenset[str]] = frozenset(
 
 # Stable UI/API codes: ``resource.operation``.
 PERMISSION_CATALOG: Final[tuple[str, ...]] = (
+    "agents.providers.personal",
     "assets.view",
     "assets.edit",
     "assets.assign",
@@ -104,9 +105,14 @@ _OPERATOR_PERMISSIONS: Final[frozenset[str]] = frozenset(
 
 _USER_PERMISSIONS: Final[frozenset[str]] = frozenset({"assets.view", "people.view"})
 
+# Adding personal OpenAI-compatible providers is an explicit grant: no built-in
+# business profile receives it implicitly. The 0023 migration grants it to the
+# installation owner so it can be handed to a custom role.
+PERSONAL_PROVIDER_PERMISSION: Final[str] = "agents.providers.personal"
+
 BUILT_IN_ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
     ROLE_SUPERADMIN: PERMISSION_CODES,
-    ROLE_ADMIN: PERMISSION_CODES - SYSTEM_PERMISSIONS,
+    ROLE_ADMIN: PERMISSION_CODES - SYSTEM_PERMISSIONS - {PERSONAL_PROVIDER_PERMISSION},
     ROLE_USER: _USER_PERMISSIONS,
 }
 
