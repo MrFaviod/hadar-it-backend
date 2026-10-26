@@ -256,6 +256,7 @@ class OpenCodeEngine(_HTTPEngine):
         running_tool: str | None = None
         running_tool_id: str | None = None
         emitted_tools: set[tuple[str, str]] = set()
+        tool_names: dict[str, str] = {}
         prompt_attempted = False
         prompt_confirmed = False
         terminal = False
@@ -311,8 +312,16 @@ class OpenCodeEngine(_HTTPEngine):
                                     )
                                     if fragment:
                                         yield {"type": "delta", "text": fragment}
-                            elif event_type == "session.tool.called":
+                            elif event_type == "session.tool.input.started":
+                                tool_id = data.get("id")
                                 tool = _tool_name(data)
+                                if isinstance(tool_id, str) and tool:
+                                    tool_names[tool_id] = tool
+                            elif event_type == "session.tool.called":
+                                tool_id = data.get("id")
+                                tool = _tool_name(data) or (
+                                    tool_names.get(tool_id) if isinstance(tool_id, str) else None
+                                )
                                 if tool:
                                     running_tool = tool
                                     tool_id = data.get("id")
@@ -328,7 +337,10 @@ class OpenCodeEngine(_HTTPEngine):
                                     emitted_tools.add((tool, "running"))
                                     yield event
                             elif event_type == "session.tool.success":
-                                tool = _tool_name(data) or running_tool or "tool"
+                                tool_id = data.get("id")
+                                tool = _tool_name(data) or (
+                                    tool_names.get(tool_id) if isinstance(tool_id, str) else None
+                                ) or running_tool or "tool"
                                 event = {
                                     "type": "tool",
                                     "tool": tool,
@@ -342,7 +354,10 @@ class OpenCodeEngine(_HTTPEngine):
                                 running_tool_id = None
                                 yield event
                             elif event_type == "session.tool.failed":
-                                tool = _tool_name(data) or running_tool or "tool"
+                                tool_id = data.get("id")
+                                tool = _tool_name(data) or (
+                                    tool_names.get(tool_id) if isinstance(tool_id, str) else None
+                                ) or running_tool or "tool"
                                 event = {
                                     "type": "tool",
                                     "tool": tool,
@@ -361,7 +376,7 @@ class OpenCodeEngine(_HTTPEngine):
                                 if isinstance(status, Mapping) and status.get("type") == "idle":
                                     terminal = True
                                     break
-                            elif event_type == "session.idle":
+                            elif event_type in {"session.idle", "session.execution.succeeded"}:
                                 terminal = True
                                 break
                             elif event_type == "session.error":
