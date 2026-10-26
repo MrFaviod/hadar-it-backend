@@ -378,7 +378,7 @@ def _bounded_value(value: object) -> object | None:
         return _truncate(value, _MAX_TOOL_CHARS)
     try:
         encoded = json.dumps(value, ensure_ascii=False, separators=(",", ":"), default=str)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
     if len(encoded) <= _MAX_TOOL_CHARS:
         return value

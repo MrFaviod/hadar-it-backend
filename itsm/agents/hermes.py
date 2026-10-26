@@ -24,13 +24,13 @@ from itsm.agents.engines import (
     EngineError,
     EngineInfo,
     EngineModel,
-    _HTTPEngine,
     _append_fragment,
     _bounded_value,
     _compose_prompt,
     _decode_sse_data,
     _error_text,
     _history_items,
+    _HTTPEngine,
     _money,
     _number,
     _snapshot_fragment,
@@ -314,15 +314,11 @@ class HermesEngine(_HTTPEngine):
                             if fragment:
                                 yield {"type": "delta", "text": fragment}
                         elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                            for event in _tool_events(
-                                event_type, data, emitted_tools
-                            ):
+                            for event in _tool_events(event_type, data, emitted_tools):
                                 yield event
                         elif event_type == "run.completed":
                             final_text = _final_text(data)
-                            fragment, current_text = _snapshot_fragment(
-                                current_text, final_text
-                            )
+                            fragment, current_text = _snapshot_fragment(current_text, final_text)
                             if fragment:
                                 yield {"type": "delta", "text": fragment}
                             usage = _usage_event(data)
@@ -358,9 +354,7 @@ class HermesEngine(_HTTPEngine):
             ):
                 yield _error_event(failure)
         finally:
-            cancelled = (
-                session_id in self._cancel_requested or cancelled_by_engine
-            )
+            cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
         yield {"type": "done", "cancelled": cancelled}
 
@@ -435,9 +429,7 @@ class HermesEngine(_HTTPEngine):
                                     "tool.completed",
                                     "tool.failed",
                                 }:
-                                    for event in _tool_events(
-                                        event_type, data, emitted_tools
-                                    ):
+                                    for event in _tool_events(event_type, data, emitted_tools):
                                         yield event
                                 elif event_type == "run.completed":
                                     final_text = _final_text(data)
@@ -491,9 +483,7 @@ class HermesEngine(_HTTPEngine):
                 self._active_runs.pop(session_id, None)
                 if not terminal:
                     await self._stop_quietly(run_id)
-            cancelled = (
-                session_id in self._cancel_requested or cancelled_by_engine
-            )
+            cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
         yield {"type": "done", "cancelled": cancelled}
 
@@ -517,7 +507,6 @@ class HermesEngine(_HTTPEngine):
 
         current_text = ""
         emitted_tools: set[tuple[str, str]] = set()
-        terminal = False
         failure: EngineError | None = None
 
         try:
@@ -529,11 +518,9 @@ class HermesEngine(_HTTPEngine):
                 ) as frames:
                     async for event_name, raw_data in frames:
                         if raw_data.strip() == "[DONE]":
-                            terminal = True
                             break
                         payload = _decode_sse_data(raw_data)
                         if payload == "[DONE]":
-                            terminal = True
                             break
                         data = payload if isinstance(payload, Mapping) else {}
                         if event_name == "hermes.tool.progress":
@@ -561,8 +548,6 @@ class HermesEngine(_HTTPEngine):
 
             if failure is not None:
                 yield _error_event(failure)
-            else:
-                terminal = True
         finally:
             cancelled = session_id in self._cancel_requested
             self._cancel_requested.discard(session_id)
@@ -710,7 +695,7 @@ def _tool_events(
     status = {
         "tool.started": "running",
         "tool.completed": "completed",
-        "tool.failed": "error",
+        "tool.failed": "failed",
     }[event_type]
     if (name, status) in emitted:
         return []
@@ -743,7 +728,7 @@ def _progress_events(
     if raw_status in {"completed", "success", "succeeded"}:
         status = "completed"
     elif raw_status in {"failed", "error"}:
-        status = "error"
+        status = "failed"
     else:
         status = "running"
     if (name, status) in emitted:
@@ -755,7 +740,7 @@ def _progress_events(
         event["input"] = value
     if status != "running":
         output = _tool_content_text(data.get("output") or data.get("preview"))
-        if output is None and status == "error":
+        if output is None and status == "failed":
             output = _error_text(data.get("error") or data)
         if output is not None:
             event["output"] = output

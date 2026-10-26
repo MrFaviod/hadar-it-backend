@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import math
-import time
 from collections.abc import AsyncIterator, Mapping
+from contextlib import suppress
 from typing import Any
 
 from itsm.agents.engines import (
@@ -13,12 +13,12 @@ from itsm.agents.engines import (
     EngineError,
     EngineInfo,
     EngineModel,
-    _HTTPEngine,
     _append_fragment,
     _bounded_value,
     _compose_prompt,
     _decode_sse_data,
     _error_text,
+    _HTTPEngine,
     _money,
     _number,
     _snapshot_fragment,
@@ -68,11 +68,7 @@ class OpenCodeEngine(_HTTPEngine):
         return EngineInfo(version=version, models=models, capabilities=dict(self._capabilities))
 
     async def _discover_v2_models(self) -> list[EngineModel]:
-        params = (
-            {"location[directory]": self.config.directory}
-            if self.config.directory
-            else None
-        )
+        params = {"location[directory]": self.config.directory} if self.config.directory else None
         payload = await self._json("GET", "/api/model", params=params)
         data = payload.get("data")
         if not isinstance(data, list):
@@ -350,13 +346,13 @@ class OpenCodeEngine(_HTTPEngine):
                                 event = {
                                     "type": "tool",
                                     "tool": tool,
-                                    "status": "error",
+                                    "status": "failed",
                                 }
                                 output = _tool_content_text(data.get("content"))
                                 if output is None:
                                     output = _error_text(data.get("error"))
                                 event["output"] = output
-                                emitted_tools.add((tool, "error"))
+                                emitted_tools.add((tool, "failed"))
                                 running_tool = None
                                 running_tool_id = None
                                 yield event
@@ -472,9 +468,7 @@ class OpenCodeEngine(_HTTPEngine):
                     if self.config.agent:
                         body["agent"] = self.config.agent
                     prompt_attempted = True
-                    post_task = asyncio.create_task(
-                        self._v1_send_message(session_id, body)
-                    )
+                    post_task = asyncio.create_task(self._v1_send_message(session_id, body))
                     async for event_name, raw_data in frames:
                         payload = _decode_sse_data(raw_data)
                         if not isinstance(payload, Mapping):
@@ -523,7 +517,7 @@ class OpenCodeEngine(_HTTPEngine):
                                     if output is None and isinstance(state.get("output"), str):
                                         output = state["output"]
                                 elif status_value == "error":
-                                    status = "error"
+                                    status = "failed"
                                     output = _tool_content_text(state.get("output"))
                                     if output is None:
                                         output = _error_text(state.get("error"))
@@ -548,7 +542,9 @@ class OpenCodeEngine(_HTTPEngine):
                                     usage_candidate = part
                         elif event_type == "message.updated":
                             info = data.get("info")
-                            if isinstance(info, Mapping) and isinstance(info.get("tokens"), Mapping):
+                            if isinstance(info, Mapping) and isinstance(
+                                info.get("tokens"), Mapping
+                            ):
                                 usage_candidate = info
                         elif event_type == "session.idle":
                             terminal = True
@@ -603,13 +599,9 @@ class OpenCodeEngine(_HTTPEngine):
                 await self._interrupt_quietly(session_id)
             if post_task is not None and not post_task.done():
                 post_task.cancel()
-                try:
+                with suppress(BaseException):
                     await post_task
-                except BaseException:
-                    pass
-            cancelled = (
-                session_id in self._cancel_requested or cancelled_by_engine
-            )
+            cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
         yield {"type": "done", "cancelled": cancelled}
 
@@ -750,7 +742,7 @@ class OpenCodeEngine(_HTTPEngine):
                     status = "completed"
                     output = _tool_content_text(state.get("content"))
                 elif status_value == "error":
-                    status = "error"
+                    status = "failed"
                     output = _tool_content_text(state.get("content")) or _error_text(
                         state.get("error")
                     )
@@ -789,9 +781,7 @@ class OpenCodeEngine(_HTTPEngine):
                     )
                 return provider, model_id
         matches = [
-            ref
-            for public_id, ref in self._model_refs.items()
-            if public_id.endswith(f"/{model}")
+            ref for public_id, ref in self._model_refs.items() if public_id.endswith(f"/{model}")
         ]
         if len(matches) == 1:
             return matches[0]
@@ -842,6 +832,10 @@ def _cost_free(cost: Mapping[str, object], *, require_cache: bool) -> bool | Non
         return None
     else:
         for key in ("read", "write"):
+            if key not in cache:
+                if require_cache:
+                    return None
+                continue
             price = _price(cache.get(key))
             if price is None:
                 return None

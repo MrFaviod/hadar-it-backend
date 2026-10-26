@@ -9,8 +9,7 @@ from typing import Any
 
 import httpx
 import pytest
-
-from itsm.agents.engines import EngineConfig, EngineError, EngineModel
+from itsm.agents.engines import EngineConfig, EngineError
 from itsm.agents.hermes import HermesEngine
 from itsm.agents.opencode import OpenCodeEngine
 
@@ -66,9 +65,7 @@ def _sse_then_failure(*frames: Mapping[str, Any]) -> httpx.Response:
 
 
 def _named_sse(*frames: tuple[str, Mapping[str, Any] | str]) -> httpx.Response:
-    body = "".join(
-        f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in frames
-    )
+    body = "".join(f"event: {name}\ndata: {json.dumps(payload)}\n\n" for name, payload in frames)
     return httpx.Response(
         200,
         headers={"content-type": "text/event-stream"},
@@ -185,11 +182,14 @@ def test_model_free_uses_all_reported_prices_without_provider_allowlist() -> Non
         missing_cache["cost"] = [{"input": 0, "output": 0}]
         paid_reasoning = _v2_model("paid-reasoning", "fourth")
         paid_reasoning["cost"][0]["reasoning"] = 1
+        partial_cache = _v2_model("partial-cache", "fifth")
+        partial_cache["cost"] = [{"input": 0, "output": 0, "cache": {"read": 0}}]
         data = [
             _v2_model("zero-other", "custom"),
             _v2_model("paid-output", "opencode", output_cost=2),
             _v2_model("paid-cache", "third-party", cache_write=1),
             paid_reasoning,
+            partial_cache,
             unknown,
             missing_cache,
         ]
@@ -245,6 +245,22 @@ def test_model_free_uses_all_reported_prices_without_provider_allowlist() -> Non
                                             "reasoning": 1,
                                         },
                                     },
+                                    "partial-read": {
+                                        "name": "Partial Read",
+                                        "cost": {
+                                            "input": 0,
+                                            "output": 0,
+                                            "cache": {"read": 0},
+                                        },
+                                    },
+                                    "partial-write": {
+                                        "name": "Partial Write",
+                                        "cost": {
+                                            "input": 0,
+                                            "output": 0,
+                                            "cache": {"write": 1},
+                                        },
+                                    },
                                     "unknown": {
                                         "name": "Unknown",
                                         "cost": {"input": 0},
@@ -266,6 +282,7 @@ def test_model_free_uses_all_reported_prices_without_provider_allowlist() -> Non
         "opencode/paid-output": False,
         "third-party/paid-cache": False,
         "fourth/paid-reasoning": False,
+        "fifth/partial-cache": None,
         "opencode/unknown": None,
         "opencode/missing-cache": None,
     }
@@ -274,6 +291,8 @@ def test_model_free_uses_all_reported_prices_without_provider_allowlist() -> Non
         "custom/paid-output": False,
         "custom/paid-cache": False,
         "custom/paid-reasoning": False,
+        "custom/partial-read": True,
+        "custom/partial-write": False,
         "custom/unknown": None,
     }
 
@@ -394,9 +413,7 @@ def test_v2_stream_is_cumulative_session_isolated_and_reports_engine_usage() -> 
         ]
         assert len(prompt_requests) == 1
         assert json.loads(prompt_requests[0].content)["text"] == "Busca activos"
-        create_requests = [
-            request for request in requests if request.url.path == "/api/session"
-        ]
+        create_requests = [request for request in requests if request.url.path == "/api/session"]
         assert json.loads(create_requests[0].content)["agent"] == "itsm"
         agent_requests = [
             request for request in requests if request.url.path == "/api/session/ses_1/agent"
@@ -634,6 +651,118 @@ def test_v2_disconnect_recovery_emits_completed_message_once() -> None:
     assert events[-1] == {"type": "done", "cancelled": False}
 
 
+def test_v2_failed_tool_stays_failed_with_appended_text_and_reported_usage() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/info":
+                return httpx.Response(200, json={"version": "2.1.2"})
+            if path == "/api/model":
+                return httpx.Response(
+                    200,
+                    json={"location": {}, "data": [_v2_model("big-pickle")]},
+                )
+            if path == "/api/event":
+                return _sse(
+                    {
+                        "id": "1",
+                        "type": "session.text.delta",
+                        "data": {"sessionID": "ses_1", "delta": "ha"},
+                    },
+                    {
+                        "id": "2",
+                        "type": "session.text.delta",
+                        "data": {"sessionID": "ses_1", "delta": "ha"},
+                    },
+                    {
+                        "id": "3",
+                        "type": "session.tool.called",
+                        "data": {
+                            "sessionID": "ses_1",
+                            "tool": "itsm_search_assets",
+                            "id": "call_1",
+                            "input": {},
+                        },
+                    },
+                    {
+                        "id": "4",
+                        "type": "session.tool.failed",
+                        "data": {
+                            "sessionID": "ses_1",
+                            "id": "call_1",
+                            "error": "permission denied",
+                        },
+                    },
+                    {
+                        "id": "5",
+                        "type": "session.idle",
+                        "data": {"sessionID": "ses_1"},
+                    },
+                )
+            if path == "/api/session/ses_1/agent":
+                return httpx.Response(204)
+            if path == "/api/session/ses_1/model":
+                return httpx.Response(204)
+            if path == "/api/session/ses_1/prompt":
+                return httpx.Response(200, json={"data": {"id": "msg_user"}})
+            if path == "/api/session/ses_1/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "msg_assistant",
+                                "type": "assistant",
+                                "time": {"created": 1, "completed": 2},
+                                "tokens": {
+                                    "input": 3,
+                                    "output": 2,
+                                    "reasoning": 0,
+                                    "cache": {"read": 0, "write": 0},
+                                },
+                                "cost": 0,
+                                "content": [{"type": "text", "text": "haha"}],
+                            }
+                        ],
+                        "cursor": {},
+                    },
+                )
+            raise AssertionError(f"unexpected request {request.method} {path}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE), client=client)
+            await engine.discover()
+            return [
+                event
+                async for event in engine.stream(
+                    "Find devices",
+                    session_id="ses_1",
+                    model="opencode/big-pickle",
+                )
+            ]
+
+    events = asyncio.run(scenario())
+
+    fragments = [str(event["text"]) for event in events if event["type"] == "delta"]
+    assert fragments == ["ha", "ha"]
+    assert "".join(fragments) == "haha"
+    tools = [event for event in events if event["type"] == "tool"]
+    assert tools[-1]["type"] == "tool"
+    assert tools[-1]["tool"] == "itsm_search_assets"
+    assert tools[-1]["status"] == "failed"
+    assert tools[-1]["output"] == "engine reported an error"
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": 3,
+            "outputTokens": 2,
+            "source": "reported",
+            "cost": 0,
+        }
+    ]
+    assert events[-1] == {"type": "done", "cancelled": False}
+
+
 def test_v2_cancel_actually_interrupts_and_stream_reports_cancelled_done() -> None:
     async def scenario() -> tuple[list[dict[str, Any]], int]:
         interrupted = asyncio.Event()
@@ -650,6 +779,7 @@ def test_v2_cancel_actually_interrupts_and_stream_reports_cancelled_done() -> No
                     json={"location": {}, "data": [_v2_model("big-pickle")]},
                 )
             if path == "/api/event":
+
                 async def frames() -> AsyncIterator[bytes]:
                     yield (
                         "data: "
@@ -782,6 +912,7 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
             if path == "/session":
                 return httpx.Response(200, json={"id": "ses_1"})
             if path == "/event":
+
                 async def frames() -> AsyncIterator[bytes]:
                     yield _frame(
                         "message.part.updated",
@@ -822,6 +953,11 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
                             "status": "completed",
                             "input": {"query": "nvr"},
                             "output": "2 activos",
+                        },
+                        {
+                            "status": "error",
+                            "input": {"query": "nvr"},
+                            "error": "permission denied",
                         },
                     ):
                         yield _frame(
@@ -893,11 +1029,17 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
         "status": "running",
         "input": {"query": "nvr"},
     }
-    assert tools[-1] == {
+    assert tools[-2] == {
         "type": "tool",
         "tool": "itsm_inventory_search",
         "status": "completed",
         "output": "2 activos",
+    }
+    assert tools[-1] == {
+        "type": "tool",
+        "tool": "itsm_inventory_search",
+        "status": "failed",
+        "output": "engine reported an error",
     }
     assert [event for event in events if event["type"] == "usage"] == [
         {
@@ -1068,6 +1210,14 @@ def test_hermes_session_stream_uses_capabilities_tools_usage_and_no_profile_fiel
                         },
                     ),
                     (
+                        "tool.failed",
+                        {
+                            "session_id": "sess_hermes",
+                            "tool": "itsm_inventory_search",
+                            "error": "permission denied",
+                        },
+                    ),
+                    (
                         "run.completed",
                         {
                             "session_id": "sess_hermes",
@@ -1135,12 +1285,16 @@ def test_hermes_session_stream_uses_capabilities_tools_usage_and_no_profile_fiel
         "status": "running",
         "input": {"query": "nvr"},
     }
-    assert tools[-1] == {
+    assert tools[-2] == {
         "type": "tool",
         "tool": "itsm_inventory_search",
         "status": "completed",
         "output": "2 activos",
     }
+    assert tools[-1]["type"] == "tool"
+    assert tools[-1]["tool"] == "itsm_inventory_search"
+    assert tools[-1]["status"] == "failed"
+    assert tools[-1]["output"] == "engine reported an error"
     assert [event for event in events if event["type"] == "usage"] == [
         {
             "type": "usage",
@@ -1278,6 +1432,7 @@ def test_hermes_runs_stop_reports_cancelled_without_resubmitting() -> None:
                 run_calls += 1
                 return httpx.Response(202, json={"run_id": "run_1"})
             if path == "/v1/runs/run_1/events":
+
                 async def frames() -> AsyncIterator[bytes]:
                     yield _frame(
                         "message.delta",
@@ -1418,9 +1573,7 @@ def test_v2_unauthorized_discovery_redacts_credentials() -> None:
             )
 
         async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            engine = OpenCodeEngine(
-                EngineConfig(BASE, token="super-secret-token"), client=client
-            )
+            engine = OpenCodeEngine(EngineConfig(BASE, token="super-secret-token"), client=client)
             with pytest.raises(EngineError) as failed:
                 await engine.discover()
         return failed.value, requests
