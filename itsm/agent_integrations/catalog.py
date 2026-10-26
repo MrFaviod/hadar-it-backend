@@ -53,6 +53,9 @@ CAPABILITIES: Final[frozenset[str]] = frozenset(
         "relationships.write",
         "reports.generate",
         "reports.read",
+        "system.configure",
+        "system.operate",
+        "system.read",
     }
 )
 
@@ -292,9 +295,7 @@ def _load_skill(
     permissions = _string_list(front["permissions"], "permissions")
     unknown_permissions = [code for code in permissions if not is_known_permission(code)]
     if unknown_permissions:
-        raise InvalidSkillPackage(
-            "unknown permissions: " + ", ".join(sorted(unknown_permissions))
-        )
+        raise InvalidSkillPackage("unknown permissions: " + ", ".join(sorted(unknown_permissions)))
     capabilities = _string_list(front["capabilities"], "capabilities")
     unknown_capabilities = [code for code in capabilities if code not in CAPABILITIES]
     if unknown_capabilities:
@@ -352,9 +353,7 @@ def _validate_manifest(manifest: Mapping[str, Any]) -> dict[str, Any]:
     permissions = _string_list(manifest["permissions"], "permissions")
     unknown_permissions = [code for code in permissions if not is_known_permission(code)]
     if unknown_permissions:
-        raise InvalidSkillPackage(
-            "unknown permissions: " + ", ".join(sorted(unknown_permissions))
-        )
+        raise InvalidSkillPackage("unknown permissions: " + ", ".join(sorted(unknown_permissions)))
 
     skills_value = manifest.get("skills", [])
     if not isinstance(skills_value, list) or any(
@@ -410,9 +409,7 @@ class SkillCatalog:
             raise InvalidSkillPackage("official skill catalog is empty")
         skills: dict[str, _Skill] = {}
         for package in packages:
-            skill = _load_skill(
-                package, root=root.resolve(), module_id=OFFICIAL_MODULE_ID
-            )
+            skill = _load_skill(package, root=root.resolve(), module_id=OFFICIAL_MODULE_ID)
             name = skill.metadata["name"]
             if name in skills:
                 raise ModuleConflict(f"skill is already registered: {name}")
@@ -501,9 +498,7 @@ class SkillCatalog:
             if not capabilities <= set(checked["capabilities"]):
                 raise InvalidSkillPackage("skill capabilities exceed the module manifest")
             if skill.metadata["name"] in self._skills or skill.metadata["name"] in staged:
-                raise ModuleConflict(
-                    f"skill is already registered: {skill.metadata['name']}"
-                )
+                raise ModuleConflict(f"skill is already registered: {skill.metadata['name']}")
             staged[skill.metadata["name"]] = skill
 
         module = _Module(

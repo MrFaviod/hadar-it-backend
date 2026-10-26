@@ -103,6 +103,7 @@ Load only when the module demonstration behavior is requested.
 Return the asset id, current status and nothing else.
 """
 
+
 def frontmatter(text: str) -> dict[str, Any]:
     """Parse the small YAML subset used by SKILL.md, independently of the product parser."""
     assert text.startswith("---\n")
@@ -297,13 +298,13 @@ def test_authorized_inventory_workflow_runs_through_real_mcp_server(
     harness = make_harness(settings_factory)
     try:
         with harness.service() as service:
-            service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+            service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
             admin = service.login("ana.admin", PASSWORD)
             service.create_user(
                 admin.principal,
                 username="agent.reader",
                 name="Reader agent",
-                role_id="reader",
+                role_id="user",
                 actor_kind="external_agent",
             )
             credential = service.issue_machine_credential("agent.reader")
@@ -342,7 +343,7 @@ def test_configured_external_module_registers_real_tools_and_skills(
     package.mkdir()
     write_skill(package / "skills" / "external-skill", name="external-skill")
     (package / "__init__.py").write_text(
-        '''from pathlib import Path
+        """from pathlib import Path
 
 
 def register_extensions(catalog, registry):
@@ -374,7 +375,7 @@ def register_extensions(catalog, registry):
 
 def _echo(context, **arguments):
     return {"source": context.source, "arguments": arguments}
-''',
+""",
         encoding="utf-8",
     )
     monkeypatch.syspath_prepend(str(tmp_path))
@@ -696,7 +697,7 @@ def test_extension_invocation_enforces_real_machine_identity_permissions(
     harness = make_harness(settings_factory)
     try:
         with harness.service() as service:
-            service.bootstrap_admin("ana.admin", "Ana Admin", PASSWORD)
+            service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
             admin = service.login("ana.admin", PASSWORD)
             service.create_user(
                 admin.principal,
@@ -709,7 +710,7 @@ def test_extension_invocation_enforces_real_machine_identity_permissions(
                 admin.principal,
                 username="agent.reader",
                 name="Reader agent",
-                role_id="reader",
+                role_id="user",
                 actor_kind="external_agent",
             )
             operator_credential = service.issue_machine_credential("agent.ops")
@@ -743,9 +744,9 @@ def test_extension_invocation_enforces_real_machine_identity_permissions(
             )
         assert result["views"] == []
         assert CALLS == [{}]
-        assert [
-            tool["name"] for tool in registry.list_tools(permissions=operator.permissions)
-        ] == ["demo_saved_views"]
+        assert [tool["name"] for tool in registry.list_tools(permissions=operator.permissions)] == [
+            "demo_saved_views"
+        ]
 
         CALLS.clear()
         with Session(harness.engine) as session:
@@ -860,4 +861,3 @@ def test_bind_fastmcp_tools_refuses_to_shadow_an_existing_server_tool(
             settings=settings_factory(),
             session_factory=lambda: None,
         )
-

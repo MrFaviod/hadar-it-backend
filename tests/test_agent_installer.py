@@ -33,7 +33,7 @@ from itsm.agent_integrations.installer import (
 from itsm.config import Settings
 from itsm.database import create_engine_from_settings
 from itsm.main import create_app
-from tests.conftest import bootstrap_admin, run_migrations
+from tests.conftest import bootstrap_superadmin, run_migrations
 from tests.inventory_support import Catalog as ItsmCatalog
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
@@ -198,7 +198,7 @@ def mcp_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, A
     )
     applied = run_migrations(settings)
     assert applied.returncode == 0, applied.stderr
-    bootstrap_admin(settings)
+    bootstrap_superadmin(settings)
     engine = create_engine_from_settings(settings)
     itsm = ItsmCatalog(settings=settings, engine=engine)
     _, token = itsm.add_machine("installer-client", "Installer Client")
@@ -696,9 +696,9 @@ def test_opencode_v2_fresh_install_is_byte_idempotent(
         for path in workspace.rglob("*")
         if path.is_file()
     }
-    assert json_config(workspace / ".itsm-agent" / "manifest.json")["config"][
-        "existsBefore"
-    ] is False
+    assert (
+        json_config(workspace / ".itsm-agent" / "manifest.json")["config"]["existsBefore"] is False
+    )
     second = run(
         installer.apply(
             target,
@@ -715,9 +715,9 @@ def test_opencode_v2_fresh_install_is_byte_idempotent(
         if path.is_file()
     }
     assert after == before
-    assert json_config(workspace / ".itsm-agent" / "manifest.json")["config"][
-        "existsBefore"
-    ] is False
+    assert (
+        json_config(workspace / ".itsm-agent" / "manifest.json")["config"]["existsBefore"] is False
+    )
 
 
 def opencode_runtime_evidence(
