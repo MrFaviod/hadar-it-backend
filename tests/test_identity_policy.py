@@ -24,7 +24,7 @@ SYSTEM_PERMISSIONS = frozenset(
     }
 )
 OWNER_PERMISSIONS = frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
-BUSINESS_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS
+BUSINESS_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS - {"agents.providers.personal"}
 
 
 @pytest.fixture
@@ -63,6 +63,7 @@ def test_admin_role_covers_business_administration_without_installation_authorit
         assert engine.allowed("admin", resource, operation), code
     assert engine.permissions("admin") == BUSINESS_PERMISSIONS
     assert engine.permissions("admin") & SYSTEM_PERMISSIONS == frozenset()
+    assert engine.allowed("admin", "agents", "providers.personal") is False
     for code in SYSTEM_PERMISSIONS:
         resource, operation = code.split(".", 1)
         assert engine.allowed("admin", resource, operation) is False, code

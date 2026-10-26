@@ -40,7 +40,7 @@ SYSTEM_PERMISSIONS = frozenset(
     }
 )
 OWNER_PERMISSIONS = frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
-ADMIN_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS
+ADMIN_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS - {"agents.providers.personal"}
 
 
 @pytest.fixture
@@ -702,6 +702,7 @@ def test_admin_profile_has_business_authority_but_no_installation_authority(
         grant = service.login("beto.admin", PASSWORD)
         assert grant.permissions == ADMIN_PERMISSIONS
         assert not grant.permissions & SYSTEM_PERMISSIONS
+        assert "agents.providers.personal" not in grant.permissions
 
         with pytest.raises(PermissionDenied):
             service.create_user(
