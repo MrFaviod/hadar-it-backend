@@ -7,7 +7,7 @@ name = "itsm-backend"
 version = "0.1.0"
 description = "ITSM backend foundation: FastAPI API, SQLAlchemy database layer and Huey task adapter."
 requires-python = ">=3.14"
-license = "UNLICENSED"
+license = "LicenseRef-Proprietary"
 dependencies = [
     "fastapi==0.156.8",
     "uvicorn==0.54.0",
@@ -23,6 +23,8 @@ dependencies = [
     "PyMySQL==1.2.3",
     "pydantic-ai-slim[openai,anthropic]==2.59.0",
     "fastmcp==4.1.3",
+    "httpx==0.28.1",
+    "httpcore==1.0.9",
     "openpyxl==3.1.5",
     "et-xmlfile==2.0.0",
     "defusedxml==0.7.1",
@@ -53,3 +55,6 @@ src = ["itsm", "tests"]
 [tool.ruff.lint]
 select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
 ignore = ["B008"]
+
+[tool.setuptools.package-data]
+"itsm.agent_integrations" = ["skills/*/*", "skills/*/*/*"]

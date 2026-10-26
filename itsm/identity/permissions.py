@@ -8,6 +8,7 @@ templates that the migration seeds.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from typing import Final, Literal
 
 ActorKind = Literal["human", "internal_agent", "external_agent", "external_client"]
@@ -112,3 +113,8 @@ def split_permission(code: str) -> tuple[str, str]:
 
 def is_known_permission(code: str) -> bool:
     return code in PERMISSION_CODES
+
+
+def is_full_administrator(grants: Iterable[tuple[str, str]]) -> bool:
+    """True only when the persisted policy grants every known permission."""
+    return {f"{resource}.{operation}" for resource, operation in grants} >= PERMISSION_CODES

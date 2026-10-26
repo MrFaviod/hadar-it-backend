@@ -51,7 +51,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
-from pydantic_ai.usage import UsageLimits
+from pydantic_ai.usage import RunUsage, UsageLimits
 from sqlalchemy.orm import Session
 
 logger = logging.getLogger("itsm.agent")
@@ -197,6 +197,14 @@ class ChatReply(BaseModel):
     actions: list[ChatAction] = Field(default_factory=list)
     results: list[dict[str, Any]] = Field(default_factory=list)
     approvalPending: bool = False
+
+
+@dataclass
+class AgentUsage:
+    """Directly measured provider tokens for one runtime call (never estimated)."""
+
+    input_tokens: int = 0
+    output_tokens: int = 0
 
 
 @dataclass
@@ -1793,6 +1801,19 @@ class AgentRuntime:
         credential_digest: str | None = None,
     ) -> ChatReply:
         """Run one bounded turn; tool authorization happens per operation."""
+        reply, _ = self.chat_with_usage(principal, request, credential_digest=credential_digest)
+        return reply
+
+    def chat_with_usage(
+        self,
+        principal: Principal,
+        request: ChatRequest,
+        *,
+        credential_digest: str | None = None,
+        usage: AgentUsage | None = None,
+        token_limit: int | None = None,
+    ) -> tuple[ChatReply, AgentUsage]:
+        """Shared run that also returns real usage, including on failure."""
         agent = self._ensure()
         deps = AgentDeps(
             settings=self._settings,
@@ -1803,22 +1824,45 @@ class AgentRuntime:
         prompt = request.message
         if request.assetId:
             prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
-        result = agent.run_sync(
-            prompt,
-            deps=deps,
-            message_history=_history(request.conversation),
-            usage_limits=UsageLimits(
+        tokens = usage if usage is not None else AgentUsage()
+        run_usage = RunUsage()
+        limits = UsageLimits(
+            request_limit=self._settings.agent_max_steps,
+            tool_calls_limit=self._settings.agent_max_steps * 4,
+        )
+        if token_limit is not None and token_limit > 0:
+            limits = UsageLimits(
                 request_limit=self._settings.agent_max_steps,
                 tool_calls_limit=self._settings.agent_max_steps * 4,
-            ),
-        )
+                total_tokens_limit=token_limit,
+            )
+        try:
+            result = agent.run_sync(
+                prompt,
+                deps=deps,
+                message_history=_history(request.conversation),
+                usage_limits=limits,
+                usage=run_usage,
+            )
+        except BaseException:
+            self._apply_usage(tokens, run_usage)
+            raise
+        self._apply_usage(tokens, run_usage)
         message = result.output.strip() or "No pude completar la solicitud."
-        return ChatReply(
-            message=message[:4000],
-            actions=deps.actions,
-            results=deps.results,
-            approvalPending=False,
+        return (
+            ChatReply(
+                message=message[:4000],
+                actions=deps.actions,
+                results=deps.results,
+                approvalPending=False,
+            ),
+            tokens,
         )
+
+    @staticmethod
+    def _apply_usage(target: AgentUsage, source: RunUsage) -> None:
+        target.input_tokens = max(0, int(getattr(source, "input_tokens", 0) or 0))
+        target.output_tokens = max(0, int(getattr(source, "output_tokens", 0) or 0))
 
 
 __all__ = [
@@ -1826,6 +1870,7 @@ __all__ = [
     "AgentDeps",
     "AgentRuntime",
     "AgentUnavailable",
+    "AgentUsage",
     "BatchUpdateArg",
     "ChatAction",
     "ChatReply",
