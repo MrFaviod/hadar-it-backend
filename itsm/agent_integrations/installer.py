@@ -1041,8 +1041,8 @@ def _detect_hermes(target: IntegrationTarget, root: Path) -> _TargetState:
         config_data=data,
         skills_relative="skills",
         limitations=[
-            "The selected Hermes profile configuration requires authenticated runtime inspection "
-            "to prove the connected API server actually uses this profile."
+            "The Hermes HTTP API does not attest the active profile home; trusted profile "
+            "verification is unavailable."
         ],
     )
 
@@ -1550,6 +1550,8 @@ def _opencode_runtime_safety(
         return False, "runtime inspection did not select the restricted ITSM agent"
     if agent.get("mode") not in {"primary", "all"}:
         return False, "runtime ITSM agent is not a selectable primary agent"
+    if agent.get("hidden") is not False:
+        return False, "runtime ITSM agent is hidden or not selectable"
     permissions = agent.get("permissions")
     if not isinstance(permissions, list) or not permissions:
         return False, "runtime ITSM agent effective permissions are missing"
@@ -1604,32 +1606,41 @@ def _opencode_runtime_safety(
     if not isinstance(config_entries, list) or not config_entries:
         return False, "runtime configuration documents were not inspected"
     selected_directory = False
-    effective_default: Any = None
+    selected_documents = 0
     for entry in config_entries:
         if not isinstance(entry, Mapping):
             return False, "runtime configuration entry is invalid"
+        if set(entry) - {"type", "path", "info"}:
+            return False, "runtime configuration entry has unsupported fields"
         kind = entry.get("type")
+        path = entry.get("path")
+        if not isinstance(path, str) or not path or not os.path.isabs(path):
+            return False, "runtime configuration entry path is not absolute"
         if kind == "directory":
-            path = entry.get("path")
-            if path is not None and not isinstance(path, str):
-                return False, "runtime configuration directory entry is invalid"
-            if _same_runtime_path(path, state.root):
-                selected_directory = True
+            if selected_directory or not _same_runtime_path(path, state.root / ".opencode"):
+                return False, (
+                    "runtime configuration includes a directory source outside the selected "
+                    "profile"
+                )
+            selected_directory = True
         elif kind == "document":
+            if not _same_runtime_path(path, state.config_path):
+                return False, (
+                    "runtime configuration includes a document source outside the selected "
+                    "profile"
+                )
             info = entry.get("info")
-            if not isinstance(info, Mapping):
-                return False, "runtime configuration document entry is invalid"
-            path = entry.get("path")
-            if path is not None and not isinstance(path, str):
-                return False, "runtime configuration document path is invalid"
-            if "default_agent" in info:
-                effective_default = info["default_agent"]
+            if not isinstance(info, Mapping) or info.get("default_agent") != DEFAULT_AGENT:
+                return False, (
+                    "runtime effective configuration does not select the ITSM default agent"
+                )
+            selected_documents += 1
         else:
             return False, "runtime configuration entry type is invalid"
     if not selected_directory:
-        return False, "runtime configuration does not include the selected workspace"
-    if effective_default != DEFAULT_AGENT:
-        return False, "runtime effective configuration does not select the ITSM default agent"
+        return False, "runtime configuration does not include the selected .opencode profile"
+    if selected_documents != 1:
+        return False, "runtime configuration does not bind exactly one selected profile document"
     saved = evidence.get("savedPermissions")
     if not isinstance(saved, list):
         return False, "saved runtime permissions were not inspected"
@@ -1662,7 +1673,55 @@ def _opencode_runtime_safety(
     for skill in requested_skills:
         if _last_effect(combined, "skill", skill) != "allow":
             return False, "runtime ITSM agent does not allow exactly the selected skills"
-    return True, "runtime agent, workspace, effective rules, and saved permissions are restricted"
+    skill_evidence = evidence.get("skills")
+    if not isinstance(skill_evidence, Mapping):
+        return False, "runtime skill inventory was not inspected"
+    if set(skill_evidence) != {"location", "data"}:
+        return False, "runtime skill inventory envelope is invalid"
+    skills_location = skill_evidence.get("location")
+    if not isinstance(skills_location, Mapping) or not _same_runtime_path(
+        skills_location.get("directory"), state.root
+    ):
+        return False, "runtime skill inventory location differs from the selected workspace"
+    skill_items = skill_evidence.get("data")
+    if not isinstance(skill_items, list):
+        return False, "runtime skill inventory is invalid"
+    expected_skill_paths = {
+        name: state.root / state.skills_relative / name / "SKILL.md" for name in requested_skills
+    }
+    seen_skills: set[str] = set()
+    for item in skill_items:
+        if not isinstance(item, Mapping):
+            return False, "runtime skill entry is invalid"
+        skill_id = item.get("id")
+        skill_name = item.get("name")
+        skill_path = item.get("path")
+        if (
+            not isinstance(skill_id, str)
+            or not skill_id
+            or not isinstance(skill_name, str)
+            or not skill_name
+            or not isinstance(skill_path, str)
+            or not skill_path
+            or not os.path.isabs(skill_path)
+        ):
+            return False, "runtime skill entry is invalid"
+        if skill_id in seen_skills:
+            return False, "runtime skill inventory contains duplicate skills"
+        seen_skills.add(skill_id)
+        expected_path = expected_skill_paths.get(skill_id)
+        if expected_path is not None:
+            if not _same_runtime_path(skill_path, expected_path):
+                return False, "runtime skill does not point at the selected profile skill"
+            continue
+        if _last_effect(combined, "skill", skill_id) != "deny":
+            return False, "runtime skill inventory exposes an unselected skill"
+    if not requested_skills.issubset(seen_skills):
+        return False, "runtime skill inventory does not include the selected skills"
+    return True, (
+        "runtime agent, workspace, effective rules, saved permissions, and selected "
+        "skills are restricted"
+    )
 
 
 def _last_effect(rules: Sequence[tuple[str, str, str]], action: str, resource: str) -> str | None:
@@ -1679,18 +1738,17 @@ def _opencode_itsm_allow(action: str) -> bool:
     return action.startswith("itsm_")
 
 
-def _hermes_runtime_safety(evidence: Mapping[str, Any], state: _TargetState) -> tuple[bool, str]:
+def _hermes_runtime_safety(
+    evidence: Mapping[str, Any], _state: _TargetState
+) -> tuple[bool, str]:
     runtime = evidence.get("runtime")
-    if not isinstance(runtime, Mapping):
-        return False, "Hermes runtime profile binding was not inspected"
-    if runtime.get("profile") != state.profile:
-        return False, "Hermes runtime profile differs from the selected profile"
-    if not _same_runtime_path(runtime.get("home"), state.root):
-        return False, "Hermes runtime home differs from the selected profile root"
-    capabilities = runtime.get("capabilities")
-    if not isinstance(capabilities, (Mapping, list)) or not capabilities:
-        return False, "Hermes runtime capabilities were not inspected"
-    return True, "Hermes runtime profile binding and capabilities match the selected profile"
+    if runtime is not None and not isinstance(runtime, Mapping):
+        return False, "Hermes runtime evidence is invalid"
+    return (
+        False,
+        "Hermes does not expose an official active-profile attestation; "
+        "profile safety verification is unavailable",
+    )
 
 
 def _hermes_profile_config_check(
@@ -1749,25 +1807,23 @@ def _opencode_profile_config_check(
             else None
         )
         expected_entry = _opencode_mcp(mcp, enabled)
+        expected_agent = _opencode_agent(skill_names if enabled else [])
         agent = (
             data.get("agents", {}).get("itsm") if isinstance(data.get("agents"), Mapping) else None
         )
-        expected_permissions = _opencode_agent(skill_names if enabled else [])["permissions"]
-        permissions = agent.get("permissions") if isinstance(agent, Mapping) else None
     else:
         entry = data.get("mcp", {}).get("itsm") if isinstance(data.get("mcp"), Mapping) else None
         expected_entry = _opencode_v1_mcp(mcp, enabled)
+        expected_agent = _opencode_v1_agent(skill_names if enabled else [])
         agent = (
             data.get("agent", {}).get("itsm") if isinstance(data.get("agent"), Mapping) else None
         )
-        expected_permissions = _opencode_v1_agent(skill_names if enabled else [])["permission"]
-        permissions = agent.get("permission") if isinstance(agent, Mapping) else None
     if not isinstance(entry, Mapping) or dict(entry) != expected_entry:
         return False, "managed MCP entry differs from the required schema and state"
     if data.get("default_agent") != DEFAULT_AGENT:
         return False, "the restricted ITSM agent is not the default agent"
-    if permissions != expected_permissions:
-        return False, "managed agent permissions differ from the restricted ruleset"
+    if not isinstance(agent, Mapping) or dict(agent) != expected_agent:
+        return False, "managed agent entry differs from the required restricted agent"
     if not enabled:
         return False, "installation is disabled"
     return True, "managed target denies native actions and allows only ITSM MCP tools/skills"
@@ -2683,7 +2739,7 @@ def build_request(
     if target.version:
         version = _normalized_version(target.version)
         "hermes" if target.engine == "hermes" else _opencode_format(version)
-        profile = target.profile or (root.name if target.engine == "hermes" else None)
+        profile = None if target.engine == "opencode" else (target.profile or root.name)
     else:
         state = _target_state(target)
         version = state.version
@@ -2756,6 +2812,10 @@ def _request_from_payload(payload: Mapping[str, Any]) -> dict[str, Any]:
     )
     if target.engine not in {"opencode", "hermes"}:
         raise InstallerError("request_invalid", "request target engine is unsupported")
+    if target.engine == "opencode" and target.profile is not None:
+        raise InstallerError(
+            "request_invalid", "OpenCode requests must use a workspace, not a profile"
+        )
     mcp = _validate_mcp(payload.get("mcp"))
     skills = _validate_skill_names(payload.get("skills"))
     operation = _validate_operation(payload.get("operation"))
