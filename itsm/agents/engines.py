@@ -359,12 +359,6 @@ def _snapshot_fragment(current: str, snapshot: str) -> tuple[str, str]:
     return "", current
 
 
-def _number(value: object) -> int | None:
-    if isinstance(value, bool) or not isinstance(value, (int, float)):
-        return None
-    return int(value)
-
-
 def _money(value: object) -> float | int | None:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         return None

@@ -447,7 +447,8 @@ def test_v2_stream_is_cumulative_session_isolated_and_reports_engine_usage() -> 
                                 },
                                 "cost": 0,
                                 "content": [{"type": "text", "text": "Hola mundo"}],
-                            }
+                            },
+                            {"id": "msg_user", "type": "user"},
                         ],
                         "cursor": {},
                     },
@@ -511,11 +512,269 @@ def test_v2_stream_is_cumulative_session_isolated_and_reports_engine_usage() -> 
             "type": "usage",
             "inputTokens": 12,
             "outputTokens": 5,
-            "source": "reported",
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 17,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
             "cost": 0,
         }
     ]
     assert events[-1] == {"type": "done", "cancelled": False}
+
+
+def test_v2_usage_aggregates_every_distinct_assistant_message_once() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/info":
+                return httpx.Response(200, json={"version": "2.1.2"})
+            if path == "/api/model":
+                return httpx.Response(
+                    200,
+                    json={"location": {}, "data": [_v2_model("big-pickle")]},
+                )
+            if path == "/api/session":
+                return httpx.Response(200, json={"data": {"id": "ses_multi"}})
+            if path == "/api/event":
+                return _sse(
+                    {
+                        "id": "1",
+                        "type": "session.text.delta",
+                        "data": {
+                            "sessionID": "ses_multi",
+                            "assistantMessageID": "msg_b",
+                            "delta": "fin",
+                        },
+                    },
+                    {
+                        "id": "2",
+                        "type": "session.idle",
+                        "data": {"sessionID": "ses_multi"},
+                    },
+                )
+            if path == "/api/session/ses_multi/agent":
+                return httpx.Response(204)
+            if path == "/api/session/ses_multi/model":
+                return httpx.Response(204)
+            if path == "/api/session/ses_multi/prompt":
+                return httpx.Response(200, json={"data": {"id": "msg_user"}})
+            if path == "/api/session/ses_multi/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "msg_b",
+                                "type": "assistant",
+                                "time": {"created": 2, "completed": 3},
+                                "tokens": {
+                                    "input": 5,
+                                    "output": 1,
+                                    "reasoning": 0,
+                                    "cache": {"read": 0, "write": 2},
+                                },
+                                "cost": 0.2,
+                                "content": [{"type": "text", "text": "fin"}],
+                            },
+                            {
+                                "id": "msg_a",
+                                "type": "assistant",
+                                "time": {"created": 1, "completed": 2},
+                                "tokens": {
+                                    "input": 10,
+                                    "output": 2,
+                                    "reasoning": 1,
+                                    "cache": {"read": 3, "write": 0},
+                                },
+                                "cost": 0.1,
+                                "content": [{"type": "text", "text": "inicio"}],
+                            },
+                            {"id": "msg_user", "type": "user"},
+                            {
+                                "id": "msg_prior_turn",
+                                "type": "assistant",
+                                "tokens": {
+                                    "input": 999,
+                                    "output": 999,
+                                    "reasoning": 999,
+                                    "cache": {"read": 999, "write": 999},
+                                },
+                                "cost": 99,
+                            },
+                        ]
+                    },
+                )
+            raise AssertionError(f"unexpected request {request.method} {path}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE), client=client)
+            await engine.discover()
+            assert await engine.create_session() == "ses_multi"
+            return [
+                event
+                async for event in engine.stream(
+                    "Busca activos",
+                    session_id="ses_multi",
+                    model="opencode/big-pickle",
+                )
+            ]
+
+    events = asyncio.run(scenario())
+
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": 15,
+            "outputTokens": 3,
+            "cacheReadTokens": 3,
+            "cacheWriteTokens": 2,
+            "reasoningTokens": 1,
+            "totalTokens": 24,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
+            "cost": 0.3,
+        }
+    ]
+    assert events[-1] == {"type": "done", "cancelled": False}
+
+
+def test_v2_missing_prompt_anchor_never_sums_prior_turn_assistants() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/api/session/ses_1/agent":
+                return httpx.Response(204)
+            if path == "/api/session/ses_1/model":
+                return httpx.Response(204)
+            if path == "/api/session/ses_1/prompt":
+                return httpx.Response(200, json={"data": {"id": "msg_user"}})
+            if path == "/api/session/ses_1/message":
+                return httpx.Response(
+                    200,
+                    json={
+                        "data": [
+                            {
+                                "id": "msg_prior_turn",
+                                "type": "assistant",
+                                "tokens": {
+                                    "input": 999,
+                                    "output": 999,
+                                    "reasoning": 999,
+                                    "cache": {"read": 999, "write": 999},
+                                },
+                                "cost": 99,
+                            },
+                            {"id": "msg_other_user", "type": "user"},
+                        ]
+                    },
+                )
+            if path == "/api/event":
+                return _sse(
+                    {
+                        "type": "session.idle",
+                        "data": {"sessionID": "ses_1"},
+                    }
+                )
+            raise AssertionError(f"unexpected request {request.method} {path}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE, agent=None), client=client)
+            engine._variant = "v2"
+            return [
+                event
+                async for event in engine.stream(
+                    "Busca activos",
+                    session_id="ses_1",
+                    model="opencode/big-pickle",
+                )
+            ]
+
+    events = asyncio.run(scenario())
+
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": None,
+            "outputTokens": None,
+            "cacheReadTokens": None,
+            "cacheWriteTokens": None,
+            "reasoningTokens": None,
+            "totalTokens": None,
+            "precision": "unavailable",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": None,
+            "totalSource": None,
+        }
+    ]
+
+
+def test_v1_unreadable_prompt_baseline_never_sums_event_snapshots() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def handler(request: httpx.Request) -> httpx.Response:
+            path = request.url.path
+            if path == "/event":
+                return _named_sse(
+                    (
+                        "message.updated",
+                        {
+                            "info": {
+                                "id": "msg_current",
+                                "role": "assistant",
+                                "tokens": {"input": 8, "output": 3},
+                            }
+                        },
+                    ),
+                    ("session.idle", {"sessionID": "ses_v1"}),
+                )
+            if path == "/session/ses_v1/message":
+                if request.method == "GET":
+                    return httpx.Response(500, json={"error": "unavailable"})
+                return httpx.Response(
+                    200,
+                    json={
+                        "info": {
+                            "id": "msg_current",
+                            "role": "assistant",
+                            "tokens": {"input": 8, "output": 3},
+                        },
+                        "parts": [{"id": "prt_text", "type": "text", "text": "fin"}],
+                    },
+                )
+            if path == "/session/ses_v1/model":
+                return httpx.Response(204)
+            raise AssertionError(f"unexpected request {request.method} {path}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE, agent=None), client=client)
+            engine._variant = "v1"
+            return [
+                event
+                async for event in engine.stream(
+                    "Busca activos",
+                    session_id="ses_v1",
+                    model="opencode/big-pickle",
+                )
+            ]
+
+    events = asyncio.run(scenario())
+
+    usage = [event for event in events if event["type"] == "usage"]
+    assert len(usage) == 1
+    assert usage[0]["precision"] == "unavailable"
+    assert usage[0]["inputTokens"] is None
+    assert usage[0]["totalTokens"] is None
 
 
 def test_v2_reconnects_without_resubmitting_prompt_or_duplicating_usage() -> None:
@@ -588,7 +847,8 @@ def test_v2_reconnects_without_resubmitting_prompt_or_duplicating_usage() -> Non
                                 },
                                 "cost": 0,
                                 "content": [{"type": "text", "text": "Hola mundo"}],
-                            }
+                            },
+                            {"id": "msg_user", "type": "user"},
                         ]
                     },
                 )
@@ -670,7 +930,8 @@ def test_v2_disconnect_recovery_emits_completed_message_once() -> None:
                                 },
                                 "cost": 0,
                                 "content": [{"type": "text", "text": "Hola mundo"}],
-                            }
+                            },
+                            {"id": "msg_user", "type": "user"},
                         ]
                     },
                 )
@@ -703,7 +964,16 @@ def test_v2_disconnect_recovery_emits_completed_message_once() -> None:
             "type": "usage",
             "inputTokens": 3,
             "outputTokens": 2,
-            "source": "reported",
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 5,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
             "cost": 0,
         }
     ]
@@ -781,7 +1051,8 @@ def test_v2_failed_tool_stays_failed_with_appended_text_and_reported_usage() -> 
                                 },
                                 "cost": 0,
                                 "content": [{"type": "text", "text": "haha"}],
-                            }
+                            },
+                            {"id": "msg_user", "type": "user"},
                         ],
                         "cursor": {},
                     },
@@ -815,7 +1086,16 @@ def test_v2_failed_tool_stays_failed_with_appended_text_and_reported_usage() -> 
             "type": "usage",
             "inputTokens": 3,
             "outputTokens": 2,
-            "source": "reported",
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 5,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
             "cost": 0,
         }
     ]
@@ -1050,6 +1330,8 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
                     stream=_GeneratedSSE(frames()),
                 )
             if path == "/session/ses_1/message":
+                if request.method == "GET":
+                    return httpx.Response(200, json=[])
                 return _v1_message()
             if path == "/session/ses_1/abort":
                 abort_calls += 1
@@ -1105,7 +1387,16 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
             "type": "usage",
             "inputTokens": 8,
             "outputTokens": 3,
-            "source": "reported",
+            "cacheReadTokens": 0,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 0,
+            "totalTokens": 11,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
             "cost": 0.001,
         }
     ]
@@ -1127,6 +1418,181 @@ def test_v1_event_stream_diffs_cumulative_parts_and_aborts_official_endpoint() -
     assert body["parts"] == [{"type": "text", "text": "Busca activos"}]
     assert body["model"] == "opencode/big-pickle"
     assert body["agent"] == "itsm"
+
+
+def test_v1_usage_aggregates_distinct_messages_without_replaying_cumulative_snapshots() -> None:
+    def info(message_id: str, tokens: Mapping[str, Any], cost: float) -> dict[str, Any]:
+        return {
+            "info": {
+                "id": message_id,
+                "role": "assistant",
+                "tokens": tokens,
+                "cost": cost,
+            }
+        }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        path = request.url.path
+        if path == "/api/info":
+            return httpx.Response(404, json={"error": "not found"})
+        if path == "/global/health":
+            return httpx.Response(200, json={"healthy": True, "version": "1.15.0"})
+        if path == "/config/providers":
+            return httpx.Response(
+                200,
+                json={
+                    "providers": [
+                        {
+                            "id": "opencode",
+                            "models": {"big-pickle": {"name": "Big Pickle", "cost": {"input": 0}}},
+                        }
+                    ]
+                },
+            )
+        if path == "/session":
+            return httpx.Response(200, json={"id": "ses_v1"})
+        if path == "/event":
+            return _named_sse(
+                (
+                    "message.updated",
+                    info(
+                        "msg_a",
+                        {
+                            "input": 4,
+                            "output": 1,
+                            "reasoning": 0,
+                            "cache": {"read": 2, "write": 0},
+                        },
+                        0.0001,
+                    ),
+                ),
+                (
+                    "message.updated",
+                    info(
+                        "msg_a",
+                        {
+                            "input": 6,
+                            "output": 2,
+                            "reasoning": 1,
+                            "cache": {"read": 2, "write": 0},
+                        },
+                        0.0001,
+                    ),
+                ),
+                (
+                    "message.updated",
+                    {
+                        "info": {
+                            "id": "msg_user",
+                            "role": "user",
+                            "tokens": {
+                                "input": 999,
+                                "output": 999,
+                                "reasoning": 999,
+                                "cache": {"read": 999, "write": 999},
+                            },
+                            "cost": 99,
+                        }
+                    },
+                ),
+                (
+                    "message.updated",
+                    info(
+                        "msg_prior",
+                        {
+                            "input": 999,
+                            "output": 999,
+                            "reasoning": 999,
+                            "cache": {"read": 999, "write": 999},
+                        },
+                        99,
+                    ),
+                ),
+                (
+                    "message.updated",
+                    info(
+                        "msg_b",
+                        {
+                            "input": 2,
+                            "output": 1,
+                            "reasoning": 0,
+                            "cache": {"read": 0, "write": 0},
+                        },
+                        0.0002,
+                    ),
+                ),
+                ("session.idle", {"sessionID": "ses_v1"}),
+            )
+        if path == "/session/ses_v1/message":
+            if request.method == "GET":
+                return httpx.Response(
+                    200,
+                    json=[
+                        {
+                            "info": {
+                                "id": "msg_prior",
+                                "role": "assistant",
+                                "tokens": {"input": 5, "output": 5},
+                                "cost": 1,
+                            },
+                            "parts": [],
+                        }
+                    ],
+                )
+            return httpx.Response(
+                200,
+                json={
+                    "info": {
+                        "id": "msg_b",
+                        "role": "assistant",
+                        "tokens": {
+                            "input": 2,
+                            "output": 1,
+                            "reasoning": 0,
+                            "cache": {"read": 0, "write": 0},
+                        },
+                        "cost": 0.0002,
+                    },
+                    "parts": [{"id": "prt_text", "type": "text", "text": "fin"}],
+                },
+            )
+        raise AssertionError(f"unexpected request {request.method} {path}")
+
+    async def scenario() -> list[dict[str, Any]]:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE), client=client)
+            await engine.discover()
+            assert await engine.create_session() == "ses_v1"
+            return [
+                event
+                async for event in engine.stream(
+                    "Busca activos",
+                    session_id="ses_v1",
+                    model="opencode/big-pickle",
+                )
+            ]
+
+    events = asyncio.run(scenario())
+
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": 8,
+            "outputTokens": 3,
+            "cacheReadTokens": 2,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 1,
+            "totalTokens": 14,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": False,
+            "totalSource": "derived",
+            "cost": 0.0003,
+        }
+    ]
+    assert events[-1] == {"type": "done", "cancelled": False}
 
 
 def test_v2_repeated_delta_text_is_not_treated_as_cumulative() -> None:
@@ -1181,7 +1647,8 @@ def test_v2_repeated_delta_text_is_not_treated_as_cumulative() -> None:
                                 },
                                 "cost": 0,
                                 "content": [{"type": "text", "text": "haha"}],
-                            }
+                            },
+                            {"id": "msg_user", "type": "user"},
                         ]
                     },
                 )
@@ -1625,7 +2092,17 @@ def test_hermes_native_stream_maps_deltas_tools_usage_and_completion() -> None:
                         "tool.complete",
                         {"tool_id": "t1", "name": "itsm_search", "result": {"items": 2}},
                     ),
-                    _native_event("session.usage", {"usage": {"input": 7, "output": 4}}),
+                    _native_event(
+                        "session.usage",
+                        {
+                            "input_tokens": 7,
+                            "output_tokens": 4,
+                            "cache_read_tokens": 2,
+                            "cache_write_tokens": 1,
+                            "reasoning_tokens": 1,
+                            "total_tokens": 14,
+                        },
+                    ),
                     _native_event(
                         "message.complete",
                         {
@@ -1697,12 +2174,230 @@ def test_hermes_native_stream_maps_deltas_tools_usage_and_completion() -> None:
             "type": "usage",
             "inputTokens": 7,
             "outputTokens": 4,
-            "source": "reported",
+            "cacheReadTokens": 2,
+            "cacheWriteTokens": 1,
+            "reasoningTokens": 1,
+            "totalTokens": 14,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": True,
+            "totalSource": "provider",
             "cost": 0.0004,
         }
     ]
     assert events[-1] == {"type": "done", "cancelled": False}
     assert "session.resume" not in [item["method"] for item in sent]
+
+
+def _hermes_counters(
+    input_tokens: int,
+    output_tokens: int,
+    cache_read: int,
+    cache_write: int,
+    reasoning: int,
+    total: int,
+    calls: int,
+) -> dict[str, int]:
+    return {
+        "input_tokens": input_tokens,
+        "output_tokens": output_tokens,
+        "cache_read_tokens": cache_read,
+        "cache_write_tokens": cache_write,
+        "reasoning_tokens": reasoning,
+        "total_tokens": total,
+        "prompt_tokens": input_tokens + cache_read + cache_write,
+        "completion_tokens": output_tokens,
+        "api_calls": calls,
+    }
+
+
+def test_hermes_usage_reports_each_turn_delta_from_cumulative_counters() -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        prompt_count = 0
+        baseline = _hermes_counters(100, 20, 30, 5, 3, 155, 1)
+        finals = [
+            _hermes_counters(150, 30, 40, 5, 4, 225, 2),
+            _hermes_counters(160, 33, 41, 6, 5, 240, 3),
+        ]
+
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            nonlocal prompt_count
+            method = request["method"]
+            if method == "session.resume":
+                return [_native_result(request, {"session_id": "rt-9"})]
+            if method == "session.stats":
+                return [_native_result(request, baseline)]
+            if method == "prompt.submit":
+                final = finals[prompt_count]
+                prompt_count += 1
+                return [
+                    _native_result(request, {}),
+                    _native_event("session.usage", final, "rt-9"),
+                    _native_event(
+                        "message.complete", {"status": "complete", "text": ""}, "rt-9"
+                    ),
+                ]
+            raise AssertionError(f"unexpected RPC {method}")
+
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            first = [
+                event
+                async for event in engine.stream("turno uno", session_id="stored-9")
+            ]
+            second = [
+                event
+                async for event in engine.stream("turno dos", session_id="stored-9")
+            ]
+            await engine.close()
+        return first + second, socket.sent
+
+    events, sent = asyncio.run(scenario())
+    usage = [event for event in events if event["type"] == "usage"]
+
+    assert [item["method"] for item in sent].count("session.stats") == 1
+    assert usage == [
+        {
+            "type": "usage",
+            "inputTokens": 50,
+            "outputTokens": 10,
+            "cacheReadTokens": 10,
+            "cacheWriteTokens": 0,
+            "reasoningTokens": 1,
+            "totalTokens": 70,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": True,
+            "totalSource": "provider",
+        },
+        {
+            "type": "usage",
+            "inputTokens": 10,
+            "outputTokens": 3,
+            "cacheReadTokens": 1,
+            "cacheWriteTokens": 1,
+            "reasoningTokens": 1,
+            "totalTokens": 15,
+            "precision": "measured",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": True,
+            "totalSource": "provider",
+        },
+    ]
+
+
+def test_hermes_usage_counter_reset_emits_unavailable_instead_of_a_negative_delta() -> None:
+    baseline = _hermes_counters(100, 20, 30, 5, 3, 155, 1)
+    reset = _hermes_counters(90, 25, 31, 5, 4, 150, 2)
+
+    def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+        method = request["method"]
+        if method == "session.resume":
+            return [_native_result(request, {"session_id": "rt-reset"})]
+        if method == "session.stats":
+            return [_native_result(request, baseline)]
+        if method == "prompt.submit":
+            return [
+                _native_result(request, {}),
+                _native_event("session.usage", reset, "rt-reset"),
+                _native_event(
+                    "message.complete", {"status": "complete", "text": "hola"}, "rt-reset"
+                ),
+            ]
+        raise AssertionError(f"unexpected RPC {method}")
+
+    async def scenario() -> list[dict[str, Any]]:
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            events = [
+                event
+                async for event in engine.stream("turno", session_id="stored-reset")
+            ]
+            await engine.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": None,
+            "outputTokens": None,
+            "cacheReadTokens": None,
+            "cacheWriteTokens": None,
+            "reasoningTokens": None,
+            "totalTokens": None,
+            "precision": "unavailable",
+            "source": "engine",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": True,
+            "totalSource": None,
+        }
+    ]
+    assert events[-1] == {"type": "done", "cancelled": False}
+
+
+def test_hermes_usage_missing_final_evidence_emits_unavailable() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "session.create":
+                return [
+                    _native_result(
+                        request, {"session_id": "rt-missing", "stored_session_id": "stored-missing"}
+                    )
+                ]
+            if method == "prompt.submit":
+                return [
+                    _native_result(request, {}),
+                    _native_event(
+                        "message.complete", {"status": "complete", "text": "hola"}, "rt-missing"
+                    ),
+                ]
+            raise AssertionError(f"unexpected RPC {method}")
+
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            stored = await engine.create_session()
+            events = [
+                event async for event in engine.stream("turno", session_id=stored)
+            ]
+            await engine.close()
+        return events
+
+    events = asyncio.run(scenario())
+
+    assert [event for event in events if event["type"] == "usage"] == [
+        {
+            "type": "usage",
+            "inputTokens": None,
+            "outputTokens": None,
+            "cacheReadTokens": None,
+            "cacheWriteTokens": None,
+            "reasoningTokens": None,
+            "totalTokens": None,
+            "precision": "unavailable",
+            "source": "none",
+            "estimationMethod": None,
+            "inputIncludesCache": False,
+            "outputIncludesReasoning": True,
+            "totalSource": None,
+        }
+    ]
+    assert events[-1] == {"type": "done", "cancelled": False}
 
 
 def test_hermes_native_resume_and_interrupt_use_stored_session_identity() -> None:
@@ -1711,6 +2406,20 @@ def test_hermes_native_resume_and_interrupt_use_stored_session_identity() -> Non
             method = request["method"]
             if method == "session.resume":
                 return [_native_result(request, {"session_id": "rt-2"})]
+            if method == "session.stats":
+                return [
+                    _native_result(
+                        request,
+                        {
+                            "input_tokens": 0,
+                            "output_tokens": 0,
+                            "cache_read_tokens": 0,
+                            "cache_write_tokens": 0,
+                            "reasoning_tokens": 0,
+                            "total_tokens": 0,
+                        },
+                    )
+                ]
             if method == "prompt.submit":
                 return [
                     _native_result(request, {}),
@@ -1739,8 +2448,11 @@ def test_hermes_native_resume_and_interrupt_use_stored_session_identity() -> Non
 
     events, sent = asyncio.run(scenario())
 
-    assert [event["type"] for event in events] == ["session", "done"]
+    assert [event["type"] for event in events] == ["session", "usage", "done"]
     assert events[-1] == {"type": "done", "cancelled": False}
+    assert events[1]["precision"] == "unavailable"
+    assert events[1]["source"] == "none"
+    assert events[1]["inputTokens"] is None
     resume = next(item for item in sent if item["method"] == "session.resume")
     assert resume["params"] == {"session_id": "stored-2"}
     prompt = next(item for item in sent if item["method"] == "prompt.submit")

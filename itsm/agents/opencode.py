@@ -4,8 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import math
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
+from decimal import Decimal
 from typing import Any
 
 from itsm.agents.engines import (
@@ -20,9 +21,14 @@ from itsm.agents.engines import (
     _error_text,
     _HTTPEngine,
     _money,
-    _number,
     _snapshot_fragment,
     _tool_content_text,
+)
+from itsm.agents.usage import (
+    UsageEvidence,
+    genuine_count,
+    measured_usage,
+    unavailable_usage,
 )
 
 _V2_CAPABILITIES = {
@@ -262,6 +268,8 @@ class OpenCodeEngine(_HTTPEngine):
         terminal = False
         failure: EngineError | None = None
         final_message: Mapping[str, Any] | None = None
+        final_messages: list[Mapping[str, Any]] = []
+        prompt_message_id: str | None = None
         seen_event_ids: set[str] = set()
 
         try:
@@ -275,7 +283,7 @@ class OpenCodeEngine(_HTTPEngine):
                                 if model_ref is not None:
                                     await self._switch_model(session_id, model_ref)
                             prompt_attempted = True
-                            await self._prompt(session_id, prompt)
+                            prompt_message_id = await self._prompt(session_id, prompt)
                             prompt_confirmed = True
 
                         async for _event_name, raw_data in frames:
@@ -403,9 +411,13 @@ class OpenCodeEngine(_HTTPEngine):
                         failure = exc
                         break
                     await asyncio.sleep(_RECONNECT_DELAY)
-                    recovered = await self._recover_message(session_id, assistant_id)
-                    if recovered is not None:
-                        final_message = recovered
+                    recovered = await self._recover_messages(
+                        session_id, prompt_message_id
+                    )
+                    if recovered:
+                        final_messages = recovered
+                    final_message = _select_final(final_messages, assistant_id)
+                    if final_message is not None:
                         terminal = True
                         break
                     continue
@@ -413,9 +425,13 @@ class OpenCodeEngine(_HTTPEngine):
                 if terminal:
                     break
                 if attempt < _RECONNECT_ATTEMPTS:
-                    recovered = await self._recover_message(session_id, assistant_id)
-                    if recovered is not None:
-                        final_message = recovered
+                    recovered = await self._recover_messages(
+                        session_id, prompt_message_id
+                    )
+                    if recovered:
+                        final_messages = recovered
+                    final_message = _select_final(final_messages, assistant_id)
+                    if final_message is not None:
                         terminal = True
                         break
                     continue
@@ -428,7 +444,12 @@ class OpenCodeEngine(_HTTPEngine):
 
             if terminal:
                 if final_message is None:
-                    final_message = await self._recover_message(session_id, assistant_id)
+                    recovered = await self._recover_messages(
+                        session_id, prompt_message_id
+                    )
+                    if recovered:
+                        final_messages = recovered
+                    final_message = _select_final(final_messages, assistant_id)
                 if final_message is not None:
                     async for event in self._final_events(
                         final_message, current_text, emitted_tools
@@ -447,6 +468,11 @@ class OpenCodeEngine(_HTTPEngine):
                 await self._interrupt_quietly(session_id)
             cancelled = session_id in self._cancel_requested
             self._cancel_requested.discard(session_id)
+        if prompt_attempted:
+            if final_messages:
+                yield _usage_evidence(final_messages).event()
+            else:
+                yield unavailable_usage(source="engine").event()
         yield {"type": "done", "cancelled": cancelled}
 
     async def _stream_v1(
@@ -465,7 +491,11 @@ class OpenCodeEngine(_HTTPEngine):
         current_text = ""
         part_texts: dict[str, str] = {}
         emitted_tools: set[tuple[str, str]] = set()
-        usage_candidate: Mapping[str, Any] | None = None
+        usage_messages: dict[str, Mapping[str, Any]] = {}
+        usage_steps: dict[str, Mapping[str, Any]] = {}
+        messages_unreliable = False
+        steps_unreliable = False
+        baseline_ids: set[str] | None = None
         cancelled_by_engine = False
         prompt_attempted = False
         terminal = False
@@ -475,6 +505,7 @@ class OpenCodeEngine(_HTTPEngine):
         try:
             try:
                 async with self._open_sse("GET", "/event") as frames:
+                    baseline_ids = await self._v1_message_ids(session_id)
                     body: dict[str, object] = {
                         "parts": [{"type": "text", "text": prompt}],
                     }
@@ -554,13 +585,32 @@ class OpenCodeEngine(_HTTPEngine):
                                 yield event
                             elif part_type == "step-finish":
                                 if isinstance(part.get("tokens"), Mapping):
-                                    usage_candidate = part
+                                    step_message_id = part.get("messageID")
+                                    if (
+                                        baseline_ids is not None
+                                        and isinstance(step_message_id, str)
+                                        and step_message_id in baseline_ids
+                                    ):
+                                        continue
+                                    step_key = part.get("id") or step_message_id
+                                    if step_key is None:
+                                        steps_unreliable = True
+                                    else:
+                                        usage_steps[str(step_key)] = part
                         elif event_type == "message.updated":
                             info = data.get("info")
-                            if isinstance(info, Mapping) and isinstance(
-                                info.get("tokens"), Mapping
+                            if (
+                                isinstance(info, Mapping)
+                                and info.get("role") == "assistant"
+                                and isinstance(info.get("tokens"), Mapping)
                             ):
-                                usage_candidate = info
+                                message_key = info.get("id") or info.get("messageID")
+                                if message_key is None:
+                                    messages_unreliable = True
+                                elif baseline_ids is not None and str(message_key) in baseline_ids:
+                                    continue
+                                else:
+                                    usage_messages[str(message_key)] = info
                         elif event_type == "session.idle":
                             terminal = True
                             break
@@ -590,12 +640,16 @@ class OpenCodeEngine(_HTTPEngine):
                         if fragment:
                             yield {"type": "delta", "text": fragment}
                     info = result.get("info")
-                    if isinstance(info, Mapping):
-                        usage_candidate = info
-                    if usage_candidate is not None:
-                        usage = _usage_event(usage_candidate)
-                        if usage is not None:
-                            yield usage
+                    if (
+                        isinstance(info, Mapping)
+                        and info.get("role") == "assistant"
+                        and isinstance(info.get("tokens"), Mapping)
+                    ):
+                        message_key = info.get("id") or info.get("messageID")
+                        if message_key is None:
+                            messages_unreliable = True
+                        elif baseline_ids is None or str(message_key) not in baseline_ids:
+                            usage_messages[str(message_key)] = info
                     terminal = True
                     failure = None
 
@@ -618,7 +672,47 @@ class OpenCodeEngine(_HTTPEngine):
                     await post_task
             cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
+        messages = (
+            list(usage_messages.values())
+            if usage_messages
+            else list(usage_steps.values())
+        )
+        reliable = baseline_ids is not None and not (
+            messages_unreliable if usage_messages else steps_unreliable
+        )
+        if prompt_attempted:
+            if messages and reliable:
+                yield _usage_evidence(messages).event()
+            else:
+                yield unavailable_usage(source="engine").event()
         yield {"type": "done", "cancelled": cancelled}
+
+    async def _v1_message_ids(self, session_id: str) -> set[str] | None:
+        """Read the pre-prompt message ids, or None when not trustworthy."""
+
+        try:
+            response = await self._request(
+                "GET",
+                f"/session/{session_id}/message",
+                expected=(200,),
+            )
+            payload = response.json()
+        except (EngineError, ValueError):
+            return None
+        data = payload.get("data") if isinstance(payload, Mapping) else payload
+        if not isinstance(data, list):
+            return None
+        ids: set[str] = set()
+        for item in data:
+            if not isinstance(item, Mapping):
+                return None
+            info = item.get("info")
+            message = info if isinstance(info, Mapping) else item
+            message_id = message.get("id") or message.get("messageID")
+            if not isinstance(message_id, str) or not message_id:
+                return None
+            ids.add(message_id)
+        return ids
 
     async def _v1_send_message(
         self, session_id: str, body: Mapping[str, object]
@@ -690,22 +784,34 @@ class OpenCodeEngine(_HTTPEngine):
             expected=(204,),
         )
 
-    async def _prompt(self, session_id: str, prompt: str) -> None:
+    async def _prompt(self, session_id: str, prompt: str) -> str | None:
         payload = await self._json(
             "POST",
             f"/api/session/{session_id}/prompt",
             json_body={"text": prompt},
         )
-        if not isinstance(payload.get("data"), Mapping):
+        data = payload.get("data")
+        if not isinstance(data, Mapping):
             raise EngineError(
                 "protocol",
                 "OpenCode did not acknowledge the prompt",
                 retryable=False,
             )
+        message_id = data.get("id")
+        return message_id if isinstance(message_id, str) else None
 
-    async def _recover_message(
-        self, session_id: str, assistant_id: str | None
-    ) -> Mapping[str, Any] | None:
+    async def _recover_messages(
+        self, session_id: str, prompt_message_id: str | None
+    ) -> list[Mapping[str, Any]] | None:
+        """Return completed assistant messages for this run, or ``None`` on failure.
+
+        The message list is session scoped. When the protocol returns the user
+        message that started this run, use it as the anchor so earlier turns are
+        not recharged. Without an anchor, all completed assistant messages in the
+        session are the only evidence available; callers must treat that as an
+        isolation limit rather than proof of run membership.
+        """
+
         try:
             payload = await self._json(
                 "GET",
@@ -717,17 +823,30 @@ class OpenCodeEngine(_HTTPEngine):
         data = payload.get("data")
         if not isinstance(data, list):
             return None
-        for item in data:
-            if not isinstance(item, Mapping) or item.get("type") != "assistant":
-                continue
-            if assistant_id is not None and item.get("id") != assistant_id:
+        if prompt_message_id is None:
+            return None
+        items = [item for item in data if isinstance(item, Mapping)]
+        anchor = next(
+            (
+                index
+                for index, item in enumerate(items)
+                if item.get("id") == prompt_message_id and item.get("type") == "user"
+            ),
+            None,
+        )
+        if anchor is None:
+            return None
+        items = items[:anchor]
+        messages: list[Mapping[str, Any]] = []
+        for item in items:
+            if item.get("type") != "assistant":
                 continue
             time_value = item.get("time")
             completed = isinstance(time_value, Mapping) and "completed" in time_value
             if not completed and not isinstance(item.get("finish"), str):
                 continue
-            return item
-        return None
+            messages.append(item)
+        return messages
 
     async def _final_events(
         self,
@@ -774,9 +893,6 @@ class OpenCodeEngine(_HTTPEngine):
                     event["output"] = output
                 emitted_tools.add((tool, status))
                 yield event
-        usage = _usage_event(message)
-        if usage is not None:
-            yield usage
 
     def _resolve_model(self, model: str | None) -> tuple[str, str] | None:
         if model is None or model == "":
@@ -923,24 +1039,86 @@ def _assistant_text(message: Mapping[str, Any]) -> str:
     return "".join(pieces)
 
 
-def _usage_event(message: Mapping[str, Any]) -> dict[str, object] | None:
-    tokens = message.get("tokens")
-    if not isinstance(tokens, Mapping):
+def _select_final(
+    messages: Sequence[Mapping[str, Any]], assistant_id: str | None
+) -> Mapping[str, Any] | None:
+    if assistant_id is not None:
+        for message in messages:
+            if message.get("id") == assistant_id:
+                return message
         return None
-    input_tokens = _number(tokens.get("input"))
-    output_tokens = _number(tokens.get("output"))
-    if input_tokens is None or output_tokens is None:
+    return messages[0] if messages else None
+
+
+def _token_count(value: object) -> int | None:
+    try:
+        return genuine_count(value)
+    except (TypeError, ValueError):
         return None
-    event: dict[str, object] = {
-        "type": "usage",
-        "inputTokens": input_tokens,
-        "outputTokens": output_tokens,
-        "source": "reported",
+
+
+def _usage_cost(value: object) -> float | None:
+    amount = _money(value)
+    if amount is None or not math.isfinite(float(amount)):
+        return None
+    return float(amount)
+
+
+def _usage_evidence(messages: Sequence[Mapping[str, Any]]) -> UsageEvidence:
+    """Sum disjoint OpenCode components across distinct assistant messages.
+
+    OpenCode reports uncached input, visible output (excluding reasoning), and
+    cache/reasoning children separately. A component missing from any message
+    stays unknown for the run; the provider total is not reported by the native
+    protocol, so a total is derived only when every component is known.
+    """
+
+    totals = {
+        "input": 0,
+        "output": 0,
+        "cache_read": 0,
+        "cache_write": 0,
+        "reasoning": 0,
     }
-    cost = _money(message.get("cost"))
-    if cost is not None:
-        event["cost"] = cost
-    return event
+    unknown = {key: False for key in totals}
+    cost = Decimal(0)
+    cost_known = True
+    for message in messages:
+        tokens = message.get("tokens")
+        if not isinstance(tokens, Mapping):
+            return unavailable_usage(source="engine")
+        cache = tokens.get("cache")
+        cache_map = cache if isinstance(cache, Mapping) else {}
+        values = {
+            "input": _token_count(tokens.get("input")),
+            "output": _token_count(tokens.get("output")),
+            "cache_read": _token_count(cache_map.get("read")),
+            "cache_write": _token_count(cache_map.get("write")),
+            "reasoning": _token_count(tokens.get("reasoning")),
+        }
+        for key, value in values.items():
+            if value is None:
+                unknown[key] = True
+            else:
+                totals[key] += value
+        amount = _usage_cost(message.get("cost"))
+        if amount is None:
+            cost_known = False
+        else:
+            cost += Decimal(str(amount))
+    try:
+        return measured_usage(
+            input_tokens=None if unknown["input"] else totals["input"],
+            output_tokens=None if unknown["output"] else totals["output"],
+            cache_read_tokens=None if unknown["cache_read"] else totals["cache_read"],
+            cache_write_tokens=None if unknown["cache_write"] else totals["cache_write"],
+            reasoning_tokens=None if unknown["reasoning"] else totals["reasoning"],
+            input_includes_cache=False,
+            output_includes_reasoning=False,
+            cost=float(cost) if cost_known else None,
+        )
+    except ValueError:
+        return unavailable_usage(source="engine")
 
 
 def _error_event(error: EngineError) -> dict[str, object]:
