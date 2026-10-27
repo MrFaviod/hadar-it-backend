@@ -107,6 +107,14 @@ class Settings(BaseSettings):
     agent_daily_token_budget: int = Field(default=200_000, ge=0, le=100_000_000)
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
+    # Ordinary human roles run Pydantic AI in a container owned by this broker.
+    # The API never receives container authority; the URL and token must be
+    # configured together or the isolated path is explicitly unavailable.
+    ai_broker_url: str | None = None
+    ai_broker_token: SecretStr | None = None
+    # Fixed host launch inspector, separate from engine credentials and user input.
+    hermes_inspector_url: str | None = None
+    hermes_inspector_token: SecretStr | None = None
     # Externally supplied Fernet key for provider credentials. Absent or blank
     # means credential writing is honestly unavailable; the process never
     # generates a key or stores it in the database.
@@ -246,6 +254,58 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(LOG_LEVELS)}")
         return level
 
+    @field_validator("hermes_inspector_url")
+    @classmethod
+    def _validate_hermes_inspector_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or re.search(r"\s", normalized)
+        ):
+            raise ValueError("hermes_inspector_url must be an http(s) URL without credentials")
+        return normalized
+
+    @field_validator("ai_broker_url")
+    @classmethod
+    def _validate_ai_broker_url(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("ai_broker_url must not be blank")
+        parsed = urlsplit(normalized)
+        if parsed.scheme not in {"ws", "wss"} or not parsed.hostname:
+            raise ValueError("ai_broker_url must be a ws(s) URL with a host")
+        if (
+            parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+            or re.search(r"\s", normalized)
+        ):
+            raise ValueError("ai_broker_url must not contain credentials, query or whitespace")
+        return normalized
+
+    @field_validator("ai_broker_token", "hermes_inspector_token")
+    @classmethod
+    def _validate_ai_broker_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        if len(raw) < 32:
+            raise ValueError("service token must contain at least 32 characters")
+        if any(character.isspace() for character in raw):
+            raise ValueError("service token must not contain whitespace")
+        return value
+
     @field_validator("agent_model")
     @classmethod
     def _validate_agent_model(cls, value: str) -> str:
@@ -332,6 +392,12 @@ class Settings(BaseSettings):
             self._reject_shared_sqlite_file()
         if self.auth_password_max_length <= self.auth_password_min_length:
             raise ValueError("auth_password_max_length must exceed auth_password_min_length")
+        if (self.ai_broker_url is None) != (self.ai_broker_token is None):
+            raise ValueError("ai_broker_url and ai_broker_token must be configured together")
+        if (self.hermes_inspector_url is None) != (self.hermes_inspector_token is None):
+            raise ValueError(
+                "hermes_inspector_url and hermes_inspector_token must be configured together"
+            )
         return self
 
     def _reject_shared_sqlite_file(self) -> None:
@@ -374,6 +440,8 @@ class Settings(BaseSettings):
             self.system_executor_token,
             self.meilisearch_api_key,
             self.ai_credential_key,
+            self.ai_broker_token,
+            self.hermes_inspector_token,
             *self.monitoring_secrets.values(),
         ):
             if secret is not None:

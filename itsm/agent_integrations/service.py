@@ -19,6 +19,7 @@ from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 from urllib.parse import quote, urlsplit
 from uuid import UUID, uuid4
@@ -2424,11 +2425,13 @@ class AgentIntegrationService:
                 skills: Sequence[str],
                 config_digest: str,
             ) -> dict[str, Any] | None:
-                return await self._opencode_profile_safety(
-                    instance_snapshot,
-                    target,
-                    mcp,
-                    list(skills),
+                inspector = (
+                    self._hermes_profile_safety
+                    if target.engine == "hermes"
+                    else self._opencode_profile_safety
+                )
+                return await inspector(
+                    instance_snapshot, target, mcp, list(skills),
                     {"configDigest": config_digest},
                 )
 
@@ -2439,9 +2442,7 @@ class AgentIntegrationService:
                         mcp=dict(mcp),
                         skills=skills,
                         operation=operation,
-                        profile_inspector=(
-                            inspect_profile if target.engine == "opencode" else None
-                        ),
+                        profile_inspector=inspect_profile,
                     )
             except TimeoutError:
                 raise IntegrationUnavailable("the installer timed out") from None
@@ -2712,13 +2713,12 @@ class AgentIntegrationService:
             connection = await self._verify_connection(mcp)
             connection_ok = bool(connection.get("verified"))
             sanitized = _sanitize_receipt(receipt, os.environ.get(mcp["secretRef"]))
-            safety = (
-                await self._opencode_profile_safety(
-                    instance_snapshot, target, mcp, skills, sanitized
-                )
-                if target.engine == "opencode"
-                else None
+            inspector = (
+                self._hermes_profile_safety
+                if target.engine == "hermes"
+                else self._opencode_profile_safety
             )
+            safety = await inspector(instance_snapshot, target, mcp, skills, sanitized)
             independent_safe = bool(safety and safety.get("verified") is True)
             claimed = sanitized.get("verified") is True and sanitized.get("status") == "verified"
             status = "verified" if claimed and independent_safe and connection_ok else "configured"
@@ -2790,6 +2790,74 @@ class AgentIntegrationService:
             "verified": result.get("verified") is True,
             "checks": list(result.get("checks") or []),
         }
+
+    async def _hermes_profile_safety(
+        self,
+        instance: Any,
+        target: Any,
+        mcp: Mapping[str, str],
+        skills: list[str],
+        receipt: Mapping[str, Any],
+    ) -> dict[str, Any] | None:
+        """Bind a live native inspection to an independently owned host launch."""
+        import httpx
+
+        from itsm.agent_integrations.installer import _hermes_runtime_safety
+
+        digest = receipt.get("configDigest")
+        inspector_url = self._settings.hermes_inspector_url
+        inspector_token = self._settings.hermes_inspector_token
+        endpoint = (getattr(instance, "base_url", None) or "").rstrip("/")
+        home = os.path.realpath(target.path)
+        if not isinstance(digest, str) or not digest or not inspector_url or not inspector_token:
+            return None
+        try:
+            async with httpx.AsyncClient(
+                timeout=30, follow_redirects=False,
+                headers={"Authorization": "Bearer " + inspector_token.get_secret_value()},
+            ) as client:
+                response = await client.post(
+                    inspector_url + "/profile-proof",
+                    json={"profileHome": home, "endpoint": endpoint, "configDigest": digest},
+                )
+            if response.status_code != 200 or len(response.content) > 8192:
+                return None
+            launch = response.json()
+            if not isinstance(launch, Mapping):
+                return None
+            pid = launch.get("processId")
+            if (
+                launch.get("protocol") != "itsm-hermes-launch-v1"
+                or launch.get("profileHome") != home
+                or launch.get("endpoint") != endpoint
+                or launch.get("configDigest") != digest
+                or not isinstance(launch.get("launchId"), str)
+                or not launch["launchId"]
+                or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+            ):
+                return None
+            engine = self._build_engine(instance)
+            try:
+                runtime = await engine.inspect_profile_runtime()
+            finally:
+                await engine.close()
+            evidence = {
+                "source": "hermes:" + endpoint, "verified": True,
+                "configDigest": digest, "targetPath": home,
+                "launch": dict(launch), "runtime": runtime,
+                "checks": [{"name": "runtime.profile", "status": "pass",
+                            "detail": "host-owned launch and live native surface inspected"}],
+            }
+            # Reuse the installer's exact restrictions, including remote receipt import.
+            state = SimpleNamespace(
+                root=home,
+                config_data={"mcp_servers": {"itsm": {"url": mcp["url"]}}},
+            )
+            safe, _detail = _hermes_runtime_safety(evidence, state, skills)
+            return evidence if safe else None
+        except Exception as exc:
+            logger.warning("Hermes runtime inspection failed: %s", type(exc).__name__)
+            return None
 
     async def _opencode_profile_safety(
         self,
