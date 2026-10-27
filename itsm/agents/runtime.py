@@ -542,6 +542,7 @@ def build_toolset() -> FunctionToolset[AgentDeps]:
     tools the model can see and therefore the single authorization surface.
     """
     toolset: FunctionToolset[AgentDeps] = FunctionToolset()
+
     @toolset.tool
     def search_assets(
         ctx: RunContext[AgentDeps],
@@ -1887,7 +1888,6 @@ def _history(conversation: list[ConversationTurn]) -> list[ModelMessage]:
 class AgentRuntime:
     """Lazily built agent bound to one settings snapshot and session factory."""
 
-
     def __init__(
         self,
         settings: Settings,
@@ -1980,9 +1980,7 @@ class AgentRuntime:
                 except AgentUnavailable:
                     raise
                 except Exception as exc:  # provider construction must stay explicit
-                    logger.warning(
-                        "agent provider could not be configured: %s", type(exc).__name__
-                    )
+                    logger.warning("agent provider could not be configured: %s", type(exc).__name__)
                     raise AgentUnavailable() from None
             elif selection is None:
                 raise AgentUnavailable()
@@ -1992,9 +1990,7 @@ class AgentRuntime:
                 except AgentUnavailable:
                     raise
                 except Exception as exc:  # provider construction must stay explicit
-                    logger.warning(
-                        "agent model could not be configured: %s", type(exc).__name__
-                    )
+                    logger.warning("agent model could not be configured: %s", type(exc).__name__)
                     raise AgentUnavailable() from None
         return self._compose(model)
 
@@ -2007,9 +2003,7 @@ class AgentRuntime:
         if provider_selection is not None:
             # Provider records can change between turns; never reuse a model
             # built for a previous endpoint or credential.
-            return self._build(
-                provider_selection=provider_selection, http_client=http_client
-            )
+            return self._build(provider_selection=provider_selection, http_client=http_client)
         if self._model is not None:
             if self._agent is None:
                 self._agent = self._build()
@@ -2047,17 +2041,27 @@ class AgentRuntime:
         usage: AgentUsage | None = None,
         token_limit: int | None = None,
         provider_selection: ProviderModelSelection | None = None,
+        quota: Any = None,
     ) -> tuple[ChatReply, AgentUsage]:
         """Shared run that also returns real usage, including on failure."""
         turn_client = None
         if provider_selection is not None and self._provider_http_client is None:
             # A guarded client is scoped to this turn: a global provider's
             # unrestricted pool must never be reused for a personal one.
-            turn_client = build_provider_http_client(
-                allow_private=provider_selection.allow_private
-            )
+            turn_client = build_provider_http_client(allow_private=provider_selection.allow_private)
         try:
             agent = self._ensure(provider_selection, http_client=turn_client)
+            if quota is not None:
+                from itsm.agents.quota import BudgetedModel
+
+                agent = self._compose(
+                    BudgetedModel(
+                        agent.model,
+                        quota,
+                        context_tokens=self._settings.agent_context_token_bound,
+                        output_tokens=self._settings.agent_max_output_tokens,
+                    )
+                )
             deps = AgentDeps(
                 settings=self._settings,
                 session_factory=self._session_factory,

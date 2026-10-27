@@ -29,7 +29,6 @@ from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session
 
 from itsm.agent_integrations.models import (
-    AgentDailyUsage,
     AgentInstallation,
     AgentInstallationPreference,
     AgentInstance,
@@ -113,16 +112,6 @@ _REDACT_KEYS = frozenset(
 _DONE = object()
 
 
-class BudgetExhausted(Exception):
-    """The local daily policy is spent; no engine call is attempted."""
-
-    code = "budget_exhausted"
-
-    def __init__(self, message: str = "the daily token budget is exhausted") -> None:
-        super().__init__(message)
-        self.message = message
-
-
 class IntegrationUnavailable(Exception):
     """The selected engine, catalog or installer cannot serve the request."""
 
@@ -147,6 +136,10 @@ class InstanceSnapshot:
     default_model: str | None
     integration_identity_id: str | None
     scope: str | None = None
+    quota_mode: str = "direct"
+    direct_company_exception: bool = False
+    managed_provider_id: str | None = None
+    managed_context_tokens: int | None = None
 
 
 @dataclass
@@ -175,61 +168,13 @@ class Turn:
     engine: Any = None
     external_session_id: str | None = None
     provider_selection: ProviderModelSelection | None = None
+    run_id: str | None = None
+    quota: Any = None
     cancel_sent: bool = False
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def stream(self) -> AsyncIterator[dict[str, Any]]:
         return self.service._stream(self)
-
-
-def usage_day(now: datetime | None = None) -> str:
-    return (now or utcnow()).date().isoformat()
-
-
-def _tokens(value: Any, *, field: str) -> int:
-    if isinstance(value, bool) or not isinstance(value, int):
-        raise ValidationFailed(f"{field} must be an integer")
-    if value < 0:
-        raise ValidationFailed(f"{field} must not be negative")
-    return min(value, 1_000_000_000)
-
-
-def record_usage(
-    session: Session,
-    day: str,
-    owner_id: str,
-    *,
-    measured: int = 0,
-    reported: int = 0,
-) -> None:
-    """Accumulate one run's tokens exactly once into the owner's daily row."""
-    measured = max(0, int(measured))
-    reported = max(0, int(reported))
-    if not measured and not reported:
-        return
-    identifier = f"{day}:{owner_id}"
-    row = session.get(AgentDailyUsage, identifier)
-    if row is None:
-        row = AgentDailyUsage(
-            id=identifier,
-            owner_id=owner_id,
-            day=day,
-            measured_tokens=measured,
-            reported_tokens=reported,
-            updated_at=utcnow(),
-        )
-        session.add(row)
-    else:
-        row.measured_tokens = int(row.measured_tokens or 0) + measured
-        row.reported_tokens = int(row.reported_tokens or 0) + reported
-        row.updated_at = utcnow()
-
-
-def _usage_totals(session: Session, day: str, owner_id: str) -> tuple[int, int]:
-    row = session.get(AgentDailyUsage, f"{day}:{owner_id}")
-    if row is None:
-        return 0, 0
-    return int(row.measured_tokens or 0), int(row.reported_tokens or 0)
 
 
 def _clean(value: Any, limit: int) -> str | None:
@@ -268,9 +213,7 @@ def _http_url(value: Any, field_name: str) -> str:
     return text.rstrip("/")
 
 
-def _provider_values(
-    payload: Mapping[str, Any], *, scope: str
-) -> dict[str, Any]:
+def _provider_values(payload: Mapping[str, Any], *, scope: str) -> dict[str, Any]:
     values: dict[str, Any] = {}
     if "name" in payload:
         name = _label(payload["name"], limit=120)
@@ -428,6 +371,9 @@ class AgentIntegrationService:
         self._stale_after_seconds = settings.agent_run_timeout_seconds + 60
         self._active: dict[str, Turn] = {}
         self._active_lock = threading.Lock()
+        from itsm.ai_usage.service import AiUsageService
+
+        self._usage = AiUsageService(settings, session_factory)
 
     # ------------------------------------------------------------- infrastructure
     @contextmanager
@@ -498,9 +444,7 @@ class AgentIntegrationService:
 
     def _require_external_role(self, db: Session, principal: Principal) -> None:
         if not self._privileged_human(db, principal):
-            raise PermissionDenied(
-                "external agent engines require administrator permissions"
-            )
+            raise PermissionDenied("external agent engines require administrator permissions")
 
     def _external_instance(self, db: Session, instance_id: str | None) -> bool:
         if instance_id is None:
@@ -513,9 +457,7 @@ class AgentIntegrationService:
         if self._privileged_human(db, principal):
             return
         if not (self._settings.ai_broker_url and self._settings.ai_broker_token):
-            raise IntegrationUnavailable(
-                "agent isolation is not configured for this account"
-            )
+            raise IntegrationUnavailable("agent isolation is not configured for this account")
 
     def _require_admin(
         self,
@@ -555,6 +497,10 @@ class AgentIntegrationService:
             enabled=bool(row.enabled),
             default_model=row.default_model,
             integration_identity_id=row.integration_identity_id,
+            quota_mode=row.quota_mode,
+            direct_company_exception=row.direct_company_exception,
+            managed_provider_id=row.managed_provider_id,
+            managed_context_tokens=row.managed_context_tokens,
         )
 
     def _secret(self, row: AgentInstance) -> str | None:
@@ -585,11 +531,9 @@ class AgentIntegrationService:
     @staticmethod
     def _provider_models(row: AgentProvider) -> list[str]:
         value = row.models if isinstance(row.models, list) else []
-        return [
-            item
-            for item in value
-            if isinstance(item, str) and item.strip()
-        ][:_MAX_PROVIDER_MODELS]
+        return [item for item in value if isinstance(item, str) and item.strip()][
+            :_MAX_PROVIDER_MODELS
+        ]
 
     @staticmethod
     def _provider_visible(row: AgentProvider, principal: Principal) -> bool:
@@ -626,15 +570,11 @@ class AgentIntegrationService:
             raise NotFound("provider not found")
         return row
 
-    def _require_personal_provider(
-        self, db: Session, principal: Principal
-    ) -> IdentityService:
+    def _require_personal_provider(self, db: Session, principal: Principal) -> IdentityService:
         if principal.kind != HUMAN_ACTOR_KIND:
             raise PermissionDenied("personal providers require a signed-in person")
         identity = IdentityService(db, self._settings)
-        identity.authorize(
-            principal, PERSONAL_PROVIDER_PERMISSION, resource="agent:providers"
-        )
+        identity.authorize(principal, PERSONAL_PROVIDER_PERMISSION, resource="agent:providers")
         return identity
 
     def _can_manage_global(self, db: Session, principal: Principal) -> bool:
@@ -701,6 +641,11 @@ class AgentIntegrationService:
             "enabled": bool(row.enabled),
             "defaultModel": row.default_model,
             "integrationIdentityId": row.integration_identity_id,
+            "quotaMode": row.quota_mode,
+            "directCompanyException": row.direct_company_exception,
+            "managedProviderId": row.managed_provider_id,
+            "managedContextTokens": row.managed_context_tokens,
+            "quota": self._quota_capability(row),
             "createdAt": row.created_at.isoformat(),
             "updatedAt": row.updated_at.isoformat(),
         }
@@ -724,6 +669,28 @@ class AgentIntegrationService:
             "version": version,
             "models": models,
             "error": error,
+            "quota": self._quota_capability(row),
+        }
+
+    def _quota_capability(self, row: AgentInstance | InstanceSnapshot) -> dict[str, Any]:
+        if row.engine == PYDANTIC_ENGINE:
+            return {
+                "mode": "builtin",
+                "enforcement": "admission_only",
+                "reason": (
+                    "Cada solicitud reserva saldo; sin contador previo o límite de contexto "
+                    "verificado no hay garantía estricta."
+                ),
+                "directException": False,
+            }
+        managed = row.quota_mode == "managed"
+        return {
+            "mode": "managed" if managed else "direct",
+            "enforcement": "admission_only" if managed else "observed",
+            "reason": "Proxy con reservas por llamada; aislamiento de salida de red no verificado."
+            if managed
+            else "Motor directo: consumo informado, sin control previo de cada llamada.",
+            "directException": bool(row.direct_company_exception),
         }
 
     # ------------------------------------------------------------------ discovery
@@ -753,9 +720,7 @@ class AgentIntegrationService:
                 f"the {row.engine} engine adapter is not available"
             ) from None
 
-    def _redact(
-        self, value: str, row: InstanceSnapshot, *, secret: str | None = None
-    ) -> str:
+    def _redact(self, value: str, row: InstanceSnapshot, *, secret: str | None = None) -> str:
         text = value
         if row.base_url:
             text = text.replace(row.base_url, _REDACTED)
@@ -805,6 +770,28 @@ class AgentIntegrationService:
                     "tools": True,
                     "usage": True,
                     "history": True,
+                },
+            }
+        if row.quota_mode == "managed":
+            with self._session() as db:
+                provider = self._provider_row(db, row.managed_provider_id or "")
+                if not provider.enabled or provider.scope != "global":
+                    raise IntegrationUnavailable("the managed provider is unavailable")
+                models = [
+                    {"id": item, "name": item, "provider": provider.name, "free": None}
+                    for item in provider.models
+                ]
+            return {
+                "version": "managed",
+                "models": models,
+                "capabilities": {
+                    "streaming": True,
+                    "sessions": True,
+                    "history": True,
+                    "model_switch": True,
+                    "cancel": True,
+                    "tools": True,
+                    "usage": True,
                 },
             }
         engine = self._build_engine(row)
@@ -894,25 +881,7 @@ class AgentIntegrationService:
         return None, None
 
     def _budget(self, db: Session, principal: Principal) -> dict[str, Any]:
-        measured, reported = _usage_totals(db, usage_day(), principal.actor_id)
-        return {
-            "dailyLimit": self._settings.agent_daily_token_budget,
-            "usedMeasured": measured,
-            "usedReported": reported,
-            "strictExternal": False,
-        }
-
-    def _budget_remaining(self, db: Session, principal: Principal) -> int | None:
-        limit = self._settings.agent_daily_token_budget
-        if limit <= 0:
-            return None
-        measured, reported = _usage_totals(db, usage_day(), principal.actor_id)
-        return max(0, limit - measured - reported)
-
-    def _check_budget(self, db: Session, principal: Principal) -> None:
-        remaining = self._budget_remaining(db, principal)
-        if remaining == 0:
-            raise BudgetExhausted()
+        return self._usage.me(principal.actor_id)
 
     # ------------------------------------------------------------- public engine API
     async def engines(self, principal: Principal) -> dict[str, Any]:
@@ -934,8 +903,7 @@ class AgentIntegrationService:
                 if self._provider_visible(row, principal)
             ]
             provider_snapshots = [
-                (self._provider_snapshot(row), self._provider_models(row))
-                for row in provider_rows
+                (self._provider_snapshot(row), self._provider_models(row)) for row in provider_rows
             ]
             preference = self._effective_preference(db, principal)
             if not privileged and self._external_instance(db, preference[0]):
@@ -1070,9 +1038,7 @@ class AgentIntegrationService:
             "credentialStorageAvailable": credential_storage_available(self._settings),
         }
 
-    def create_provider(
-        self, principal: Principal, payload: Mapping[str, Any]
-    ) -> dict[str, Any]:
+    def create_provider(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         self._require_human(principal)
         scope = payload.get("scope")
         if scope not in PROVIDER_SCOPES:
@@ -1195,6 +1161,36 @@ class AgentIntegrationService:
                 payload.get("defaultModel"), "defaultModel", 200
             )
 
+        mapping = {
+            "quotaMode": "quota_mode",
+            "directCompanyException": "direct_company_exception",
+            "managedProviderId": "managed_provider_id",
+            "managedContextTokens": "managed_context_tokens",
+        }
+        for public, stored in mapping.items():
+            if public in payload:
+                values[stored] = payload[public]
+        mode = values.get("quota_mode", getattr(existing, "quota_mode", "direct"))
+        if mode not in {"direct", "managed"}:
+            raise ValidationFailed("quotaMode must be managed or direct")
+        if mode == "managed":
+            provider_id = values.get(
+                "managed_provider_id", getattr(existing, "managed_provider_id", None)
+            )
+            provider = db.get(AgentProvider, provider_id) if provider_id else None
+            if provider is None or provider.scope != "global" or not provider.enabled:
+                raise ValidationFailed("managedProviderId must select an enabled global provider")
+            model = values.get("default_model", getattr(existing, "default_model", None))
+            self._validate_provider_model(provider, model)
+            bound = values.get(
+                "managed_context_tokens", getattr(existing, "managed_context_tokens", None)
+            )
+            if (
+                isinstance(bound, bool)
+                or not isinstance(bound, int)
+                or not 1 <= bound <= 100_000_000
+            ):
+                raise ValidationFailed("managedContextTokens must be a positive input bound")
         if engine == PYDANTIC_ENGINE:
             forbidden = {
                 "baseUrl",
@@ -1554,7 +1550,7 @@ class AgentIntegrationService:
                         )
         capabilities: dict[str, bool] = self._session_capabilities(snapshot.engine, None)
         external_session_id: str | None = None
-        if snapshot.engine != PYDANTIC_ENGINE:
+        if snapshot.engine != PYDANTIC_ENGINE and snapshot.quota_mode != "managed":
             info = await self._discover(snapshot)
             available = {item["id"] for item in info["models"]}
             if model not in available:
@@ -1801,6 +1797,17 @@ class AgentIntegrationService:
                 instance_row = self._instance(db, row.instance_id)
                 self._assert_binding_ceiling(db, identity, principal, instance_row)
                 self._require_verified_profile(db, instance_row)
+                if instance.quota_mode == "direct" and not instance.direct_company_exception:
+                    raise PermissionDenied(
+                        "company-funded direct engines require an explicit quota exception"
+                    )
+                if instance.quota_mode == "managed":
+                    provider = self._provider_row(db, instance.managed_provider_id or "")
+                    if provider.scope != "global" or not provider.enabled:
+                        raise IntegrationUnavailable("the managed global provider is unavailable")
+                    provider_selection = self._provider_selection(
+                        db, principal, provider, row.model
+                    )
             else:
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
@@ -1809,10 +1816,26 @@ class AgentIntegrationService:
                     )
                 elif not self._runtime_configured():
                     raise IntegrationUnavailable("agent model is not configured")
-            self._check_budget(db, principal)
+            run_id = str(uuid4())
             self._recover_stale(db, now)
             if row.status == "running":
                 raise Conflict("a response is already running in this session")
+            from itsm.agents.quota import reserve_run
+
+            attribution = {
+                "provider_id": provider.id if provider is not None else None,
+                "provider_scope": provider.scope if provider is not None else None,
+                "provider_name": provider.name if provider is not None else None,
+                "model": row.model,
+            }
+            quota = reserve_run(
+                self._settings,
+                self._session_factory,
+                principal,
+                run_id=run_id,
+                engine=instance.engine,
+                provider=attribution,
+            )
             original_updated_at = row.updated_at
             messages = list(row.messages or [])
             messages.append({"role": "user", "content": message})
@@ -1837,10 +1860,11 @@ class AgentIntegrationService:
             )
             if claimed.rowcount != 1:
                 db.rollback()
+                quota.finish_without_dispatch()
                 raise Conflict("the session changed while starting the turn")
             db.add(
                 AgentRun(
-                    id=str(uuid4()),
+                    id=run_id,
                     session_id=row.id,
                     owner_id=principal.actor_id,
                     status="running",
@@ -1869,6 +1893,8 @@ class AgentIntegrationService:
             asset_id=asset_id,
             external_session_id=snapshot.external_session_id,
             provider_selection=provider_selection,
+            run_id=run_id,
+            quota=quota,
         )
         with self._active_lock:
             self._active[session_id] = turn
@@ -1886,7 +1912,11 @@ class AgentIntegrationService:
         reported = 0
         completed = False
         try:
-            if turn.session.engine != PYDANTIC_ENGINE and turn.engine is None:
+            if (
+                turn.session.engine != PYDANTIC_ENGINE
+                and turn.engine is None
+                and turn.instance.quota_mode != "managed"
+            ):
                 with turn.lock:
                     if turn.engine is None:
                         turn.engine = self._build_engine(turn.instance)
@@ -1896,11 +1926,7 @@ class AgentIntegrationService:
                 if kind == "delta":
                     text = (text + event["text"])[-_MAX_MESSAGE:]
                 elif kind == "usage":
-                    tokens = int(event["inputTokens"]) + int(event["outputTokens"])
-                    if event["source"] == "measured":
-                        measured += tokens
-                    else:
-                        reported += tokens
+                    turn._usage_events = [*getattr(turn, "_usage_events", []), event]
                 elif kind == "error":
                     error_seen = event
                 elif kind == "done":
@@ -1991,42 +2017,28 @@ class AgentIntegrationService:
             conversation=history,
             assetId=turn.asset_id,
         )
-        with self._session() as db:
-            remaining = self._budget_remaining(db, turn.principal)
         usage = AgentUsage()
-        if hasattr(runtime, "chat_with_usage"):
-            options: dict[str, Any] = {
-                "credential_digest": None,
-                "usage": usage,
-                "token_limit": remaining,
-            }
-            if turn.provider_selection is not None:
-                options["provider_selection"] = turn.provider_selection
-            try:
-                reply, usage = await asyncio.to_thread(
-                    runtime.chat_with_usage,
-                    turn.principal,
-                    request,
-                    **options,
-                )
-            except BaseException:
-                turn._usage = usage  # type: ignore[attr-defined]
-                raise
-        else:
-            if turn.provider_selection is not None:
-                raise IntegrationUnavailable(
-                    "the configured runtime cannot execute provider selections"
-                )
-            reply = await asyncio.to_thread(runtime.chat, turn.principal, request)
+        options: dict[str, Any] = {
+            "credential_digest": None,
+            "usage": usage,
+            "quota": turn.quota,
+        }
+        if turn.provider_selection is not None:
+            options["provider_selection"] = turn.provider_selection
+        try:
+            reply, usage = await asyncio.to_thread(
+                runtime.chat_with_usage,
+                turn.principal,
+                request,
+                **options,
+            )
+        except BaseException:
+            turn._usage = usage  # type: ignore[attr-defined]
+            raise
         turn._usage = usage  # type: ignore[attr-defined]
         turn._reply = reply  # type: ignore[attr-defined]
-        if usage.input_tokens or usage.output_tokens:
-            yield {
-                "type": "usage",
-                "inputTokens": usage.input_tokens,
-                "outputTokens": usage.output_tokens,
-                "source": "measured",
-            }
+        for event in turn.quota.evidence if turn.quota is not None else []:
+            yield event
         for action in reply.actions:
             yield {
                 "type": "tool",
@@ -2037,7 +2049,103 @@ class AgentIntegrationService:
             yield {"type": "delta", "text": reply.message}
         yield {"type": "done", "cancelled": False}
 
+    async def _managed_events(self, turn: Turn) -> AsyncIterator[dict[str, Any]]:
+        from itsm.agents.managed import (
+            ManagedEngineRunner,
+            ManagedEngineSettings,
+            ManagedProfileInputs,
+        )
+        from itsm.ai_gateway import AiGatewayService
+
+        settings = self._settings
+        gateway_url = settings.ai_managed_gateway_url
+        if not gateway_url or turn.provider_selection is None or turn.quota is None:
+            raise IntegrationUnavailable("the managed engine gateway is not configured")
+        with self._session() as db:
+            row = db.get(AgentInstance, turn.instance.id)
+            installation = self._verified_installation(db, row) if row else None
+            if installation is None:
+                raise IntegrationUnavailable("the managed profile is not verified")
+            receipt = installation.receipt or {}
+            mcp = receipt.get("mcp") or {}
+            token = os.environ.get(mcp.get("secretRef", ""))
+            if not token:
+                raise IntegrationUnavailable("the integration credential is unavailable")
+            packages = {
+                name: self._catalog_instance().get_skill(name)["files"]
+                for name in _skill_names(receipt.get("skills"))
+            }
+            provider_name = self._provider_row(db, turn.instance.managed_provider_id).name
+        profile = ManagedProfileInputs(
+            mcp_url=mcp.get("url"), mcp_token=token, skill_packages=packages
+        )
+        gateway = AiGatewayService(settings, self._session_factory, self._usage)
+        grant = turn.quota.reservation
+        lease = gateway.issue_lease(
+            actor_id=turn.principal.actor_id,
+            funding=grant.funding,
+            parent_reservation_id=grant.reservation_id,
+            selection=turn.provider_selection,
+            provider_id=turn.instance.managed_provider_id,
+            provider_scope="global",
+            provider_name=provider_name,
+            model=turn.session.model,
+            engine=turn.session.engine,
+            run_id=turn.run_id,
+            context_tokens=turn.instance.managed_context_tokens,
+            output_tokens=settings.agent_max_output_tokens,
+        )
+        runner = None
+        try:
+            # Replace admission sentinel before starting anything capable of inference.
+            turn.quota.finish_without_dispatch()
+            runner = ManagedEngineRunner(
+                ManagedEngineSettings(
+                    hermes_binary=settings.ai_managed_hermes_binary,
+                    opencode_binary=settings.ai_managed_opencode_binary,
+                    profile_root=settings.ai_managed_profile_root,
+                    startup_timeout_seconds=settings.ai_managed_startup_timeout_seconds,
+                    shutdown_timeout_seconds=settings.ai_managed_shutdown_timeout_seconds,
+                ),
+                turn.instance,
+                lease,
+                gateway_url,
+                profile=profile,
+            )
+            async with asyncio.timeout(settings.agent_run_timeout_seconds):
+                await runner.start()
+                with turn.lock:
+                    turn.engine = runner
+                session_id = await runner.create_session()
+                turn.external_session_id = session_id
+                if self._cancel_requested(turn.session.id):
+                    await runner.cancel(session_id)
+                    return
+                history = [
+                    {"role": item["role"], "content": item["content"][:8000]}
+                    for item in turn.session.messages[:-1]
+                    if item.get("role") in {"user", "assistant"}
+                ]
+                count = settings.agent_max_history_messages
+                history = history[-count:] if count else []
+                async for raw in runner.stream(
+                    turn.message, session_id=session_id, model=runner.native_model, history=history
+                ):
+                    event = self._normalize_event(raw, turn)
+                    if event is not None:
+                        yield event
+        finally:
+            try:
+                if runner is not None:
+                    await runner.aclose()
+            finally:
+                gateway.revoke(lease.lease_id)
+
     async def _external_events(self, turn: Turn) -> AsyncIterator[dict[str, Any]]:
+        if turn.instance.quota_mode == "managed":
+            async for event in self._managed_events(turn):
+                yield event
+            return
         with turn.lock:
             engine = turn.engine or self._build_engine(turn.instance)
             turn.engine = engine
@@ -2130,32 +2238,33 @@ class AgentIntegrationService:
                 event["output"] = _bounded_payload(raw.get("output"))
             return event
         if kind == "usage":
-            source = raw.get("source")
-            if source not in {"measured", "reported"}:
-                return None
-            try:
-                input_tokens = _tokens(raw.get("inputTokens", 0), field="inputTokens")
-                output_tokens = _tokens(raw.get("outputTokens", 0), field="outputTokens")
-            except ValidationFailed:
-                return None
-            event = {
-                "type": "usage",
-                "inputTokens": input_tokens,
-                "outputTokens": output_tokens,
-                "source": source,
+            from itsm.agents.usage import UsageEvidence
+
+            names = {
+                "inputTokens": "input_tokens",
+                "outputTokens": "output_tokens",
+                "cacheReadTokens": "cache_read_tokens",
+                "cacheWriteTokens": "cache_write_tokens",
+                "reasoningTokens": "reasoning_tokens",
+                "totalTokens": "total_tokens",
+                "estimationMethod": "estimation_method",
+                "inputIncludesCache": "input_includes_cache",
+                "outputIncludesReasoning": "output_includes_reasoning",
+                "totalSource": "total_source",
             }
-            cost = raw.get("cost")
-            if isinstance(cost, (int, float)) and not isinstance(cost, bool) and cost >= 0:
-                event["cost"] = float(cost)
-            return event
+            try:
+                payload = {
+                    names.get(key, key): value for key, value in raw.items() if key != "type"
+                }
+                return UsageEvidence.model_validate(payload).event()
+            except ValueError:
+                return None
         if kind == "error":
             code = _label(raw.get("code"), limit=64) or "engine_error"
             message = _clean(raw.get("message"), 1000)
             if message is None:
                 message = "the engine reported an error"
-            message = self._redact(
-                message, turn.instance, secret=self._turn_secret(turn)
-            )
+            message = self._redact(message, turn.instance, secret=self._turn_secret(turn))
             retryable = raw.get("retryable")
             return {
                 "type": "error",
@@ -2181,6 +2290,10 @@ class AgentIntegrationService:
 
         instance = turn.instance
         secret = self._turn_secret(turn)
+        from itsm.ai_usage import QuotaExceeded
+
+        if isinstance(exc, QuotaExceeded):
+            return {"type": "error", "code": exc.code, "message": str(exc), "retryable": False}
         if isinstance(exc, AgentUnavailable):
             return {
                 "type": "error",
@@ -2276,12 +2389,7 @@ class AgentIntegrationService:
                     row.approval_pending = False
                 if turn.external_session_id:
                     row.external_session_id = turn.external_session_id
-            run = db.execute(
-                select(AgentRun)
-                .where(AgentRun.session_id == turn.session.id, AgentRun.status == "running")
-                .order_by(AgentRun.started_at.desc())
-                .limit(1)
-            ).scalar_one_or_none()
+            run = db.get(AgentRun, turn.run_id) if turn.run_id else None
             if run is not None:
                 if cancelled:
                     run.status = "cancelled"
@@ -2290,10 +2398,25 @@ class AgentIntegrationService:
                 else:
                     run.status = "completed"
                 run.finished_at = now
-            record_usage(
-                db, usage_day(now), turn.principal.actor_id, measured=measured, reported=reported
-            )
             db.commit()
+        # The ledger owns a separate transaction: never nest its writes inside
+        # the session transaction (SQLite would deadlock against our own lock).
+        if (
+            turn.quota is not None
+            and turn.session.engine != PYDANTIC_ENGINE
+            and turn.instance.quota_mode != "managed"
+        ):
+            events = getattr(turn, "_usage_events", [])
+            if len(events) == 1:
+                evidence = {
+                    key: value for key, value in events[0].items() if key not in {"type", "cost"}
+                }
+                self._usage.settle(turn.quota.reservation.reservation_id, evidence)
+            else:
+                self._usage.settle(
+                    turn.quota.reservation.reservation_id,
+                    {"precision": "unavailable", "source": "engine"},
+                )
 
     # ----------------------------------------------------------------- install
     def _installer_instance(self) -> Any:
@@ -2489,7 +2612,10 @@ class AgentIntegrationService:
                     else self._opencode_profile_safety
                 )
                 return await inspector(
-                    instance_snapshot, target, mcp, list(skills),
+                    instance_snapshot,
+                    target,
+                    mcp,
+                    list(skills),
                     {"configDigest": config_digest},
                 )
 
@@ -2871,7 +2997,8 @@ class AgentIntegrationService:
             return None
         try:
             async with httpx.AsyncClient(
-                timeout=30, follow_redirects=False,
+                timeout=30,
+                follow_redirects=False,
                 headers={"Authorization": "Bearer " + inspector_token.get_secret_value()},
             ) as client:
                 response = await client.post(
@@ -2891,7 +3018,9 @@ class AgentIntegrationService:
                 or launch.get("configDigest") != digest
                 or not isinstance(launch.get("launchId"), str)
                 or not launch["launchId"]
-                or not isinstance(pid, int) or isinstance(pid, bool) or pid <= 0
+                or not isinstance(pid, int)
+                or isinstance(pid, bool)
+                or pid <= 0
             ):
                 return None
             engine = self._build_engine(instance)
@@ -2900,11 +3029,19 @@ class AgentIntegrationService:
             finally:
                 await engine.close()
             evidence = {
-                "source": "hermes:" + endpoint, "verified": True,
-                "configDigest": digest, "targetPath": home,
-                "launch": dict(launch), "runtime": runtime,
-                "checks": [{"name": "runtime.profile", "status": "pass",
-                            "detail": "host-owned launch and live native surface inspected"}],
+                "source": "hermes:" + endpoint,
+                "verified": True,
+                "configDigest": digest,
+                "targetPath": home,
+                "launch": dict(launch),
+                "runtime": runtime,
+                "checks": [
+                    {
+                        "name": "runtime.profile",
+                        "status": "pass",
+                        "detail": "host-owned launch and live native surface inspected",
+                    }
+                ],
             }
             # Reuse the installer's exact restrictions, including remote receipt import.
             state = SimpleNamespace(
@@ -3081,9 +3218,7 @@ class AgentIntegrationService:
                 os.path.join(target.path, ".opencode", "skills", skill_id, "SKILL.md")
             ):
                 return None
-            projected_skills.append(
-                {"id": skill_id, "name": skill_name, "path": skill_path}
-            )
+            projected_skills.append({"id": skill_id, "name": skill_name, "path": skill_path})
         if not set(skills).issubset(seen_skills):
             return None
         discovered = await self._discover(instance)
@@ -3365,11 +3500,8 @@ __all__ = [
     "PYDANTIC_ENGINE",
     "PYDANTIC_INSTANCE_ID",
     "AgentIntegrationService",
-    "BudgetExhausted",
     "IntegrationUnavailable",
     "Turn",
-    "record_usage",
-    "usage_day",
 ]
 
 

@@ -105,6 +105,9 @@ class Settings(BaseSettings):
     agent_run_timeout_seconds: int = Field(default=180, ge=10, le=900)
     agent_install_timeout_seconds: int = Field(default=120, ge=10, le=600)
     agent_daily_token_budget: int = Field(default=200_000, ge=0, le=100_000_000)
+    # Optional operator-declared upper bound for input billed tokens per call.
+    # No bound means honest admission-only control, not strict token counting.
+    agent_context_token_bound: int | None = Field(default=None, ge=1, le=100_000_000)
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
     # Ordinary human roles run Pydantic AI in a container owned by this broker.
@@ -112,6 +115,13 @@ class Settings(BaseSettings):
     # configured together or the isolated path is explicitly unavailable.
     ai_broker_url: str | None = None
     ai_broker_token: SecretStr | None = None
+    # Disposable managed engines are opt-in; no fallback to shared native state.
+    ai_managed_hermes_binary: str | None = None
+    ai_managed_opencode_binary: str | None = None
+    ai_managed_profile_root: str | None = None
+    ai_managed_gateway_url: str | None = None
+    ai_managed_startup_timeout_seconds: int = Field(default=30, ge=1, le=120)
+    ai_managed_shutdown_timeout_seconds: int = Field(default=10, ge=1, le=60)
     # Fixed host launch inspector, separate from engine credentials and user input.
     hermes_inspector_url: str | None = None
     hermes_inspector_token: SecretStr | None = None

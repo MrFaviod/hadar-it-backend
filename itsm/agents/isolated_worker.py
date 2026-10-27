@@ -76,6 +76,23 @@ class _Bridge:
             raise WorkerProtocolError("tool result is too large")
         return result
 
+    def before_call(self, bound: int) -> str:
+        self._calls += 1
+        call_id = f"q{self._calls}"
+        self._quota(call_id, "reserve")
+        return call_id
+
+    def after_call(self, call_id: str, evidence: dict[str, Any]) -> None:
+        self._quota(call_id, "settle", evidence)
+
+    def _quota(self, call_id: str, phase: str, evidence: dict[str, Any] | None = None) -> None:
+        self._write({"type": "quota.call", "callId": call_id, "phase": phase, "evidence": evidence})
+        result = self._read()
+        if result.get("type") != "quota.result" or result.get("callId") != call_id:
+            raise WorkerProtocolError("unexpected quota response")
+        if result.get("ok") is not True:
+            raise WorkerProtocolError("quota admission denied")
+
     def _write(self, payload: dict[str, Any]) -> None:
         line = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
         if len(line.encode("utf-8")) > _MAX_LINE:
@@ -153,7 +170,7 @@ def _model(start: RunStart) -> tuple[Model, Any]:
         if not provider.allow_private:
             try:
                 ensure_public_endpoint(provider.base_url)
-            except (ProviderEndpointError, OSError):
+            except ProviderEndpointError, OSError:
                 raise WorkerProtocolError("provider endpoint is not allowed") from None
         client = provider_http_client(allow_private=provider.allow_private)
         selection = ProviderModelSelection(
@@ -202,6 +219,15 @@ def _model(start: RunStart) -> tuple[Model, Any]:
 
 async def _run(start: RunStart, bridge: _Bridge) -> tuple[RunUsage, str]:
     model, client = _model(start)
+    if start.quota_enabled:
+        from itsm.agents.quota import BudgetedModel
+
+        model = BudgetedModel(
+            model,
+            bridge,
+            context_tokens=start.context_token_bound,
+            output_tokens=start.max_output_tokens,
+        )
     agent: Agent[None, str] = Agent(
         model,
         output_type=str,
@@ -282,7 +308,7 @@ def _bounded_start(start: RunStart) -> bool:
         encoded = json.dumps(
             start.model_dump(by_alias=True, exclude_none=True), default=str
         ).encode("utf-8")
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
     return len(encoded) <= _MAX_LINE
 

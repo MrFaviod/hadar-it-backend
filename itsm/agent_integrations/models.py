@@ -33,6 +33,10 @@ class AgentInstance(InventoryBase):
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     default_model: Mapped[str | None] = mapped_column(String(200), nullable=True)
     integration_identity_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    quota_mode: Mapped[str] = mapped_column(String(16), nullable=False, default="direct")
+    direct_company_exception: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    managed_provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    managed_context_tokens: Mapped[int | None] = mapped_column(Integer, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
@@ -110,7 +114,7 @@ class AgentRun(InventoryBase):
 
 
 class AgentDailyUsage(InventoryBase):
-    """Daily token counters; measured and externally reported stay separate."""
+    """Read-only legacy UTC counters carried conservatively into quota periods."""
 
     __tablename__ = "agent_daily_usage"
 

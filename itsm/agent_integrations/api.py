@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
 from itsm.agent_integrations.service import (
     AgentIntegrationService,
-    BudgetExhausted,
     IntegrationUnavailable,
 )
 from itsm.identity.api import AuthDependency, MutationDependency
@@ -40,6 +39,10 @@ class InstancePayload(BaseModel):
     enabled: bool | None = None
     defaultModel: str | None = Field(default=None, max_length=200)
     integrationIdentityId: str | None = Field(default=None, max_length=36)
+    quotaMode: Literal["managed", "direct"] | None = None
+    directCompanyException: bool | None = None
+    managedProviderId: str | None = Field(default=None, max_length=36)
+    managedContextTokens: int | None = Field(default=None, ge=1, le=100_000_000)
 
 
 class TargetPayload(BaseModel):
@@ -199,12 +202,7 @@ def create_agent_integrations_router() -> APIRouter:
         context: MutationDependency,
     ) -> StreamingResponse:
         service = _service(request)
-        try:
-            turn = service.prepare_turn(
-                context.principal, session_id, payload.message, payload.assetId
-            )
-        except BudgetExhausted as exc:
-            raise HTTPException(status_code=429, detail=str(exc)) from None
+        turn = service.prepare_turn(context.principal, session_id, payload.message, payload.assetId)
         return StreamingResponse(
             _sse(turn.stream()),
             media_type="text/event-stream",
@@ -337,13 +335,6 @@ def create_agent_integrations_router() -> APIRouter:
 
 def install_agent_integration_error_handlers(app: Any) -> None:
     """Map control-plane domain errors onto the shared error envelope."""
-
-    @app.exception_handler(BudgetExhausted)
-    async def on_budget(request: Request, exc: BudgetExhausted) -> JSONResponse:
-        return JSONResponse(
-            status_code=429,
-            content={"error": {"code": "too_many_requests", "message": str(exc)}},
-        )
 
     @app.exception_handler(IntegrationUnavailable)
     async def on_unavailable(request: Request, exc: IntegrationUnavailable) -> JSONResponse:

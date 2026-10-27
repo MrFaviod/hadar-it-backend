@@ -38,6 +38,7 @@ from itsm.agents.runtime import (
     ChatRequest,
     build_toolset,
 )
+from itsm.ai_usage import QuotaExceeded
 from itsm.config import Settings
 from itsm.identity.permissions import HUMAN_ACTOR_KIND, ROLE_ADMIN, ROLE_SUPERADMIN
 from itsm.identity.service import IdentityService, Principal
@@ -120,6 +121,8 @@ class RunStart(_Strict):
     max_steps: int = Field(default=8, ge=1, le=20)
     max_output_tokens: int = Field(default=1024, ge=1, le=8192)
     token_limit: int | None = Field(default=None, ge=0, le=1_000_000)
+    quota_enabled: bool = False
+    context_token_bound: int | None = Field(default=None, ge=1, le=100_000_000)
 
     @field_validator("run_id", "user_id")
     @classmethod
@@ -139,6 +142,19 @@ class WorkerUsage(_Strict):
     type: Literal["usage"] = "usage"
     input_tokens: int = Field(default=0, ge=0, le=10_000_000)
     output_tokens: int = Field(default=0, ge=0, le=10_000_000)
+
+
+class WorkerQuotaCall(_Strict):
+    type: Literal["quota.call"] = "quota.call"
+    call_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    phase: Literal["reserve", "settle"]
+    evidence: dict[str, Any] | None = None
+
+
+class QuotaResult(_Strict):
+    type: Literal["quota.result"] = "quota.result"
+    call_id: str = Field(min_length=1, max_length=64, pattern=r"^[A-Za-z0-9_-]+$")
+    ok: bool
 
 
 class WorkerToolCall(_Strict):
@@ -196,14 +212,12 @@ def _json_line(payload: BaseModel) -> str:
 def _bounded_json(payload: Any, limit: int) -> bool:
     try:
         return len(json.dumps(payload, ensure_ascii=False, default=str).encode("utf-8")) <= limit
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return False
 
 
 def _history(request: ChatRequest) -> list[HistoryMessage]:
-    return [
-        HistoryMessage(role=turn.role, content=turn.content) for turn in request.conversation
-    ]
+    return [HistoryMessage(role=turn.role, content=turn.content) for turn in request.conversation]
 
 
 def _provider_spec(
@@ -227,9 +241,7 @@ def _provider_spec(
         api_key = os.environ.get("OPENAI_API_KEY")
         base_url = settings.agent_openai_base_url
     elif selection.provider == "anthropic":
-        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get(
-            "ANTHROPIC_AUTH_TOKEN"
-        )
+        api_key = os.environ.get("ANTHROPIC_API_KEY") or os.environ.get("ANTHROPIC_AUTH_TOKEN")
         base_url = None
     else:
         raise AgentUnavailable()
@@ -303,6 +315,7 @@ class IsolatedRuntime:
         usage: AgentUsage | None = None,
         token_limit: int | None = None,
         provider_selection: ProviderModelSelection | None = None,
+        quota: Any = None,
     ) -> tuple[ChatReply, AgentUsage]:
         if not self.configured:
             raise IsolationUnavailable(_UNAVAILABLE)
@@ -319,7 +332,7 @@ class IsolatedRuntime:
         if request.assetId:
             prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
         start = RunStart(
-            run_id=str(uuid.uuid4()),
+            run_id=(quota.reservation.run_id if quota is not None else str(uuid.uuid4())),
             user_id=_uuid_text(principal.actor_id, "principal"),
             timeout_seconds=_run_timeout(self._settings),
             provider=provider,
@@ -330,8 +343,10 @@ class IsolatedRuntime:
             max_steps=self._settings.agent_max_steps,
             max_output_tokens=self._settings.agent_max_output_tokens,
             token_limit=token_limit,
+            quota_enabled=quota is not None,
+            context_token_bound=self._settings.agent_context_token_bound,
         )
-        measured = self._exchange(start, prepared, deps)
+        measured = self._exchange(start, prepared, deps, quota=quota)
         tokens = usage if usage is not None else AgentUsage()
         tokens.input_tokens = measured[0]
         tokens.output_tokens = measured[1]
@@ -377,6 +392,8 @@ class IsolatedRuntime:
         start: RunStart,
         prepared: _PreparedTools,
         deps: AgentDeps,
+        *,
+        quota: Any = None,
     ) -> tuple[int, int, str]:
         from websockets.sync.client import connect
 
@@ -388,6 +405,7 @@ class IsolatedRuntime:
         deadline = _run_timeout(self._settings) + 10
         input_tokens = 0
         output_tokens = 0
+        quota_calls: dict[str, str] = {}
         try:
             with connector(
                 url,
@@ -412,6 +430,35 @@ class IsolatedRuntime:
                         input_tokens += message.input_tokens
                         output_tokens += message.output_tokens
                         continue
+                    if isinstance(message, WorkerQuotaCall):
+                        if quota is None:
+                            raise IsolationUnavailable(_UNAVAILABLE)
+                        if message.phase == "reserve":
+                            if (
+                                message.call_id in quota_calls
+                                or len(quota_calls) >= start.max_steps
+                            ):
+                                raise IsolationUnavailable(_UNAVAILABLE)
+                            try:
+                                identifier = quota.before_call(
+                                    (self._settings.agent_context_token_bound or 0)
+                                    + self._settings.agent_max_output_tokens
+                                )
+                            except Exception as exc:
+                                if not isinstance(exc, QuotaExceeded):
+                                    raise
+                                socket.send(
+                                    _json_line(QuotaResult(call_id=message.call_id, ok=False))
+                                )
+                                raise
+                            quota_calls[message.call_id] = identifier
+                        else:
+                            identifier = quota_calls.get(message.call_id)
+                            if identifier is None or message.evidence is None:
+                                raise IsolationUnavailable(_UNAVAILABLE)
+                            quota.after_call(identifier, message.evidence)
+                        socket.send(_json_line(QuotaResult(call_id=message.call_id, ok=True)))
+                        continue
                     if isinstance(message, WorkerToolCall):
                         socket.send(_json_line(self._tool_result(message, prepared)))
                         continue
@@ -420,9 +467,11 @@ class IsolatedRuntime:
                     if isinstance(message, WorkerError):
                         raise IsolationUnavailable(_UNAVAILABLE)
                     raise IsolationUnavailable(_UNAVAILABLE)
+        except QuotaExceeded:
+            raise
         except IsolationUnavailable:
             raise
-        except (TimeoutError, OSError):
+        except TimeoutError, OSError:
             raise IsolationUnavailable(_UNAVAILABLE) from None
         except Exception:
             logger.warning("isolated agent transport failed")
@@ -467,7 +516,7 @@ class IsolatedRuntime:
 def _worker_message(raw: str) -> Any:
     try:
         payload = json.loads(raw)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         raise IsolationUnavailable(_UNAVAILABLE) from None
     if not isinstance(payload, dict):
         raise IsolationUnavailable(_UNAVAILABLE)
@@ -476,6 +525,7 @@ def _worker_message(raw: str) -> Any:
         "ready": WorkerReady,
         "usage": WorkerUsage,
         "tool.call": WorkerToolCall,
+        "quota.call": WorkerQuotaCall,
         "final": WorkerFinal,
         "error": WorkerError,
     }.get(kind)

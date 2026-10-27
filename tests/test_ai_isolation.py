@@ -70,10 +70,7 @@ def fake_broker(script: Callable[[Any, dict[str, Any], FakeBroker], None]) -> Fa
     state: dict[str, Any] = {}
 
     def authorized(connection: Any, request: Any) -> Any:
-        if (
-            request.path != "/runs"
-            or request.headers.get("Authorization") != f"Bearer {TOKEN}"
-        ):
+        if request.path != "/runs" or request.headers.get("Authorization") != f"Bearer {TOKEN}":
             return connection.respond(401, "unauthorized\n")
         return None
 
@@ -89,9 +86,7 @@ def fake_broker(script: Callable[[Any, dict[str, Any], FakeBroker], None]) -> Fa
             with contextlib.suppress(Exception):
                 connection.close()
 
-    server = sync_serve(
-        handler, "127.0.0.1", 0, process_request=authorized, compression=None
-    )
+    server = sync_serve(handler, "127.0.0.1", 0, process_request=authorized, compression=None)
     broker = FakeBroker(
         server=server,
         thread=threading.Thread(target=server.serve_forever, daemon=True),
@@ -248,9 +243,7 @@ def test_session_turn_uses_the_isolated_runtime(
         assert broker.results[0]["ok"] is True
         assert events[-1]["type"] == "done"
         assert events[-1]["actions"][0]["tool"] == "search_assets"
-        stored = client.get(
-            f"{API}/agent/sessions/{created.json()['id']}", headers=headers
-        )
+        stored = client.get(f"{API}/agent/sessions/{created.json()['id']}", headers=headers)
         assert [item["role"] for item in stored.json()["messages"]] == [
             "user",
             "assistant",
@@ -626,3 +619,62 @@ def test_broker_launches_one_hardened_worker_and_relays_tools(tmp_path: Path) ->
     assert not any(part.startswith("itsm.ai.image") for part in run)
     assert f"itsm.ai.user={__import__('hashlib').sha256(user_id.encode()).hexdigest()[:32]}" in run
     assert any(item and item[0] == "rm" and "--force" in item for item in lines)
+
+
+def test_isolated_calls_settle_then_deny_next_call_without_dispatch(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    from itsm.agents.usage import measured_usage
+
+    admitted: list[str] = []
+
+    def script(connection: Any, start: dict[str, Any], broker: FakeBroker) -> None:
+        for call_id in ("q1", "q2"):
+            connection.send(
+                json.dumps(
+                    {"type": "quota.call", "callId": call_id, "phase": "reserve", "evidence": None}
+                )
+            )
+            reply = json.loads(connection.recv(timeout=10))
+            if not reply["ok"]:
+                return
+            admitted.append(call_id)
+            connection.send(
+                json.dumps(
+                    {
+                        "type": "quota.call",
+                        "callId": call_id,
+                        "phase": "settle",
+                        "evidence": measured_usage(
+                            input_tokens=4,
+                            output_tokens=2,
+                            total_tokens=6,
+                            total_source="provider",
+                            source="provider",
+                        ).event(),
+                    }
+                )
+            )
+            assert json.loads(connection.recv(timeout=10))["ok"] is True
+        finish(connection, "unexpected second dispatch")
+
+    broker = fake_broker(script)
+    catalog, client, settings = app_with_broker(settings_factory, broker)
+    try:
+        reader = catalog.add_user(*READER)
+        usage = client.app.state.agent_usage
+        usage.update_policy(catalog.admin(), company_daily_limit=settings.agent_max_output_tokens)
+        headers = sign_in_as(client, settings, READER[0], MACHINE_PASSWORD)
+        response = chat(client, headers, "buscá switches")
+        assert response.status_code == 429, response.text
+        assert response.json()["error"]["code"] == "quota_exceeded"
+        assert admitted == ["q1"]
+        balance = usage.me(reader.actor_id)["funding"]["company"]
+        assert balance["consumedTokens"] == 6
+        assert balance["reservedTokens"] == 0
+        assert balance["availableTokens"] == settings.agent_max_output_tokens - 6
+        assert broker.errors == []
+    finally:
+        broker.close()
+        client.__exit__(None, None, None)
+        catalog.engine.dispose()

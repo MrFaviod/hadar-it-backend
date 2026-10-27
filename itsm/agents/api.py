@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import logging
 from typing import Any
+from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Request
 from itsm.agents.isolation import IsolatedRuntime, IsolationUnavailable, is_privileged_human
-from itsm.agents.runtime import AgentUnavailable, ChatReply, ChatRequest
+from itsm.agents.quota import reserve_run
+from itsm.agents.runtime import AgentUnavailable, ChatRequest
+from itsm.ai_usage.service import QuotaExceeded
 from itsm.identity.api import MutationDependency
 from itsm.identity.hashing import hash_token
 from itsm.identity.service import Principal
@@ -74,20 +77,24 @@ def create_agent_router() -> APIRouter:
                     f"conversation must have at most {settings.agent_max_history_messages} messages"
                 ),
             )
+        quota = reserve_run(
+            settings, request.app.state.session_factory, context.principal, run_id=str(uuid4())
+        )
         try:
-            reply: ChatReply = runtime.chat(
+            reply, _ = runtime.chat_with_usage(
                 context.principal,
                 payload,
                 credential_digest=_bearer_digest(request),
+                quota=quota,
             )
+        except QuotaExceeded:
+            raise
         except AgentUnavailable:
             log_event(logger, "agent.unavailable", level=logging.WARNING)
             raise HTTPException(status_code=503, detail="agent model is not configured") from None
         except IsolationUnavailable:
             log_event(logger, "agent.isolation_unavailable", level=logging.WARNING)
-            raise HTTPException(
-                status_code=503, detail="agent isolation is unavailable"
-            ) from None
+            raise HTTPException(status_code=503, detail="agent isolation is unavailable") from None
         except Exception as exc:  # provider failures stay factual and redacted
             logger.warning("agent request failed: %s", type(exc).__name__)
             log_event(logger, "agent.request_failed", level=logging.WARNING)

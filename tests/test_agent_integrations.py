@@ -81,7 +81,15 @@ class FakeEngine:
         }
         self.events = events or [
             {"type": "delta", "text": "hola"},
-            {"type": "usage", "inputTokens": 3, "outputTokens": 2, "source": "reported"},
+            {
+                "type": "usage",
+                "inputTokens": 3,
+                "outputTokens": 2,
+                "totalTokens": 5,
+                "totalSource": "provider",
+                "precision": "measured",
+                "source": "engine",
+            },
             {"type": "done", "cancelled": False},
         ]
         self.discover_error = discover_error
@@ -147,11 +155,23 @@ class FakeRuntime:
         self.reply = reply
         self.requests: list[Any] = []
 
-    def chat(
-        self, principal: Any, request: Any, *, credential_digest: str | None = None
-    ) -> ChatReply:
+    def chat_with_usage(
+        self,
+        principal: Any,
+        request: Any,
+        *,
+        credential_digest: str | None = None,
+        usage: Any = None,
+        quota: Any = None,
+        **options: Any,
+    ) -> tuple[ChatReply, Any]:
         self.requests.append(request)
-        return self.reply
+        identifier = quota.before_call(8)
+        quota.after_call(
+            identifier,
+            {"type": "usage", "totalTokens": 5, "precision": "measured", "source": "provider"},
+        )
+        return self.reply, usage
 
 
 def _normalize_receipt(receipt: dict[str, Any]) -> dict[str, Any]:
@@ -482,6 +502,7 @@ def configure_instance(
         "engine": "opencode",
         "baseUrl": "http://127.0.0.1:9",
         "profile": "itsm",
+        "directCompanyException": True,
         **overrides,
     }
     response = client.post(f"{API}/agent/integrations/instances", json=payload, headers=headers)
@@ -640,12 +661,10 @@ def test_preferences_and_installation_defaults(app_client) -> None:
     assert engines.status_code == 200, engines.text
     body = engines.json()
     assert body["preference"] == {"instanceId": "pydantic", "model": "openai:gpt-4o-mini"}
-    assert body["budget"] == {
-        "dailyLimit": 200_000,
-        "usedMeasured": 0,
-        "usedReported": 0,
-        "strictExternal": False,
-    }
+    company = body["budget"]["funding"]["company"]
+    assert company["availableTokens"] == 200_000
+    assert company["consumedTokens"] == 0
+    assert body["budget"]["funding"]["personal"]["unlimited"] is True
     pydantic = next(item for item in body["instances"] if item["id"] == "pydantic")
     assert pydantic["models"] == [
         {
@@ -939,8 +958,15 @@ def test_external_session_stream_redacts_usage_and_enforces_local_budget(
         {"type": "tool", "tool": "legacy_error", "status": "error"},
         {"type": "tool", "tool": "engine_failed", "status": "failed"},
         {"type": "delta", "text": "Dos activos."},
-        {"type": "usage", "inputTokens": 3, "outputTokens": 2, "source": "reported"},
-        {"type": "usage", "inputTokens": 1, "outputTokens": 0, "source": "measured"},
+        {
+            "type": "usage",
+            "inputTokens": 4,
+            "outputTokens": 2,
+            "totalTokens": 6,
+            "totalSource": "provider",
+            "precision": "measured",
+            "source": "engine",
+        },
         {"type": "done", "cancelled": False},
     ]
     engine = FakeEngine(events=events)
@@ -987,12 +1013,9 @@ def test_external_session_stream_redacts_usage_and_enforces_local_budget(
     assert streamed[-1] == {"type": "done", "cancelled": False}
 
     engines = client.get(f"{API}/agent/engines", headers=reader).json()
-    assert engines["budget"] == {
-        "dailyLimit": 5,
-        "usedMeasured": 1,
-        "usedReported": 5,
-        "strictExternal": False,
-    }
+    company = engines["budget"]["funding"]["company"]
+    assert company["consumedTokens"] == 6
+    assert company["availableTokens"] == 0
     blocked = client.post(
         f"{API}/agent/sessions/{session_id}/messages",
         json={"message": "otra vez"},
@@ -1016,7 +1039,15 @@ def test_reconnect_does_not_duplicate_usage(app_client, monkeypatch) -> None:
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(
         events=[
-            {"type": "usage", "inputTokens": 2, "outputTokens": 1, "source": "reported"},
+            {
+                "type": "usage",
+                "inputTokens": 2,
+                "outputTokens": 1,
+                "totalTokens": 3,
+                "totalSource": "provider",
+                "precision": "measured",
+                "source": "engine",
+            },
             {"type": "done", "cancelled": False},
         ]
     )
@@ -1046,8 +1077,8 @@ def test_reconnect_does_not_duplicate_usage(app_client, monkeypatch) -> None:
             read_sse(response)
         client.get(f"{API}/agent/sessions/{session_id}", headers=reader)
     budget = client.get(f"{API}/agent/engines", headers=reader).json()["budget"]
-    assert budget["usedReported"] == 6
-    assert budget["usedMeasured"] == 0
+    assert budget["funding"]["company"]["consumedTokens"] == 6
+    assert budget["funding"]["company"]["reservedTokens"] == 0
     assert engine.created == 1  # the external session id was reused
 
 
@@ -1058,7 +1089,15 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(
         events=[
-            {"type": "usage", "inputTokens": 1, "outputTokens": 1, "source": "reported"},
+            {
+                "type": "usage",
+                "inputTokens": 1,
+                "outputTokens": 1,
+                "totalTokens": 2,
+                "totalSource": "provider",
+                "precision": "measured",
+                "source": "engine",
+            },
             {
                 "type": "error",
                 "code": "provider",
@@ -1098,7 +1137,7 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
     assert "127.0.0.1" not in error["message"]
     assert streamed[-1]["type"] == "done"
     budget = client.get(f"{API}/agent/engines", headers=reader).json()["budget"]
-    assert budget["usedReported"] == 2
+    assert budget["funding"]["company"]["consumedTokens"] == 2
 
 
 def test_installer_failure_detail_survives_public_receipt_without_secrets(
@@ -1111,11 +1150,19 @@ def test_installer_failure_detail_survives_public_receipt_without_secrets(
         client,
         catalog,
         engine_factory=lambda instance, secret: FakeEngine(),
-        installer=FakeInstaller([{
-            "status": "failed", "verified": False,
-            "error": {"code": "config_invalid", "message": f"invalid configuration {token}"},
-            "limitations": ["Profile inspection did not complete"],
-        }]),
+        installer=FakeInstaller(
+            [
+                {
+                    "status": "failed",
+                    "verified": False,
+                    "error": {
+                        "code": "config_invalid",
+                        "message": f"invalid configuration {token}",
+                    },
+                    "limitations": ["Profile inspection did not complete"],
+                }
+            ]
+        ),
         catalog_api=FakeCatalog(),
     )
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
@@ -1467,13 +1514,7 @@ def test_budget_precheck_blocks_before_engine_call(app_client, monkeypatch) -> N
     install_verified(client, admin, instance, machine.actor_id)
 
     principal = catalog.admin()
-    with service._session() as db:
-        from itsm.agent_integrations.service import record_usage, usage_day
-
-        record_usage(db, usage_day(), principal.actor_id, measured=0, reported=10_000)
-        db.commit()
-
-    settings.agent_daily_token_budget = 10
+    service._usage.update_policy(principal, company_daily_limit=0)
 
     async def scenario() -> None:
         session = await service.create_session(
@@ -1481,7 +1522,7 @@ def test_budget_precheck_blocks_before_engine_call(app_client, monkeypatch) -> N
         )
         with pytest.raises(Exception) as excinfo:
             service.prepare_turn(principal, session["id"], "hola", None)
-        assert getattr(excinfo.value, "code", None) == "budget_exhausted"
+        assert getattr(excinfo.value, "code", None) == "quota_exceeded"
         assert engine.messages == []
 
     asyncio.run(scenario())
@@ -1964,10 +2005,7 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
                         {
                             "id": "itsm-inventory",
                             "name": "itsm-inventory",
-                            "path": (
-                                "/srv/opencode/itsm/.opencode/skills/"
-                                "itsm-inventory/SKILL.md"
-                            ),
+                            "path": ("/srv/opencode/itsm/.opencode/skills/itsm-inventory/SKILL.md"),
                         },
                         {
                             "id": "opencode.skill",
@@ -2119,9 +2157,7 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
         agent_permissions.append(later)
         assert (
             asyncio.run(
-                service._opencode_profile_safety(
-                    instance, target, mcp, ["itsm-inventory"], receipt
-                )
+                service._opencode_profile_safety(instance, target, mcp, ["itsm-inventory"], receipt)
             )
             is None
         ), later
@@ -2380,3 +2416,141 @@ def test_first_install_still_requires_a_skill_selection(app_client, monkeypatch)
     assert response.json()["error"]["message"] == "skills are required for the first installation"
     assert installer.calls == []
     assert client.get(f"{API}/agent/integrations", headers=admin).json()["installations"] == []
+
+
+@pytest.mark.parametrize("constructor_fails", [False, True])
+def test_managed_dispatch_binds_real_gateway_and_revokes_lease(
+    app_client, monkeypatch, constructor_fails
+) -> None:
+    from itsm.agents import managed as managed_module
+    from itsm.ai_gateway import AiGatewayService
+    from itsm.ai_gateway import service as gateway_module
+    from itsm.ai_gateway.models import AiGatewayLease
+    from pydantic import SecretStr
+    from sqlalchemy import select
+
+    catalog, client, settings = app_client
+    settings.ai_credential_key = SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    settings.ai_managed_gateway_url = "http://127.0.0.1:18080/api/v1/agent/gateway/v1"
+    settings.agent_max_output_tokens = 10
+    machine, token = catalog.add_machine("managed-client", "Managed Client")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    skills = FakeCatalog()
+    skills.skills["itsm-inventory"]["files"] = {"SKILL.md": b"# Inventory\n"}
+    service = build_service(
+        client,
+        catalog,
+        installer=FakeInstaller([{"skills": ["itsm-inventory"]}]),
+        catalog_api=skills,
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    provider = client.post(
+        f"{API}/agent/providers",
+        headers=admin,
+        json={
+            "scope": "global",
+            "name": "Managed provider",
+            "baseUrl": "http://127.0.0.1:18081/v1",
+            "models": ["model-a"],
+            "apiKey": "test-only-upstream-key",
+        },
+    )
+    assert provider.status_code == 201, provider.text
+    instance = configure_instance(
+        client,
+        admin,
+        integrationIdentityId=machine.actor_id,
+        quotaMode="managed",
+        managedProviderId=provider.json()["id"],
+        managedContextTokens=20,
+        directCompanyException=False,
+        defaultModel="model-a",
+    )
+    assert install_verified(client, admin, instance, machine.actor_id)["verified"]
+    upstream_requests = []
+    lease_tokens = []
+    closed = []
+
+    def upstream(request):
+        upstream_requests.append(request)
+        assert request.headers["Authorization"] == "Bearer test-only-upstream-key"
+        assert json.loads(request.content)["model"] == "model-a"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "managed reply"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    monkeypatch.setattr(
+        gateway_module,
+        "provider_http_client",
+        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+    )
+
+    class NativeBoundary:
+        native_model = "itsm/model-a"
+
+        def __init__(self, config, instance, lease, gateway_url, *, profile):
+            self.lease = lease
+            lease_tokens.append(lease.bearer_token)
+            if constructor_fails:
+                raise ValueError("invalid native profile")
+
+        async def start(self):
+            pass
+
+        async def create_session(self):
+            return "managed-session"
+
+        async def stream(self, message, **kwargs):
+            gateway = AiGatewayService(settings, catalog.factory(), service._usage)
+            context = gateway.authenticate(self.lease.bearer_token)
+            result = await gateway.chat(
+                context,
+                {
+                    "model": "model-a",
+                    "messages": [{"role": "user", "content": message}],
+                    "max_tokens": 10,
+                },
+            )
+            assert result.status_code == 200
+            yield {"type": "delta", "text": "managed reply"}
+            yield {"type": "done", "cancelled": False}
+
+        async def aclose(self):
+            closed.append(True)
+
+    monkeypatch.setattr(managed_module, "ManagedEngineRunner", NativeBoundary)
+    created = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={"instanceId": instance["id"], "model": "model-a"},
+    )
+    assert created.status_code == 201, created.text
+    response = client.post(
+        f"{API}/agent/sessions/{created.json()['id']}/messages",
+        headers=admin,
+        json={"message": "hola"},
+    )
+    assert response.status_code == 200, response.text
+    events = read_sse(response)
+    assert lease_tokens, events
+    if constructor_fails:
+        assert any(event["type"] == "error" for event in events)
+        assert not upstream_requests
+        assert not closed
+    else:
+        assert any(event.get("text") == "managed reply" for event in events), events
+        assert len(upstream_requests) == 1
+        assert closed == [True]
+    with catalog.factory()() as db:
+        leases = db.scalars(select(AiGatewayLease)).all()
+        assert len(leases) == 1
+        assert leases[0].revoked_at is not None
+    own = client.get(f"{API}/agent/usage/me", headers=admin).json()["funding"]
+    assert own["company"]["consumedTokens"] == (0 if constructor_fails else 5)
+    assert own["personal"]["consumedTokens"] == 0
+    assert own["company"]["reservedTokens"] == 0
+    assert all(secret not in response.text for secret in lease_tokens)

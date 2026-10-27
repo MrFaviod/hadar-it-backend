@@ -28,10 +28,12 @@ from dataclasses import dataclass, field
 from typing import Any, Final
 
 from itsm.agents.isolation import (
+    QuotaResult,
     RunStart,
     ToolResult,
     WorkerError,
     WorkerFinal,
+    WorkerQuotaCall,
     WorkerReady,
     WorkerToolCall,
     WorkerUsage,
@@ -143,9 +145,7 @@ class Broker:
 
     async def handle(self, connection: Any) -> None:
         try:
-            raw = await asyncio.wait_for(
-                connection.recv(), timeout=self._config.connect_timeout
-            )
+            raw = await asyncio.wait_for(connection.recv(), timeout=self._config.connect_timeout)
         except Exception:
             await connection.close(code=1008, reason="missing start")
             return
@@ -212,9 +212,7 @@ class Broker:
         user = hashlib.sha256(start.user_id.encode("utf-8")).hexdigest()[:32]
         return f"itsm-ai-{user}-{start.run_id[:8]}"
 
-    async def _serve(
-        self, connection: Any, start: RunStart, container: _Container
-    ) -> None:
+    async def _serve(self, connection: Any, start: RunStart, container: _Container) -> None:
         name = container.name
         command = [
             self._config.docker,
@@ -265,9 +263,7 @@ class Broker:
         container.process = process
         try:
             if process.stderr is not None:
-                container.stderr = asyncio.create_task(
-                    self._drain(process.stderr, start.run_id)
-                )
+                container.stderr = asyncio.create_task(self._drain(process.stderr, start.run_id))
             assert process.stdin is not None and process.stdout is not None
             process.stdin.write((_encode(start) + "\n").encode("utf-8"))
             await process.stdin.drain()
@@ -296,9 +292,7 @@ class Broker:
         start: RunStart,
     ) -> None:
         state = _CallState()
-        reader = asyncio.create_task(
-            self._from_container(connection, process, start, state)
-        )
+        reader = asyncio.create_task(self._from_container(connection, process, start, state))
         writer = asyncio.create_task(self._to_container(connection, process, state))
         try:
             done, pending = await asyncio.wait(
@@ -334,13 +328,24 @@ class Broker:
             if len(raw.encode("utf-8")) > _MAX_FRAME_BYTES:
                 raise _RelayClosed()
             try:
-                result = ToolResult.model_validate(json.loads(raw))
+                payload = json.loads(raw)
+                result = (
+                    QuotaResult.model_validate(payload)
+                    if payload.get("type") == "quota.result"
+                    else ToolResult.model_validate(payload)
+                )
             except Exception:
                 raise _RelayClosed() from None
-            if result.call_id not in state.pending:
+            expected = state.pending.get(result.call_id)
+            actual = "quota.result" if isinstance(result, QuotaResult) else "tool.result"
+            if expected != actual:
                 raise _RelayClosed()
-            state.pending.discard(result.call_id)
-            if result.ok and len(_encode(result.result)) > self._config.max_output_bytes:
+            state.pending.pop(result.call_id)
+            if (
+                isinstance(result, ToolResult)
+                and result.ok
+                and len(_encode(result.result)) > self._config.max_output_bytes
+            ):
                 result = ToolResult(call_id=result.call_id, ok=False)
             process.stdin.write((_encode(result) + "\n").encode("utf-8"))
             await process.stdin.drain()
@@ -382,6 +387,13 @@ class Broker:
                 usage = WorkerUsage.model_validate(payload)
                 await connection.send(_encode(usage))
                 continue
+            if kind == "quota.call":
+                call = WorkerQuotaCall.model_validate(payload)
+                if not start.quota_enabled or call.call_id in state.pending:
+                    raise _RelayClosed()
+                state.pending[call.call_id] = "quota.result"
+                await connection.send(_encode(call))
+                continue
             if kind == "tool.call":
                 call = WorkerToolCall.model_validate(payload)
                 if call.name not in names:
@@ -391,7 +403,7 @@ class Broker:
                     raise _RelayClosed()
                 if call.call_id in state.pending:
                     raise _RelayClosed()
-                state.pending.add(call.call_id)
+                state.pending[call.call_id] = "tool.result"
                 await connection.send(_encode(call))
                 continue
             if kind == "final":
@@ -468,7 +480,7 @@ class _RelayClosed(Exception):
 
 @dataclass
 class _CallState:
-    pending: set[str] = field(default_factory=set)
+    pending: dict[str, str] = field(default_factory=dict)
 
 
 def _encode(payload: Any) -> str:
