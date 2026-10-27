@@ -4,10 +4,14 @@ from __future__ import annotations
 
 import logging
 
+from typing import Any
+
 from fastapi import APIRouter, HTTPException, Request
+from itsm.agents.isolation import IsolatedRuntime, IsolationUnavailable, is_privileged_human
 from itsm.agents.runtime import AgentRuntime, AgentUnavailable, ChatReply, ChatRequest
 from itsm.identity.api import MutationDependency
 from itsm.identity.hashing import hash_token
+from itsm.identity.service import Principal
 from itsm.logging import log_event
 
 logger = logging.getLogger("itsm.agent")
@@ -22,11 +26,24 @@ def _bearer_digest(request: Request) -> str | None:
     return hash_token(token.strip())
 
 
-def _runtime(request: Request) -> AgentRuntime:
-    runtime = getattr(request.app.state, "agent_runtime", None)
-    if runtime is None:
-        raise HTTPException(status_code=503, detail="agent model is not configured")
-    return runtime
+def _runtime(request: Request, principal: Principal) -> Any:
+    settings = request.app.state.settings
+    session_factory = request.app.state.session_factory
+    with session_factory() as db:
+        privileged = is_privileged_human(db, settings, principal)
+    if privileged:
+        runtime = getattr(request.app.state, "agent_runtime", None)
+        if runtime is None:
+            raise HTTPException(status_code=503, detail="agent model is not configured")
+        return runtime
+    isolated = getattr(request.app.state, "isolated_runtime", None)
+    if isolated is not None:
+        return isolated
+    return IsolatedRuntime(
+        settings,
+        session_factory,
+        system=getattr(request.app.state, "system", None),
+    )
 
 
 def create_agent_router() -> APIRouter:
@@ -39,13 +56,13 @@ def create_agent_router() -> APIRouter:
         request: Request,
         context: MutationDependency,
     ) -> dict[str, object]:
-        runtime = _runtime(request)
         settings = request.app.state.settings
         if context.principal.kind != "human":
             raise HTTPException(
                 status_code=422,
                 detail="the conversational agent is available to signed-in people",
             )
+        runtime = _runtime(request, context.principal)
         if len(payload.message) > settings.agent_message_max_length:
             raise HTTPException(
                 status_code=422,
@@ -67,6 +84,11 @@ def create_agent_router() -> APIRouter:
         except AgentUnavailable:
             log_event(logger, "agent.unavailable", level=logging.WARNING)
             raise HTTPException(status_code=503, detail="agent model is not configured") from None
+        except IsolationUnavailable:
+            log_event(logger, "agent.isolation_unavailable", level=logging.WARNING)
+            raise HTTPException(
+                status_code=503, detail="agent isolation is unavailable"
+            ) from None
         except Exception as exc:  # provider failures stay factual and redacted
             logger.warning("agent request failed: %s", type(exc).__name__)
             log_event(logger, "agent.request_failed", level=logging.WARNING)

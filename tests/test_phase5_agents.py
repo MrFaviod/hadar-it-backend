@@ -84,9 +84,11 @@ def asset(client: Any, auth: dict[str, str], **overrides: Any) -> dict[str, Any]
 
 def use_model(client: Any, model: FunctionModel) -> None:
     app = client.app
-    app.state.agent_runtime = AgentRuntime(
-        app.state.settings, app.state.session_factory, model=model
-    )
+    runtime = AgentRuntime(app.state.settings, app.state.session_factory, model=model)
+    app.state.agent_runtime = runtime
+    # Ordinary roles use the isolated bridge in production; preserve their
+    # tool-authorization coverage with this offline proxy.
+    app.state.isolated_runtime = runtime
 
 
 def chat(client: Any, auth: dict[str, str], message: str) -> dict[str, Any]:

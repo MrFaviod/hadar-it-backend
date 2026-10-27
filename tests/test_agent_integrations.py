@@ -451,6 +451,7 @@ def build_service(
     client.app.state.agent_integrations = service
     if runtime is not None:
         client.app.state.agent_runtime = runtime
+        client.app.state.isolated_runtime = runtime
     return service
 
 
@@ -458,7 +459,12 @@ def build_service(
 def app_client(
     settings_factory: Callable[..., Settings],
 ) -> Iterator[tuple[Any, TestClient, Settings]]:
-    catalog = prepare(settings_factory, agent_model="openai:gpt-4o-mini")
+    catalog = prepare(
+        settings_factory,
+        agent_model="openai:gpt-4o-mini",
+        ai_broker_url="ws://127.0.0.1:9/runs",
+        ai_broker_token="t" * 48,
+    )
     client = TestClient(create_app(catalog.settings))
     client.__enter__()
     try:
@@ -657,6 +663,58 @@ def test_preferences_and_installation_defaults(app_client) -> None:
         headers=reader,
     )
     assert unknown.status_code == 422
+
+
+def test_reader_discovery_hides_external_engines_and_denies_mutation(
+    app_client, monkeypatch
+) -> None:
+    catalog, client, settings = app_client
+    catalog.add_user("reader-one", "Reader One", "user")
+    machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
+    build_service(client, catalog)
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    external = configure_instance(
+        client,
+        headers=admin,
+        engine="hermes",
+        integrationIdentityId=machine.actor_id,
+    )
+    logout(client, admin)
+
+    reader = login(client, settings, "reader-one")
+    body = client.get(f"{API}/agent/engines", headers=reader)
+    assert body.status_code == 200, body.text
+    assert [item["id"] for item in body.json()["instances"]] == ["pydantic"]
+
+    created = client.post(
+        f"{API}/agent/integrations/instances",
+        json={
+            "name": "Reader Hermes",
+            "engine": "hermes",
+            "baseUrl": "http://127.0.0.1:9",
+            "profile": "itsm",
+        },
+        headers=reader,
+    )
+    assert created.status_code == 403, created.text
+
+    switched = client.put(
+        f"{API}/agent/preferences",
+        json={"instanceId": external["id"], "model": "hermes/default"},
+        headers=reader,
+    )
+    assert switched.status_code == 403, switched.text
+
+    session = client.post(
+        f"{API}/agent/sessions",
+        json={"instanceId": external["id"], "model": "hermes/default"},
+        headers=reader,
+    )
+    assert session.status_code == 403, session.text
+
+    admin_only = client.get(f"{API}/agent/integrations", headers=reader)
+    assert admin_only.status_code == 403, admin_only.text
 
 
 def test_pydantic_common_session_streams_cards_and_keeps_agent_chat(app_client) -> None:
@@ -897,9 +955,8 @@ def test_external_session_stream_redacts_usage_and_enforces_local_budget(
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
     instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
     install_verified(client, admin, instance, machine.actor_id)
-    logout(client, admin)
 
-    reader = login(client, settings, "reader-one")
+    reader = admin
     session = client.post(
         f"{API}/agent/sessions",
         json={"instanceId": instance["id"], "model": "fake/model-a"},
@@ -973,8 +1030,7 @@ def test_reconnect_does_not_duplicate_usage(app_client, monkeypatch) -> None:
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
     instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
     install_verified(client, admin, instance, machine.actor_id)
-    logout(client, admin)
-    reader = login(client, settings, "reader-one")
+    reader = admin
     session_id = client.post(
         f"{API}/agent/sessions",
         json={"instanceId": instance["id"], "model": "fake/model-a"},
@@ -1022,8 +1078,7 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
     instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
     install_verified(client, admin, instance, machine.actor_id)
-    logout(client, admin)
-    reader = login(client, settings, "reader-one")
+    reader = admin
     session_id = client.post(
         f"{API}/agent/sessions",
         json={"instanceId": instance["id"], "model": "fake/model-a"},
@@ -1044,6 +1099,34 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
     assert streamed[-1]["type"] == "done"
     budget = client.get(f"{API}/agent/engines", headers=reader).json()["budget"]
     assert budget["usedReported"] == 2
+
+
+def test_installer_failure_detail_survives_public_receipt_without_secrets(
+    app_client, monkeypatch
+) -> None:
+    catalog, client, settings = app_client
+    machine, token = catalog.add_machine("failed-installer", "Failed Installer")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    build_service(
+        client,
+        catalog,
+        engine_factory=lambda instance, secret: FakeEngine(),
+        installer=FakeInstaller([{
+            "status": "failed", "verified": False,
+            "error": {"code": "config_invalid", "message": f"invalid configuration {token}"},
+            "limitations": ["Profile inspection did not complete"],
+        }]),
+        catalog_api=FakeCatalog(),
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
+    receipt = install_verified(client, admin, instance, machine.actor_id)
+    assert receipt["error"]["code"] == "config_invalid"
+    assert "invalid configuration" in receipt["error"]["message"]
+    assert token not in json.dumps(receipt)
+    assert receipt["limitations"] == ["Profile inspection did not complete"]
+    stored = client.get(f"{API}/agent/integrations", headers=admin).json()["installations"]
+    assert next(row for row in stored if row["id"] == receipt["id"])["error"] == receipt["error"]
 
 
 def test_install_receipts_are_truthful_and_gate_external_chat(app_client, monkeypatch) -> None:
@@ -1084,16 +1167,23 @@ def test_install_receipts_are_truthful_and_gate_external_chat(app_client, monkey
 
     logout(client, admin)
     reader = login(client, settings, "reader-one")
-    denied = client.post(
+    forbidden = client.post(
         f"{API}/agent/sessions",
         json={"instanceId": instance["id"], "model": "fake/model-a"},
         headers=reader,
     )
-    assert denied.status_code == 409, denied.text
-    assert "verified" in denied.json()["error"]["message"]
+    assert forbidden.status_code == 403, forbidden.text
     logout(client, reader)
 
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    denied = client.post(
+        f"{API}/agent/sessions",
+        json={"instanceId": instance["id"], "model": "fake/model-a"},
+        headers=admin,
+    )
+    assert denied.status_code == 409, denied.text
+    assert "verified" in denied.json()["error"]["message"]
+
     installed = install_verified(
         client, admin, instance, machine.actor_id, receipt={"status": "verified", "verified": True}
     )
@@ -1139,10 +1229,19 @@ def test_install_receipts_are_truthful_and_gate_external_chat(app_client, monkey
 
     logout(client, admin)
     reader = login(client, settings, "reader-one")
-    allowed = client.post(
+    forbidden = client.post(
         f"{API}/agent/sessions",
         json={"instanceId": instance["id"], "model": "fake/model-a"},
         headers=reader,
+    )
+    assert forbidden.status_code == 403, forbidden.text
+    logout(client, reader)
+
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    allowed = client.post(
+        f"{API}/agent/sessions",
+        json={"instanceId": instance["id"], "model": "fake/model-a"},
+        headers=admin,
     )
     assert allowed.status_code == 201, allowed.text
 
@@ -1277,7 +1376,7 @@ def test_run_concurrency_cancel_and_model_switch_are_owner_scoped(app_client, mo
     install_verified(client, admin, instance, machine.actor_id)
     logout(client, admin)
 
-    principal = catalog.principal("reader-one")
+    principal = catalog.admin()
     service = client.app.state.agent_integrations
 
     async def scenario() -> None:
@@ -1326,7 +1425,7 @@ def test_stale_run_is_recovered_and_budget_precheck_skips_engine(app_client, mon
     install_verified(client, admin, instance, machine.actor_id)
     logout(client, admin)
 
-    principal = catalog.principal("reader-one")
+    principal = catalog.admin()
 
     async def scenario() -> None:
         session = await service.create_session(
@@ -1367,7 +1466,7 @@ def test_budget_precheck_blocks_before_engine_call(app_client, monkeypatch) -> N
     instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
     install_verified(client, admin, instance, machine.actor_id)
 
-    principal = catalog.principal("reader-one")
+    principal = catalog.admin()
     with service._session() as db:
         from itsm.agent_integrations.service import record_usage, usage_day
 

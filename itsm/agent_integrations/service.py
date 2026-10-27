@@ -49,6 +49,7 @@ from itsm.agent_integrations.providers import (
     unseal_credential,
     validate_provider_endpoint,
 )
+from itsm.agents.isolation import IsolatedRuntime, is_privileged_human
 from itsm.agents.runtime import (
     AgentUnavailable,
     AgentUsage,
@@ -491,6 +492,31 @@ class AgentIntegrationService:
         if principal.kind != HUMAN_ACTOR_KIND:
             raise ValidationFailed("the conversational agent is available to signed-in people")
 
+    def _privileged_human(self, db: Session, principal: Principal) -> bool:
+        """Reload the persisted active role; request data never selects it."""
+        return is_privileged_human(db, self._settings, principal)
+
+    def _require_external_role(self, db: Session, principal: Principal) -> None:
+        if not self._privileged_human(db, principal):
+            raise PermissionDenied(
+                "external agent engines require administrator permissions"
+            )
+
+    def _external_instance(self, db: Session, instance_id: str | None) -> bool:
+        if instance_id is None:
+            return False
+        row = db.get(AgentInstance, instance_id)
+        return row is not None and row.engine in EXTERNAL_ENGINES
+
+    def _require_pydantic_available(self, db: Session, principal: Principal) -> None:
+        """Ordinary Pydantic turns are unservable without the container broker."""
+        if self._privileged_human(db, principal):
+            return
+        if not (self._settings.ai_broker_url and self._settings.ai_broker_token):
+            raise IntegrationUnavailable(
+                "agent isolation is not configured for this account"
+            )
+
     def _require_admin(
         self,
         db: Session,
@@ -893,8 +919,13 @@ class AgentIntegrationService:
         self._require_human(principal)
         with self._session() as db:
             self._ensure_builtin(db)
+            privileged = self._privileged_human(db, principal)
             rows = db.execute(select(AgentInstance).order_by(AgentInstance.created_at)).scalars()
-            snapshots = [self._snapshot(row) for row in rows]
+            snapshots = [
+                self._snapshot(row)
+                for row in rows
+                if privileged or row.engine not in EXTERNAL_ENGINES
+            ]
             provider_rows = [
                 row
                 for row in db.execute(
@@ -907,6 +938,8 @@ class AgentIntegrationService:
                 for row in provider_rows
             ]
             preference = self._effective_preference(db, principal)
+            if not privileged and self._external_instance(db, preference[0]):
+                preference = (None, None)
             budget = self._budget(db, principal)
         instances: list[dict[str, Any]] = []
         for snapshot in snapshots:
@@ -990,6 +1023,8 @@ class AgentIntegrationService:
             else:
                 if not row.enabled:
                     raise ValidationFailed("the selected instance is disabled")
+                if row.engine in EXTERNAL_ENGINES:
+                    self._require_external_role(db, principal)
                 snapshot = self._snapshot(row)
         value: str | None = None
         if model is not None:
@@ -1499,21 +1534,24 @@ class AgentIntegrationService:
             if not snapshot.enabled:
                 raise ValidationFailed("the selected instance is disabled")
             if snapshot.engine != PYDANTIC_ENGINE:
+                self._require_external_role(db, principal)
                 instance = self._instance(db, instance_id)
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
-            elif provider is not None:
-                self._validate_provider_model(provider, model)
-                if provider.scope == "personal":
-                    self._require_personal_provider(db, principal)
             else:
-                if not self._runtime_configured():
-                    raise IntegrationUnavailable("agent model is not configured")
-                if model != self._settings.agent_model:
-                    raise ValidationFailed(
-                        "the built-in instance uses the server-configured model"
-                    )
+                self._require_pydantic_available(db, principal)
+                if provider is not None:
+                    self._validate_provider_model(provider, model)
+                    if provider.scope == "personal":
+                        self._require_personal_provider(db, principal)
+                else:
+                    if not self._runtime_configured():
+                        raise IntegrationUnavailable("agent model is not configured")
+                    if model != self._settings.agent_model:
+                        raise ValidationFailed(
+                            "the built-in instance uses the server-configured model"
+                        )
         capabilities: dict[str, bool] = self._session_capabilities(snapshot.engine, None)
         external_session_id: str | None = None
         if snapshot.engine != PYDANTIC_ENGINE:
@@ -1541,6 +1579,8 @@ class AgentIntegrationService:
             current, current_provider = self._resolve_instance(db, principal, instance_id)
             if not current.enabled:
                 raise Conflict("the selected instance changed while starting the session")
+            if current.engine != PYDANTIC_ENGINE:
+                self._require_external_role(db, principal)
             if provider is not None and current_provider is None:
                 raise Conflict("the selected provider changed while starting the session")
             if provider is not None and provider.scope == "personal":
@@ -1588,29 +1628,35 @@ class AgentIntegrationService:
             if not snapshot.enabled:
                 raise ValidationFailed("the selected instance is disabled")
             if snapshot.engine != PYDANTIC_ENGINE:
+                self._require_external_role(db, principal)
                 instance = self._instance(db, target_id)
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
                 value = requested_model
-            elif provider is not None:
-                configured = self._provider_models(provider)
-                if requested_model is not None:
-                    value = self._validate_provider_model(provider, requested_model)
-                elif not configured:
-                    raise ValidationFailed("the selected provider has no configured models")
-                else:
-                    value = current_model if current_model in configured else configured[0]
-                if provider.scope == "personal":
-                    self._require_personal_provider(db, principal)
             else:
-                if requested_model is not None and requested_model != self._settings.agent_model:
-                    raise ValidationFailed(
-                        "the built-in instance uses the server-configured model"
-                    )
-                value = self._settings.agent_model
-                if value is None:
-                    raise IntegrationUnavailable("agent model is not configured")
+                self._require_pydantic_available(db, principal)
+                if provider is not None:
+                    configured = self._provider_models(provider)
+                    if requested_model is not None:
+                        value = self._validate_provider_model(provider, requested_model)
+                    elif not configured:
+                        raise ValidationFailed("the selected provider has no configured models")
+                    else:
+                        value = current_model if current_model in configured else configured[0]
+                    if provider.scope == "personal":
+                        self._require_personal_provider(db, principal)
+                else:
+                    if (
+                        requested_model is not None
+                        and requested_model != self._settings.agent_model
+                    ):
+                        raise ValidationFailed(
+                            "the built-in instance uses the server-configured model"
+                        )
+                    value = self._settings.agent_model
+                    if value is None:
+                        raise IntegrationUnavailable("agent model is not configured")
         capabilities = self._session_capabilities(snapshot.engine, None)
         if snapshot.engine != PYDANTIC_ENGINE:
             if not capabilities.get("model_switch", True):
@@ -1639,16 +1685,19 @@ class AgentIntegrationService:
             if not target.enabled:
                 raise Conflict("the selected instance changed while switching engines")
             if target.engine != PYDANTIC_ENGINE:
+                self._require_external_role(db, principal)
                 instance = self._instance(db, target_id)
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
-            elif provider is not None:
-                self._validate_provider_model(provider, value)
-                if provider.scope == "personal":
-                    self._require_personal_provider(db, principal)
-            elif value != self._settings.agent_model:
-                raise Conflict("the built-in instance uses the server-configured model")
+            else:
+                self._require_pydantic_available(db, principal)
+                if provider is not None:
+                    self._validate_provider_model(provider, value)
+                    if provider.scope == "personal":
+                        self._require_personal_provider(db, principal)
+                elif value != self._settings.agent_model:
+                    raise Conflict("the built-in instance uses the server-configured model")
             values: dict[str, Any] = {"model": value, "updated_at": utcnow()}
             if target_id != row.instance_id:
                 values.update(
@@ -1747,16 +1796,19 @@ class AgentIntegrationService:
                 raise Conflict("the selected instance is disabled")
             provider_selection: ProviderModelSelection | None = None
             if instance.engine != PYDANTIC_ENGINE:
+                self._require_external_role(db, principal)
                 identity = IdentityService(db, self._settings)
                 instance_row = self._instance(db, row.instance_id)
                 self._assert_binding_ceiling(db, identity, principal, instance_row)
                 self._require_verified_profile(db, instance_row)
-            elif provider is not None:
-                provider_selection = self._provider_selection(
-                    db, principal, provider, row.model
-                )
-            elif not self._runtime_configured():
-                raise IntegrationUnavailable("agent model is not configured")
+            else:
+                self._require_pydantic_available(db, principal)
+                if provider is not None:
+                    provider_selection = self._provider_selection(
+                        db, principal, provider, row.model
+                    )
+                elif not self._runtime_configured():
+                    raise IntegrationUnavailable("agent model is not configured")
             self._check_budget(db, principal)
             self._recover_stale(db, now)
             if row.status == "running":
@@ -1914,11 +1966,17 @@ class AgentIntegrationService:
             yield event
 
     async def _pydantic_events(self, turn: Turn) -> AsyncIterator[dict[str, Any]]:
-        runtime = self._runtime
-        if runtime is None:
-            from itsm.agents.runtime import AgentRuntime
+        with self._session() as db:
+            privileged = self._privileged_human(db, turn.principal)
+        if privileged:
+            runtime = self._runtime
+            if runtime is None:
+                from itsm.agents.runtime import AgentRuntime
 
-            runtime = AgentRuntime(self._settings, self._session_factory)
+                runtime = AgentRuntime(self._settings, self._session_factory)
+                turn._owned_runtime = runtime  # type: ignore[attr-defined]
+        else:
+            runtime = IsolatedRuntime(self._settings, self._session_factory)
             turn._owned_runtime = runtime  # type: ignore[attr-defined]
         history = [
             ConversationTurn(role=item["role"], content=item["content"][:8000])
@@ -3135,6 +3193,8 @@ class AgentIntegrationService:
             "mcpVerified": bool(receipt.get("mcpVerified", False)),
             "profileSafetyVerified": bool(receipt.get("profileSafetyVerified", False)),
             "checks": list(receipt.get("checks") or []),
+            "error": dict(receipt["error"]) if isinstance(receipt.get("error"), Mapping) else None,
+            "limitations": _string_list(receipt.get("limitations")),
             "conflicts": list(receipt.get("conflicts") or []),
             "binding": binding,
             "requestDigest": receipt.get("requestDigest"),

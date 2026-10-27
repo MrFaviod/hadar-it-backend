@@ -51,11 +51,15 @@ def scripted(*parts: Any) -> Any:
 
 def use_model(test_client: TestClient, model: FunctionModel) -> None:
     app = test_client.app
-    app.state.agent_runtime = AgentRuntime(  # type: ignore[attr-defined]
+    runtime = AgentRuntime(  # type: ignore[attr-defined]
         app.state.settings,
         app.state.session_factory,
         model=model,
     )
+    app.state.agent_runtime = runtime
+    # Ordinary roles run through the isolated bridge in production; this proxy
+    # preserves their real tool authorization while keeping tests offline.
+    app.state.isolated_runtime = runtime
 
 
 def chat(

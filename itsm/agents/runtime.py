@@ -60,6 +60,7 @@ from pydantic_ai.messages import (
 )
 from pydantic_ai.models import Model
 from pydantic_ai.settings import ModelSettings
+from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage, UsageLimits
 from sqlalchemy.orm import Session
 
@@ -534,8 +535,14 @@ def _execute(
     return {"ok": True, "result": result}
 
 
-def _register_tools(agent: Agent[AgentDeps, str]) -> None:
-    @agent.tool
+def build_toolset() -> FunctionToolset[AgentDeps]:
+    """Canonical typed tool inventory shared by the agent and the isolated proxy.
+
+    Every execution path must use this builder; it is the single source of the
+    tools the model can see and therefore the single authorization surface.
+    """
+    toolset: FunctionToolset[AgentDeps] = FunctionToolset()
+    @toolset.tool
     def search_assets(
         ctx: RunContext[AgentDeps],
         query: str | None = None,
@@ -564,7 +571,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def get_asset(
         ctx: RunContext[AgentDeps], asset_id: str, fields: list[str] | None = None
     ) -> dict[str, Any]:
@@ -576,7 +583,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def create_asset(
         ctx: RunContext[AgentDeps],
         name: str,
@@ -634,7 +641,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def update_asset(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -691,7 +698,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def batch_update_assets(
         ctx: RunContext[AgentDeps], updates: list[BatchUpdateArg], fields: list[str] | None = None
     ) -> dict[str, Any]:
@@ -708,7 +715,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def clone_asset(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -725,7 +732,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def archive_asset(
         ctx: RunContext[AgentDeps], asset_id: str, reason: str | None = None
     ) -> dict[str, Any]:
@@ -736,14 +743,14 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.archive(ctx.deps.principal, asset_id, reason=reason),
         )
 
-    @agent.tool
+    @toolset.tool
     def restore_asset(ctx: RunContext[AgentDeps], asset_id: str) -> dict[str, Any]:
         """Restaurar un activo archivado, sin alterar sus otros datos."""
         return _execute(
             ctx.deps, "restore_asset", lambda service: service.restore(ctx.deps.principal, asset_id)
         )
 
-    @agent.tool
+    @toolset.tool
     def retire_asset(ctx: RunContext[AgentDeps], asset_id: str, reason: str) -> dict[str, Any]:
         """Dar de baja con motivo y controles de transición y asignación."""
         return _execute(
@@ -752,7 +759,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.retire(ctx.deps.principal, asset_id, reason=reason),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_asset_history(
         ctx: RunContext[AgentDeps], asset_id: str, limit: int = 20, offset: int = 0
     ) -> dict[str, Any]:
@@ -765,7 +772,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_inventory_config(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Consultar formularios, campos, estados y reglas configurados."""
         return _execute(
@@ -776,7 +783,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def search_locations(
         ctx: RunContext[AgentDeps],
         query: str | None = None,
@@ -821,7 +828,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "search_locations", operation)
 
-    @agent.tool
+    @toolset.tool
     def search_people(
         ctx: RunContext[AgentDeps],
         query: str | None = None,
@@ -853,7 +860,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "search_people", operation)
 
-    @agent.tool
+    @toolset.tool
     def assign_asset(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -878,7 +885,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def return_asset(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -901,7 +908,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def transfer_asset(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -928,7 +935,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             fields,
         )
 
-    @agent.tool
+    @toolset.tool
     def get_asset_relations(
         ctx: RunContext[AgentDeps],
         asset_ids: list[str],
@@ -956,7 +963,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_asset_relations", operation)
 
-    @agent.tool
+    @toolset.tool
     def create_relationship(
         ctx: RunContext[AgentDeps],
         source_id: str,
@@ -983,7 +990,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "create_relationship", operation)
 
-    @agent.tool
+    @toolset.tool
     def remove_relationship(
         ctx: RunContext[AgentDeps],
         relationship_id: str,
@@ -1006,7 +1013,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "remove_relationship", operation)
 
-    @agent.tool
+    @toolset.tool
     def move_host(
         ctx: RunContext[AgentDeps],
         child_id: str,
@@ -1031,7 +1038,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "move_host", operation)
 
-    @agent.tool
+    @toolset.tool
     def get_asset_map(
         ctx: RunContext[AgentDeps],
         site_id: str | None = None,
@@ -1049,7 +1056,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_asset_map", operation)
 
-    @agent.tool
+    @toolset.tool
     def list_redundancy_groups(
         ctx: RunContext[AgentDeps],
         query: str | None = None,
@@ -1074,7 +1081,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "list_redundancy_groups", operation)
 
-    @agent.tool
+    @toolset.tool
     def get_redundancy_group(ctx: RunContext[AgentDeps], group_id: str) -> dict[str, Any]:
         """Leer un grupo de redundancia: modo, activación, roles y hosts reales."""
 
@@ -1085,7 +1092,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_redundancy_group", operation)
 
-    @agent.tool
+    @toolset.tool
     def save_redundancy_group(
         ctx: RunContext[AgentDeps],
         group_id: str | None = None,
@@ -1147,7 +1154,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "save_redundancy_group", operation)
 
-    @agent.tool
+    @toolset.tool
     def search_maintenance(
         ctx: RunContext[AgentDeps],
         state: str | None = None,
@@ -1192,7 +1199,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "search_maintenance", operation)
 
-    @agent.tool
+    @toolset.tool
     def complete_maintenance(
         ctx: RunContext[AgentDeps],
         plan_id: str,
@@ -1211,7 +1218,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "complete_maintenance", operation)
 
-    @agent.tool
+    @toolset.tool
     def record_intervention(
         ctx: RunContext[AgentDeps],
         asset_id: str,
@@ -1264,7 +1271,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "record_intervention", operation)
 
-    @agent.tool
+    @toolset.tool
     def create_incident(
         ctx: RunContext[AgentDeps],
         primary_asset_id: str,
@@ -1295,7 +1302,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "create_incident", operation)
 
-    @agent.tool
+    @toolset.tool
     def link_incident_assets(
         ctx: RunContext[AgentDeps], incident_id: str, affected_asset_ids: list[str]
     ) -> dict[str, Any]:
@@ -1311,7 +1318,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "link_incident_assets", operation)
 
-    @agent.tool
+    @toolset.tool
     def get_technical_history(
         ctx: RunContext[AgentDeps], asset_id: str, limit: int = 20, offset: int = 0
     ) -> dict[str, Any]:
@@ -1327,7 +1334,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_technical_history", operation)
 
-    @agent.tool
+    @toolset.tool
     def prepare_incident_resolution(
         ctx: RunContext[AgentDeps], incident_id: str, note: str | None = None
     ) -> dict[str, Any]:
@@ -1342,7 +1349,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "prepare_incident_resolution", operation)
 
-    @agent.tool
+    @toolset.tool
     def confirm_incident_resolution(
         ctx: RunContext[AgentDeps],
         incident_id: str,
@@ -1360,7 +1367,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "confirm_incident_resolution", operation)
 
-    @agent.tool
+    @toolset.tool
     def search_incidents(
         ctx: RunContext[AgentDeps],
         active: bool | None = None,
@@ -1398,7 +1405,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "search_incidents", operation)
 
-    @agent.tool
+    @toolset.tool
     def get_asset_availability(
         ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
     ) -> dict[str, Any]:
@@ -1411,7 +1418,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_asset_availability", operation)
 
-    @agent.tool
+    @toolset.tool
     def get_asset_metrics(
         ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
     ) -> dict[str, Any]:
@@ -1426,7 +1433,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "get_asset_metrics", operation)
 
-    @agent.tool
+    @toolset.tool
     def investigate_outage(
         ctx: RunContext[AgentDeps], asset_id: str, period: str = "24h"
     ) -> dict[str, Any]:
@@ -1448,7 +1455,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "investigate_outage", operation)
 
-    @agent.tool
+    @toolset.tool
     def list_active_alerts(
         ctx: RunContext[AgentDeps], asset_id: str | None = None, limit: int = 10, offset: int = 0
     ) -> dict[str, Any]:
@@ -1469,7 +1476,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "list_active_alerts", operation)
 
-    @agent.tool
+    @toolset.tool
     def acknowledge_alert(
         ctx: RunContext[AgentDeps], alert_id: str, notes: str = ""
     ) -> dict[str, Any]:
@@ -1482,7 +1489,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "acknowledge_alert", operation)
 
-    @agent.tool
+    @toolset.tool
     def link_alert_incident(
         ctx: RunContext[AgentDeps], alert_id: str, incident_id: str | None = None
     ) -> dict[str, Any]:
@@ -1497,7 +1504,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, "link_alert_incident", operation)
 
-    @agent.tool
+    @toolset.tool
     def prepare_monitoring_maintenance(ctx: RunContext[AgentDeps], alert_id: str) -> dict[str, Any]:
         """Preparar una ventana de mantenimiento sugerida, sin guardarla ni silenciar."""
 
@@ -1518,7 +1525,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, name, operation)
 
-    @agent.tool
+    @toolset.tool
     def prepare_inventory_import(
         ctx: RunContext[AgentDeps], csv_text: str, options: dict[str, Any] | None = None
     ) -> dict[str, Any]:
@@ -1529,7 +1536,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda s, p: s.analyze(p, csv_text.encode(), "assets.csv", options),
         )
 
-    @agent.tool
+    @toolset.tool
     def preview_bulk_operation(
         ctx: RunContext[AgentDeps],
         asset_ids: list[str],
@@ -1546,7 +1553,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_inventory_operation(
         ctx: RunContext[AgentDeps], operation_id: str, offset: int = 0, limit: int = 20
     ) -> dict[str, Any]:
@@ -1557,7 +1564,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda s, p: s.get(p, operation_id, offset=offset, limit=min(limit, 50)),
         )
 
-    @agent.tool
+    @toolset.tool
     def resolve_import_conflict(
         ctx: RunContext[AgentDeps],
         operation_id: str,
@@ -1573,7 +1580,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda s, p: s.resolve(p, operation_id, index, action, asset_id, values),
         )
 
-    @agent.tool
+    @toolset.tool
     def apply_inventory_operation(ctx: RunContext[AgentDeps], operation_id: str) -> dict[str, Any]:
         """Apply only a human-approved fixed preview under current permissions."""
         return workflow(ctx, "apply_inventory_operation", lambda s, p: s.execute(p, operation_id))
@@ -1596,7 +1603,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return _collect(ctx.deps, name, execute)
 
-    @agent.tool
+    @toolset.tool
     def list_report_templates(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """List authorized default and custom structured report templates."""
         return reports(
@@ -1605,7 +1612,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service, principal, _digest: service.templates(principal),
         )
 
-    @agent.tool
+    @toolset.tool
     def prepare_report(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
         """Preview canonical filters and up to twenty rows, without rendering or queuing."""
 
@@ -1622,7 +1629,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return reports(ctx, "prepare_report", operation)
 
-    @agent.tool
+    @toolset.tool
     def generate_report(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
         """Queue a canonical PDF/CSV/Excel report and return its durable job locator."""
         return reports(
@@ -1633,7 +1640,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def report_job_status(ctx: RunContext[AgentDeps], job_id: str) -> dict[str, Any]:
         """Read current owned job progress, errors and protected document references."""
         return reports(
@@ -1642,7 +1649,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service, principal, _digest: service.job(principal, job_id),
         )
 
-    @agent.tool
+    @toolset.tool
     def report_documents(ctx: RunContext[AgentDeps], job_id: str) -> dict[str, Any]:
         """Read protected download references for a job, never server paths or file bytes."""
 
@@ -1652,7 +1659,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
 
         return reports(ctx, "report_documents", operation)
 
-    @agent.tool
+    @toolset.tool
     def generate_labels(ctx: RunContext[AgentDeps], request: ReportRequest) -> dict[str, Any]:
         """Queue physical labels using explicit structured dimensions and asset filters."""
         if request.labels is None:
@@ -1667,7 +1674,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_operational_summary(
         ctx: RunContext[AgentDeps],
         period: str = "24h",
@@ -1690,7 +1697,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def search_everything(
         ctx: RunContext[AgentDeps],
         query: str,
@@ -1715,7 +1722,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def query_relationships(
         ctx: RunContext[AgentDeps],
         asset_id: str | None = None,
@@ -1744,7 +1751,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def list_saved_views(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Leer las vistas, favoritos y accesos guardados de la identidad actual."""
         return _operational(
@@ -1755,7 +1762,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_system_status(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Leer el estado factual y redactado de la instalación y del ejecutor externo."""
         return _system_collect(
@@ -1764,7 +1771,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.status(ctx.deps.principal),
         )
 
-    @agent.tool
+    @toolset.tool
     def get_system_configuration(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Leer las preferencias finitas de despliegue propias de la aplicación."""
         return _system_collect(
@@ -1773,7 +1780,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.configuration(ctx.deps.principal),
         )
 
-    @agent.tool
+    @toolset.tool
     def list_system_providers(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Listar los proveedores de IA permitidos y la selección persistida."""
         return _system_collect(
@@ -1782,7 +1789,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.providers(ctx.deps.principal),
         )
 
-    @agent.tool
+    @toolset.tool
     def configure_system_provider(
         ctx: RunContext[AgentDeps],
         provider: Literal["openai", "anthropic"],
@@ -1797,7 +1804,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
-    @agent.tool
+    @toolset.tool
     def list_system_modules(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Listar los módulos oficiales registrados y su estado habilitado."""
         return _system_collect(
@@ -1806,7 +1813,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.modules(ctx.deps.principal),
         )
 
-    @agent.tool
+    @toolset.tool
     def set_system_module(
         ctx: RunContext[AgentDeps],
         module_id: str,
@@ -1819,7 +1826,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.set_module(ctx.deps.principal, module_id, {"enabled": enabled}),
         )
 
-    @agent.tool
+    @toolset.tool
     def prepare_system_update(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Solicitar al ejecutor externo configurado la preparación de una actualización."""
         return _system_collect(
@@ -1828,7 +1835,7 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             lambda service: service.operation(ctx.deps.principal, "update.prepare"),
         )
 
-    @agent.tool
+    @toolset.tool
     def create_system_backup(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
         """Solicitar al ejecutor externo configurado una copia de seguridad verificada."""
         return _system_collect(
@@ -1836,6 +1843,8 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             "create_system_backup",
             lambda service: service.operation(ctx.deps.principal, "backup.create"),
         )
+
+    return toolset
 
 
 def resolve_model(
@@ -1941,8 +1950,8 @@ class AgentRuntime:
             instructions=INSTRUCTIONS,
             retries=1,
             model_settings=ModelSettings(max_tokens=self._settings.agent_max_output_tokens),
+            toolsets=[build_toolset()],
         )
-        _register_tools(agent)
         return agent
 
     def _build(
@@ -2149,6 +2158,7 @@ class AgentRuntime:
 __all__ = [
     "SYSTEM_TOOL_NAMES",
     "TOOL_NAMES",
+    "INSTRUCTIONS",
     "AgentDeps",
     "AgentRuntime",
     "AgentUnavailable",
@@ -2160,5 +2170,6 @@ __all__ = [
     "ConversationTurn",
     "InterventionPartArg",
     "ProviderModelSelection",
+    "build_toolset",
     "resolve_model",
 ]

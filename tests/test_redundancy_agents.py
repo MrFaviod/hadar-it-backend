@@ -35,11 +35,15 @@ def catalog(settings_factory: SettingsFactory) -> Catalog:
 
 def use_model(test_client: TestClient, model: FunctionModel) -> None:
     app = test_client.app
-    app.state.agent_runtime = AgentRuntime(  # type: ignore[attr-defined]
+    runtime = AgentRuntime(  # type: ignore[attr-defined]
         app.state.settings,
         app.state.session_factory,
         model=model,
     )
+    app.state.agent_runtime = runtime
+    # Ordinary roles use the isolated bridge in production; preserve their
+    # tool-authorization coverage with this offline proxy.
+    app.state.isolated_runtime = runtime
 
 
 def chat(client: TestClient, auth: dict[str, str], message: str) -> dict[str, Any]:
