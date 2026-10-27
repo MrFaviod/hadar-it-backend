@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import json
 from collections.abc import AsyncIterator, Mapping
+from pathlib import Path
 from typing import Any
 
 import httpx
@@ -1204,155 +1205,493 @@ def test_v2_repeated_delta_text_is_not_treated_as_cumulative() -> None:
     assert "".join(fragments) == "haha"
 
 
-def test_hermes_session_stream_uses_capabilities_tools_usage_and_no_profile_field() -> None:
-    async def scenario() -> tuple[
-        list[dict[str, Any]], list[httpx.Request], Any, list[httpx.Request]
-    ]:
-        from itsm.agents.engines import EngineInfo
 
-        requests: list[httpx.Request] = []
-        create_bodies: list[dict[str, Any]] = []
-        stream_bodies: list[dict[str, Any]] = []
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            requests.append(request)
-            path = request.url.path
-            if path == "/v1/capabilities":
-                return httpx.Response(
-                    200,
-                    json={
-                        "version": "1.0.0",
-                        "features": {
-                            "session_resources": True,
-                            "session_chat_stream": True,
-                        },
+
+
+
+
+
+
+
+
+
+
+class _HermesSocket:
+    """Deterministic native dashboard socket; no network or provider call."""
+
+    def __init__(self, responder: Any) -> None:
+        self.incoming: asyncio.Queue[str] = asyncio.Queue()
+        self.sent: list[dict[str, Any]] = []
+        self._responder = responder
+        self.incoming.put_nowait(
+            json.dumps(
+                {"jsonrpc": "2.0", "method": "event", "params": {"type": "gateway.ready"}}
+            )
+        )
+
+    async def recv(self) -> str:
+        return await self.incoming.get()
+
+    async def send(self, raw: str) -> None:
+        request = json.loads(raw)
+        self.sent.append(request)
+        for frame in self._responder(request):
+            self.incoming.put_nowait(json.dumps(frame))
+
+    def methods(self) -> list[str]:
+        return [str(request["method"]) for request in self.sent]
+
+
+def _native_http(
+    *, ticket: int = 200, token_page: bool = False
+) -> tuple[Any, list[tuple[str, str]]]:
+    seen: list[tuple[str, str]] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append((request.method, request.url.path))
+        path = request.url.path
+        if path == "/auth/password-login":
+            assert json.loads(request.content)["provider"] == "basic"
+            return httpx.Response(200, json={})
+        if path == "/api/auth/ws-ticket":
+            if ticket == 200:
+                return httpx.Response(200, json={"ticket": "native-ticket", "ttl_seconds": 30})
+            return httpx.Response(ticket, json={"detail": "Unauthorized"})
+        if path == "/":
+            marker = "false" if token_page else "true"
+            token = (
+                '<script>window.__HERMES_SESSION_TOKEN__ = "process-token";</script>'
+                if token_page
+                else ""
+            )
+            return httpx.Response(
+                200,
+                text=f"<html><script>window.__HERMES_AUTH_REQUIRED__ = {marker};</script>"
+                f"{token}</html>",
+            )
+        if path == "/openapi.json":
+            return httpx.Response(200, json={"info": {"version": "0.22.5"}})
+        raise AssertionError(f"unexpected HTTP request {request.method} {path}")
+
+    return httpx.MockTransport(handler), seen
+
+
+def _native_result(request: Mapping[str, Any], result: Mapping[str, Any]) -> dict[str, Any]:
+    return {"jsonrpc": "2.0", "id": request.get("id"), "result": dict(result)}
+
+
+def _native_event(kind: str, payload: Mapping[str, Any], session: str = "rt-1") -> dict[str, Any]:
+    return {
+        "jsonrpc": "2.0",
+        "method": "event",
+        "params": {"type": kind, "session_id": session, "payload": dict(payload)},
+    }
+
+
+def _native_engine(
+    client: httpx.AsyncClient,
+    socket: _HermesSocket,
+    *,
+    urls: list[str] | None = None,
+    directory: str | None = None,
+) -> HermesEngine:
+    async def factory(uri: str) -> _HermesSocket:
+        if urls is not None:
+            urls.append(uri)
+        return socket
+
+    return HermesEngine(
+        EngineConfig(BASE, username="admin", token="dev-password", directory=directory),
+        client=client,
+        socket_factory=factory,
+    )
+
+
+def test_hermes_native_loopback_login_uses_process_token_and_real_models() -> None:
+    async def scenario() -> tuple[Any, list[str], list[tuple[str, str]]]:
+        urls: list[str] = []
+
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            assert request["method"] == "model.options"
+            return [
+                _native_result(
+                    request,
+                    {
+                        "providers": [
+                            {"slug": "itsm-omp", "models": ["omni/one", "omni/two"], "free": True},
+                            {"slug": "other", "models": ["omni/two"]},
+                        ],
+                        "model": "omni/one",
+                        "provider": "itsm-omp",
                     },
                 )
-            if path == "/v1/models":
-                return httpx.Response(
-                    200,
-                    json={"data": [{"id": "anthropic/claude", "owned_by": "anthropic"}]},
-                )
-            if path == "/api/sessions" and request.method == "POST":
-                create_bodies.append(json.loads(request.content))
-                return httpx.Response(201, json={"session": {"id": "sess_hermes"}})
-            if path == "/api/sessions/sess_hermes/chat/stream":
-                stream_bodies.append(json.loads(request.content))
-                return _named_sse(
-                    (
-                        "assistant.delta",
-                        {"session_id": "sess_hermes", "delta": "Hola"},
-                    ),
-                    (
-                        "assistant.commentary",
-                        {"session_id": "sess_hermes", "delta": "nota"},
-                    ),
-                    (
-                        "assistant.delta",
-                        {"session_id": "sess_hermes", "delta": " mundo"},
-                    ),
-                    (
-                        "tool.started",
-                        {
-                            "session_id": "sess_hermes",
-                            "tool": "itsm_inventory_search",
-                            "preview": {"query": "nvr"},
-                        },
-                    ),
-                    (
-                        "tool.completed",
-                        {
-                            "session_id": "sess_hermes",
-                            "tool": "itsm_inventory_search",
-                            "preview": "2 activos",
-                        },
-                    ),
-                    (
-                        "tool.failed",
-                        {
-                            "session_id": "sess_hermes",
-                            "tool": "itsm_inventory_search",
-                            "error": "permission denied",
-                        },
-                    ),
-                    (
-                        "run.completed",
-                        {
-                            "session_id": "sess_hermes",
-                            "content": "Hola mundo",
-                            "usage": {
-                                "input_tokens": 7,
-                                "output_tokens": 4,
-                                "cost_usd": 0.0004,
-                            },
-                        },
-                    ),
-                )
-            raise AssertionError(f"unexpected request {request.method} {path}")
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            engine = HermesEngine(
-                EngineConfig(BASE, profile="itsm-verification"),
-                client=client,
-            )
-            info: EngineInfo = await engine.discover()
-            session_id = await engine.create_session()
-            assert session_id == "sess_hermes"
-            with pytest.raises(EngineError) as failed:
-                await engine.cancel(session_id)
-            assert failed.value.code == "unsupported"
-            events = [
-                event
-                async for event in engine.stream(
-                    "Busca activos",
-                    session_id=session_id,
-                    model="anthropic/claude",
-                )
             ]
-        return events, requests, info, []
 
-    events, requests, info, _ = asyncio.run(scenario())
+        socket = _HermesSocket(responder)
+        transport, seen = _native_http(ticket=401, token_page=True)
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket, urls=urls)
+            info = await engine.discover()
+            await engine.close()
+        return info, urls, seen
 
-    assert [model.id for model in info.models] == ["anthropic/claude"]
-    assert info.models[0].provider == "anthropic"
-    assert info.models[0].free is None
+    info, urls, seen = asyncio.run(scenario())
+
+    assert info.version == "0.22.5"
+    assert [(model.id, model.provider) for model in info.models] == [
+        ("omni/one", "itsm-omp"),
+        ("omni/two", "itsm-omp"),
+        ("omni/two", "other"),
+    ]
+    assert info.models[0].free is True
     assert info.capabilities == {
         "streaming": True,
         "sessions": True,
         "model_switch": True,
-        "cancel": False,
+        "cancel": True,
         "tools": True,
         "usage": True,
-        "history": True,
+        "history": False,
     }
-    create_requests = [r for r in requests if r.url.path == "/api/sessions"]
-    assert "profile" not in json.loads(create_requests[0].content)
-    stream_request = next(
-        r for r in requests if r.url.path == "/api/sessions/sess_hermes/chat/stream"
-    )
-    stream_body = json.loads(stream_request.content)
-    assert stream_body["input"] == "Busca activos"
-    assert stream_body["model"] == "anthropic/claude"
-    assert "profile" not in stream_body
-    fragments = [str(event["text"]) for event in events if event["type"] == "delta"]
-    assert fragments == ["Hola", " mundo"]
-    tools = [event for event in events if event["type"] == "tool"]
-    assert tools[0] == {
-        "type": "tool",
-        "tool": "itsm_inventory_search",
-        "status": "running",
-        "input": {"query": "nvr"},
+    assert urls and "token=process-token" in urls[0]
+    assert "ticket=" not in urls[0]
+    assert seen == [
+        ("POST", "/auth/password-login"),
+        ("POST", "/api/auth/ws-ticket"),
+        ("GET", "/"),
+        ("GET", "/openapi.json"),
+    ]
+
+
+def test_hermes_native_gated_serve_without_ticket_fails_closed() -> None:
+    async def scenario() -> EngineError:
+        socket = _HermesSocket(lambda request: [])
+        transport, _ = _native_http(ticket=401, token_page=False)
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            with pytest.raises(EngineError) as failed:
+                await engine.discover()
+            await engine.close()
+        return failed.value
+
+    failed = asyncio.run(scenario())
+
+    assert failed.code == "authentication"
+    assert "ticket" in failed.message.lower()
+    assert "process-token" not in failed.message
+
+
+def test_hermes_native_inspection_normalizes_active_surface_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[dict[str, object], _HermesSocket]:
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "session.create":
+                assert request["params"] == {
+                    "source": "cli",
+                    "close_on_disconnect": True,
+                    "cwd": str(tmp_path),
+                }
+                return [
+                    _native_result(
+                        request,
+                        {"session_id": "rt-inspect", "stored_session_id": "stored-inspect"},
+                    )
+                ]
+            if method == "tools.list":
+                assert request["params"] == {"session_id": "rt-inspect"}
+                return [
+                    _native_result(
+                        request,
+                        {
+                            "toolsets": [
+                                {
+                                    "name": "itsm",
+                                    "description": "",
+                                    "tool_count": 2,
+                                    "enabled": True,
+                                    "tools": [
+                                        "itsm_search_assets",
+                                        "mcp__itsm__search_assets",
+                                    ],
+                                },
+                                {
+                                    "name": "skills",
+                                    "description": "",
+                                    "tool_count": 1,
+                                    "enabled": True,
+                                    "tools": ["skills_list"],
+                                },
+                                {
+                                    "name": "plugin-search",
+                                    "description": "",
+                                    "tool_count": 1,
+                                    "enabled": True,
+                                    "tools": ["mcp__plugin-search__lookup"],
+                                },
+                                {
+                                    "name": "project",
+                                    "description": "",
+                                    "tool_count": 1,
+                                    "enabled": False,
+                                    "tools": ["Bash"],
+                                },
+                            ]
+                        },
+                    )
+                ]
+            if method == "mcp.servers.list":
+                assert request["params"] == {}
+                return [
+                    _native_result(
+                        request,
+                        {
+                            "servers": [
+                                {
+                                    "name": "itsm",
+                                    "transport": "http",
+                                    "url": "http://127.0.0.1:9000/mcp",
+                                    "enabled": True,
+                                    "source": "config",
+                                },
+                                {
+                                    "name": "plugin-search",
+                                    "transport": "http",
+                                    "url": "http://127.0.0.1:9000/plugin",
+                                    "enabled": True,
+                                    "source": "plugin",
+                                },
+                                {
+                                    "name": "disabled-search",
+                                    "transport": "http",
+                                    "url": "http://127.0.0.1:9000/disabled",
+                                    "enabled": False,
+                                    "source": "config",
+                                },
+                            ]
+                        },
+                    )
+                ]
+            if method == "skills.manage":
+                assert request["params"] == {"action": "list"}
+                return [
+                    _native_result(
+                        request,
+                        {
+                            "skills": {
+                                "productivity": ["itsm-inventory", "hermes-agent"],
+                                "creative": ["other"],
+                                "duplicate": ["other"],
+                            }
+                        },
+                    )
+                ]
+            if method == "session.close":
+                assert request["params"] == {"session_id": "rt-inspect"}
+                return [_native_result(request, {"closed": True, "messages": []})]
+            if method == "session.delete":
+                assert request["params"] == {"session_id": "stored-inspect"}
+                return [_native_result(request, {"deleted": True})]
+            raise AssertionError(f"unexpected method {method}")
+
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket, directory=str(tmp_path))
+            runtime = await engine.inspect_profile_runtime()
+            await engine.close()
+        return runtime, socket
+
+    runtime, socket = asyncio.run(scenario())
+
+    assert runtime == {
+        "protocol": "hermes-native-serve-v1",
+        "endpoint": BASE,
+        "profileHome": str(tmp_path),
+        "toolsets": ["itsm", "plugin-search", "skills"],
+        "mcpServers": [
+            {
+                "name": "itsm",
+                "url": "http://127.0.0.1:9000/mcp",
+                "enabled": True,
+            },
+            {
+                "name": "plugin-search",
+                "url": "http://127.0.0.1:9000/plugin",
+                "enabled": True,
+            },
+        ],
+        "skills": ["hermes-agent", "itsm-inventory", "other"],
+        "tools": [
+            "itsm_search_assets",
+            "mcp__itsm__search_assets",
+            "mcp__plugin-search__lookup",
+            "skills_list",
+        ],
     }
-    assert tools[-2] == {
-        "type": "tool",
-        "tool": "itsm_inventory_search",
-        "status": "completed",
-        "output": "2 activos",
+    methods = socket.methods()
+    assert methods[:4] == [
+        "session.create",
+        "tools.list",
+        "mcp.servers.list",
+        "skills.manage",
+    ]
+    assert methods[-2:] == ["session.close", "session.delete"]
+
+
+def test_hermes_native_inspection_requires_managed_mcp_tools_and_cleans_up(
+    tmp_path: Path,
+) -> None:
+    async def scenario() -> tuple[EngineError, _HermesSocket]:
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "session.create":
+                return [
+                    _native_result(
+                        request,
+                        {"session_id": "rt-missing", "stored_session_id": "stored-missing"},
+                    )
+                ]
+            if method == "tools.list":
+                return [
+                    _native_result(
+                        request,
+                        {
+                            "toolsets": [
+                                {
+                                    "name": "itsm",
+                                    "description": "",
+                                    "tool_count": 1,
+                                    "enabled": True,
+                                    "tools": ["itsm_search_assets"],
+                                }
+                            ]
+                        },
+                    )
+                ]
+            if method == "session.close":
+                return [_native_result(request, {"closed": True})]
+            if method == "session.delete":
+                return [_native_result(request, {"deleted": True})]
+            raise AssertionError(f"unexpected method {method}")
+
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket, directory=str(tmp_path))
+            with pytest.raises(EngineError) as failed:
+                await engine.inspect_profile_runtime()
+            await engine.close()
+        return failed.value, socket
+
+    failed, socket = asyncio.run(scenario())
+
+    assert failed.code == "protocol"
+    assert "MCP" in failed.message
+    assert socket.methods()[-2:] == ["session.close", "session.delete"]
+
+
+def test_hermes_native_stream_maps_deltas_tools_usage_and_completion() -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], list[dict[str, Any]], str]:
+        socket: _HermesSocket
+
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "model.options":
+                return [
+                    _native_result(
+                        request,
+                        {"providers": [{"slug": "itsm-omp", "models": ["omni/one"]}]},
+                    )
+                ]
+            if method == "session.create":
+                return [
+                    _native_result(
+                        request, {"session_id": "rt-1", "stored_session_id": "stored-1"}
+                    )
+                ]
+            if method == "config.set":
+                return [_native_result(request, {"ok": True})]
+            if method == "prompt.submit":
+                return [
+                    _native_result(request, {}),
+                    _native_event("message.delta", {"text": "Hola"}),
+                    _native_event(
+                        "tool.start", {"tool_id": "t1", "name": "itsm_search", "args": {"q": "nvr"}}
+                    ),
+                    _native_event(
+                        "tool.complete",
+                        {"tool_id": "t1", "name": "itsm_search", "result": {"items": 2}},
+                    ),
+                    _native_event("session.usage", {"usage": {"input": 7, "output": 4}}),
+                    _native_event(
+                        "message.complete",
+                        {
+                            "status": "complete",
+                            "text": "Hola mundo",
+                            "usage": {"input": 7, "output": 4, "cost_usd": 0.0004},
+                        },
+                    ),
+                ]
+            if method == "session.interrupt":
+                return [_native_result(request, {"status": "interrupted"})]
+            raise AssertionError(f"unexpected RPC {method}")
+
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            await engine.discover()
+            stored = await engine.create_session()
+            events = [
+                event
+                async for event in engine.stream(
+                    "Busca activos",
+                    session_id=stored,
+                    model="omni/one",
+                    history=[
+                        {"role": "user", "content": "uno"},
+                        {"role": "assistant", "content": "dos"},
+                    ],
+                )
+            ]
+            await engine.cancel(stored)
+            await engine.close()
+        return events, socket.sent, stored
+
+    events, sent, stored = asyncio.run(scenario())
+
+    assert stored == "stored-1"
+    create = next(item for item in sent if item["method"] == "session.create")
+    assert create["params"]["source"] == "cli"
+    assert create["params"]["close_on_disconnect"] is False
+    switch = next(item for item in sent if item["method"] == "config.set")
+    assert switch["params"] == {
+        "key": "model",
+        "value": "omni/one --session --provider itsm-omp",
+        "session_id": "rt-1",
     }
-    assert tools[-1]["type"] == "tool"
-    assert tools[-1]["tool"] == "itsm_inventory_search"
-    assert tools[-1]["status"] == "failed"
-    assert tools[-1]["output"] == "engine reported an error"
+    prompt = next(item for item in sent if item["method"] == "prompt.submit")
+    assert prompt["params"]["session_id"] == "rt-1"
+    assert "Busca activos" in prompt["params"]["text"]
+    assert "uno" in prompt["params"]["text"] and "dos" in prompt["params"]["text"]
+    assert [event["text"] for event in events if event["type"] == "delta"] == ["Hola"]
+    assert [event for event in events if event["type"] == "tool"] == [
+        {
+            "type": "tool",
+            "tool": "itsm_search",
+            "status": "running",
+            "input": {"q": "nvr"},
+        },
+        {
+            "type": "tool",
+            "tool": "itsm_search",
+            "status": "completed",
+            "output": '{"items": 2}',
+        },
+    ]
     assert [event for event in events if event["type"] == "usage"] == [
         {
             "type": "usage",
@@ -1362,260 +1701,92 @@ def test_hermes_session_stream_uses_capabilities_tools_usage_and_no_profile_fiel
             "cost": 0.0004,
         }
     ]
-    assert [event for event in events if event["type"] == "error"] == []
     assert events[-1] == {"type": "done", "cancelled": False}
+    assert "session.resume" not in [item["method"] for item in sent]
 
 
-def test_hermes_runs_ignore_interim_events_and_emit_final_answer_usage() -> None:
-    async def scenario() -> tuple[list[dict[str, Any]], dict[str, Any]]:
-        run_body: dict[str, Any] = {}
+def test_hermes_native_resume_and_interrupt_use_stored_session_identity() -> None:
+    async def scenario() -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "session.resume":
+                return [_native_result(request, {"session_id": "rt-2"})]
+            if method == "prompt.submit":
+                return [
+                    _native_result(request, {}),
+                    _native_event(
+                        "message.complete", {"status": "interrupted", "text": ""}, "rt-2"
+                    ),
+                ]
+            if method == "session.interrupt":
+                return [_native_result(request, {"status": "not_interrupted"})]
+            raise AssertionError(f"unexpected RPC {method}")
 
-        def handler(request: httpx.Request) -> httpx.Response:
-            path = request.url.path
-            if path == "/v1/capabilities":
-                return httpx.Response(
-                    200,
-                    json={
-                        "version": "1.1.0",
-                        "features": {
-                            "run_submission": True,
-                            "run_events_sse": True,
-                            "run_stop": True,
-                        },
-                    },
-                )
-            if path == "/v1/models":
-                return httpx.Response(
-                    200,
-                    json={"data": [{"id": "hermes-4", "owned_by": "nous"}]},
-                )
-            if path == "/v1/runs" and request.method == "POST":
-                run_body.update(json.loads(request.content))
-                return httpx.Response(202, json={"run_id": "run_1"})
-            if path == "/v1/runs/run_1/events":
-                return _named_sse(
-                    (
-                        "message.delta",
-                        {"session_id": "sess_runs", "delta": "partial"},
-                    ),
-                    (
-                        "tool.started",
-                        {"tool": "itsm_inventory_search", "input": {"query": "nvr"}},
-                    ),
-                    (
-                        "tool.completed",
-                        {"tool": "itsm_inventory_search", "output": "2 activos"},
-                    ),
-                    (
-                        "run.completed",
-                        {
-                            "content": "Final completo",
-                            "usage": {
-                                "input_tokens": 2,
-                                "output_tokens": 1,
-                                "cost_usd": 0.0002,
-                            },
-                        },
-                    ),
-                )
-            raise AssertionError(f"unexpected request {request.method} {path}")
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            engine = HermesEngine(EngineConfig(BASE), client=client)
-            await engine.discover()
-            session_id = await engine.create_session()
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
             events = [
                 event
                 async for event in engine.stream(
-                    "Busca activos",
-                    session_id=session_id,
-                    model="hermes-4",
-                    history=[
-                        {"role": "user", "content": "uno"},
-                        {"role": "assistant", "content": "dos"},
-                    ],
+                    "continua", session_id="stored-2", history=[{"role": "user", "content": "x"}]
                 )
             ]
-        return events, run_body
+            with pytest.raises(EngineError):
+                await engine.cancel("stored-2")
+            await engine.close()
+        return events, socket.sent
 
-    events, run_body = asyncio.run(scenario())
+    events, sent = asyncio.run(scenario())
 
-    assert run_body["input"] == "Busca activos"
-    assert run_body["model"] == "hermes-4"
-    assert run_body["conversation_history"] == [
-        {"role": "user", "content": "uno"},
-        {"role": "assistant", "content": "dos"},
-    ]
-    assert "tool_calls" not in json.dumps(run_body["conversation_history"])
-    fragments = [str(event["text"]) for event in events if event["type"] == "delta"]
-    assert fragments == ["Final completo"]
-    assert "partial" not in "".join(fragments)
-    assert [event for event in events if event["type"] == "usage"] == [
-        {
-            "type": "usage",
-            "inputTokens": 2,
-            "outputTokens": 1,
-            "source": "reported",
-            "cost": 0.0002,
-        }
-    ]
+    assert [event["type"] for event in events] == ["session", "done"]
     assert events[-1] == {"type": "done", "cancelled": False}
+    resume = next(item for item in sent if item["method"] == "session.resume")
+    assert resume["params"] == {"session_id": "stored-2"}
+    prompt = next(item for item in sent if item["method"] == "prompt.submit")
+    assert prompt["params"]["session_id"] == "rt-2"
+    assert [item["method"] for item in sent].count("config.set") == 0
 
 
-def test_hermes_runs_stop_reports_cancelled_without_resubmitting() -> None:
-    async def scenario() -> tuple[list[dict[str, Any]], int, int]:
-        run_calls = 0
-        stop_calls = 0
-        events_open = asyncio.Event()
-        stopped = asyncio.Event()
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            nonlocal run_calls, stop_calls
-            path = request.url.path
-            if path == "/v1/capabilities":
-                return httpx.Response(
-                    200,
-                    json={
-                        "version": "1.1.0",
-                        "features": {
-                            "run_submission": True,
-                            "run_events_sse": True,
-                            "run_stop": True,
-                        },
-                    },
-                )
-            if path == "/v1/models":
-                return httpx.Response(200, json={"data": [{"id": "hermes-4"}]})
-            if path == "/v1/runs" and request.method == "POST":
-                run_calls += 1
-                return httpx.Response(202, json={"run_id": "run_1"})
-            if path == "/v1/runs/run_1/events":
-
-                async def frames() -> AsyncIterator[bytes]:
-                    yield _frame(
-                        "message.delta",
-                        {"session_id": "sess_runs", "delta": "parcial"},
+def test_hermes_native_failed_turn_emits_truthful_error_and_done() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        def responder(request: Mapping[str, Any]) -> list[dict[str, Any]]:
+            method = request["method"]
+            if method == "session.create":
+                return [
+                    _native_result(
+                        request, {"session_id": "rt-3", "stored_session_id": "stored-3"}
                     )
-                    events_open.set()
-                    await stopped.wait()
-                    yield _frame("run.cancelled", {"status": "cancelled"})
+                ]
+            if method == "prompt.submit":
+                return [
+                    _native_result(request, {}),
+                    _native_event(
+                        "message.complete",
+                        {"status": "error", "failure_reason": "provider rejected the turn"},
+                        "rt-3",
+                    ),
+                ]
+            raise AssertionError(f"unexpected RPC {method}")
 
-                return httpx.Response(
-                    200,
-                    headers={"content-type": "text/event-stream"},
-                    stream=_GeneratedSSE(frames()),
-                )
-            if path == "/v1/runs/run_1/stop":
-                stop_calls += 1
-                stopped.set()
-                return httpx.Response(200, json={"status": "stopping"})
-            raise AssertionError(f"unexpected request {request.method} {path}")
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            engine = HermesEngine(EngineConfig(BASE), client=client)
-            await engine.discover()
-            session_id = await engine.create_session()
-            stream = engine.stream("Busca activos", session_id=session_id)
-            assert await stream.__anext__() == {"type": "session", "sessionId": session_id}
-
-            async def collect() -> list[dict[str, Any]]:
-                return [event async for event in stream]
-
-            consumer = asyncio.create_task(collect())
-            await asyncio.wait_for(events_open.wait(), 1)
-            await engine.cancel(session_id)
-            events = await asyncio.wait_for(consumer, 1)
-
-            idle_session = await engine.create_session()
-            with pytest.raises(EngineError) as failed:
-                await engine.cancel(idle_session)
-            assert failed.value.code == "not_found"
-        return events, run_calls, stop_calls
-
-    events, run_calls, stop_calls = asyncio.run(scenario())
-
-    assert run_calls == 1
-    assert stop_calls == 1
-    assert [event for event in events if event["type"] == "delta"] == []
-    assert events[-1] == {"type": "done", "cancelled": True}
-
-
-def test_hermes_legacy_chat_is_stateless_fragmented_and_truthful_about_capabilities() -> None:
-    async def scenario() -> tuple[list[dict[str, Any]], Any, str]:
-        from itsm.agents.engines import EngineInfo
-
-        requests: list[httpx.Request] = []
-        chat_bodies: list[dict[str, Any]] = []
-
-        def handler(request: httpx.Request) -> httpx.Response:
-            requests.append(request)
-            path = request.url.path
-            if path == "/v1/capabilities":
-                return httpx.Response(404, json={"error": "not found"})
-            if path == "/health":
-                return httpx.Response(
-                    200,
-                    json={"status": "ok", "version": "0.9.0"},
-                )
-            if path == "/v1/models":
-                return httpx.Response(
-                    200,
-                    json={"data": [{"id": "hermes-3", "owned_by": "nous"}]},
-                )
-            if path == "/v1/chat/completions":
-                chat_bodies.append(json.loads(request.content))
-                return _sse(
-                    {"choices": [{"delta": {"content": "ha"}}]},
-                    {"choices": [{"delta": {"content": "ha"}}]},
-                    {
-                        "choices": [],
-                        "usage": {
-                            "prompt_tokens": 2,
-                            "completion_tokens": 2,
-                            "cost_usd": 0.0001,
-                        },
-                    },
-                    "[DONE]",
-                )
-            raise AssertionError(f"unexpected request {request.method} {path}")
-
-        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
-            engine = HermesEngine(EngineConfig(BASE), client=client)
-            info: EngineInfo = await engine.discover()
-            session_id = await engine.create_session()
+        socket = _HermesSocket(responder)
+        transport, _ = _native_http()
+        async with httpx.AsyncClient(transport=transport) as client:
+            engine = _native_engine(client, socket)
+            stored = await engine.create_session()
             events = [
-                event
-                async for event in engine.stream(
-                    "Di ha",
-                    session_id=session_id,
-                    model="hermes-3",
-                    history=[{"role": "user", "content": "antes"}],
-                )
+                event async for event in engine.stream("falla", session_id=stored)
             ]
-            with pytest.raises(EngineError) as failed:
-                await engine.cancel(session_id)
-            assert failed.value.code == "unsupported"
-        return events, info, session_id
+            await engine.close()
+        return events
 
-    events, info, session_id = asyncio.run(scenario())
+    events = asyncio.run(scenario())
 
-    assert info.version == "0.9.0"
-    assert info.models[0].id == "hermes-3"
-    assert info.models[0].provider == "nous"
-    assert info.capabilities == {
-        "streaming": True,
-        "sessions": False,
-        "model_switch": True,
-        "cancel": False,
-        "tools": False,
-        "usage": True,
-        "history": True,
-    }
-    assert session_id.startswith("itsm-")
-    fragments = [str(event["text"]) for event in events if event["type"] == "delta"]
-    assert fragments == ["ha", "ha"]
-    assert "".join(fragments) == "haha"
     assert events[-1] == {"type": "done", "cancelled": False}
+    error = next(event for event in events if event["type"] == "error")
+    assert error["code"] == "upstream"
+    assert "provider rejected the turn" in error["message"]
+    assert error["retryable"] is False
 
 
 def test_v2_unauthorized_discovery_redacts_credentials() -> None:

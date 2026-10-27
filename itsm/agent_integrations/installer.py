@@ -30,6 +30,7 @@ ProfileInspector = Callable[..., Awaitable[Mapping[str, Any] | None]]
 SCHEMA_VERSION = 1
 MANIFEST_RELATIVE = ".itsm-agent/manifest.json"
 DEFAULT_AGENT = "itsm"
+HERMES_ESSENTIAL_SKILL = "hermes-agent"
 DEFAULT_SKILLS = (
     "itsm-inventory",
     "itsm-infrastructure",
@@ -654,10 +655,17 @@ def _block_end(lines: list[str], start: int, indent: int) -> int:
         if not stripped:
             index += 1
             continue
-        if stripped.startswith("#") and _indent(lines[index]) <= indent:
+        line_indent = _indent(lines[index])
+        if stripped.startswith("#") and line_indent <= indent:
             break
-        if _indent(lines[index]) <= indent:
+        if line_indent < indent:
             break
+        if line_indent == indent and not (
+            stripped == "-" or stripped.startswith("- ")
+        ):
+            break
+        # A YAML sequence may be indentless: ``cli:`` followed by ``- itsm``
+        # at the key's own indentation.  Those items belong to the block.
         index += 1
     return index
 
@@ -709,9 +717,6 @@ def _hermes_mcp_lines(mcp: Mapping[str, Any], enabled: bool) -> list[str]:
         "    headers:",
         f"      Authorization: Bearer ${{{mcp['secretRef']}}}",
         f"    enabled: {'true' if enabled else 'false'}",
-        "    tools:",
-        "      prompts: false",
-        "      resources: false",
     ]
 
 
@@ -767,11 +772,138 @@ def _hermes_remove_entry(text: str, *, remove_parent: bool) -> tuple[str, bool]:
     return "\n".join(lines) + "\n", entry_removed
 
 
-def _hermes_set_api_server(text: str, toolsets: list[str]) -> tuple[str, bool]:
+def _hermes_set_skills_disabled(text: str, disabled: list[str]) -> tuple[str, bool]:
+    lines = text.splitlines()
+    parent = _find_block(lines, "skills", 0)
+    value = f"  disabled: {_yaml_dump(disabled)}"
+    if parent is None:
+        block = ["skills:", value]
+        base = text if not text else text.rstrip("\n") + "\n"
+        return base + "\n".join(block) + "\n", True
+    start, end = parent
+    inline = _inline_value(lines[start])
+    if inline and inline not in {"{}", "null", "~"}:
+        raise InstallerError("config_invalid", "inline skills mapping is not safely editable")
+    child = _find_block(lines, "disabled", 2, start + 1, end)
+    if inline in {"{}", "null", "~"}:
+        header = lines[start].split("#", 1)[0].rstrip()
+        lines[start : start + 1] = [header, value]
+        return "\n".join(lines) + "\n", True
+    if child is None:
+        lines[end:end] = [value]
+        return "\n".join(lines) + "\n", True
+    child_start, child_end = child
+    while (
+        child_end < len(lines)
+        and lines[child_end].lstrip().startswith("- ")
+        and _indent(lines[child_end]) == 2
+    ):
+        child_end += 1
+    lines[child_start:child_end] = [value]
+    return "\n".join(lines) + "\n", False
+
+
+def _hermes_remove_skills_disabled(text: str, *, remove_parent: bool) -> str:
+    lines = text.splitlines()
+    parent = _find_block(lines, "skills", 0)
+    if parent is None:
+        return text
+    start, end = parent
+    child = _find_block(lines, "disabled", 2, start + 1, end)
+    if child is None:
+        return text
+    child_start, child_end = child
+    while (
+        child_end < len(lines)
+        and lines[child_end].lstrip().startswith("- ")
+        and _indent(lines[child_end]) == 2
+    ):
+        child_end += 1
+    del lines[child_start:child_end]
+    if remove_parent:
+        try:
+            parent_value = _yaml_load("\n".join(lines)).get("skills")
+        except InstallerError:
+            parent_value = None
+        if parent_value in ({}, None):
+            current = _find_block(lines, "skills", 0)
+            if current is not None:
+                current_start, current_end = current
+                del lines[current_start:current_end]
+    return "\n".join(lines) + "\n"
+
+
+def _hermes_skill_inventory(state: _TargetState) -> list[str]:
+    """Names of every skill installed under the selected profile home.
+
+    Mirrors Hermes' profile-local discovery (``skills/**/SKILL.md`` plus the
+    frontmatter ``name``).  Bundled/plugin roots live outside this home and are
+    not writable here; the launcher is responsible for those.
+    """
+
+    base = state.root.joinpath(*PurePosixPath(state.skills_relative).parts)
+    if not base.is_dir():
+        return []
+    base_real = os.path.realpath(base)
+    names: set[str] = set()
+    seen: set[str] = set()
+    for root, dirs, files in os.walk(base, followlinks=True):
+        real_root = os.path.realpath(root)
+        if real_root in seen:
+            dirs[:] = []
+            continue
+        seen.add(real_root)
+        if "SKILL.md" not in files:
+            continue
+        path = Path(root) / "SKILL.md"
+        if not real_root.startswith(base_real + os.sep) and real_root != base_real:
+            # A symlinked skill outside the profile is still visible to Hermes;
+            # disable it by directory name without reading outside the profile.
+            names.add(path.parent.name)
+            dirs[:] = []
+            continue
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                head = handle.read(4000)
+        except OSError:
+            continue
+        name = path.parent.name
+        if head.startswith("---"):
+            end = head.find("\n---", 3)
+            if end > 3:
+                try:
+                    frontmatter = _yaml_load(head[3:end])
+                except InstallerError:
+                    frontmatter = {}
+                declared = frontmatter.get("name") if isinstance(frontmatter, Mapping) else None
+                if isinstance(declared, str) and declared.strip():
+                    name = declared.strip()
+        if name:
+            names.add(name)
+    return sorted(names)
+
+
+def _hermes_disabled_skills(data: Mapping[str, Any] | None) -> list[str]:
+    section = (data or {}).get("skills")
+    if section is None:
+        return []
+    if not isinstance(section, Mapping):
+        raise InstallerError("config_invalid", "skills section must be a mapping")
+    disabled = section.get("disabled")
+    if disabled is None:
+        return []
+    if not isinstance(disabled, list) or any(
+        not isinstance(name, str) or not name for name in disabled
+    ):
+        raise InstallerError("config_invalid", "skills.disabled must be a list of names")
+    return sorted(set(disabled))
+
+
+def _hermes_set_cli_toolset(text: str, toolsets: list[str]) -> tuple[str, bool]:
     lines = text.splitlines()
     parent = _find_block(lines, "platform_toolsets", 0)
     if parent is None:
-        block = ["platform_toolsets:", f"  api_server: {_yaml_dump(toolsets)}"]
+        block = ["platform_toolsets:", f"  cli: {_yaml_dump(toolsets)}"]
         base = text if not text else text.rstrip("\n") + "\n"
         return base + "\n".join(block) + "\n", True
     start, end = parent
@@ -780,8 +912,8 @@ def _hermes_set_api_server(text: str, toolsets: list[str]) -> tuple[str, bool]:
         raise InstallerError(
             "config_invalid", "inline platform_toolsets mapping is not safely editable"
         )
-    child = _find_block(lines, "api_server", 2, start + 1, end)
-    value = f"  api_server: {_yaml_dump(toolsets)}"
+    child = _find_block(lines, "cli", 2, start + 1, end)
+    value = f"  cli: {_yaml_dump(toolsets)}"
     if inline in {"{}", "null", "~"}:
         header = lines[start].split("#", 1)[0].rstrip()
         lines[start : start + 1] = [header, value]
@@ -794,13 +926,13 @@ def _hermes_set_api_server(text: str, toolsets: list[str]) -> tuple[str, bool]:
     return "\n".join(lines) + "\n", False
 
 
-def _hermes_remove_api_server(text: str, *, remove_parent: bool) -> str:
+def _hermes_remove_cli_toolset(text: str, *, remove_parent: bool) -> str:
     lines = text.splitlines()
     parent = _find_block(lines, "platform_toolsets", 0)
     if parent is None:
         return text
     start, end = parent
-    child = _find_block(lines, "api_server", 2, start + 1, end)
+    child = _find_block(lines, "cli", 2, start + 1, end)
     if child is None:
         return text
     child_start, child_end = child
@@ -1041,8 +1173,8 @@ def _detect_hermes(target: IntegrationTarget, root: Path) -> _TargetState:
         config_data=data,
         skills_relative="skills",
         limitations=[
-            "The Hermes HTTP API does not attest the active profile home; trusted profile "
-            "verification is unavailable."
+            "The native Hermes serve does not by itself attest the active profile home; "
+            "verification requires the trusted host launch receipt and live native inspection."
         ],
     )
 
@@ -1269,15 +1401,16 @@ def _preflight_hermes(
     expected = ["itsm"] + (["skills"] if skills else [])
     if (
         isinstance(toolsets, Mapping)
-        and "api_server" in toolsets
-        and toolsets["api_server"] != expected
+        and "cli" in toolsets
+        and toolsets["cli"] != expected
     ):
         conflicts.append(
             _conflict(
-                "platform_toolsets.api_server",
-                "existing API server toolset allowlist differs from the safe ITSM allowlist",
+                "platform_toolsets.cli",
+                "existing CLI toolset allowlist differs from the safe ITSM allowlist",
             )
         )
+    _hermes_disabled_skills(data)
     agent = data.get("agent")
     if agent is not None and not isinstance(agent, Mapping):
         raise InstallerError("config_invalid", "agent section must be a mapping")
@@ -1458,9 +1591,21 @@ def _hermes_install_text(
     if "platform_toolsets" not in (state.config_data or {}):
         created.append("platform_toolsets")
     toolsets = ["itsm"] + (["skills"] if skill_names and enabled else [])
-    text, changed = _hermes_set_api_server(text, toolsets)
+    text, changed = _hermes_set_cli_toolset(text, toolsets)
     if changed and "platform_toolsets" not in created:
-        created.append("platform_toolsets.api_server")
+        created.append("platform_toolsets.cli")
+    selected = set(skill_names) if enabled else set()
+    inventory = set(_hermes_skill_inventory(state))
+    existing = set(_hermes_disabled_skills(state.config_data))
+    disabled = sorted((existing | inventory) - selected - {HERMES_ESSENTIAL_SKILL})
+    data = state.config_data or {}
+    skills_section = data.get("skills")
+    if disabled or (isinstance(skills_section, Mapping) and "disabled" in skills_section):
+        text, _ = _hermes_set_skills_disabled(text, disabled)
+        if "skills" not in data:
+            created.append("skills")
+        elif isinstance(skills_section, Mapping) and "disabled" not in skills_section:
+            created.append("skills.disabled")
     return text, created
 
 
@@ -1468,7 +1613,18 @@ def _hermes_uninstall_text(state: _TargetState, manifest: Mapping[str, Any]) -> 
     text = state.config_text or ""
     created_keys = set(manifest.get("config", {}).get("createdKeys", []))
     text, _ = _hermes_remove_entry(text, remove_parent="mcp_servers" in created_keys)
-    text = _hermes_remove_api_server(text, remove_parent="platform_toolsets" in created_keys)
+    if {"platform_toolsets", "platform_toolsets.cli"} & created_keys:
+        text = _hermes_remove_cli_toolset(
+            text, remove_parent="platform_toolsets" in created_keys
+        )
+    prior = (manifest.get("config") or {}).get("disabledSkillsBefore")
+    if isinstance(prior, list) and all(isinstance(name, str) for name in prior):
+        if "skills" in created_keys:
+            text = _hermes_remove_skills_disabled(text, remove_parent=True)
+        elif "skills.disabled" in created_keys:
+            text = _hermes_remove_skills_disabled(text, remove_parent=False)
+        else:
+            text, _ = _hermes_set_skills_disabled(text, sorted(set(prior)))
     return text
 
 
@@ -1525,7 +1681,7 @@ def _runtime_evidence(
     if engine == "opencode":
         ok, detail = _opencode_runtime_safety(evidence, state, skill_names)
     else:
-        ok, detail = _hermes_runtime_safety(evidence, state)
+        ok, detail = _hermes_runtime_safety(evidence, state, skill_names)
     if not ok:
         return "fail", False, detail
     return "pass", True, f"authenticated runtime inspection accepted from {source}"
@@ -1738,16 +1894,99 @@ def _opencode_itsm_allow(action: str) -> bool:
     return action.startswith("itsm_")
 
 
+def _hermes_endpoint(raw: Any) -> str | None:
+    if not isinstance(raw, str) or not raw:
+        return None
+    parsed = urlsplit(raw)
+    if parsed.scheme not in {"http", "https"} or parsed.hostname not in {
+        "127.0.0.1",
+        "::1",
+        "localhost",
+    }:
+        return None
+    return raw.rstrip("/")
+
+
 def _hermes_runtime_safety(
-    evidence: Mapping[str, Any], _state: _TargetState
+    evidence: Mapping[str, Any], state: _TargetState, skill_names: Sequence[str]
 ) -> tuple[bool, str]:
+    """Validate a trusted launcher receipt plus live native surface inspection.
+
+    ``profile_inspector`` is the only path that reaches this function.  The
+    launcher receipt therefore comes from a host-controlled launch, never from
+    the engine's own configuration or from a request body.
+    """
+
+    launch = evidence.get("launch")
     runtime = evidence.get("runtime")
-    if runtime is not None and not isinstance(runtime, Mapping):
-        return False, "Hermes runtime evidence is invalid"
-    return (
-        False,
-        "Hermes does not expose an official active-profile attestation; "
-        "profile safety verification is unavailable",
+    if not isinstance(launch, Mapping) or not isinstance(runtime, Mapping):
+        return False, "trusted Hermes launch and runtime evidence are required"
+    if launch.get("protocol") != "itsm-hermes-launch-v1":
+        return False, "trusted Hermes launch receipt has an unsupported protocol"
+    if not _same_runtime_path(launch.get("profileHome"), state.root):
+        return False, "trusted Hermes launch bound a different profile home"
+    launch_id = launch.get("launchId")
+    if not isinstance(launch_id, str) or not launch_id:
+        return False, "trusted Hermes launch receipt has no launch identity"
+    process_id = launch.get("processId")
+    if not isinstance(process_id, int) or isinstance(process_id, bool) or process_id <= 0:
+        return False, "trusted Hermes launch receipt has no process identity"
+    if launch.get("configDigest") != evidence.get("configDigest"):
+        return False, "trusted Hermes launch receipt bound a different configuration"
+    endpoint = _hermes_endpoint(launch.get("endpoint"))
+    if endpoint is None:
+        return False, "trusted Hermes launch endpoint is not a loopback serve URL"
+
+    if runtime.get("protocol") != "hermes-native-serve-v1":
+        return False, "Hermes runtime inspection has an unsupported protocol"
+    if not _same_runtime_path(runtime.get("profileHome"), state.root):
+        return False, "Hermes runtime inspection reported a different profile home"
+    if _hermes_endpoint(runtime.get("endpoint")) != endpoint:
+        return False, "Hermes runtime inspection contacted a different endpoint"
+
+    expected_toolsets = ["itsm"] + (["skills"] if skill_names else [])
+    toolsets = runtime.get("toolsets")
+    if (
+        not isinstance(toolsets, list)
+        or any(not isinstance(name, str) for name in toolsets)
+        or sorted(toolsets) != sorted(expected_toolsets)
+    ):
+        return False, "Hermes runtime toolset allowlist differs from the restricted profile"
+
+    # Hermes refuses to disable this builtin (agent.skill_utils.ESSENTIAL_SKILLS);
+    # every real skills-enabled profile therefore exposes it in addition to the
+    # selected ITSM skills.  Nothing else may be enabled.
+    expected_skills = set(skill_names)
+    if skill_names:
+        expected_skills.add(HERMES_ESSENTIAL_SKILL)
+    skills = runtime.get("skills")
+    if (
+        not isinstance(skills, list)
+        or any(not isinstance(name, str) for name in skills)
+        or sorted(skills) != sorted(expected_skills)
+    ):
+        return False, "Hermes runtime skill surface differs from the selected skills"
+
+    config = state.config_data or {}
+    configured = (
+        config.get("mcp_servers", {}).get("itsm")
+        if isinstance(config.get("mcp_servers"), Mapping)
+        else None
+    )
+    expected_url = configured.get("url") if isinstance(configured, Mapping) else None
+    servers = runtime.get("mcpServers")
+    if (
+        not isinstance(servers, list)
+        or len(servers) != 1
+        or not isinstance(servers[0], Mapping)
+        or servers[0].get("name") != "itsm"
+        or servers[0].get("enabled") is not True
+        or servers[0].get("url") != expected_url
+    ):
+        return False, "Hermes runtime MCP surface differs from the managed profile"
+    return True, (
+        "trusted launch receipt is bound to the managed profile home and endpoint, "
+        "and the live native toolset, MCP, and skill surfaces are restricted"
     )
 
 
@@ -1771,6 +2010,8 @@ def _hermes_profile_config_check(
     )
     if not isinstance(entry, Mapping):
         return False, "managed MCP entry is missing"
+    if entry.get("url") != mcp["url"]:
+        return False, "managed MCP entry URL differs from the receipt"
     if entry.get("enabled") is not enabled:
         return False, "managed MCP entry state differs from the receipt"
     headers = entry.get("headers")
@@ -1780,13 +2021,24 @@ def _hermes_profile_config_check(
         return False, "MCP authorization must use the environment reference"
     toolsets = data.get("platform_toolsets")
     expected = ["itsm"] + (["skills"] if skill_names and enabled else [])
-    if not isinstance(toolsets, Mapping) or toolsets.get("api_server") != expected:
-        return False, "api_server toolset allowlist is not the restricted ITSM allowlist"
+    if not isinstance(toolsets, Mapping) or toolsets.get("cli") != expected:
+        return False, "cli toolset allowlist is not the restricted ITSM allowlist"
     agent = data.get("agent")
     disabled = agent.get("disabled_toolsets") if isinstance(agent, Mapping) else None
     if isinstance(disabled, list) and {"itsm", "skills"} & set(disabled):
         return False, "agent.disabled_toolsets overrides the ITSM allowlist"
-    return True, "api_server allowlist contains only ITSM and selected skills"
+    try:
+        disabled_skills = set(_hermes_disabled_skills(data))
+    except InstallerError:
+        return False, "skills.disabled is not a valid name list"
+    discovered = set(_hermes_skill_inventory(state))
+    selected = set(skill_names) if enabled else set()
+    if selected & disabled_skills or HERMES_ESSENTIAL_SKILL in disabled_skills:
+        return False, "selected or essential skills are disabled"
+    missing = discovered - selected - {HERMES_ESSENTIAL_SKILL} - disabled_skills
+    if missing:
+        return False, "installed skills outside the selected allowlist remain enabled"
+    return True, "cli allowlist contains only ITSM and selected skills; others are disabled"
 
 
 def _opencode_profile_config_check(
@@ -2092,6 +2344,15 @@ class IntegrationInstaller:
             _preflight(state, catalog_skills, manifest, mcp)
         enabled = operation != "disable"
         skill_names = [skill.name for skill in catalog_skills] if enabled else []
+        disabled_before: list[str] | None = None
+        if state.engine == "hermes":
+            prior_cfg = (manifest or {}).get("config")
+            if isinstance(prior_cfg, Mapping) and isinstance(
+                prior_cfg.get("disabledSkillsBefore"), list
+            ):
+                disabled_before = list(prior_cfg["disabledSkillsBefore"])
+            else:
+                disabled_before = _hermes_disabled_skills(state.config_data)
         if state.engine == "opencode":
             text, created_keys = _opencode_install_text(state, mcp, skill_names, enabled=enabled)
         else:
@@ -2112,6 +2373,7 @@ class IntegrationInstaller:
             skill_payloads,
             config_digest,
             enabled=True,
+            disabled_skills_before=disabled_before,
         )
         if isinstance(prior_config, Mapping) and isinstance(
             prior_config.get("existsBefore"), bool
@@ -2626,7 +2888,17 @@ def _build_manifest(
     config_digest: str,
     *,
     enabled: bool,
+    disabled_skills_before: Sequence[str] | None = None,
 ) -> dict[str, Any]:
+    config: dict[str, Any] = {
+        "path": state.config_relative,
+        "digest": config_digest,
+        "existsBefore": state.config_exists,
+        "skillsDirectory": state.skills_relative,
+        "createdKeys": sorted(set(created_keys)),
+    }
+    if disabled_skills_before is not None:
+        config["disabledSkillsBefore"] = sorted(set(disabled_skills_before))
     return {
         "schemaVersion": SCHEMA_VERSION,
         "engine": state.engine,
@@ -2641,13 +2913,7 @@ def _build_manifest(
             "identityId": mcp["identityId"],
         },
         "state": "enabled" if enabled else "disabled",
-        "config": {
-            "path": state.config_relative,
-            "digest": config_digest,
-            "existsBefore": state.config_exists,
-            "skillsDirectory": state.skills_relative,
-            "createdKeys": sorted(set(created_keys)),
-        },
+        "config": config,
         "skills": dict(skills),
     }
 
