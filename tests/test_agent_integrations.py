@@ -238,6 +238,50 @@ class FakeInstaller:
         return {"verified": True, "checks": [{"name": "mcp", "status": "pass"}], "toolCount": 3}
 
 
+class VerifyingInstaller(FakeInstaller):
+    """Mirror the real installer's rule that verify input must match the manifest.
+
+    The real installer compares the requested skill names with the managed
+    manifest and returns a conflict when they differ, so the double refuses a
+    dropped selection instead of accepting whatever list the service forwards.
+    """
+
+    def __init__(self, receipts: list[dict[str, Any]]) -> None:
+        super().__init__(receipts)
+        self.managed: dict[tuple[str, str, str | None], list[str]] = {}
+
+    async def apply(
+        self, target: Any, *, mcp: dict[str, Any], skills: list[str], operation: str, **kwargs: Any
+    ) -> dict[str, Any]:
+        key = (target.engine, target.path, target.profile)
+        if operation == "install":
+            self.managed[key] = list(skills)
+        elif key in self.managed and list(skills) != self.managed[key]:
+            self.calls.append(
+                {"target": target, "mcp": mcp, "skills": skills, "operation": operation, **kwargs}
+            )
+            return {
+                "status": "conflict",
+                "verified": False,
+                "version": "2.1.2",
+                "engine": target.engine,
+                "profile": target.profile,
+                "identityId": mcp["identityId"],
+                "managedFiles": [],
+                "conflicts": [
+                    {"path": "skills", "detail": "verification input does not match the manifest"}
+                ],
+                "checks": [],
+            }
+        return await super().apply(
+            target=target, mcp=mcp, skills=skills, operation=operation, **kwargs
+        )
+
+
+def _receipt_skills(*names: str) -> list[dict[str, str]]:
+    return [{"name": name, "version": "1.0.0", "digest": "a" * 64} for name in names]
+
+
 _MODULE_SKILL = """---
 name: demo-skill
 description: "Trigger: module demonstration. Exercise one module-provided ITSM skill."
@@ -2101,3 +2145,139 @@ def test_self_certified_receipt_cannot_verify_without_engine_inspection(
         check["name"] == "control.profile" and check["status"] == "fail" for check in body["checks"]
     )
     assert not any(check["name"] == "profile.safety" for check in body["checks"])
+
+
+def test_verify_reuses_installed_skill_names_from_the_stored_binding(
+    app_client, monkeypatch
+) -> None:
+    catalog, client, settings = app_client
+    machine, token = catalog.add_machine("binding-skills", "Binding Skills")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    receipt_skills = [{"name": "itsm-inventory", "version": "1.0.0", "digest": "a" * 64}]
+    installer = VerifyingInstaller(
+        [{"skills": list(receipt_skills)}, {"skills": list(receipt_skills)}]
+    )
+    build_service(
+        client,
+        catalog,
+        engine_factory=lambda instance, secret: FakeEngine(),
+        installer=installer,
+        catalog_api=FakeCatalog(),
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
+
+    installed = install_verified(client, admin, instance, machine.actor_id)
+    assert installed["skills"] == ["itsm-inventory"]
+    stored = client.get(f"{API}/agent/integrations", headers=admin).json()["installations"]
+    assert next(row for row in stored if row["id"] == installed["id"])["skills"] == [
+        "itsm-inventory"
+    ]
+
+    verified = client.post(
+        f"{API}/agent/integrations/install",
+        json={
+            "instanceId": instance["id"],
+            "target": {"engine": "opencode", "path": "/srv/opencode/itsm", "profile": "itsm"},
+            "operation": "verify",
+        },
+        headers=admin,
+    )
+    assert verified.status_code == 200, verified.text
+    body = verified.json()
+    assert body["status"] == "verified", body
+    assert body["verified"] is True
+    assert body["skills"] == ["itsm-inventory"]
+    assert body["binding"]["skills"] == ["itsm-inventory"]
+    assert installer.calls[-1]["operation"] == "verify"
+    assert installer.calls[-1]["skills"] == ["itsm-inventory"]
+
+
+def test_failed_verify_preserves_the_binding_for_the_next_retry(app_client, monkeypatch) -> None:
+    catalog, client, settings = app_client
+    machine, token = catalog.add_machine("retry-skills", "Retry Skills")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    receipt_skills = [{"name": "itsm-inventory", "version": "1.0.0", "digest": "a" * 64}]
+    installer = VerifyingInstaller(
+        [
+            {"skills": list(receipt_skills)},
+            {
+                "status": "failed",
+                "verified": False,
+                "error": {"code": "mcp_unreachable", "message": "MCP handshake failed"},
+            },
+            {"skills": list(receipt_skills)},
+        ]
+    )
+    build_service(
+        client,
+        catalog,
+        engine_factory=lambda instance, secret: FakeEngine(),
+        installer=installer,
+        catalog_api=FakeCatalog(),
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
+    installed = install_verified(client, admin, instance, machine.actor_id)
+    assert installed["skills"] == ["itsm-inventory"]
+
+    payload = {
+        "instanceId": instance["id"],
+        "target": {"engine": "opencode", "path": "/srv/opencode/itsm", "profile": "itsm"},
+        "operation": "verify",
+    }
+    failed = client.post(f"{API}/agent/integrations/install", json=payload, headers=admin)
+    assert failed.status_code == 200, failed.text
+    failure = failed.json()
+    assert failure["status"] == "failed", failure
+    assert failure["verified"] is False
+    assert failure["skills"] == ["itsm-inventory"]
+    stored = client.get(f"{API}/agent/integrations", headers=admin).json()["installations"]
+    row = next(item for item in stored if item["id"] == installed["id"])
+    assert row["status"] == "failed"
+    assert row["verified"] is False
+    assert row["skills"] == ["itsm-inventory"]
+    assert row["binding"]["skills"] == ["itsm-inventory"]
+
+    retried = client.post(f"{API}/agent/integrations/install", json=payload, headers=admin)
+    assert retried.status_code == 200, retried.text
+    recovered = retried.json()
+    assert recovered["status"] == "verified", recovered
+    assert recovered["verified"] is True
+    assert recovered["skills"] == ["itsm-inventory"]
+    assert installer.calls[-1]["skills"] == ["itsm-inventory"]
+
+
+def test_first_install_still_requires_a_skill_selection(app_client, monkeypatch) -> None:
+    catalog, client, settings = app_client
+    machine, token = catalog.add_machine("first-install", "First Install")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    installer = FakeInstaller([])
+    build_service(
+        client,
+        catalog,
+        engine_factory=lambda instance, secret: FakeEngine(),
+        installer=installer,
+        catalog_api=FakeCatalog(),
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    instance = configure_instance(client, headers=admin, integrationIdentityId=machine.actor_id)
+
+    response = client.post(
+        f"{API}/agent/integrations/install",
+        json={
+            "instanceId": instance["id"],
+            "target": {"engine": "opencode", "path": "/srv/opencode/itsm", "profile": "itsm"},
+            "mcp": {
+                "url": "http://127.0.0.1:18080/api/v1/mcp",
+                "secretRef": "ITSM_TEST_MCP_TOKEN",
+                "identityId": machine.actor_id,
+            },
+            "operation": "install",
+        },
+        headers=admin,
+    )
+    assert response.status_code == 422, response.text
+    assert response.json()["error"]["message"] == "skills are required for the first installation"
+    assert installer.calls == []
+    assert client.get(f"{API}/agent/integrations", headers=admin).json()["installations"] == []

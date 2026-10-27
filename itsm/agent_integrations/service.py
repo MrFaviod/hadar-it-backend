@@ -2405,7 +2405,7 @@ class AgentIntegrationService:
             if payload.get("skills") is not None:
                 skills = self._skills(payload.get("skills"))
             elif existing is not None:
-                skills = _string_list(
+                skills = _skill_names(
                     (stored.get("binding") or {}).get("skills") or stored.get("skills")
                 )
             else:
@@ -2570,9 +2570,25 @@ class AgentIntegrationService:
             )
             if key in sanitized
         }
+        if "skills" in binding:
+            binding["skills"] = _skill_names(binding["skills"])
         with self._session() as db:
             identity = self._require_admin(db, principal, "agent:integrations", human_only=True)
             row = self._installation_row(db, instance.id, target)
+            previous = dict((row.receipt or {}).get("binding") or {}) if row is not None else {}
+            if previous and status in {"failed", "conflict"}:
+                # A failed lifecycle operation reports why it failed; it must not
+                # drop the last known binding a retry needs.
+                binding = {
+                    **previous,
+                    **{
+                        key: value
+                        for key, value in binding.items()
+                        if value not in (None, "", [], {})
+                    },
+                }
+                if "skills" in previous:
+                    binding["skills"] = _skill_names(previous["skills"])
             runtime_binding = self._instance_runtime_binding(instance, target)
             if row is None:
                 row = AgentInstallation(
@@ -2666,7 +2682,7 @@ class AgentIntegrationService:
                 },
                 engine=row.engine,
             )
-            skills = _string_list((stored.get("binding") or {}).get("skills"))
+            skills = _skill_names((stored.get("binding") or {}).get("skills"))
             expected_digest = stored.get("requestDigest")
             provided_digest = (
                 _label(payload.get("requestDigest"), limit=200)
@@ -3029,7 +3045,7 @@ class AgentIntegrationService:
         if remote:
             binding.setdefault("requestDigest", receipt.get("requestDigest"))
         stored_mcp = receipt.get("mcp") if isinstance(receipt.get("mcp"), Mapping) else {}
-        skills = _string_list(binding.get("skills") or receipt.get("skills"))
+        skills = _skill_names(binding.get("skills") or receipt.get("skills"))
         payload = {
             "id": row.id,
             "instanceId": row.instance_id,
@@ -3168,6 +3184,28 @@ def _string_list(value: Any) -> list[str]:
     if not isinstance(value, list):
         return []
     return [str(item)[:500] for item in value if isinstance(item, (str, int, float))][:200]
+
+
+def _skill_names(value: Any) -> list[str]:
+    """Canonical skill names from a binding list or installer receipt objects.
+
+    Installer receipts list selected skills as ``{name, version, digest}``
+    objects while requests use plain names; both shapes reduce to the same
+    canonical selection so verification keeps comparing exact names.
+    """
+    if not isinstance(value, list):
+        return []
+    names: list[str] = []
+    seen: set[str] = set()
+    for item in value:
+        name = item.get("name") if isinstance(item, Mapping) else item
+        if not isinstance(name, str):
+            continue
+        name = name.strip()[:200]
+        if name and name not in seen:
+            seen.add(name)
+            names.append(name)
+    return names[:50]
 
 
 def _sanitize_receipt(value: dict[str, Any], secret: str | None) -> dict[str, Any]:
