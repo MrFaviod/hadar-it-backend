@@ -387,7 +387,7 @@ class OpenCodeEngine(_HTTPEngine):
                             elif event_type in {"session.idle", "session.execution.succeeded"}:
                                 terminal = True
                                 break
-                            elif event_type == "session.error":
+                            elif event_type in {"session.error", "session.execution.failed"}:
                                 error = EngineError(
                                     "upstream",
                                     _error_text(data.get("error") or data),

@@ -356,6 +356,51 @@ def test_v212_native_execution_success_finishes_without_waiting_for_stream_close
     assert events[-1] == {"type": "done", "cancelled": False}
 
 
+def test_v212_native_execution_failure_finishes_without_waiting_for_stream_close() -> None:
+    async def scenario() -> list[dict[str, Any]]:
+        async def frames() -> AsyncIterator[bytes]:
+            for payload in (
+                {"type": "session.execution.failed", "data": {
+                    "sessionID": "other", "error": {"message": "foreign failure"},
+                }},
+                {"type": "session.execution.failed", "data": {
+                    "sessionID": "ses_native", "error": {"message": "output bound exceeded"},
+                }},
+            ):
+                yield f"data: {json.dumps(payload)}\n\n".encode()
+            await asyncio.sleep(10)
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            if request.url.path == "/api/event":
+                return httpx.Response(
+                    200, headers={"content-type": "text/event-stream"},
+                    stream=_GeneratedSSE(frames()),
+                )
+            if request.url.path.endswith("/prompt"):
+                return httpx.Response(200, json={"data": {"id": "user_native"}})
+            if request.url.path.endswith("/message"):
+                return httpx.Response(200, json={"data": []})
+            if request.url.path.endswith("/interrupt"):
+                return httpx.Response(200, json={})
+            raise AssertionError(f"unexpected request {request.url.path}")
+
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig(BASE, agent=None), client=client)
+            engine._variant = "v2"
+
+            async def collect() -> list[dict[str, Any]]:
+                return [event async for event in engine.stream("hello", session_id="ses_native")]
+
+            return await asyncio.wait_for(collect(), timeout=0.5)
+
+    events = asyncio.run(scenario())
+    errors = [event for event in events if event["type"] == "error"]
+    assert len(errors) == 1
+    assert errors[0]["message"] == "output bound exceeded"
+    assert not [event for event in events if event["type"] == "delta"]
+    assert events[-1] == {"type": "done", "cancelled": False}
+
+
 def test_v2_stream_is_cumulative_session_isolated_and_reports_engine_usage() -> None:
     async def scenario() -> list[dict[str, Any]]:
         requests: list[httpx.Request] = []
