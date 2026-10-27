@@ -25,6 +25,10 @@ from itsm.agent_integrations.extensions import ExtensionRegistry, load_extension
 from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
+from itsm.ai_gateway.router import create_ai_gateway_router
+from itsm.ai_gateway.service import AiGatewayService
+from itsm.ai_usage.api import create_agent_usage_router
+from itsm.ai_usage.service import AiUsageService, QuotaExceeded
 from itsm.appearance import build_appearance_service, create_appearance_router
 from itsm.attachments.api import create_attachment_router
 from itsm.config import Settings, get_settings
@@ -181,6 +185,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             extension_sync=getattr(extension_mount, "sync", None),
         )
         app.state.agent_integrations.initialize()
+        app.state.agent_usage = AiUsageService(settings, factory)
+        app.state.ai_gateway = AiGatewayService(settings, factory, app.state.agent_usage)
         app.state.system = SystemService(
             settings,
             factory,
@@ -232,6 +238,21 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 status_code=status_code,
                 duration_ms=round((time.perf_counter() - started) * 1000, 2),
             )
+
+    @app.exception_handler(QuotaExceeded)
+    async def on_quota_exceeded(request: Request, exc: QuotaExceeded) -> JSONResponse:
+        return JSONResponse(
+            status_code=429,
+            content={
+                "error": {
+                    "code": exc.code,
+                    "message": str(exc),
+                    "remainingTokens": exc.remaining_tokens,
+                    "periodDay": exc.period_day,
+                }
+            },
+            headers={"Cache-Control": "no-store"},
+        )
 
     @app.exception_handler(RequestValidationError)
     async def on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
@@ -370,6 +391,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_directory_media_router())
     api.include_router(create_agent_router())
     api.include_router(create_agent_integrations_router())
+    api.include_router(create_agent_usage_router())
+    api.include_router(create_ai_gateway_router())
     api.include_router(create_system_router())
     api.include_router(create_identity_router())
     app.include_router(api)
