@@ -3,12 +3,11 @@
 from __future__ import annotations
 
 import logging
-
 from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request
 from itsm.agents.isolation import IsolatedRuntime, IsolationUnavailable, is_privileged_human
-from itsm.agents.runtime import AgentRuntime, AgentUnavailable, ChatReply, ChatRequest
+from itsm.agents.runtime import AgentUnavailable, ChatReply, ChatRequest
 from itsm.identity.api import MutationDependency
 from itsm.identity.hashing import hash_token
 from itsm.identity.service import Principal

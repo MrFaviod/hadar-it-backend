@@ -90,6 +90,8 @@ def provider_env(settings_factory: Any):
         settings_factory,
         agent_model="openai:gpt-4o-mini",
         ai_credential_key=MASTER_KEY,
+        ai_broker_url="ws://127.0.0.1:9/runs",
+        ai_broker_token="t" * 48,
     )
     client = TestClient(create_app(catalog.settings))
     client.__enter__()

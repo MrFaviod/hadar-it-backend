@@ -2156,9 +2156,9 @@ class AgentRuntime:
 
 
 __all__ = [
+    "INSTRUCTIONS",
     "SYSTEM_TOOL_NAMES",
     "TOOL_NAMES",
-    "INSTRUCTIONS",
     "AgentDeps",
     "AgentRuntime",
     "AgentUnavailable",
