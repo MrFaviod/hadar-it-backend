@@ -26,6 +26,8 @@ from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
 from itsm.ai_gateway.router import create_ai_gateway_router
+from itsm.extensions.api import create_extension_router, install_extension_error_handlers
+from itsm.extensions.composition import create_extension_services
 from itsm.ai_gateway.service import AiGatewayService
 from itsm.ai_usage.api import create_agent_usage_router
 from itsm.ai_usage.service import AiUsageService, QuotaExceeded
@@ -176,7 +178,15 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.session_factory = factory
         install_search_sync(settings)
         app.state.task_queue = create_task_queue(settings)
-        app.state.agent_runtime = AgentRuntime(settings, app.state.session_factory)
+        app.state.extensions, app.state.extension_development = create_extension_services(
+            settings, factory
+        )
+        app.state.agent_runtime = AgentRuntime(
+            settings,
+            factory,
+            extensions=app.state.extensions,
+            extension_development=app.state.extension_development,
+        )
         app.state.agent_integrations = AgentIntegrationService(
             settings,
             app.state.session_factory,
@@ -220,6 +230,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     )
     install_error_handlers(app)
     install_agent_integration_error_handlers(app)
+    install_extension_error_handlers(app)
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next: Any) -> Any:
@@ -393,6 +404,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_agent_integrations_router())
     api.include_router(create_agent_usage_router())
     api.include_router(create_ai_gateway_router())
+    api.include_router(create_extension_router())
     api.include_router(create_system_router())
     api.include_router(create_identity_router())
     app.include_router(api)

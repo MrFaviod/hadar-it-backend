@@ -22,6 +22,11 @@ from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_http_headers
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
+from itsm.extensions.tools import (
+    EXTENSION_TOOL_NAMES,
+    dispatch_extension_tool,
+    register_mcp_extension_tools,
+)
 from itsm.identity.hashing import hash_token
 from itsm.identity.service import (
     AuthenticationFailed,
@@ -105,7 +110,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "query_relationships",
     "list_saved_views",
     *SYSTEM_TOOL_NAMES,
-)
+) + EXTENSION_TOOL_NAMES
 
 INSTRUCTIONS = """\
 These tools operate on the ITSM asset inventory with the permissions of the
@@ -1627,6 +1632,29 @@ def create_mcp_server(
     def create_system_backup() -> dict[str, Any]:
         """Ask the operator-configured external executor for a verified backup."""
         return run_system(lambda service, principal: service.operation(principal, "backup.create"))
+
+    def run_extension_tool(name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        from itsm.extensions.composition import create_extension_services
+        from itsm.extensions.host import ExtensionHostError
+
+        try:
+            with session_factory() as session:
+                identity = IdentityService(session, settings)
+                principal = identity.authenticate_token(_bearer_token()).principal
+            host, development = create_extension_services(settings, session_factory)
+            return dispatch_extension_tool(
+                name,
+                arguments,
+                principal=principal,
+                host=host,
+                development=development,
+            )
+        except IdentityError as exc:
+            raise _translate(exc) from exc
+        except ExtensionHostError as exc:
+            raise ToolError(str(exc)) from exc
+
+    register_mcp_extension_tools(server, run_extension_tool)
 
     if extensions is not None:
         from itsm.agent_integrations.extensions import bind_fastmcp_tools

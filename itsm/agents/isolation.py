@@ -356,7 +356,7 @@ class IsolatedRuntime:
                 message=message[:4000],
                 actions=deps.actions,
                 results=deps.results,
-                approvalPending=False,
+                approvalPending=deps.approval_pending,
             ),
             tokens,
         )

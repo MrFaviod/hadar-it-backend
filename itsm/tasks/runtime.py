@@ -252,6 +252,29 @@ def register_notification_task(huey: Huey, settings: Settings):
     return notification_dispatch
 
 
+def register_extension_task(huey: Huey, settings: Settings):
+    """Run only installed declared schedules; SQL owns due state and live authority."""
+
+    @huey.periodic_task(
+        crontab(minute="*"),
+        name="extension_schedules",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+        context=True,
+    )
+    def extension_schedules(task: Any = None) -> dict[str, Any]:
+        from itsm.extensions.scheduler import process_extension_schedules
+
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        result = process_extension_schedules(settings)
+        log_event(logger, "extensions.schedules.processed", **result)
+        payload = {"state": TaskState.COMPLETE.value, "summary": result}
+        huey.put_result(task.id, payload)
+        return payload
+
+    return extension_schedules
+
+
 def register_report_task(huey: Huey, settings: Settings):
     """Render durable document jobs using only a server-side SQL locator."""
 
@@ -335,6 +358,7 @@ def build_runtime(settings: Settings) -> TaskRuntime:
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
     huey = build_huey(settings)
     register_maintenance_task(huey, settings)
+    register_extension_task(huey, settings)
     search_sync, search_rebuild = register_search_tasks(huey, settings)
     return TaskRuntime(
         huey=huey,
@@ -360,6 +384,7 @@ def _consumer_huey() -> Huey:
     register_maintenance_task(huey_instance, settings)
     register_monitoring_task(huey_instance, settings)
     register_notification_task(huey_instance, settings)
+    register_extension_task(huey_instance, settings)
     register_report_task(huey_instance, settings)
     register_search_tasks(huey_instance, settings)
     return huey_instance

@@ -110,6 +110,12 @@ class Settings(BaseSettings):
     agent_context_token_bound: int | None = Field(default=None, ge=1, le=100_000_000)
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
+    extension_workspace_path: Path = Path("/data/extensions/workspaces")
+    extension_validator_image: str = "itsm-extension-validator:1"
+    extension_validation_timeout_seconds: int = Field(default=60, ge=5, le=300)
+    # Optional fixed host validator: application containers never receive Docker authority.
+    extension_validator_url: str | None = None
+    extension_validator_token: SecretStr | None = None
     # Ordinary human roles run Pydantic AI in a container owned by this broker.
     # The API never receives container authority; the URL and token must be
     # configured together or the isolated path is explicitly unavailable.
@@ -283,6 +289,33 @@ class Settings(BaseSettings):
             raise ValueError("hermes_inspector_url must be an http(s) URL without credentials")
         return normalized
 
+    @field_validator("extension_validator_url")
+    @classmethod
+    def _validate_extension_validator_url(cls, value: str | None) -> str | None:
+        if value is None or not value.strip():
+            return None
+        normalized = value.strip().rstrip("/")
+        parsed = urlsplit(normalized)
+        if (
+            parsed.scheme not in {"http", "https"}
+            or not parsed.hostname
+            or parsed.path
+            or parsed.username is not None
+            or parsed.password is not None
+            or parsed.query
+            or parsed.fragment
+            or re.search(r"\s", normalized)
+        ):
+            raise ValueError("extension_validator_url must be an http(s) URL without credentials")
+        return normalized
+
+    @field_validator("extension_validator_token", mode="before")
+    @classmethod
+    def _normalize_extension_validator_token(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
+
     @field_validator("ai_broker_url")
     @classmethod
     def _validate_ai_broker_url(cls, value: str | None) -> str | None:
@@ -304,7 +337,7 @@ class Settings(BaseSettings):
             raise ValueError("ai_broker_url must not contain credentials, query or whitespace")
         return normalized
 
-    @field_validator("ai_broker_token", "hermes_inspector_token")
+    @field_validator("ai_broker_token", "hermes_inspector_token", "extension_validator_token")
     @classmethod
     def _validate_ai_broker_token(cls, value: SecretStr | None) -> SecretStr | None:
         if value is None:
@@ -408,6 +441,10 @@ class Settings(BaseSettings):
             raise ValueError(
                 "hermes_inspector_url and hermes_inspector_token must be configured together"
             )
+        if (self.extension_validator_url is None) != (self.extension_validator_token is None):
+            raise ValueError(
+                "extension_validator_url and extension_validator_token must be configured together"
+            )
         return self
 
     def _reject_shared_sqlite_file(self) -> None:
@@ -452,6 +489,7 @@ class Settings(BaseSettings):
             self.ai_credential_key,
             self.ai_broker_token,
             self.hermes_inspector_token,
+            self.extension_validator_token,
             *self.monitoring_secrets.values(),
         ):
             if secret is not None:

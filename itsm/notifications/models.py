@@ -173,6 +173,10 @@ class NotificationInbox(NotificationBase):
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
     url: Mapped[str | None] = mapped_column(String(500), nullable=True)
+    # Native extension notices remain owned inbox rows, with live permission
+    # filtering after a recipient's module grant is revoked.
+    extension_id: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    required_permission: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

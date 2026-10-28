@@ -25,6 +25,7 @@ dependencies = [
     "pydantic-ai-slim[openai,anthropic]==2.59.0",
     "fastmcp==4.1.3",
     "httpx==0.28.1",
+    "jsonschema==4.26.0",
     "httpcore==1.0.9",
     "websockets==17.3",
     "openpyxl==3.1.5",
@@ -60,3 +61,4 @@ ignore = ["B008"]
 
 [tool.setuptools.package-data]
 "itsm.agent_integrations" = ["skills/*/*", "skills/*/*/*"]
+"itsm.extensions" = ["sdk/schema/*.json", "sdk/references/*.md", "sdk/templates/record_registry/*", "sdk/templates/record_registry/tests/*", "sdk/templates/record_registry/skills/*/*", "sdk/validator/js/*"]

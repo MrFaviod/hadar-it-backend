@@ -26,6 +26,11 @@ from itsm.agent_integrations.providers import (
 )
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
+from itsm.extensions.tools import (
+    EXTENSION_TOOL_NAMES,
+    dispatch_extension_tool,
+    register_agent_extension_tools,
+)
 from itsm.identity.service import (
     Conflict,
     IdentityError,
@@ -123,7 +128,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "query_relationships",
     "list_saved_views",
     *SYSTEM_TOOL_NAMES,
-)
+) + EXTENSION_TOOL_NAMES
 
 MAX_RESULTS = 50
 
@@ -155,6 +160,12 @@ Reglas:
   vigentes; no supongas que una coincidencia existe si la herramienta no la devuelve.
 - Las relaciones se consultan desde un activo concreto o de forma paginada; no recorras
   todo el grafo para responder por un solo equipo.
+Para desarrollar funciones nuevas, primero consulta extension_sdk_index y las referencias del SDK.
+Trabaja solo en los archivos del espacio independiente mediante extension_workspace_*; valida
+el paquete exacto en el contenedor aislado y remítelo a revisión humana. Nunca apruebes ni
+instales el paquete tú mismo, ni modifiques el núcleo. Explica los permisos y la ejecución
+nativa de confianza. Para módulos instalados, descubre extension_list/extension_operations
+y usa extension_invoke con sus parámetros declarados y los permisos vigentes.
 """
 
 
@@ -230,6 +241,9 @@ class AgentDeps:
     actions: list[ChatAction] = field(default_factory=list)
     results: list[dict[str, Any]] = field(default_factory=list)
     system: Any = None
+    extensions: Any = None
+    extension_development: Any = None
+    approval_pending: bool = False
 
 
 class BatchUpdateArg(BaseModel):
@@ -364,6 +378,47 @@ def _system_collect(
     _record(deps, tool, "completed")
     if len(deps.results) < MAX_RESULTS:
         deps.results.append(payload)
+    return {"ok": True, **payload}
+
+
+def _extension_collect(deps: AgentDeps, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+    """Use the same SDK boundary as HTTP/MCP, including isolated proxy calls."""
+    from itsm.extensions.host import ExtensionHostError
+    if deps.extensions is None or deps.extension_development is None:
+        from itsm.extensions.composition import create_extension_services
+
+        deps.extensions, deps.extension_development = create_extension_services(
+            deps.settings, deps.session_factory
+        )
+    try:
+        payload = dispatch_extension_tool(
+            name,
+            arguments,
+            principal=deps.principal,
+            host=deps.extensions,
+            development=deps.extension_development,
+        )
+    except IdentityError as exc:
+        return _failed(deps, name, exc)
+    except ExtensionHostError as exc:
+        return _failure(deps, name, "failed", str(exc))
+    _record(deps, name, "completed")
+    if (
+        name == "extension_workspace_submit"
+        and payload.get("state") == "pending"
+        and isinstance(payload.get("id"), str)
+    ):
+        deps.approval_pending = True
+        if len(deps.results) < MAX_RESULTS:
+            deps.results.append(
+                {
+                    "type": "extension_review",
+                    "candidateId": payload["id"],
+                    "extensionId": payload["extensionId"],
+                    "digest": payload["digest"],
+                    "version": payload["version"],
+                }
+            )
     return {"ok": True, **payload}
 
 
@@ -1845,6 +1900,7 @@ def build_toolset() -> FunctionToolset[AgentDeps]:
             lambda service: service.operation(ctx.deps.principal, "backup.create"),
         )
 
+    register_agent_extension_tools(toolset, _extension_collect)
     return toolset
 
 
@@ -1896,12 +1952,16 @@ class AgentRuntime:
         model: Model | None = None,
         system: Any = None,
         provider_http_client: Any = None,
+        extensions: Any = None,
+        extension_development: Any = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._model = model
         self._system = system
         self._provider_http_client = provider_http_client
+        self._extensions = extensions
+        self._extension_development = extension_development
         self._owns_provider_client = provider_http_client is None
         self._agent: Agent[AgentDeps, str] | None = None
         self._selection_key: tuple[str, str] | None = None
@@ -2068,6 +2128,8 @@ class AgentRuntime:
                 principal=principal,
                 credential_digest=credential_digest,
                 system=self._system,
+                extensions=self._extensions,
+                extension_development=self._extension_development,
             )
             prompt = request.message
             if request.assetId:
@@ -2117,7 +2179,7 @@ class AgentRuntime:
                     message=message[:4000],
                     actions=deps.actions,
                     results=deps.results,
-                    approvalPending=False,
+                    approvalPending=deps.approval_pending,
                 ),
                 tokens,
             )

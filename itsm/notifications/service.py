@@ -628,6 +628,15 @@ class NotificationService:
         if unread is not None and not isinstance(unread, bool):
             raise ValidationFailed("unread must be a boolean")
         conditions = [NotificationInbox.recipient_id == principal.actor_id]
+        # Legacy notices have no extra grant. Native extension notices retain
+        # their required permission so revoked access cannot leak old content.
+        grants = self._identity._persisted_permissions(principal)
+        conditions.append(
+            or_(
+                NotificationInbox.required_permission.is_(None),
+                NotificationInbox.required_permission.in_(grants),
+            )
+        )
         if unread is True:
             conditions.append(NotificationInbox.read_at.is_(None))
         elif unread is False:
@@ -660,6 +669,11 @@ class NotificationService:
         notification_id = _entity_id(notification_id, "notificationId")
         item = self._session.get(NotificationInbox, notification_id)
         if item is None or item.recipient_id != principal.actor_id:
+            raise NotFound("notification not found")
+        if (
+            item.required_permission is not None
+            and item.required_permission not in self._identity._persisted_permissions(principal)
+        ):
             raise NotFound("notification not found")
         if item.read_at is None:
             item.read_at = utcnow()
