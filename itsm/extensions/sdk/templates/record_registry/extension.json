@@ -85,7 +85,8 @@
         "component": "RecordSummary",
         "permission": "{{PERMISSION_PREFIX}}records_read"
       }
-    ]
+    ],
+    "contributions": []
   },
   "schedules": [],
   "skills": [

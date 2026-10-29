@@ -500,9 +500,16 @@ def _frontend_checks(
         raise ValidationFailure(f"frontend syntax is invalid: {message[:MAX_DETAIL]}")
 
     components: list[str] = []
-    for item in manifest["frontend"]["pages"] + manifest["frontend"]["assetPanels"]:
-        if item["component"] not in components:
-            components.append(item["component"])
+    frontend_manifest = manifest["frontend"]
+    contributions = (
+        frontend_manifest["pages"]
+        + frontend_manifest["assetPanels"]
+        + frontend_manifest.get("contributions", [])
+    )
+    for item in contributions:
+        component = item.get("component")
+        if component is not None and component not in components:
+            components.append(component)
     try:
         registered = subprocess.run(
             [

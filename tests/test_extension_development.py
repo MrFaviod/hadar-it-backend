@@ -487,6 +487,142 @@ def test_manifest_contract_rejects_unknown_fields_and_unsafe_shapes() -> None:
     assert schema["additionalProperties"] is False
 
 
+def _composition_manifest(mode="replace", target="page.inventory"):
+    manifest = generate_package(
+        extension_id="record-registry",
+        name="Records",
+        description="SDK composition test.",
+    ).manifest
+    item = {
+        "id": "inventory-summary",
+        "label": "Inventory summary",
+        "target": target,
+        "mode": mode,
+        "permission": "ext_record_registry.records_read",
+        "order": 10,
+    }
+    if mode != "hide":
+        item["component"] = "RecordList"
+    manifest["frontend"]["contributions"] = [item]
+    return manifest
+
+
+@pytest.mark.parametrize("mode", ["add", "hide", "replace"])
+def test_business_ui_composition_roundtrips_package_and_keeps_old_pages(mode):
+    manifest = _composition_manifest(mode)
+    validated = validate_manifest(manifest, known_core_permissions=())
+    assert validated["sdkVersion"] == 1
+    assert validated["frontend"]["contributions"][0]["mode"] == mode
+    generated = generate_package(
+        extension_id="record-registry",
+        name="Records",
+        description="SDK composition test.",
+    )
+    files = dict(generated.files)
+    files["extension.json"] = json.dumps(manifest)
+    packed = build_package(files, known_core_permissions=())
+    decoded = parse_package(packed.data, known_core_permissions=()).manifest
+    assert decoded == manifest
+    assert decoded["frontend"]["pages"] == generated.manifest["frontend"]["pages"]
+    assert (
+        decoded["frontend"]["assetPanels"]
+        == generated.manifest["frontend"]["assetPanels"]
+    )
+    legacy = copy.deepcopy(manifest)
+    del legacy["frontend"]["contributions"]
+    assert validate_manifest(legacy, known_core_permissions=()) == legacy
+
+
+@pytest.mark.parametrize(
+    "target",
+    [
+        "nav.reports",
+        "page.inventory",
+        "widget.activity",
+        "asset.panel.warranty",
+        "asset.action.assign",
+        "config.apariencia",
+    ],
+)
+def test_business_ui_catalogue_accepts_each_surface(target):
+    manifest = _composition_manifest(target=target)
+    assert validate_manifest(manifest, known_core_permissions=()) == manifest
+
+
+@pytest.mark.parametrize(
+    "change",
+    [
+        {"target": "page.login"},
+        {"target": "nav.users"},
+        {"target": "nav.config"},
+        {"target": "config.seguridad"},
+        {"target": "config.extensiones"},
+        {"target": "config.sistema"},
+        {"target": "#app .sidebar"},
+        {"target": "widget.unknown"},
+        {"mode": "remove"},
+        {"order": True},
+        {"permission": "assets.view"},
+        {"component": "<script>"},
+        {"id": "records"},
+        {"mode": "hide", "component": "RecordList"},
+        {"target": "nav.extensions", "mode": "replace"},
+    ],
+)
+def test_business_ui_composition_rejects_invalid_declarations_without_mutating(change):
+    manifest = _composition_manifest()
+    manifest["frontend"]["contributions"][0].update(change)
+    before = copy.deepcopy(manifest)
+    with pytest.raises(ManifestError):
+        validate_manifest(manifest, known_core_permissions=())
+    assert manifest == before
+
+
+@pytest.mark.parametrize("mode", ["add", "replace"])
+def test_business_ui_composition_requires_a_component(mode):
+    manifest = _composition_manifest(mode)
+    del manifest["frontend"]["contributions"][0]["component"]
+    with pytest.raises(ManifestError):
+        validate_manifest(manifest, known_core_permissions=())
+
+
+@pytest.mark.parametrize("registered", [False, True])
+def test_real_harness_requires_new_composition_components(tmp_path, registered):
+    if not (shutil.which("node") or shutil.which("bun")):
+        pytest.skip("no JavaScript engine on the host for the local harness")
+    generated = generate_package(
+        extension_id="record-registry",
+        name="Records",
+        description="SDK composition test.",
+    )
+    manifest = _composition_manifest()
+    component = "RecordList" if registered else "MissingBusinessWidget"
+    manifest["frontend"]["contributions"][0]["component"] = component
+    files = dict(generated.files)
+    files["extension.json"] = json.dumps(manifest)
+    built = build_package(files, known_core_permissions=())
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-I",
+            str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py"),
+        ],
+        input=build_frame(built.data, digest=built.digest, known_core_permissions=()),
+        capture_output=True,
+        timeout=90,
+        cwd=tmp_path,
+        check=False,
+    )
+    report = json.loads(completed.stdout)
+    # The framed validator process completed; rejection lives in the report.
+    assert completed.returncode == 0, completed.stderr.decode()
+    assert report["status"] == ("passed" if registered else "failed"), report
+    if registered:
+        assert report["errors"] == []
+    else:
+        assert "MissingBusinessWidget" in json.dumps(report["errors"])
+
+
 def test_manifest_allows_forward_compatible_rollback_without_down_migration() -> None:
     generated = generate_package(
         extension_id="record-registry",
@@ -994,7 +1130,10 @@ def test_cli_generate_pack_inspect_offline_roundtrip(tmp_path: Path) -> None:
 
 
 def test_container_validator_smoke_is_prerequisite_gated(tmp_path: Path) -> None:
-    validator = ContainerValidator(core_permissions=())
+    validator = ContainerValidator(
+        core_permissions=(),
+        image=os.environ.get("ITSM_TEST_EXTENSION_VALIDATOR_IMAGE", "itsm-extension-validator:1"),
+    )
     if not validator.available():
         pytest.skip(
             "validator image is not built; parent runs the actual container smoke"
@@ -1044,7 +1183,10 @@ def test_real_container_bounds_candidate_output_and_time(backend) -> None:
 def _running_validator_broker():
     from itsm.extensions.validator import create_validator_server
 
-    validator = ContainerValidator(core_permissions=())
+    validator = ContainerValidator(
+        core_permissions=(),
+        image=os.environ.get("ITSM_TEST_EXTENSION_VALIDATOR_IMAGE", "itsm-extension-validator:1"),
+    )
     if not validator.available():
         pytest.skip("fixed local validator image is not available")
     token = "fixed-broker-test-token-with-32-characters"
