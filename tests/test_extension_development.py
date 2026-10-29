@@ -351,6 +351,91 @@ def test_real_harness_validates_generated_package_operations_and_migrations(
     assert "1->2" in checks["migrations"]["detail"]
 
 
+@pytest.mark.parametrize("failure", [None, "signature", "business"])
+def test_validator_uses_package_fixtures_for_domain_operations(
+    tmp_path: Path, failure: str | None,
+) -> None:
+    generated = generate_package(
+        extension_id="asset-records", name="Registros de equipos",
+        description="Validación con activos y fechas reales de prueba.",
+    )
+    files = dict(generated.files)
+    manifest = copy.deepcopy(generated.manifest)
+    operation = manifest["operations"][1]
+    manifest["corePermissions"] = ["assets.view"]
+    manifest["operations"] = [{
+        **operation, "name": "record_asset", "parameters": {
+            "type": "object", "additionalProperties": False,
+            "properties": {
+                "asset_id": {"type": "string"},
+                "expires_on": {"type": "string"},
+                "notes": {"type": "string"},
+            },
+            "required": ["asset_id", "expires_on"],
+        },
+    }]
+    manifest["schemaVersion"] = 1
+    manifest["compatibleSchemaVersions"] = [1]
+    manifest["migrations"] = []
+    files["extension.json"] = json.dumps(manifest)
+    files["backend.py"] = '''
+from datetime import date
+
+def record_asset(context, asset_id, expires_on, notes=""):
+    asset = context.assets.get(asset_id)
+    return {"asset_id": asset["id"],
+            "expires_on": date.fromisoformat(expires_on).isoformat(), "notes": notes}
+
+def register(sdk):
+    sdk.operation("record_asset", record_asset)
+'''
+    files["tests/test_backend.py"] = '''
+import unittest
+from types import SimpleNamespace
+from backend import record_asset
+
+class Assets:
+    def get(self, asset_id):
+        if asset_id != "test-computer":
+            raise LookupError(asset_id)
+        return {"id": "test-computer"}
+
+class DomainTests(unittest.TestCase):
+    def test_required_asset_and_expiration(self):
+        context = SimpleNamespace(assets=Assets())
+        self.assertEqual(record_asset(context, "test-computer", "2030-01-02", "Office"),
+                         {"asset_id": "test-computer", "expires_on": "2030-01-02",
+                          "notes": "Office"})
+        with self.assertRaises(LookupError):
+            record_asset(context, "missing", "2030-01-02")
+        with self.assertRaises(ValueError):
+            record_asset(context, "test-computer", "not-a-date")
+'''
+    if failure == "signature":
+        files["backend.py"] += '''
+def register(sdk):
+    sdk.operation("record_asset", lambda context, asset_id, expires_on: {})
+'''
+    elif failure == "business":
+        files["backend.py"] = files["backend.py"].replace(
+            'date.fromisoformat(expires_on).isoformat()', '"incorrect-expiration"',
+        )
+    built = build_package(files, known_core_permissions=("assets.view",))
+    completed = subprocess.run(
+        [sys.executable, "-I", str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py")],
+        input=build_frame(built.data, digest=built.digest, known_core_permissions=("assets.view",)),
+        capture_output=True, timeout=90, cwd=tmp_path, check=False,
+    )
+    assert completed.returncode == 0, completed.stderr.decode(errors="replace")
+    report = json.loads(completed.stdout)
+    checks = {item["name"]: item for item in report["checks"]}
+    if failure is None:
+        assert report["status"] == "passed", report["errors"]
+    else:
+        assert report["status"] == "failed"
+        assert checks["operations" if failure == "signature" else "tests"]["status"] == "failed"
+
+
 def test_manifest_contract_rejects_unknown_fields_and_unsafe_shapes() -> None:
     generated = generate_package(
         extension_id="record-registry",
@@ -1051,7 +1136,7 @@ def test_harness_context_matches_native_store_assets_and_notice_contract(tmp_pat
 
 _create_record = create_record
 
-def create_record(context, title, status="open", notes=""):
+def create_record(context, title, status="open", notes="", asset_id=None):
     assert context.principal.actor_id
     assert context.principal.kind == "human"
     page = context.assets.search(query="registry", limit=2, offset=0)
@@ -1062,7 +1147,7 @@ def create_record(context, title, status="open", notes=""):
         assert type(exc).__name__ == "NotFound"
     else:
         raise AssertionError("missing assets must not return None")
-    result = _create_record(context, title, status, notes)
+    result = _create_record(context, title, status, notes, asset_id)
     record = result["record"]
     try:
         with context.transaction() as active:
@@ -1085,6 +1170,12 @@ def create_record(context, title, status="open", notes=""):
         permission=WRITE_PERMISSION, url="#/extensiones/context-records/records",
     )
     return result
+
+_normalize_status = normalize_status
+
+def normalize_status(context):
+    create_record(context, "Explicit context fixture")
+    return _normalize_status(context)
 '''
     files["tests/test_backend.py"] = '''
 import unittest

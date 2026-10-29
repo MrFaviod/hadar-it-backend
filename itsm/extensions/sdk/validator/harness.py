@@ -32,7 +32,7 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from ..contract import ManifestError, validate_arguments, validate_manifest
+    from ..contract import ManifestError, validate_manifest
     from ..package import (
         DEFAULT_LIMITS,
         ArchiveLimits,
@@ -50,7 +50,6 @@ try:
 except ImportError:  # pragma: no cover - only the fixed image layout
     from itsm.extensions.sdk.contract import (  # type: ignore[no-redef]
         ManifestError,
-        validate_arguments,
         validate_manifest,
     )
     from itsm.extensions.sdk.package import (  # type: ignore[no-redef]
@@ -435,38 +434,6 @@ class _Binder:
         target[name] = handler
 
 
-def _sample_value(schema: Any) -> Any:
-    if not isinstance(schema, dict):
-        return "example"
-    if "default" in schema:
-        return copy.deepcopy(schema["default"])
-    examples = schema.get("examples")
-    if isinstance(examples, list) and examples:
-        return copy.deepcopy(examples[0])
-    kind = schema.get("type", "string")
-    if kind == "integer":
-        return 1
-    if kind == "number":
-        return 1
-    if kind == "boolean":
-        return False
-    if kind == "array":
-        return []
-    if kind == "object":
-        return {}
-    return "example"
-
-
-def _sample_arguments(operation: dict[str, Any]) -> dict[str, Any]:
-    parameters = operation["parameters"]
-    arguments = {
-        name: _sample_value(parameters["properties"].get(name, {}))
-        for name in parameters.get("required", [])
-    }
-    validate_arguments(parameters, arguments)
-    return arguments
-
-
 def _check_signature(handler: Any, operation: dict[str, Any]) -> None:
     try:
         signature = inspect.signature(handler)
@@ -480,26 +447,15 @@ def _check_signature(handler: Any, operation: dict[str, Any]) -> None:
         inspect.Parameter.POSITIONAL_OR_KEYWORD,
     ):
         raise ValidationFailure("handler context must be positional")
-    declared = {
-        name
-        for name, schema in operation["parameters"]["properties"].items()
-        if schema.get("type") != "object"
-    }
-    accepts_extra = any(
-        parameter.kind is inspect.Parameter.VAR_KEYWORD
-        for parameter in parameters[1:]
-    )
-    for parameter in parameters[1:]:
-        if parameter.kind is inspect.Parameter.VAR_POSITIONAL:
-            raise ValidationFailure("handler must not accept *args")
-        if parameter.kind is inspect.Parameter.VAR_KEYWORD:
-            continue
-        if parameter.default is not inspect.Parameter.empty:
-            continue
-        if parameter.name not in declared and not accepts_extra:
-            raise ValidationFailure(
-                f"handler requires undeclared argument {parameter.name!r}"
-            )
+    if any(parameter.kind is inspect.Parameter.VAR_POSITIONAL for parameter in parameters):
+        raise ValidationFailure("handler must not accept *args")
+    properties = operation["parameters"]["properties"]
+    required = operation["parameters"].get("required", [])
+    for names in (required, properties):
+        try:
+            signature.bind(object(), **dict.fromkeys(names))
+        except TypeError as exc:
+            raise ValidationFailure(f"handler does not accept declared arguments: {exc}") from exc
 
 
 def _json_bound(value: Any, label: str) -> None:
@@ -731,16 +687,15 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
         return Context(permissions, {item["name"] for item in manifest["collections"]}, manifest["id"])
 
     def operations_check() -> str:
-        current = context()
-        names: list[str] = []
+        names = []
         for operation in manifest["operations"]:
             handler = binder.bound_operations[operation["name"]]
             _check_signature(handler, operation)
-            current.authorize(operation["permission"])
-            result = handler(current, **_sample_arguments(operation))
-            _json_bound(result, operation["name"])
             names.append(operation["name"])
-        return f"{len(names)} operations: " + ", ".join(names)
+        return (
+            f"{len(names)} operations: " + ", ".join(names)
+            + "; signatures checked; domain execution belongs to package tests"
+        )
 
     record("operations", operations_check)
 

@@ -38,8 +38,10 @@ recomputes the delta and never trusts a client-supplied list.
 `parameters` is a bounded JSON Schema object with `type: "object"`,
 `properties`, optional `required`, and optional `additionalProperties`. Each
 property declares `type` as one of `array`, `boolean`, `integer`, `number`,
-`object`, `string`. `default` and `examples` are recommended: the fixed
-validator uses them as sample arguments. A mutation operation is still
+`object`, `string`. Property annotations `default` and `examples` are not supported
+by this bounded schema. Handler defaults provide optional argument behavior;
+package tests supply explicit domain fixtures. The fixed validator checks handler
+signatures without inventing operation inputs. A mutation operation is still
 dispatched through the same declared permission and host context.
 
 ## Migration plan

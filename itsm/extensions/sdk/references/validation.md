@@ -30,14 +30,20 @@ candidate input.
 | `backend` | `backend.py` imports only stdlib and declares `register(sdk)`. |
 | `execution` | The bounded candidate subprocess exited normally and returned only the expected per-check diagnostics. |
 | `registration` | Every declared operation, migration and schedule is bound. |
-| `operations` | Each operation runs once with schema-derived arguments and returns bounded JSON. |
+| `operations` | Every handler accepts the context and both required-only and all declared keyword arguments; no business inputs are fabricated. |
 | `migrations` | Each migration handler runs and returns bounded JSON. |
 | `schedules` | Each schedule handler runs, or none are declared. |
 | `tests` | The package's own `unittest` suite passes (not merely imports). |
 | `frontend` | JavaScript syntax and the actual `register(id, {components})` call. |
 
-A compile-only result is not business validation. The generated example ships
-real operation and migration tests.
+A signature result is not business validation. The required package `unittest`
+suite must execute operations with explicit domain fixtures, including existing
+and missing assets, valid and invalid dates, authorization and optimistic-version
+errors where applicable. The generated example ships real operation and migration
+tests. The fixed validator cannot invent valid inventory IDs or other business
+preconditions, and never catches an operation error to turn it into a pass.
+Actual operation results remain JSON-bounded by the installed host. Package tests
+are developer-provided evidence, not independent proof of coverage.
 
 The fixed parent owns archive framing, digest, static checks and final report
 status. Candidate Python runs in a separate bounded subprocess with closed
