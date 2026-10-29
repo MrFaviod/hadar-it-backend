@@ -212,15 +212,20 @@ def _semantic_errors(
 
         frontend = manifest["frontend"]
         contribution_ids: list[str] = []
-        for collection_name, key in (("page", "pages"), ("asset panel", "assetPanels")):
-            for contribution in frontend[key]:
+        for collection_name, key in (
+            ("page", "pages"),
+            ("asset panel", "assetPanels"),
+            ("UI contribution", "contributions"),
+        ):
+            for contribution in frontend.get(key, []):
                 contribution_ids.append(contribution["id"])
                 if contribution["permission"] not in codes:
                     errors.append(
                         f"{collection_name} {contribution['id']}: permission "
                         f"{contribution['permission']} is not declared permission"
                     )
-                if not COMPONENT_PATTERN.fullmatch(contribution["component"]):
+                component = contribution.get("component")
+                if component is not None and not COMPONENT_PATTERN.fullmatch(component):
                     errors.append(
                         f"{collection_name} {contribution['id']}: invalid component name"
                     )

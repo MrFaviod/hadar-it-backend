@@ -122,6 +122,11 @@
           "items": {
             "$ref": "#/$defs/contribution"
           }
+        },
+        "contributions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {"$ref": "#/$defs/uiContribution"}
         }
       }
     },
@@ -141,6 +146,182 @@
     }
   },
   "$defs": {
+    "uiTarget": {
+      "type": "string",
+      "enum": [
+        "nav.panel",
+        "nav.inventory",
+        "nav.conversation",
+        "nav.maintenance",
+        "nav.monitoring",
+        "nav.infrastructure",
+        "nav.datos",
+        "nav.reports",
+        "nav.warranties",
+        "nav.labels",
+        "nav.people",
+        "nav.help",
+        "nav.extensions",
+        "page.panel",
+        "page.inventory",
+        "page.conversation",
+        "page.maintenance",
+        "page.monitoring",
+        "page.map",
+        "page.graph",
+        "page.datos",
+        "page.reports",
+        "page.warranties",
+        "page.labels",
+        "page.people",
+        "page.person",
+        "page.detail",
+        "page.incident",
+        "page.reportAsset",
+        "page.monitorDevice",
+        "page.monitorAlert",
+        "page.notifications",
+        "page.help",
+        "widget.availability",
+        "widget.alerts",
+        "widget.distribution",
+        "widget.infrastructure",
+        "widget.activity",
+        "widget.maintenance",
+        "widget.warranties",
+        "widget.inventory",
+        "widget.latency",
+        "widget.incidents",
+        "asset.panel.warranty",
+        "asset.panel.attachments",
+        "asset.panel.qr",
+        "asset.panel.relations",
+        "asset.panel.maintenance",
+        "asset.panel.monitoring",
+        "asset.panel.history",
+        "asset.action.edit",
+        "asset.action.assign",
+        "asset.action.return",
+        "asset.action.transfer",
+        "asset.action.ask",
+        "asset.action.duplicate",
+        "asset.action.change-status",
+        "asset.action.restore",
+        "asset.action.archive",
+        "asset.action.retire",
+        "asset.action.purge",
+        "asset.action.delete",
+        "config.apariencia",
+        "config.general",
+        "config.categorias",
+        "config.activos",
+        "config.sedes",
+        "config.personas",
+        "config.integraciones",
+        "config.relaciones",
+        "config.mantenimiento",
+        "config.supervision",
+        "config.alertas",
+        "config.notificaciones",
+        "config.mapas",
+        "config.datos",
+        "config.reportes",
+        "config.garantias",
+        "config.qr",
+        "config.etiquetas"
+      ]
+    },
+    "uiContribution": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "target",
+        "mode",
+        "permission"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9-]{1,47}$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "component": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9]{1,63}$"
+        },
+        "permission": {
+          "type": "string",
+          "pattern": "^ext_[a-z0-9_]+\\.[a-z][a-z0-9_]{1,63}$",
+          "maxLength": 128
+        },
+        "icon": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "target": {
+          "$ref": "#/$defs/uiTarget"
+        },
+        "mode": {
+          "enum": [
+            "add",
+            "hide",
+            "replace"
+          ]
+        },
+        "order": {
+          "type": "integer",
+          "minimum": -10000,
+          "maximum": 10000,
+          "default": 0
+        }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "mode": {
+                "const": "hide"
+              }
+            }
+          },
+          "then": {
+            "not": {
+              "required": [
+                "component"
+              ]
+            }
+          },
+          "else": {
+            "required": [
+              "component"
+            ]
+          }
+        },
+        {
+          "if": {
+            "properties": {
+              "target": {
+                "const": "nav.extensions"
+              }
+            }
+          },
+          "then": {
+            "properties": {
+              "mode": {
+                "const": "add"
+              }
+            }
+          }
+        }
+      ]
+    },
     "permission": {
       "type": "object",
       "additionalProperties": false,
