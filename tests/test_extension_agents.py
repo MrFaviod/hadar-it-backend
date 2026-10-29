@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import pydantic_ai.models
+import pytest
 from pydantic_ai.messages import TextPart, ToolCallPart
 from pydantic_ai.models.function import FunctionModel
 from tests.test_agent_chat import chat, scripted, use_model
@@ -48,19 +49,19 @@ def test_chat_discovers_sdk_and_creates_owned_independent_workspace(
     assert client.get("/api/v1/extensions").json()["items"] == []
 
 
+@pytest.mark.parametrize("core_permission", ["assets.view", "assets.not_a_real_permission"])
 def test_chat_validation_submission_requires_exact_human_review(
-    signed_in_client, settings_factory, tmp_path, monkeypatch
+    signed_in_client, settings_factory, tmp_path, monkeypatch, core_permission
 ):
-    """Actual isolated validation cannot turn a model request into installation."""
+    """Known core permissions reach real validation; unknown codes fail closed."""
     import json
 
-    import pytest
     from pydantic_ai.messages import ModelResponse
 
     from itsm.extensions.validator import ContainerValidator
     from tests.test_agent_chat import tool_returns
 
-    validator = ContainerValidator(core_permissions=())
+    validator = ContainerValidator()
     if not validator.available():
         pytest.skip("fixed local extension validator image is unavailable")
     monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", False)
@@ -74,20 +75,33 @@ def test_chat_validation_submission_requires_exact_human_review(
                 "id": "chat-reviewed", "name": "Registros revisados",
                 "description": "Paquete independiente con revisión humana.",
             })])
-        created = returns[0].content
-        if isinstance(created, str):
-            created = json.loads(created)
-        assert created["ok"] is True, created
-        workspace_id = created["id"]
-        if len(returns) == 1:
+        results = [json.loads(row.content) if isinstance(row.content, str) else row.content
+                   for row in returns]
+        assert results[0]["ok"] is True, results[0]
+        workspace_id = results[0]["id"]
+        if len(results) == 1:
+            return ModelResponse(parts=[ToolCallPart("extension_workspace_read", {
+                "workspace_id": workspace_id, "path": "extension.json",
+            })])
+        if len(results) == 2:
+            manifest = json.loads(results[1]["content"])
+            manifest["corePermissions"] = [core_permission]
+            return ModelResponse(parts=[ToolCallPart("extension_workspace_write", {
+                "workspace_id": workspace_id, "path": "extension.json",
+                "content": json.dumps(manifest),
+            })])
+        if len(results) == 3:
             return ModelResponse(parts=[ToolCallPart("extension_workspace_validate", {
                 "workspace_id": workspace_id,
             })])
-        report = returns[1].content
-        if isinstance(report, str):
-            report = json.loads(report)
+        report = results[3]
+        if core_permission != "assets.view":
+            assert report["status"] == "failed", report
+            assert "unknown core permission" in " ".join(report["errors"])
+            assert report["container"]["image"] == "not-run"
+            return ModelResponse(parts=[TextPart("El permiso desconocido impide la revisión.")])
         assert report["status"] == "passed", report
-        if len(returns) == 2:
+        if len(results) == 4:
             return ModelResponse(parts=[ToolCallPart("extension_workspace_submit", {
                 "workspace_id": workspace_id,
             })])
@@ -97,17 +111,23 @@ def test_chat_validation_submission_requires_exact_human_review(
     response = chat(client, headers, message="Prepara registros y solicita mi revisión, sin instalar.")
     assert response.status_code == 200, response.text
     reply = response.json()
-    assert reply["approvalPending"] is True
     assert [row["tool"] for row in reply["actions"]] == [
-        "extension_workspace_create", "extension_workspace_validate", "extension_workspace_submit",
-    ]
-    review = next(row for row in reply["results"] if row.get("type") == "extension_review")
-    assert review["extensionId"] == "chat-reviewed"
-    candidate = client.get("/api/v1/extensions/candidates/" + review["candidateId"])
-    assert candidate.status_code == 200, candidate.text
-    assert candidate.json()["digest"] == review["digest"]
-    assert candidate.json()["state"] == "pending"
-    assert candidate.json()["validation"]["digest"] == review["digest"]
+        "extension_workspace_create", "extension_workspace_read", "extension_workspace_write",
+        "extension_workspace_validate",
+    ] + (["extension_workspace_submit"] if core_permission == "assets.view" else [])
+    if core_permission == "assets.view":
+        assert reply["approvalPending"] is True
+        review = next(row for row in reply["results"] if row.get("type") == "extension_review")
+        assert review["extensionId"] == "chat-reviewed"
+        candidate = client.get("/api/v1/extensions/candidates/" + review["candidateId"])
+        assert candidate.status_code == 200, candidate.text
+        assert candidate.json()["digest"] == review["digest"]
+        assert candidate.json()["state"] == "pending"
+        assert candidate.json()["validation"]["digest"] == review["digest"]
+        assert candidate.json()["manifest"]["corePermissions"] == ["assets.view"]
+    else:
+        assert reply["approvalPending"] is False
+        assert client.get("/api/v1/extensions/candidates").json()["items"] == []
     assert client.get("/api/v1/extensions").json()["items"] == []
 
 

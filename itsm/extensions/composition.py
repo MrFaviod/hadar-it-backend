@@ -45,6 +45,7 @@ def create_extension_services(
         session_factory=session_factory,
         identity_factory=lambda session: IdentityService(session, settings),
         validator=validator,
+        known_core_permissions=PERMISSION_CODES,
         host=host,
     )
     return host, development
