@@ -295,6 +295,35 @@ def test_search_filters_paginates_and_escapes_wildcards(catalog: Catalog) -> Non
     assert page.offset == 1
 
 
+@pytest.mark.parametrize("case", ["missing", "purged", "malformed"])
+def test_search_missing_or_purged_asset_returns_empty_page(catalog: Catalog, case: str) -> None:
+    asset_id = "not-a-uuid" if case == "malformed" else "00000000-0000-0000-0000-000000000000"
+    with catalog.session() as session:
+        inventory = service(catalog, session)
+        inventory.create(catalog.admin(), asset_values(quick_code="OTHER-001"))
+        if case == "purged":
+            created = inventory.create(catalog.admin(), asset_values())
+            asset_id = created.id
+            found = inventory.search(catalog.admin(), asset_id=asset_id)
+            assert [item.id for item in found.items] == [asset_id]
+            inventory.purge(catalog.admin(), asset_id, confirm=True)
+        page = inventory.search(catalog.admin(), asset_id=asset_id, limit=7, offset=3)
+        assert page.as_payload() == {"items": [], "total": 0, "limit": 7, "offset": 3}
+        if case != "malformed":
+            with pytest.raises(NotFound):
+                inventory.get(catalog.admin(), asset_id)
+
+
+def test_missing_asset_search_still_requires_global_view_permission(catalog: Catalog) -> None:
+    with catalog.session() as session:
+        role = catalog.service(session).create_role(
+            catalog.admin(), name="no-inventory-read", permissions=[]
+        )
+    actor = catalog.add_user("no-read-user", "No Read User", role.id)
+    with catalog.session() as session, pytest.raises(PermissionDenied):
+        service(catalog, session).search(actor, asset_id="00000000-0000-0000-0000-000000000000")
+
+
 def test_search_bounds_are_validated(catalog: Catalog) -> None:
     with catalog.session() as session:
         inventory = service(catalog, session)
@@ -305,6 +334,8 @@ def test_search_bounds_are_validated(catalog: Catalog) -> None:
             inventory.search(catalog.admin(), offset=-1)
         with pytest.raises(ValidationFailed):
             inventory.search(catalog.admin(), status="deleted")
+        with pytest.raises(ValidationFailed, match="asset id is required"):
+            inventory.search(catalog.admin(), asset_id=7)  # type: ignore[arg-type]
 
 
 def test_allowed_and_denied_operations_are_audited(catalog: Catalog) -> None:

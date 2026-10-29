@@ -40,6 +40,11 @@ recheck with `context.authorize(permission)`.
   `responsible_person_id`, `archived`, `limit=50`, `offset=0`, and returns
   `{"items": [...], "total": 0, "limit": 50, "offset": 0}`. Declare
   `assets.view` in `corePermissions` when using these reads.
+  A missing, purged or malformed string `asset_id` returns an empty search page
+  with the requested limit/offset; non-string ids are invalid. `get` still
+  raises `NotFound` for missing assets. These reads use
+  global `assets.view`: a missing permission raises `PermissionDenied`, not a
+  per-asset omission. Do not catch or suppress authorization failures.
 - `transaction()` is a context manager yielding the context. It creates a
   nested savepoint inside the host-owned transaction. Exceptions roll it
   back; store mutation and notice methods enforce read-only operations. No

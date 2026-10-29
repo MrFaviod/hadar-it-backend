@@ -28,7 +28,7 @@ from decimal import Decimal, InvalidOperation
 from typing import Any
 from uuid import UUID, uuid4
 
-from sqlalchemy import ColumnElement, delete, func, or_, select
+from sqlalchemy import ColumnElement, delete, false, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -1076,7 +1076,14 @@ class InventoryService:
         if quick_code_value:
             filters.append(Asset.quick_code_key == quick_code_value.lower())
         if asset_id is not None:
-            filters.append(Asset.id == self._asset(asset_id).id)
+            if not isinstance(asset_id, str):
+                raise ValidationFailed("asset id is required")
+            try:
+                UUID(asset_id)
+            except ValueError:
+                filters.append(false())
+            else:
+                filters.append(Asset.id == asset_id)
         if archived is True:
             filters.append(Asset.archived_at.is_not(None))
         elif archived is False:
