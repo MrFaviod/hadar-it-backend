@@ -32,6 +32,7 @@ from sqlalchemy.orm import Session
 
 from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
+from itsm.demo.state import is_demo
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.models import Identity
 from itsm.identity.permissions import HUMAN_ACTOR_KIND
@@ -1175,6 +1176,12 @@ class NotificationService:
                 else:
                     self._deliver_internal(row, row.recipient_id, now)
                     counts["delivered"] += 1
+                self._session.commit()
+                continue
+
+            if is_demo(self._session):
+                self._finish(row, STATUS_SUPPRESSED, now, "demo_external_delivery_blocked")
+                counts["suppressed"] += 1
                 self._session.commit()
                 continue
 
