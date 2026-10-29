@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response, statu
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.demo.state import is_demo
 from itsm.identity.service import (
     AccountThrottled,
     AuditView,
@@ -71,6 +72,9 @@ class SessionEnvelope(BaseModel):
     permissions: list[str]
     csrfToken: str | None
     sessionMinutes: int
+    # Additive, server-derived installation identity. Legacy payloads that omit
+    # it stay ordinary installations; a client can never set it.
+    demoMode: bool = False
 
 
 class StateDTO(BaseModel):
@@ -189,12 +193,13 @@ def role_dto(view: RoleView) -> RoleDTO:
     )
 
 
-def session_envelope(view: CurrentView) -> SessionEnvelope:
+def session_envelope(view: CurrentView, *, demo_mode: bool = False) -> SessionEnvelope:
     return SessionEnvelope(
         user=user_dto(view.user),
         permissions=sorted(view.permissions),
         csrfToken=view.csrf_token,
         sessionMinutes=view.session_minutes,
+        demoMode=demo_mode,
     )
 
 
@@ -261,9 +266,25 @@ def mutation_guard(
     return context
 
 
+def read_demo_mode(request: Request) -> bool:
+    """Read the durable demo marker through the application session seam.
+
+    This reports persisted installation identity only; it grants nothing and no
+    request input reaches it. Migrations are an explicit prerequisite, so a
+    failed read is surfaced instead of being reported as an ordinary
+    installation; guessing here would misstate the installation's identity.
+    """
+    session = request.app.state.session_factory()
+    try:
+        return is_demo(session)
+    finally:
+        session.close()
+
+
 AuthDependency = Annotated[AuthContext, Depends(authenticated_actor)]
 MutationDependency = Annotated[AuthContext, Depends(mutation_guard)]
 ServiceDependency = Annotated[IdentityService, Depends(get_identity_service)]
+DemoModeDependency = Annotated[bool, Depends(read_demo_mode)]
 
 
 def _cookie_secure(request: Request) -> bool:
@@ -301,17 +322,23 @@ def create_identity_router() -> APIRouter:
         payload: LoginRequest,
         request: Request,
         service: ServiceDependency,
+        demo_mode: DemoModeDependency,
     ) -> JSONResponse:
         _require_origin(request)
         grant = service.login(payload.username, payload.password)
-        body = session_envelope(service.me(grant))
+        body = session_envelope(service.me(grant), demo_mode=demo_mode)
         response = JSONResponse(content=body.model_dump(mode="json"), headers=NO_STORE)
         set_session_cookie(request, response, grant.token, grant.session_minutes)
         return response
 
     @router.get("/auth/me")
-    def me(request: Request, context: AuthDependency, service: ServiceDependency) -> JSONResponse:
-        body = session_envelope(service.me(context))
+    def me(
+        request: Request,
+        context: AuthDependency,
+        service: ServiceDependency,
+        demo_mode: DemoModeDependency,
+    ) -> JSONResponse:
+        body = session_envelope(service.me(context), demo_mode=demo_mode)
         return JSONResponse(content=body.model_dump(mode="json"), headers=NO_STORE)
 
     @router.post("/auth/logout")
