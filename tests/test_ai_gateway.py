@@ -22,7 +22,10 @@ import httpx
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from itsm.agent_integrations.providers import ProviderModelSelection
+from itsm.agent_integrations.providers import (
+    ProviderModelSelection,
+    ProviderNetworkPolicy,
+)
 from itsm.ai_gateway import (
     AiGatewayCall,
     AiGatewayLease,
@@ -39,6 +42,7 @@ from itsm.ai_gateway import (
 from itsm.ai_gateway import (
     service as gateway_service,
 )
+from itsm.config import parse_personal_private_endpoints
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -298,7 +302,36 @@ class Upstream:
 
 @pytest.fixture
 def harness(tmp_path: Any, settings_factory: Any) -> Any:
-    settings = settings_factory(ai_credential_key=MASTER_KEY)
+    built = _build_harness(tmp_path, settings_factory, name="gateway")
+    try:
+        yield built
+    finally:
+        built.client.close()
+        built.engine.dispose()
+
+
+@pytest.fixture
+def private_harness(tmp_path: Any, settings_factory: Any) -> Any:
+    """Gateway whose deployment allowlists loopback personal endpoints."""
+    built = _build_harness(
+        tmp_path,
+        settings_factory,
+        name="gateway-private",
+        ai_personal_private_endpoints="127.0.0.0/8",
+    )
+    try:
+        yield built
+    finally:
+        built.client.close()
+        built.engine.dispose()
+
+
+def _build_harness(tmp_path: Any, settings_factory: Any, *, name: str, **overrides: Any) -> Any:
+    settings = settings_factory(
+        ai_credential_key=MASTER_KEY,
+        database_url=f"sqlite:///{tmp_path / f'{name}.db'}",
+        **overrides,
+    )
     engine = create_engine(settings.database_url)
     AiGatewayLease.__table__.create(engine)
     AiGatewayCall.__table__.create(engine)
@@ -316,7 +349,7 @@ def harness(tmp_path: Any, settings_factory: Any) -> Any:
     app = FastAPI()
     app.include_router(create_ai_gateway_router(service), prefix=settings.api_prefix)
     client = TestClient(app)
-    yield SimpleNamespace(
+    return SimpleNamespace(
         settings=settings,
         engine=engine,
         factory=factory,
@@ -326,8 +359,6 @@ def harness(tmp_path: Any, settings_factory: Any) -> Any:
         clock=clock,
         client=client,
     )
-    client.close()
-    engine.dispose()
 
 
 def issue(
@@ -1083,3 +1114,47 @@ def test_migration_follows_ledger_revision() -> None:
 
     assert module.revision == "0025_ai_gateway"
     assert module.down_revision == "0024_ai_usage"
+
+
+def test_allowlisted_personal_private_endpoint_is_issued_and_forwarded(
+    private_harness: Any,
+) -> None:
+    parent = private_harness.ledger.seed(funding="personal", provider_scope="personal")
+
+    lease, _ = issue(
+        private_harness,
+        parent=parent,
+        funding="personal",
+        provider_scope="personal",
+        base_url="http://127.0.0.1:18081/v1",
+        allow_private=False,
+    )
+
+    response = private_harness.client.post(CHAT, json=payload(), headers=bearer(lease))
+
+    assert response.status_code == 200, response.text
+    assert response.json()["choices"][0]["message"]["content"] == "ok"
+    # The guarded client is rebuilt at forward time from the deployment policy,
+    # never from an authority carried by the lease snapshot.
+    policy = private_harness.upstream.allow_private_calls[0]
+    assert isinstance(policy, ProviderNetworkPolicy)
+    assert [entry.describe() for entry in policy.allowlist] == ["127.0.0.0/8"]
+
+
+def test_selection_policy_cannot_widen_the_deployment_allowlist(harness: Any) -> None:
+    parent = harness.ledger.seed(funding="personal", provider_scope="personal")
+
+    with pytest.raises(GatewayRejected) as error:
+        issue(
+            harness,
+            parent=parent,
+            funding="personal",
+            provider_scope="personal",
+            base_url="http://127.0.0.1:18081/v1",
+            allow_private=ProviderNetworkPolicy(
+                allowlist=parse_personal_private_endpoints("127.0.0.0/8")
+            ),
+        )
+
+    assert error.value.code == "invalid_provider_endpoint"
+    assert harness.upstream.requests == []

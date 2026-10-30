@@ -21,6 +21,14 @@ import sys
 from collections.abc import Callable
 from typing import Any, TextIO
 
+from itsm.agent_integrations.providers import (
+    ProviderEndpointError,
+    ProviderModelSelection,
+    build_provider_model,
+    ensure_endpoint_allowed,
+    personal_endpoint_policy_from_entries,
+    provider_http_client,
+)
 from itsm.agents.isolation import RunStart, ToolSchema, WorkerFinal
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
@@ -155,29 +163,23 @@ def _tools(schemas: list[ToolSchema], bridge: _Bridge) -> list[Tool[Any]]:
 
 def _model(start: RunStart) -> tuple[Model, Any]:
     """Build the inference model, re-validating the private endpoint at use time."""
-    from itsm.agent_integrations.providers import (
-        ProviderEndpointError,
-        ProviderModelSelection,
-        build_provider_model,
-        ensure_public_endpoint,
-        provider_http_client,
-    )
-
     provider = start.provider
     if provider.kind == "openai-compatible":
         if not provider.base_url:
             raise WorkerProtocolError("provider baseUrl is required")
-        if not provider.allow_private:
-            try:
-                ensure_public_endpoint(provider.base_url)
-            except ProviderEndpointError, OSError:
-                raise WorkerProtocolError("provider endpoint is not allowed") from None
-        client = provider_http_client(allow_private=provider.allow_private)
+        # The broker relays the deployment allowlist as data; the worker never
+        # widens it and re-applies the same resolution policy at use time.
+        try:
+            policy = personal_endpoint_policy_from_entries(provider.private_allowlist)
+            ensure_endpoint_allowed(provider.base_url, policy)
+        except ProviderEndpointError, OSError, ValueError:
+            raise WorkerProtocolError("provider endpoint is not allowed") from None
+        client = provider_http_client(policy=policy)
         selection = ProviderModelSelection(
             base_url=provider.base_url,
             model=provider.model,
             api_key=provider.api_key or "",
-            allow_private=provider.allow_private,
+            allow_private=policy,
         )
         try:
             return build_provider_model(selection, http_client=client), client

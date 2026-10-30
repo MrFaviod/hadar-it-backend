@@ -36,7 +36,9 @@ from itsm.agent_integrations.providers import (
     CredentialUnavailable,
     ProviderEndpointError,
     ProviderModelSelection,
+    ProviderNetworkPolicy,
     credential_storage_available,
+    personal_endpoint_policy,
     provider_http_client,
     seal_credential,
     unseal_credential,
@@ -481,17 +483,25 @@ class AiGatewayService:
             )
         _bounded_text(selection.base_url, "provider base URL", 2048)
         _secret_text(selection.api_key, "provider API key")
-        if not isinstance(selection.allow_private, bool):
-            raise GatewayRejected("invalid_selection", "allow_private must be a boolean")
-        if provider_scope == "personal" and selection.allow_private:
+        if not isinstance(selection.allow_private, bool | ProviderNetworkPolicy):
             raise GatewayRejected(
                 "invalid_selection",
-                "A personal provider selection cannot allow private connections",
+                "allow_private must be a boolean or a network policy",
             )
+        policy = None
+        if provider_scope == "personal":
+            # The deployment allowlist is the only authority for private personal
+            # destinations: a selection cannot widen it.
+            policy = personal_endpoint_policy(self._settings)
+            if selection.allow_private is True:
+                raise GatewayRejected(
+                    "invalid_selection",
+                    "A personal provider selection cannot allow private connections",
+                )
         context_tokens = _positive_int(context_tokens, "context tokens", MAX_CONTEXT_TOKENS)
         output_tokens = _positive_int(output_tokens, "output tokens", MAX_OUTPUT_TOKENS)
         ttl_seconds = _positive_int(ttl_seconds, "lease TTL", MAX_TTL_SECONDS)
-        self._endpoint(selection.base_url, provider_scope, at_issue=True)
+        self._endpoint(selection.base_url, provider_scope, at_issue=True, policy=policy)
         self._require_parent(
             actor_id=actor_id,
             funding=funding,
@@ -509,7 +519,7 @@ class AiGatewayService:
                 "base_url": selection.base_url,
                 "model": selection.model,
                 "api_key": selection.api_key,
-                "allow_private": selection.allow_private,
+                "allow_private": selection.allow_private is True,
             },
             ensure_ascii=False,
             separators=(",", ":"),
@@ -541,7 +551,7 @@ class AiGatewayService:
             context_tokens=context_tokens,
             output_tokens=output_tokens,
             selection_ciphertext=ciphertext,
-            allow_private=selection.allow_private,
+            allow_private=selection.allow_private is True,
             created_at=now,
             expires_at=expires_at,
         )
@@ -709,13 +719,18 @@ class AiGatewayService:
                 "credential_unavailable",
                 "A personal provider lease cannot allow private connections",
             )
-        endpoint = self._endpoint(base_url, verified.provider_scope, at_issue=False)
+        policy = None
+        if verified.provider_scope == "personal":
+            # Re-derived from current settings on every forward: the lease carries
+            # no private-network authority of its own.
+            policy = personal_endpoint_policy(self._settings)
+        endpoint = self._endpoint(base_url, verified.provider_scope, at_issue=False, policy=policy)
         return (
             ProviderModelSelection(
                 base_url=base_url,
                 model=model,
                 api_key=api_key,
-                allow_private=allow_private,
+                allow_private=policy if policy is not None else allow_private,
             ),
             endpoint,
             verified,
@@ -1076,9 +1091,16 @@ class AiGatewayService:
         except Exception:
             logger.warning("Gateway accounting state is unavailable; the hold remains")
 
-    def _endpoint(self, base_url: str, scope: str, *, at_issue: bool) -> str:
+    def _endpoint(
+        self,
+        base_url: str,
+        scope: str,
+        *,
+        at_issue: bool,
+        policy: ProviderNetworkPolicy | None = None,
+    ) -> str:
         try:
-            return validate_provider_endpoint(base_url, scope=scope)
+            return validate_provider_endpoint(base_url, scope=scope, policy=policy)
         except ProviderEndpointError as exc:
             if at_issue:
                 raise GatewayRejected("invalid_provider_endpoint", str(exc)) from exc

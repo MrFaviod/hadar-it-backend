@@ -22,11 +22,14 @@ from itsm.agent_integrations.models import AgentProvider, AgentRun, AgentSession
 from itsm.agent_integrations.providers import (
     ProviderEndpointError,
     ProviderModelSelection,
+    ProviderNetworkPolicy,
+    personal_endpoint_policy,
     provider_http_client,
     validate_provider_endpoint,
 )
 from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.runtime import AgentRuntime, AgentUsage, ChatReply, ChatRequest
+from itsm.config import parse_personal_private_endpoints
 from itsm.main import create_app
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
@@ -1171,3 +1174,171 @@ def test_strict_profile_boundary_requires_explicit_wildcard_resource() -> None:
     ]
     assert _restrictive_permissions(missing_skill_resource, skills) is False
     assert _strict_permission_suffix(missing_skill_resource, skills) is False
+
+
+# ------------------------------------------- deployment allowlist for private endpoints
+
+
+@pytest.fixture
+def private_provider_env(settings_factory: Any):
+    """Providers environment whose deployment authorizes loopback personal targets."""
+    catalog = prepare(
+        settings_factory,
+        agent_model="openai:gpt-4o-mini",
+        ai_credential_key=MASTER_KEY,
+        ai_personal_private_endpoints="127.0.0.0/8,::1/128",
+        ai_broker_url="ws://127.0.0.1:9/runs",
+        ai_broker_token="t" * 48,
+    )
+    client = TestClient(create_app(catalog.settings))
+    client.__enter__()
+    client.app.state.agent_integrations = AgentIntegrationService(
+        catalog.settings, catalog.factory()
+    )
+    try:
+        yield catalog, client
+    finally:
+        client.__exit__(None, None, None)
+        catalog.engine.dispose()
+
+
+def test_personal_private_endpoint_stays_rejected_without_an_allowlist(provider_env: Any) -> None:
+    catalog, client = provider_env
+    role_id = _role_with_permission(catalog)
+    catalog.add_user("private.user", "Private User", role_id)
+    headers = _login(client, catalog.settings, "private.user", MACHINE_PASSWORD)
+
+    response = _create_provider(
+        client,
+        headers,
+        scope="personal",
+        baseUrl="http://127.0.0.1:18081/v1",
+        models=["model-a"],
+        apiKey="sk-private",
+    )
+
+    assert response.status_code == 422, response.text
+    assert "sk-private" not in response.text
+
+
+def test_allowlisted_personal_private_endpoint_is_accepted(private_provider_env: Any) -> None:
+    catalog, client = private_provider_env
+    role_id = _role_with_permission(catalog)
+    catalog.add_user("allowed.user", "Allowed User", role_id)
+    headers = _login(client, catalog.settings, "allowed.user", MACHINE_PASSWORD)
+
+    response = _create_provider(
+        client,
+        headers,
+        scope="personal",
+        baseUrl="http://127.0.0.1:18081/v1",
+        models=["model-a"],
+        apiKey="sk-allowed",
+    )
+
+    assert response.status_code == 201, response.text
+    assert response.json()["baseUrl"] == "http://127.0.0.1:18081/v1"
+
+
+def test_public_https_personal_endpoint_needs_no_allowlist(provider_env: Any) -> None:
+    catalog, client = provider_env
+    role_id = _role_with_permission(catalog)
+    catalog.add_user("public.user", "Public User", role_id)
+    headers = _login(client, catalog.settings, "public.user", MACHINE_PASSWORD)
+
+    response = _create_provider(
+        client,
+        headers,
+        scope="personal",
+        baseUrl="https://api.example.com/v1",
+        models=["model-a"],
+        apiKey="sk-public",
+    )
+
+    assert response.status_code == 201, response.text
+
+
+def test_exact_hostname_entry_allows_http_but_keeps_other_private_hosts_out(
+    settings_factory: Any,
+) -> None:
+    settings = settings_factory(ai_personal_private_endpoints="models.internal:8080")
+    policy = personal_endpoint_policy(settings)
+
+    accepted = validate_provider_endpoint(
+        "http://models.internal:8080/v1", scope="personal", policy=policy
+    )
+    assert accepted == "http://models.internal:8080/v1"
+    with pytest.raises(ProviderEndpointError):
+        validate_provider_endpoint(
+            "http://models.internal:9090/v1", scope="personal", policy=policy
+        )
+    with pytest.raises(ProviderEndpointError):
+        validate_provider_endpoint(
+            "http://other.internal:8080/v1", scope="personal", policy=policy
+        )
+
+
+def test_private_policy_decides_on_the_resolved_address_not_the_hostname() -> None:
+    policy = ProviderNetworkPolicy(
+        allowlist=parse_personal_private_endpoints("10.0.0.0/8,models.internal:8443")
+    )
+
+    assert policy.permits("models.internal", ("10.4.5.6",), port=8443) is True
+    assert policy.permits("models.internal", ("192.168.1.5",), port=8443) is True
+    assert policy.permits("models.internal", ("192.168.1.5",), port=9100) is False
+    assert policy.permits("other.internal", ("192.168.1.5",), port=8443) is False
+    assert policy.permits("public.example.com", ("93.184.216.34",), port=443) is True
+    assert policy.permits("public.example.com", ("172.16.0.9",), port=443) is False
+    assert policy.permits("models.internal", ("127.0.0.1",), port=8443) is False
+    assert policy.permits("models.internal", ("::1",), port=8443) is False
+
+
+def test_metadata_addresses_need_an_explicit_cidr_even_for_an_allowlisted_host() -> None:
+    host_only = ProviderNetworkPolicy(
+        allowlist=parse_personal_private_endpoints("metadata.internal:80")
+    )
+
+    assert host_only.permits("metadata.internal", ("169.254.169.254",), port=80) is False
+    assert host_only.permits("metadata.internal", ("fd00:ec2::254",), port=80) is False
+
+    explicit = ProviderNetworkPolicy(
+        allowlist=parse_personal_private_endpoints("169.254.169.254/32")
+    )
+    assert explicit.permits("metadata.internal", ("169.254.169.254",), port=80) is True
+
+
+def test_guarded_client_refuses_a_private_resolution_without_an_allowlist(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen: list[tuple[str, int]] = []
+
+    def fake_resolve(host: str, port: int) -> list[str]:
+        seen.append((host, port))
+        return ["192.0.2.10"]
+
+    monkeypatch.setattr(providers_module, "resolve_addresses", fake_resolve)
+    client = provider_http_client(policy=ProviderNetworkPolicy())
+    try:
+        with pytest.raises(httpx.HTTPError):
+            asyncio.run(client.get("https://models.internal/v1/models"))
+    finally:
+        asyncio.run(client.aclose())
+
+    assert seen == [("models.internal", 443)]
+
+
+def test_global_provider_selection_keeps_owner_trusted_private_access(
+    private_provider_env: Any,
+) -> None:
+    catalog, client = private_provider_env
+    admin = _admin_login(client, catalog.settings)
+    created = _create_provider(client, admin)
+    assert created.status_code == 201, created.text
+
+    service = client.app.state.agent_integrations
+    with catalog.session() as session:
+        row = session.get(AgentProvider, created.json()["id"])
+        principal = catalog.admin()
+        selection = service._provider_selection(session, principal, row, "model-a")
+
+    assert selection.allow_private is True
