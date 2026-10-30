@@ -30,6 +30,7 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
 from itsm import __version__
+from itsm.agent_integrations.providers import credential_key_fingerprints
 from itsm.config import Settings, settings_for
 from itsm.database import (
     DatabaseUnavailable,
@@ -358,6 +359,7 @@ def backup(context: OpsContext) -> store.BackupArtifact:
             dump_file=engines.dump_filename(target.engine),
             tool_versions=_tool_versions(target),
             write_dump=lambda path: _write_dump(context, target, path),
+            credential_key_fingerprints=credential_key_fingerprints(context.settings),
         )
     except OpsError as exc:
         _record_failure(root, operation="backup", reason=str(exc), target=target)
@@ -422,13 +424,44 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
             reason=error or "verification failed",
             target=target,
         )
-    return {
+    payload = {
         "status": "ok" if verified else "failed",
         "backupId": artifact.manifest.id,
         "checks": checks,
         "verified": verified,
         "error": None if verified else (error or "verification failed"),
     }
+    return _attach_credential_report(context, artifact, payload)
+
+
+def _credential_key_report(context: OpsContext, artifact: store.BackupArtifact) -> dict[str, Any]:
+    """Compare the ring recorded in the backup with the ring this process has.
+
+    Only fingerprints travel in a manifest, so this is a readability warning, not
+    key recovery: a missing fingerprint means the saved credentials written with
+    that key cannot be decrypted until the operator restores the key itself.
+    """
+    recorded = list(artifact.manifest.credential_key_fingerprints)
+    current = credential_key_fingerprints(context.settings)
+    missing = [fingerprint for fingerprint in recorded if fingerprint not in current]
+    warning: str | None = None
+    if missing:
+        warning = (
+            "the current AI credential key ring lacks "
+            f"{len(missing)} recorded fingerprint(s): {', '.join(missing)}; "
+            "provider credentials sealed with those keys stay unreadable until the key is "
+            "restored"
+        )
+    return {"recorded": recorded, "current": current, "missing": missing, "warning": warning}
+
+
+def _attach_credential_report(
+    context: OpsContext, artifact: store.BackupArtifact, payload: dict[str, Any]
+) -> dict[str, Any]:
+    report = _credential_key_report(context, artifact)
+    payload["credentialKeys"] = report
+    payload["warnings"] = [report["warning"]] if report["warning"] else []
+    return payload
 
 
 def verify(context: OpsContext, identifier: str) -> dict[str, Any]:
@@ -605,7 +638,7 @@ def restore(
         raise OpsError(f"backup {identifier} failed verification: {verification['error']}")
     target = context.target()
     if target.engine == "sqlite":
-        return _restore_sqlite(
+        payload = _restore_sqlite(
             context,
             artifact,
             target_file=target_file,
@@ -613,15 +646,17 @@ def restore(
             replace_live=replace_live,
             confirm=confirm,
         )
-    return _restore_external(
-        context,
-        artifact,
-        target,
-        target_file=target_file,
-        target_database=target_database,
-        replace_live=replace_live,
-        confirm=confirm,
-    )
+    else:
+        payload = _restore_external(
+            context,
+            artifact,
+            target,
+            target_file=target_file,
+            target_database=target_database,
+            replace_live=replace_live,
+            confirm=confirm,
+        )
+    return _attach_credential_report(context, artifact, payload)
 
 
 # --------------------------------------------------------------------------- #

@@ -126,6 +126,7 @@ def test_global_provider_is_owner_managed_and_secret_is_write_only(provider_env:
     assert body["baseUrl"] == "http://127.0.0.1:18081/v1"
     assert body["models"] == ["model-a", "model-b"]
     assert body["credentialConfigured"] is True
+    assert body["credentialStatus"] == "primary"
     assert body["enabled"] is True
     assert "apiKey" not in body
     assert "apiKeyCiphertext" not in body
@@ -370,6 +371,7 @@ def test_missing_master_key_reports_unavailable_credential_writes(settings_facto
         keyless = _create_provider(client, headers, apiKey=None)
         assert keyless.status_code == 201, keyless.text
         assert keyless.json()["credentialConfigured"] is False
+        assert keyless.json()["credentialStatus"] == "missing"
     finally:
         client.__exit__(None, None, None)
         catalog.engine.dispose()

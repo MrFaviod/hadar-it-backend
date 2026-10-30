@@ -19,7 +19,7 @@ import os
 import re
 import shutil
 import uuid
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
@@ -36,6 +36,7 @@ ARTIFACT_DIR_MODE = 0o700
 MAX_FAILURES = 10
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
+_FINGERPRINT = re.compile(r"^[0-9a-f]{12}$")
 _PARTIAL_PREFIX = ".partial-"
 _MANIFEST_KEYS = (
     "id",
@@ -71,6 +72,7 @@ class BackupManifest:
     format: str
     dump_file: str
     tool_versions: dict[str, str]
+    credential_key_fingerprints: tuple[str, ...] = ()
     verified: bool | None = None
     verified_at: str | None = None
 
@@ -87,6 +89,8 @@ class BackupManifest:
             "format": self.format,
             "dumpFile": self.dump_file,
             "toolVersions": dict(self.tool_versions),
+            # Fingerprints only: a backup never carries the key material itself.
+            "aiCredentialKeyFingerprints": list(self.credential_key_fingerprints),
             "verified": self.verified,
             "verifiedAt": self.verified_at,
         }
@@ -134,6 +138,14 @@ class BackupManifest:
         verified_at = raw.get("verifiedAt")
         if verified_at is not None and not isinstance(verified_at, str):
             raise OpsError("invalid backup manifest: verifiedAt must be text or null")
+        fingerprints = raw.get("aiCredentialKeyFingerprints", [])
+        if not isinstance(fingerprints, list) or any(
+            not isinstance(value, str) or not _FINGERPRINT.fullmatch(value)
+            for value in fingerprints
+        ):
+            raise OpsError(
+                "invalid backup manifest: aiCredentialKeyFingerprints must be fingerprint text"
+            )
         return cls(
             id=identifier,
             engine=raw["engine"],
@@ -146,6 +158,7 @@ class BackupManifest:
             format=raw["format"],
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
+            credential_key_fingerprints=tuple(fingerprints),
             verified=verified,
             verified_at=verified_at,
         )
@@ -230,6 +243,7 @@ def create_artifact(
     dump_file: str,
     tool_versions: Mapping[str, str],
     write_dump: Callable[[Path], None],
+    credential_key_fingerprints: Sequence[str] = (),
     now: datetime | None = None,
 ) -> BackupArtifact:
     """Assemble one artifact atomically; a failure leaves no visible artifact."""
@@ -258,6 +272,7 @@ def create_artifact(
             format=engine,
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
+            credential_key_fingerprints=tuple(credential_key_fingerprints),
         )
         _write_private(partial / MANIFEST_NAME, json.dumps(manifest.as_dict()).encode())
         _fsync_directory(partial)
