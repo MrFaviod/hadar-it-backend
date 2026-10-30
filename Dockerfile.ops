@@ -1,0 +1,15 @@
+# Separate maintenance image: never used by the application API or worker.
+# Build explicitly; preparing this file does not authorize downloads or deployment.
+FROM itsm-backend:0.1.0
+USER root
+# Debian's PostgreSQL client must match the target server major. PG16 servers
+# require a PG16 tool image supplied by the maintainer, not an arbitrary newer dump.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends postgresql-client mariadb-client unixodbc \
+    && rm -rf /var/lib/apt/lists/* \
+    && mkdir -p /data/backups \
+    && chown 10001:10001 /data/backups
+USER 10001:10001
+CMD ["python", "-m", "itsm.deployment", "backup-loop"]
+# MSSQL requires an explicitly supplied licensed sqlcmd/ODBC tool variant.
+# It is not present in this generic image and is not verified live.
