@@ -72,6 +72,13 @@ _METADATA_ADDRESSES = frozenset({"169.254.169.254", "fd00:ec2::254", "100.100.10
 _CHECK_TIMEOUT = 10.0
 _CHECK_MAX_BYTES = 64 * 1024
 
+# Discovery keeps every id a provider reports, up to this documented bound, so an
+# automatic listing stays bounded even for a very large catalogue. The record's
+# offered ``models`` list is capped separately by the service.
+_MAX_DISCOVERED_MODELS = 500
+_MAX_MODEL_LABEL = 200
+_MODALITY_KEYS = ("input_modalities", "modalities")
+
 
 def _address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
     try:
@@ -194,6 +201,94 @@ class ProviderModelSelection:
 
 def _hostname(value: str) -> str:
     return value.rstrip(".").lower()
+
+
+@dataclass(frozen=True)
+class DiscoveredModel:
+    """One model id reported by an OpenAI-compatible models listing.
+
+    ``input_modalities`` keeps whatever the provider reported (for example
+    OpenRouter's ``architecture.input_modalities``) or ``None`` when the provider
+    said nothing, so a caller can distinguish "unknown" from "text only".
+    """
+
+    id: str
+    input_modalities: tuple[str, ...] | None = None
+
+    def as_payload(self) -> dict[str, object]:
+        """Public discovery entry; never contains upstream bytes beyond the id."""
+        return {
+            "id": self.id,
+            "inputModalities": list(self.input_modalities)
+            if self.input_modalities is not None
+            else None,
+        }
+
+
+@dataclass(frozen=True)
+class ProviderProbe:
+    """Closed-code result of one bounded models listing plus its parsed entries."""
+
+    code: str
+    models: tuple[DiscoveredModel, ...] = ()
+
+    @property
+    def count(self) -> int:
+        return len(self.models)
+
+
+def _modalities(value: object) -> tuple[str, ...] | None:
+    """Normalize a provider-reported modality list, or ``None`` when unknown."""
+    if not isinstance(value, list):
+        return None
+    labels: list[str] = []
+    for item in value:
+        if not isinstance(item, str):
+            continue
+        label = item.strip().lower()
+        if label and label not in labels:
+            labels.append(label)
+    return tuple(labels)
+
+
+def _entry_modalities(entry: dict[str, object]) -> tuple[str, ...] | None:
+    architecture = entry.get("architecture")
+    if isinstance(architecture, dict):
+        reported = _modalities(architecture.get("input_modalities"))
+        if reported is not None:
+            return reported
+    for key in _MODALITY_KEYS:
+        reported = _modalities(entry.get(key))
+        if reported is not None:
+            return reported
+    return None
+
+
+def _discovered_models(data: list[object]) -> tuple[DiscoveredModel, ...]:
+    """Parse, deduplicate and bound the entries of a models listing."""
+    found: list[DiscoveredModel] = []
+    seen: set[str] = set()
+    for entry in data:
+        if len(found) >= _MAX_DISCOVERED_MODELS:
+            break
+        if isinstance(entry, str):
+            label, modalities = entry, None
+        elif isinstance(entry, dict):
+            raw = entry.get("id")
+            if not isinstance(raw, str):
+                continue
+            label, modalities = raw, _entry_modalities(entry)
+        else:
+            continue
+        label = label.strip()
+        if not label or len(label) > _MAX_MODEL_LABEL:
+            continue
+        key = label.casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        found.append(DiscoveredModel(label, modalities))
+    return tuple(found)
 
 
 def is_public_address(value: str) -> bool:
@@ -539,18 +634,19 @@ def _blocked_address(exc: BaseException) -> bool:
     return False
 
 
-async def probe_provider_models(
+async def _list_provider_models(
     base_url: str,
     api_key: str,
     *,
     allow_private: bool | ProviderNetworkPolicy = False,
     timeout: float = _CHECK_TIMEOUT,
     max_bytes: int = _CHECK_MAX_BYTES,
-) -> tuple[str, int | None]:
-    """Bounded models listing used by the owner-only provider check.
+) -> tuple[str, list[object] | None]:
+    """One bounded ``GET {baseUrl}/models`` through the guarded transport.
 
-    Returns a closed status code and an optional model count. It never returns
-    or logs the credential, an upstream response body or a resolved address.
+    Returns a closed status code plus the raw ``data`` entries when the answer
+    was a well-formed listing. It never returns or logs the credential, an
+    upstream response body or a resolved address.
     """
     url = base_url.rstrip("/") + "/models"
     body = bytearray()
@@ -588,7 +684,51 @@ async def probe_provider_models(
     data = payload.get("data") if isinstance(payload, dict) else None
     if not isinstance(data, list):
         return "invalid_response", None
-    return "ok", len(data)
+    return "ok", data
+
+
+async def probe_provider_models(
+    base_url: str,
+    api_key: str,
+    *,
+    allow_private: bool | ProviderNetworkPolicy = False,
+    timeout: float = _CHECK_TIMEOUT,
+    max_bytes: int = _CHECK_MAX_BYTES,
+) -> tuple[str, int | None]:
+    """Bounded models listing returning a closed status code and model count."""
+    code, data = await _list_provider_models(
+        base_url,
+        api_key,
+        allow_private=allow_private,
+        timeout=timeout,
+        max_bytes=max_bytes,
+    )
+    return code, None if data is None else len(data)
+
+
+async def discover_provider_models(
+    base_url: str,
+    api_key: str,
+    *,
+    allow_private: bool | ProviderNetworkPolicy = False,
+    timeout: float = _CHECK_TIMEOUT,
+    max_bytes: int = _CHECK_MAX_BYTES,
+) -> ProviderProbe:
+    """Discover a provider's models for storage and for an owner-visible check.
+
+    Nothing but the closed status code, the bounded model ids and their reported
+    input modalities leaves this function; a failure returns no entries at all.
+    """
+    code, data = await _list_provider_models(
+        base_url,
+        api_key,
+        allow_private=allow_private,
+        timeout=timeout,
+        max_bytes=max_bytes,
+    )
+    if code != "ok" or data is None:
+        return ProviderProbe(code)
+    return ProviderProbe(code, _discovered_models(data))
 
 
 def build_provider_model(
@@ -617,16 +757,19 @@ __all__ = [
     "KEY_STATE_UNREADABLE",
     "CredentialInvalid",
     "CredentialUnavailable",
+    "DiscoveredModel",
     "ProviderAddressBlocked",
     "ProviderEndpointError",
     "ProviderModelSelection",
     "ProviderNetworkPolicy",
+    "ProviderProbe",
     "build_provider_model",
     "credential_fingerprint",
     "credential_key_fingerprints",
     "credential_key_state",
     "credential_key_values",
     "credential_storage_available",
+    "discover_provider_models",
     "ensure_endpoint_allowed",
     "is_public_address",
     "personal_endpoint_policy",

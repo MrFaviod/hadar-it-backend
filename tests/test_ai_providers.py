@@ -81,6 +81,9 @@ def _create_provider(
         "name": "NOC gateway",
         "baseUrl": "http://127.0.0.1:18081/v1",
         "models": ["model-a", "model-b"],
+        # Manual selection keeps the historical contract of these tests: the
+        # owner's list is offered, discovery cannot rewrite it.
+        "modelSelection": "manual",
         "apiKey": "sk-global-secret",
     }
     payload.update(overrides)

@@ -134,6 +134,8 @@ class ProviderPayload(BaseModel):
     name: str | None = Field(default=None, max_length=120)
     baseUrl: str | None = Field(default=None, max_length=2048)
     models: list[str] | None = Field(default=None, max_length=50)
+    modelSelection: Literal["auto", "manual"] | None = None
+    modelCapabilities: dict[str, dict[str, bool | None]] | None = None
     apiKey: SecretStr | None = Field(default=None, max_length=2048)
     enabled: bool | None = None
 
@@ -223,23 +225,23 @@ def create_agent_integrations_router() -> APIRouter:
         return _service(request).providers(context.principal)
 
     @router.post("/agent/providers", status_code=201)
-    def create_provider(
+    async def create_provider(
         payload: ProviderPayload,
         request: Request,
         context: MutationDependency,
     ) -> dict[str, Any]:
-        return _service(request).create_provider(
+        return await _service(request).create_provider(
             context.principal, payload.model_dump(exclude_unset=True)
         )
 
     @router.patch("/agent/providers/{provider_id}")
-    def update_provider(
+    async def update_provider(
         provider_id: str,
         payload: ProviderPayload,
         request: Request,
         context: MutationDependency,
     ) -> dict[str, Any]:
-        return _service(request).update_provider(
+        return await _service(request).update_provider(
             context.principal, provider_id, payload.model_dump(exclude_unset=True)
         )
 
