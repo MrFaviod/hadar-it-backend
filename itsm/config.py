@@ -78,14 +78,15 @@ class Settings(BaseSettings):
     demo_message_max_length: int = Field(default=200, ge=1, le=1000)
     demo_max_delay_seconds: int = Field(default=30, ge=0, le=300)
     demo_periodic_minutes: int = Field(default=0, ge=0, le=60)
+    demo_data_directory: Path | None = None
 
     # Public demo exposure limits. They are only built when the release mode
     # capability set is the public demo (``itsm.limits``); ``prod`` and ``dev``
     # never construct a limiter, so these values cannot change their behaviour.
     # ``trusted_proxy`` is the single opt-in for honouring ``X-Forwarded-For``:
     # without it the header is attacker-controlled and ignored.
-    demo_rate_limit_per_minute: int = Field(default=60, ge=1, le=100_000)
-    demo_rate_limit_burst: int = Field(default=20, ge=1, le=100_000)
+    demo_rate_limit_per_minute: int = Field(default=180, ge=1, le=100_000)
+    demo_rate_limit_burst: int = Field(default=60, ge=1, le=100_000)
     demo_login_rate_per_minute: int = Field(default=10, ge=1, le=10_000)
     demo_login_rate_burst: int = Field(default=5, ge=1, le=10_000)
     demo_max_request_body_bytes: int = Field(default=1024 * 1024, ge=1024, le=64 * 1024 * 1024)

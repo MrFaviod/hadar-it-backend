@@ -91,6 +91,8 @@ def worker_environment(settings: Settings) -> dict[str, str]:
             "ITSM_AUTH_PASSWORD_MAX_LENGTH": str(settings.auth_password_max_length),
         }
     )
+    if settings.demo_data_directory is not None:
+        env["ITSM_DEMO_DATA_DIRECTORY"] = str(settings.demo_data_directory)
     return env
 
 

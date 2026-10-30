@@ -136,6 +136,10 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
         # database owned by another mode, before any task is dequeued.
         try:
             release = enforce_startup(settings, require_identity=True)
+            if release.mode == "demo" and settings.demo_data_directory is not None:
+                raise ReleaseModeError(
+                    "external consumers are forbidden for an automatically resetting demo"
+                )
         except ReleaseModeError as exc:
             log_event(logger, "worker.refused", level=logging.ERROR, reason=str(exc))
             # Huey logs startup-hook exceptions and keeps consuming, and hooks run

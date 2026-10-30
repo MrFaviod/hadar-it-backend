@@ -5,7 +5,8 @@ from __future__ import annotations
 import logging
 import time
 from collections.abc import AsyncIterator, Callable
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
@@ -183,6 +184,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     extension_mount = getattr(mcp_server, "extension_mount", None)
     mcp_app = mcp_server.http_app(path="/mcp")
 
+    demo_controller = None
+    if read_release_mode() == "demo" and settings.demo_data_directory is not None:
+        from itsm.demo.controller import DemoController
+
+        demo_controller = DemoController(settings)
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         # The release mode and the database owner are validated before any
@@ -238,10 +245,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             database=settings.safe_database_url(),
             task_storage=settings.task_storage,
         )
+        cycle_task = None
+        if demo_controller is not None:
+            from itsm.demo.reset import validate_reset_paths
+
+            validate_reset_paths(settings)
+            demo_controller.engine = engine
+            demo_controller.factory = factory
+            cycle_task = asyncio.create_task(demo_controller.run())
         try:
             async with mcp_app.lifespan(app):
                 yield
         finally:
+            if cycle_task is not None:
+                cycle_task.cancel()
+                with suppress(asyncio.CancelledError):
+                    await cycle_task
             engine.dispose()
             log_event(logger, "app.stopped", app=settings.app_name)
 
@@ -258,6 +277,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.add_middleware(DemoRestrictionMiddleware, restrictions=demo_restrictions)
     if demo_limits is not None:
         app.add_middleware(DemoLimitsMiddleware, limits=demo_limits)
+    if demo_controller is not None:
+        from itsm.demo.controller import DemoCycleMiddleware
+
+        app.add_middleware(DemoCycleMiddleware, controller=demo_controller)
+        app.state.demo_controller = demo_controller
     install_error_handlers(app)
     install_agent_integration_error_handlers(app)
     install_extension_error_handlers(app)
@@ -425,6 +449,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             error=status.error,
             retries_remaining=status.retries_remaining,
         )
+
+    @api.get("/demo/status")
+    def demo_cycle_status(request: Request) -> JSONResponse:
+        """Public server deadline; never expose credentials or internal configuration."""
+        if request.app.state.release_mode != "demo":
+            return JSONResponse({"enabled": False}, headers={"Cache-Control": "no-store"})
+        from itsm.demo.cycle import cycle_status
+
+        with request.app.state.session_factory() as session:
+            payload = cycle_status(session)
+        return JSONResponse(payload, headers={"Cache-Control": "no-store"})
 
     @api.get("/health/ready")
     def ready(request: Request) -> JSONResponse:

@@ -150,6 +150,18 @@ def test_request_rate_limit_returns_429_after_the_burst(
         assert_limited(client.get(f"{API}/health/live"), 429, "rate_limited")
 
 
+def test_default_request_budget_accepts_normal_shell_boot(demo_base: Settings) -> None:
+    settings = variant(
+        demo_base,
+        demo_rate_limit_per_minute=Settings.model_fields["demo_rate_limit_per_minute"].default,
+        demo_rate_limit_burst=Settings.model_fields["demo_rate_limit_burst"].default,
+    )
+    with started(settings) as client:
+        for _ in range(35):
+            response = client.get(f"{API}/health/live")
+            assert response.status_code == 200, response.text
+
+
 def test_login_attempts_have_a_stricter_bucket(demo_base: Settings, tmp_path: Path) -> None:
     settings = variant(
         demo_base,
