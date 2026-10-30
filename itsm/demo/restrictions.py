@@ -57,6 +57,10 @@ PROTECTED_PREFIXES: tuple[str, ...] = (
     "/agent/sessions",
 )
 
+#: Permissions the demo session envelope does not advertise: their surfaces are
+#: denied by ``PROTECTED_PREFIXES``, so the UI must not offer them.
+DEMO_HIDDEN_PERMISSIONS: frozenset[str] = frozenset({"agents.providers.personal"})
+
 #: Paths (relative to the API prefix) where mutations are denied and reads stay.
 PROTECTED_MUTATION_PREFIXES: tuple[str, ...] = (
     "/identity",

@@ -14,7 +14,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response, statu
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
-from itsm.demo.restrictions import visitor_password_waiver
+from itsm.demo.restrictions import DEMO_HIDDEN_PERMISSIONS, visitor_password_waiver
 from itsm.demo.state import is_demo
 from itsm.identity.service import (
     AccountThrottled,
@@ -197,7 +197,9 @@ def role_dto(view: RoleView) -> RoleDTO:
 def session_envelope(view: CurrentView, *, demo_mode: bool = False) -> SessionEnvelope:
     return SessionEnvelope(
         user=user_dto(view.user),
-        permissions=sorted(view.permissions),
+        permissions=sorted(
+            view.permissions - DEMO_HIDDEN_PERMISSIONS if demo_mode else view.permissions
+        ),
         csrfToken=view.csrf_token,
         sessionMinutes=view.session_minutes,
         demoMode=demo_mode,
