@@ -247,6 +247,12 @@ def create_agent_integrations_router() -> APIRouter:
     ) -> dict[str, Any]:
         return _service(request).delete_provider(context.principal, provider_id)
 
+    @router.post("/agent/providers/{provider_id}/check")
+    async def check_provider(
+        provider_id: str, request: Request, context: MutationDependency
+    ) -> dict[str, Any]:
+        return await _service(request).check_provider(context.principal, provider_id)
+
     # -------------------------------------------------------------- admin surface
     @router.get("/agent/integrations")
     def integrations(request: Request, context: AuthDependency) -> dict[str, Any]:

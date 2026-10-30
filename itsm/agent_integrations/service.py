@@ -43,9 +43,12 @@ from itsm.agent_integrations.providers import (
     CredentialUnavailable,
     ProviderEndpointError,
     ProviderModelSelection,
+    ProviderNetworkPolicy,
     credential_key_state,
     credential_key_values,
     credential_storage_available,
+    personal_endpoint_policy,
+    probe_provider_models,
     seal_credential,
     unseal_credential,
     validate_provider_endpoint,
@@ -215,7 +218,12 @@ def _http_url(value: Any, field_name: str) -> str:
     return text.rstrip("/")
 
 
-def _provider_values(payload: Mapping[str, Any], *, scope: str) -> dict[str, Any]:
+def _provider_values(
+    payload: Mapping[str, Any],
+    *,
+    scope: str,
+    policy: ProviderNetworkPolicy | None = None,
+) -> dict[str, Any]:
     values: dict[str, Any] = {}
     if "name" in payload:
         name = _label(payload["name"], limit=120)
@@ -224,7 +232,9 @@ def _provider_values(payload: Mapping[str, Any], *, scope: str) -> dict[str, Any
         values["name"] = name
     if "baseUrl" in payload:
         try:
-            values["base_url"] = validate_provider_endpoint(payload["baseUrl"], scope=scope)
+            values["base_url"] = validate_provider_endpoint(
+                payload["baseUrl"], scope=scope, policy=policy
+            )
         except ProviderEndpointError as exc:
             raise ValidationFailed(str(exc)) from None
     if "models" in payload:
@@ -586,6 +596,10 @@ class AgentIntegrationService:
         identity.authorize(principal, PERSONAL_PROVIDER_PERMISSION, resource="agent:providers")
         return identity
 
+    def _provider_policy(self, scope: str) -> ProviderNetworkPolicy | None:
+        """Deployment policy for personal records; ``None`` for global records."""
+        return personal_endpoint_policy(self._settings) if scope == "personal" else None
+
     def _can_manage_global(self, db: Session, principal: Principal) -> bool:
         if principal.kind != HUMAN_ACTOR_KIND:
             return False
@@ -626,14 +640,16 @@ class AgentIntegrationService:
         model: str,
     ) -> ProviderModelSelection:
         value = self._validate_provider_model(row, model)
+        allow_private: bool | ProviderNetworkPolicy = True
         if row.scope == "personal":
             self._require_personal_provider(db, principal)
+            allow_private = personal_endpoint_policy(self._settings)
         credential = self._provider_credential(row)
         return ProviderModelSelection(
             base_url=row.base_url,
             model=value,
             api_key=credential,
-            allow_private=row.scope != "personal",
+            allow_private=allow_private,
         )
 
     def _admin_instance(self, row: AgentInstance) -> dict[str, Any]:
@@ -1054,7 +1070,7 @@ class AgentIntegrationService:
                 self._require_admin(db, principal, "agent:providers", human_only=True)
             else:
                 self._require_personal_provider(db, principal)
-            values = _provider_values(payload, scope=scope)
+            values = _provider_values(payload, scope=scope, policy=self._provider_policy(scope))
             if "name" not in values:
                 raise ValidationFailed("provider name is required")
             if "base_url" not in values:
@@ -1089,7 +1105,9 @@ class AgentIntegrationService:
             requested_scope = payload.get("scope")
             if requested_scope is not None and requested_scope != row.scope:
                 raise ValidationFailed("provider scope cannot be changed")
-            values = _provider_values(payload, scope=row.scope)
+            values = _provider_values(
+                payload, scope=row.scope, policy=self._provider_policy(row.scope)
+            )
             for name, value in values.items():
                 setattr(row, name, value)
             if api_key:
@@ -1112,6 +1130,46 @@ class AgentIntegrationService:
             db.delete(row)
             db.commit()
         return {"id": provider_id, "deleted": True}
+
+    async def check_provider(self, principal: Principal, provider_id: str) -> dict[str, Any]:
+        """Owner-authorized, bounded models probe for one stored provider.
+
+        It uses the same guarded transport as a turn, records no usage and never
+        returns the credential, an upstream body or a resolved address.
+        """
+        self._require_human(principal)
+        with self._session() as db:
+            row = self._provider_row(db, provider_id)
+            if not self._provider_visible(row, principal):
+                raise NotFound("provider not found")
+            if row.scope == "personal":
+                self._require_personal_provider(db, principal)
+            else:
+                self._require_admin(db, principal, "agent:providers", human_only=True)
+            base_url = row.base_url
+            scope = row.scope
+            try:
+                credential = self._provider_credential(row)
+            except IntegrationUnavailable:
+                return {
+                    "ok": False,
+                    "code": "credential_unavailable",
+                    "checkedAt": utcnow().isoformat(),
+                }
+        allow_private: bool | ProviderNetworkPolicy = (
+            personal_endpoint_policy(self._settings) if scope == "personal" else True
+        )
+        code, model_count = await probe_provider_models(
+            base_url, credential, allow_private=allow_private
+        )
+        checked: dict[str, Any] = {
+            "ok": code == "ok",
+            "code": code,
+            "checkedAt": utcnow().isoformat(),
+        }
+        if model_count is not None:
+            checked["modelCount"] = model_count
+        return checked
 
     # -------------------------------------------------------------- admin: instances
     def admin_snapshot(self, principal: Principal) -> dict[str, Any]:

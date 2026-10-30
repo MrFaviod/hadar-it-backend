@@ -678,3 +678,59 @@ def test_isolated_calls_settle_then_deny_next_call_without_dispatch(
         broker.close()
         client.__exit__(None, None, None)
         catalog.engine.dispose()
+
+
+def test_worker_accepts_only_the_allowlisted_private_provider() -> None:
+    from itsm.agents.isolated_worker import WorkerProtocolError, _model
+
+    start = _worker_start("http://127.0.0.1:18081/v1", private_allowlist=["127.0.0.0/8"])
+    model, client = _model(start)
+    try:
+        assert model is not None
+        assert client is not None
+        assert client.follow_redirects is False
+        assert client.trust_env is False
+    finally:
+        asyncio.run(client.aclose())
+
+    with pytest.raises(WorkerProtocolError):
+        _model(_worker_start("http://127.0.0.1:18081/v1"))
+
+
+def test_worker_refuses_metadata_even_for_an_allowlisted_hostname(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from itsm.agents import isolated_worker
+
+    monkeypatch.setattr(isolated_worker, "ensure_endpoint_allowed", _raises_blocked_address)
+    with pytest.raises(isolated_worker.WorkerProtocolError):
+        isolated_worker._model(
+            _worker_start(
+                "http://metadata.internal:80/v1",
+                private_allowlist=["metadata.internal:80"],
+            )
+        )
+
+
+def _worker_start(base_url: str, *, private_allowlist: list[str] | None = None) -> Any:
+    from itsm.agents.isolation import RunStart
+
+    return RunStart(
+        run_id="11111111-1111-4111-8111-111111111111",
+        user_id="22222222-2222-4222-8222-222222222222",
+        provider={
+            "kind": "openai-compatible",
+            "model": "model-a",
+            "baseUrl": base_url,
+            "apiKey": "sk-worker-secret",
+            "privateAllowlist": private_allowlist or [],
+        },
+        instructions="instructions",
+        prompt="hola",
+    )
+
+
+def _raises_blocked_address(*args: Any, **kwargs: Any) -> None:
+    from itsm.agent_integrations.providers import ProviderEndpointError
+
+    raise ProviderEndpointError("provider endpoint resolves to a non-public address")

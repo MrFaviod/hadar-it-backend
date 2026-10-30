@@ -83,6 +83,9 @@ class ProviderSpec(_Strict):
     base_url: str | None = Field(default=None, max_length=2048)
     api_key: str | None = Field(default=None, max_length=8192)
     allow_private: bool = False
+    # Deployment-authorized private destinations travel as data: the broker only
+    # relays them, and the worker re-applies the same resolution policy.
+    private_allowlist: list[str] = Field(default_factory=list, max_length=64)
 
     @field_validator("base_url")
     @classmethod
@@ -226,12 +229,14 @@ def _provider_spec(
     provider_selection: ProviderModelSelection | None,
 ) -> ProviderSpec:
     if provider_selection is not None:
+        policy = provider_selection.allow_private
         return ProviderSpec(
             kind="openai-compatible",
             model=provider_selection.model,
             base_url=provider_selection.base_url,
             api_key=provider_selection.api_key,
-            allow_private=provider_selection.allow_private,
+            allow_private=policy is True,
+            private_allowlist=[entry.describe() for entry in getattr(policy, "allowlist", ())],
         )
     with session_factory() as db:
         selection = effective_selection(db, settings)

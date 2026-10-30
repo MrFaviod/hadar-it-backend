@@ -7,8 +7,10 @@ container environment or a secret manager.
 
 from __future__ import annotations
 
+import ipaddress
 import os
 import re
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
@@ -40,6 +42,106 @@ LOG_LEVELS = frozenset({"CRITICAL", "ERROR", "WARNING", "INFO", "DEBUG"})
 PROVIDER_SECRET_ENV = ("OPENAI_API_KEY", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN")
 
 COOKIE_NAME_PATTERN = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+_HOST_LABEL = re.compile(r"^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$")
+
+
+@dataclass(frozen=True)
+class PersonalPrivateEndpoint:
+    """One deployment-authorized private destination for personal providers.
+
+    An entry is either a network (a CIDR or a single address) or an exact
+    hostname with an optional port. Matching is always performed against the
+    address this process resolved, never against a caller-supplied label.
+    """
+
+    network: ipaddress.IPv4Network | ipaddress.IPv6Network | None = None
+    host: str | None = None
+    port: int | None = None
+
+    def contains(self, address: str) -> bool:
+        """True when the resolved address falls inside this network entry."""
+        if self.network is None:
+            return False
+        parsed = _address(address)
+        if parsed is None:
+            return False
+        return parsed in self.network
+
+    def matches_host(self, host: str, port: int | None) -> bool:
+        """True for the exact hostname (case-insensitive) and allowed port."""
+        if self.host is None or self.host != host.rstrip(".").lower():
+            return False
+        return self.port is None or self.port == port
+
+    def describe(self) -> str:
+        """Canonical text used in configuration errors and diagnostics."""
+        if self.network is not None:
+            return str(self.network)
+        return f"{self.host}:{self.port}" if self.port is not None else str(self.host)
+
+
+def _address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def _endpoint_port(value: str | None) -> int | None:
+    if value is None:
+        return None
+    if not value.isdigit() or not 1 <= int(value) <= 65535:
+        raise ValueError("port is outside 1-65535")
+    return int(value)
+
+
+def _parse_endpoint_entry(entry: str) -> PersonalPrivateEndpoint:
+    try:
+        return PersonalPrivateEndpoint(network=ipaddress.ip_network(entry, strict=False))
+    except ValueError:
+        pass
+    if entry.count(":") > 1:
+        # Unbracketed IPv6 with a port is ambiguous and never silently guessed.
+        raise ValueError("an IPv6 entry must be a bare address or CIDR")
+    host, separator, port_text = entry.partition(":")
+    port = _endpoint_port(port_text if separator else None)
+    normalized = host.rstrip(".").lower()
+    labels = normalized.split(".")
+    if (
+        not normalized
+        or len(normalized) > 253
+        or not all(_HOST_LABEL.match(label) for label in labels)
+    ):
+        raise ValueError("entry is neither a CIDR, an address nor an exact hostname")
+    return PersonalPrivateEndpoint(host=normalized, port=port)
+
+
+def parse_personal_private_endpoints(raw: str) -> tuple[PersonalPrivateEndpoint, ...]:
+    """Parse ``ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS``; an exact blank disables it.
+
+    Entries are comma-separated CIDRs, single addresses or exact
+    ``hostname[:port]`` values. Empty or malformed entries fail closed instead
+    of silently widening the deployment's private destination policy.
+    """
+    text = raw.strip()
+    if not text:
+        return ()
+    entries: list[PersonalPrivateEndpoint] = []
+    for position, item in enumerate(text.split(","), start=1):
+        entry = item.strip()
+        if not entry:
+            raise ValueError(f"ai_personal_private_endpoints entry {position} is empty")
+        try:
+            parsed = _parse_endpoint_entry(entry)
+        except ValueError as exc:
+            raise ValueError(
+                f"ai_personal_private_endpoints entry {position} is not a CIDR, "
+                "address or hostname[:port]"
+            ) from exc
+        if parsed not in entries:
+            entries.append(parsed)
+    return tuple(entries)
 
 
 class Settings(BaseSettings):
@@ -157,6 +259,10 @@ class Settings(BaseSettings):
     # Legacy single key, kept for deployments and rows that still use it: it is
     # appended to the ring as a decryption-only key when not already present.
     ai_credential_key: SecretStr | None = None
+    # Private destinations a personal provider may reach; empty keeps the
+    # public-HTTPS-only default. CIDRs, single addresses or exact
+    # hostname[:port] values, matched against the resolved address.
+    ai_personal_private_endpoints: str = ""
 
     # Operator-configured external executor. ITSM never receives host, shell or
     # container authority; it only calls fixed actions on this trusted endpoint.
@@ -413,6 +519,13 @@ class Settings(BaseSettings):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise ValueError("agent_openai_base_url must be an http(s) URL")
         return normalized
+
+    @field_validator("ai_personal_private_endpoints")
+    @classmethod
+    def _validate_personal_private_endpoints(cls, value: str) -> str:
+        """Reject malformed allowlist entries at configuration time."""
+        parse_personal_private_endpoints(value)
+        return value.strip()
 
     @field_validator("ai_credential_key")
     @classmethod

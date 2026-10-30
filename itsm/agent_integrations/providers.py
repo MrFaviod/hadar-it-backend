@@ -23,7 +23,9 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import ipaddress
+import json
 import socket
+from collections.abc import Iterable
 from dataclasses import dataclass
 from urllib.parse import urlsplit, urlunsplit
 
@@ -31,7 +33,7 @@ import httpcore
 import httpx
 from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
-from itsm.config import Settings
+from itsm.config import PersonalPrivateEndpoint, Settings, parse_personal_private_endpoints
 
 _MAX_ENDPOINT = 500
 _LOCAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
@@ -58,18 +60,136 @@ class CredentialInvalid(Exception):
     """A sealed credential cannot be read with the configured key."""
 
 
+class ProviderAddressBlocked(httpcore.ConnectError):
+    """The resolved destination is outside this deployment's policy."""
+
+
+# Cloud metadata services are never reachable through a hostname allowlist;
+# only an explicit CIDR entry (for example ``169.254.169.254/32``) can include
+# them, and doing so is a deliberate, documented deployment decision.
+_METADATA_ADDRESSES = frozenset({"169.254.169.254", "fd00:ec2::254", "100.100.100.200"})
+
+_CHECK_TIMEOUT = 10.0
+_CHECK_MAX_BYTES = 64 * 1024
+
+
+def _address(value: str) -> ipaddress.IPv4Address | ipaddress.IPv6Address | None:
+    try:
+        return ipaddress.ip_address(value.split("%", 1)[0])
+    except ValueError:
+        return None
+
+
+def _address_class(address: ipaddress.IPv4Address | ipaddress.IPv6Address) -> str:
+    """Classify a resolved address: public, private or never-allowed.
+
+    Loopback, link-local and metadata addresses are only reachable through an
+    explicit CIDR, even when the hostname itself is allowlisted. Multicast,
+    unspecified and reserved addresses are treated the same way.
+    """
+
+    if isinstance(address, ipaddress.IPv6Address):
+        mapped = address.ipv4_mapped
+        if mapped is not None:
+            address = mapped
+    if str(address) in _METADATA_ADDRESSES:
+        return "blocked"
+    if address.is_global and not address.is_multicast:
+        return "public"
+    if address.is_loopback or address.is_link_local:
+        return "blocked"
+    if address.is_multicast or address.is_unspecified or address.is_reserved:
+        return "blocked"
+    return "private"
+
+
+@dataclass(frozen=True)
+class ProviderNetworkPolicy:
+    """Deployment-authorized destinations for one provider boundary.
+
+    The empty policy keeps the historical personal behavior: every resolved
+    address must be public. An allowlist may add CIDRs, single addresses and
+    exact ``hostname[:port]`` values. The decision is always taken against the
+    address resolved at connection time, so a name that later points somewhere
+    else is refused instead of being trusted for having been approved once.
+    """
+
+    allowlist: tuple[PersonalPrivateEndpoint, ...] = ()
+
+    def host_allowed(self, host: str, port: int | None) -> bool:
+        name = host.rstrip(".").lower()
+        return any(entry.matches_host(name, port) for entry in self.allowlist)
+
+    def contains(self, address: str) -> bool:
+        return any(entry.contains(address) for entry in self.allowlist)
+
+    def permits(self, host: str, addresses: Iterable[str], *, port: int | None) -> bool:
+        """True only when every resolved address is allowed for this host."""
+        checked = list(addresses)
+        if not checked:
+            return False
+        host_allowed = self.host_allowed(host, port)
+        for value in checked:
+            address = _address(value)
+            if address is None:
+                return False
+            kind = _address_class(address)
+            if kind == "public":
+                continue
+            if self.contains(value):
+                continue
+            if kind == "private" and host_allowed:
+                continue
+            return False
+        return True
+
+
+def personal_endpoint_policy(settings: Settings) -> ProviderNetworkPolicy:
+    """Policy for personal providers, resolved from deployment configuration."""
+    return ProviderNetworkPolicy(
+        allowlist=parse_personal_private_endpoints(settings.ai_personal_private_endpoints)
+    )
+
+
+def personal_endpoint_policy_from_entries(
+    entries: Iterable[str],
+) -> ProviderNetworkPolicy:
+    """Policy rebuilt from allowlist entries relayed inside a worker request.
+
+    The entries are validated with the same parser as the deployment setting, so
+    a broker or caller cannot smuggle a rule the configuration could not express.
+    """
+    return ProviderNetworkPolicy(
+        allowlist=parse_personal_private_endpoints(",".join(str(entry) for entry in entries))
+    )
+
+
 @dataclass(frozen=True)
 class ProviderModelSelection:
     """Server-resolved selection passed to the Pydantic AI runtime.
 
     ``api_key`` is the decrypted record credential. It is never returned by an
     API, logged or persisted outside the provider row ciphertext.
+
+    ``allow_private`` is ``True`` for an owner-trusted global record, a
+    :class:`ProviderNetworkPolicy` for a personal record (deployment allowlist),
+    or ``False`` for the strict public-only default. Keeping the policy in this
+    field lets every existing execution boundary pass it through unchanged.
     """
 
     base_url: str
     model: str
     api_key: str
-    allow_private: bool = False
+    allow_private: bool | ProviderNetworkPolicy = False
+
+    @property
+    def network_policy(self) -> ProviderNetworkPolicy | None:
+        """Guarded policy for this selection, or ``None`` for owner-trusted access."""
+        if self.allow_private is True:
+            return None
+        if isinstance(self.allow_private, ProviderNetworkPolicy):
+            return self.allow_private
+        return ProviderNetworkPolicy()
 
 
 def _hostname(value: str) -> str:
@@ -98,8 +218,18 @@ def _literal_address(host: str) -> str | None:
     return host
 
 
-def validate_provider_endpoint(value: object, *, scope: str) -> str:
-    """Validate and normalize a provider base URL for its authority scope."""
+def validate_provider_endpoint(
+    value: object,
+    *,
+    scope: str,
+    policy: ProviderNetworkPolicy | None = None,
+) -> str:
+    """Validate and normalize a provider base URL for its authority scope.
+
+    A personal record is public HTTPS by default. The deployment policy may
+    allowlist an exact hostname or an address range, in which case HTTP is also
+    accepted for that destination. Global records stay owner-trusted.
+    """
     if not isinstance(value, str):
         raise ProviderEndpointError("baseUrl must be a string")
     text = value.strip()
@@ -122,12 +252,20 @@ def validate_provider_endpoint(value: object, *, scope: str) -> str:
         raise ProviderEndpointError("baseUrl has an invalid port") from exc
     host = _hostname(parts.hostname)
     if scope == "personal":
-        if parts.scheme != "https":
-            raise ProviderEndpointError("personal provider endpoints require HTTPS")
-        if host in _LOCAL_HOSTNAMES or host.endswith(".localhost"):
-            raise ProviderEndpointError("personal provider endpoints must be publicly reachable")
+        active = policy or ProviderNetworkPolicy()
         literal = _literal_address(host)
-        if literal is not None and not is_public_address(literal):
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+        allowlisted = active.host_allowed(host, port) or (
+            literal is not None and active.contains(literal)
+        )
+        if parts.scheme != "https" and not allowlisted:
+            raise ProviderEndpointError(
+                "personal provider endpoints require HTTPS unless the deployment "
+                "allowlists the destination"
+            )
+        if (host in _LOCAL_HOSTNAMES or host.endswith(".localhost")) and not allowlisted:
+            raise ProviderEndpointError("personal provider endpoints must be publicly reachable")
+        if literal is not None and not active.permits(host, (literal,), port=port):
             raise ProviderEndpointError("personal provider endpoints must be publicly routable")
     path = parts.path.rstrip("/")
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
@@ -147,25 +285,27 @@ def resolve_addresses(host: str, port: int | None) -> tuple[str, ...]:
     return tuple(addresses)
 
 
-def ensure_public_endpoint(url: str) -> None:
-    """Pre-flight the destination of a personal endpoint; fail closed.
+def ensure_endpoint_allowed(url: str, policy: ProviderNetworkPolicy | None = None) -> None:
+    """Pre-flight the destination of a provider endpoint; fail closed.
 
     This check improves the error message before a request is attempted. The
-    authoritative boundary is :class:`_PublicOnlyNetworkBackend`, which repeats
+    authoritative boundary is :class:`_PolicyNetworkBackend`, which repeats
     resolution and filtering for the actual connection, so a DNS answer that
-    changes between the two calls cannot reach a private address.
+    changes between the two calls cannot reach a destination outside the policy.
     """
     parts = urlsplit(url)
     host = parts.hostname
     if host is None:
         raise ProviderEndpointError("provider endpoint must include a host")
+    port = parts.port or (443 if parts.scheme == "https" else 80)
     try:
-        addresses = resolve_addresses(host, parts.port or 443)
+        addresses = resolve_addresses(host, port)
     except OSError as exc:
         raise ProviderEndpointError("provider endpoint could not be resolved") from exc
     if not addresses:
         raise ProviderEndpointError("provider endpoint did not resolve to an address")
-    if any(not is_public_address(address) for address in addresses):
+    active = policy or ProviderNetworkPolicy()
+    if not active.permits(host, addresses, port=port):
         raise ProviderEndpointError("provider endpoint resolves to a non-public address")
 
 
@@ -288,10 +428,11 @@ def rotate_credential(settings: Settings, token: str) -> str:
         raise CredentialInvalid("the stored provider credential cannot be read") from exc
 
 
-class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
-    """Connect only to public addresses resolved for this exact connection."""
+class _PolicyNetworkBackend(httpcore.AsyncNetworkBackend):
+    """Connect only to destinations this deployment allows for this boundary."""
 
-    def __init__(self) -> None:
+    def __init__(self, policy: ProviderNetworkPolicy) -> None:
+        self._policy = policy
         self._delegate = httpcore.AnyIOBackend()
 
     async def connect_tcp(
@@ -305,12 +446,12 @@ class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
         try:
             addresses = await asyncio.to_thread(resolve_addresses, host, port)
         except OSError as exc:
-            raise httpcore.ConnectError(
+            raise ProviderAddressBlocked(
                 f"refusing provider endpoint {host}: it did not resolve"
             ) from exc
-        if not addresses or any(not is_public_address(address) for address in addresses):
-            raise httpcore.ConnectError(
-                f"refusing provider endpoint {host}: it resolves outside the public internet"
+        if not self._policy.permits(host, addresses, port=port):
+            raise ProviderAddressBlocked(
+                f"refusing provider endpoint {host}: its resolved destination is not allowed"
             )
         last: Exception | None = None
         for address in addresses:
@@ -325,7 +466,7 @@ class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
             except (OSError, httpcore.ConnectError) as exc:
                 last = exc
         raise httpcore.ConnectError(
-            f"refusing provider endpoint {host}: no public address accepted the connection"
+            f"refusing provider endpoint {host}: no allowed address accepted the connection"
         ) from last
 
     async def connect_unix_socket(
@@ -340,21 +481,32 @@ class _PublicOnlyNetworkBackend(httpcore.AsyncNetworkBackend):
         await self._delegate.sleep(seconds)
 
 
-def provider_http_client(*, allow_private: bool, timeout: float = 30.0) -> httpx.AsyncClient:
+def provider_http_client(
+    *,
+    allow_private: bool | ProviderNetworkPolicy = False,
+    policy: ProviderNetworkPolicy | None = None,
+    timeout: float = 30.0,
+) -> httpx.AsyncClient:
     """Build the client used for one execution boundary.
 
-    Personal providers get the public-only backend. Global operator providers
-    may target a private LAN engine, matching the installation's existing
-    server-configured endpoint allowance. Both disable redirects and ignore
-    proxy environment variables, so an approved destination is not forwarded.
+    ``allow_private=True`` keeps the owner-trusted global behavior. A
+    :class:`ProviderNetworkPolicy` (or the explicit ``policy`` argument) applies
+    the deployment allowlist to a personal record; ``False`` is the strict
+    public-only default. Every client disables redirects and ignores proxy
+    environment variables, so an approved destination is never forwarded.
     """
+    if policy is None:
+        if isinstance(allow_private, ProviderNetworkPolicy):
+            policy = allow_private
+        elif allow_private is not True:
+            policy = ProviderNetworkPolicy()
     transport = httpx.AsyncHTTPTransport(
         verify=True,
         trust_env=False,
         retries=0,
         http2=False,
     )
-    if not allow_private:
+    if policy is not None:
         # httpx 0.28 does not expose the httpcore network backend, so replace
         # the freshly built pool (which has no connections) with the guarded one.
         transport._pool = httpcore.AsyncConnectionPool(
@@ -365,7 +517,7 @@ def provider_http_client(*, allow_private: bool, timeout: float = 30.0) -> httpx
             http1=True,
             http2=False,
             retries=0,
-            network_backend=_PublicOnlyNetworkBackend(),
+            network_backend=_PolicyNetworkBackend(policy),
         )
     return httpx.AsyncClient(
         transport=transport,
@@ -373,6 +525,70 @@ def provider_http_client(*, allow_private: bool, timeout: float = 30.0) -> httpx
         trust_env=False,
         timeout=timeout,
     )
+
+
+def _blocked_address(exc: BaseException) -> bool:
+    """True when a transport failure came from this module's address policy."""
+    seen: set[int] = set()
+    current: BaseException | None = exc
+    while current is not None and id(current) not in seen:
+        if isinstance(current, ProviderAddressBlocked):
+            return True
+        seen.add(id(current))
+        current = current.__cause__ or current.__context__
+    return False
+
+
+async def probe_provider_models(
+    base_url: str,
+    api_key: str,
+    *,
+    allow_private: bool | ProviderNetworkPolicy = False,
+    timeout: float = _CHECK_TIMEOUT,
+    max_bytes: int = _CHECK_MAX_BYTES,
+) -> tuple[str, int | None]:
+    """Bounded models listing used by the owner-only provider check.
+
+    Returns a closed status code and an optional model count. It never returns
+    or logs the credential, an upstream response body or a resolved address.
+    """
+    url = base_url.rstrip("/") + "/models"
+    body = bytearray()
+    client = provider_http_client(allow_private=allow_private, timeout=timeout)
+    try:
+        async with client.stream(
+            "GET",
+            url,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Accept": "application/json",
+            },
+        ) as response:
+            status = response.status_code
+            if status in {401, 403}:
+                return "unauthorized", None
+            if 300 <= status < 400:
+                return "redirect", None
+            if status != 200:
+                return "invalid_response", None
+            async for chunk in response.aiter_bytes():
+                body.extend(chunk)
+                if len(body) > max_bytes:
+                    return "invalid_response", None
+    except httpx.TimeoutException:
+        return "timeout", None
+    except httpx.HTTPError as exc:
+        return ("blocked_address" if _blocked_address(exc) else "unreachable"), None
+    finally:
+        await client.aclose()
+    try:
+        payload = json.loads(bytes(body))
+    except ValueError:
+        return "invalid_response", None
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        return "invalid_response", None
+    return "ok", len(data)
 
 
 def build_provider_model(
@@ -401,18 +617,23 @@ __all__ = [
     "KEY_STATE_UNREADABLE",
     "CredentialInvalid",
     "CredentialUnavailable",
+    "ProviderAddressBlocked",
     "ProviderEndpointError",
     "ProviderModelSelection",
+    "ProviderNetworkPolicy",
     "build_provider_model",
     "credential_fingerprint",
     "credential_key_fingerprints",
     "credential_key_state",
     "credential_key_values",
     "credential_storage_available",
-    "ensure_public_endpoint",
+    "ensure_endpoint_allowed",
     "is_public_address",
+    "personal_endpoint_policy",
+    "personal_endpoint_policy_from_entries",
     "primary_cipher",
     "primary_fingerprint",
+    "probe_provider_models",
     "provider_http_client",
     "resolve_addresses",
     "rotate_credential",

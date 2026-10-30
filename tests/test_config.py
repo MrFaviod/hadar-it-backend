@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import pytest
-from itsm.config import Settings
+from itsm.config import Settings, parse_personal_private_endpoints
 from pydantic import ValidationError
 
 
@@ -118,3 +118,62 @@ def test_extension_validator_requires_paired_redacted_secret() -> None:
     assert token not in repr(configured)
     # Empty Compose variables leave validation unavailable, not a malformed credential.
     make_settings(extension_validator_url="", extension_validator_token="")
+
+
+def test_personal_private_endpoints_default_to_disabled() -> None:
+    settings = make_settings()
+
+    assert settings.ai_personal_private_endpoints == ""
+    assert parse_personal_private_endpoints(settings.ai_personal_private_endpoints) == ()
+    # An exactly blank value (for example an exported Compose variable) is
+    # disabled configuration, not a malformed entry.
+    assert parse_personal_private_endpoints("   ") == ()
+
+
+def test_personal_private_endpoints_accept_cidrs_and_exact_hosts() -> None:
+    settings = make_settings(
+        ai_personal_private_endpoints="10.0.0.0/8, 192.0.2.20,models.internal:8443,fd00::/8"
+    )
+
+    entries = parse_personal_private_endpoints(settings.ai_personal_private_endpoints)
+
+    assert [entry.describe() for entry in entries] == [
+        "10.0.0.0/8",
+        "192.0.2.20/32",
+        "models.internal:8443",
+        "fd00::/8",
+    ]
+    assert entries[0].contains("10.4.5.6") is True
+    assert entries[1].contains("10.4.5.6") is False
+    assert entries[2].matches_host("Models.Internal.", 8443) is True
+    assert entries[2].matches_host("models.internal", 9000) is False
+    assert entries[3].contains("fd00::1") is True
+
+
+def test_personal_private_endpoints_follow_the_environment_prefix(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", "192.0.2.10/24")
+
+    settings = Settings(_env_file=None)
+
+    assert settings.ai_personal_private_endpoints == "192.0.2.10/24"
+
+
+@pytest.mark.parametrize(
+    "raw",
+    [
+        "10.0.0.0/33",
+        "models.internal:0",
+        "models.internal:70000",
+        "http://models.internal/",
+        "bad host",
+        "*.local",
+        "10.0.0.0/8,,models.internal",
+        "models.internal,",
+        "[::1]:8080",
+    ],
+)
+def test_malformed_personal_private_endpoints_fail_configuration(raw: str) -> None:
+    with pytest.raises(ValidationError, match="ai_personal_private_endpoints"):
+        make_settings(ai_personal_private_endpoints=raw)
