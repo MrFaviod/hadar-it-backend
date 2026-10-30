@@ -2554,3 +2554,437 @@ def test_managed_dispatch_binds_real_gateway_and_revokes_lease(
     assert own["personal"]["consumedTokens"] == 0
     assert own["company"]["reservedTokens"] == 0
     assert all(secret not in response.text for secret in lease_tokens)
+
+
+# ------------------------------------------------ managed personal provider binding
+PERSONAL_KEY = "sk-personal-owner-only"
+GLOBAL_KEY = "sk-global-upstream"
+
+
+def _personal_provider(
+    client: TestClient,
+    headers: dict[str, str],
+    *,
+    name: str = "Personal provider",
+    models: tuple[str, ...] = ("personal-a",),
+    api_key: str = PERSONAL_KEY,
+) -> dict[str, Any]:
+    response = client.post(
+        f"{API}/agent/providers",
+        headers=headers,
+        json={
+            "scope": "personal",
+            "name": name,
+            "baseUrl": "https://api.example.com/v1",
+            "models": list(models),
+            "apiKey": api_key,
+        },
+    )
+    assert response.status_code == 201, response.text
+    return response.json()
+
+
+def _second_owner(
+    catalog: Any, client: TestClient, settings: Settings, username: str
+) -> dict[str, str]:
+    """Another signed-in person; owner role keeps the personal-provider grant."""
+
+    with catalog.session() as session:
+        catalog.service(session).create_user(
+            catalog.admin(),
+            username=username,
+            name="Second Owner",
+            password=MACHINE_PASSWORD,
+            role_id="superadmin",
+        )
+    return login(client, settings, username)
+
+
+def _managed_setup(
+    catalog: Any,
+    client: TestClient,
+    settings: Settings,
+    monkeypatch: pytest.MonkeyPatch,
+    upstream: Callable[[httpx.Request], httpx.Response],
+    *,
+    machine_name: str = "managed-personal",
+) -> tuple[dict[str, str], dict[str, Any], AgentIntegrationService, list[dict[str, Any]]]:
+    """A verified managed instance plus a native boundary that spends through the gateway."""
+    from itsm.agents import managed as managed_module
+    from itsm.ai_gateway import AiGatewayService
+    from itsm.ai_gateway import service as gateway_module
+    from pydantic import SecretStr
+
+    settings.ai_credential_key = SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    settings.ai_managed_gateway_url = "http://127.0.0.1:18080/api/v1/agent/gateway/v1"
+    settings.agent_max_output_tokens = 10
+    machine, token = catalog.add_machine(machine_name, "Managed Client")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    skills = FakeCatalog()
+    skills.skills["itsm-inventory"]["files"] = {"SKILL.md": b"# Inventory\n"}
+    service = build_service(
+        client,
+        catalog,
+        installer=FakeInstaller([{"skills": ["itsm-inventory"]}]),
+        catalog_api=skills,
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    provider = client.post(
+        f"{API}/agent/providers",
+        headers=admin,
+        json={
+            "scope": "global",
+            "name": "Managed provider",
+            "baseUrl": "http://127.0.0.1:18081/v1",
+            "models": ["model-a"],
+            "apiKey": GLOBAL_KEY,
+        },
+    )
+    assert provider.status_code == 201, provider.text
+    instance = configure_instance(
+        client,
+        admin,
+        integrationIdentityId=machine.actor_id,
+        quotaMode="managed",
+        managedProviderId=provider.json()["id"],
+        managedContextTokens=20,
+        directCompanyException=False,
+        defaultModel="model-a",
+    )
+    assert install_verified(client, admin, instance, machine.actor_id)["verified"]
+    monkeypatch.setattr(
+        gateway_module,
+        "provider_http_client",
+        lambda **kwargs: httpx.AsyncClient(transport=httpx.MockTransport(upstream)),
+    )
+    leases: list[dict[str, Any]] = []
+
+    class NativeBoundary:
+        native_model = None
+
+        def __init__(
+            self, config: Any, instance: Any, lease: Any, gateway_url: str, *, profile: Any
+        ):
+            self.lease = lease
+            leases.append({"lease": lease, "profile": profile, "gateway_url": gateway_url})
+
+        async def start(self) -> None:
+            pass
+
+        async def create_session(self) -> str:
+            return "managed-session"
+
+        async def stream(self, message: str, **kwargs: Any) -> AsyncIterator[dict[str, Any]]:
+            gateway = AiGatewayService(settings, catalog.factory(), service._usage)
+            context = gateway.authenticate(self.lease.bearer_token)
+            result = await gateway.chat(
+                context,
+                {
+                    "model": context.model,
+                    "messages": [{"role": "user", "content": message}],
+                    "max_tokens": 10,
+                },
+            )
+            assert result.status_code == 200, result.body
+            yield {"type": "delta", "text": "managed reply"}
+            yield {"type": "done", "cancelled": False}
+
+        async def aclose(self) -> None:
+            pass
+
+    monkeypatch.setattr(managed_module, "ManagedEngineRunner", NativeBoundary)
+    return admin, instance, service, leases
+
+
+def _usage_funding(client: TestClient, headers: dict[str, str]) -> dict[str, Any]:
+    response = client.get(f"{API}/agent/usage/me", headers=headers)
+    assert response.status_code == 200, response.text
+    return response.json()["funding"]
+
+
+def _send(client: TestClient, headers: dict[str, str], session_id: str) -> list[dict[str, Any]]:
+    response = client.post(
+        f"{API}/agent/sessions/{session_id}/messages",
+        headers=headers,
+        json={"message": "hola"},
+    )
+    assert response.status_code == 200, response.text
+    return read_sse(response)
+
+
+def _lease_rows(catalog: Any) -> list[Any]:
+    from itsm.ai_gateway.models import AiGatewayLease
+    from sqlalchemy import select
+
+    with catalog.factory()() as db:
+        return list(db.scalars(select(AiGatewayLease).order_by(AiGatewayLease.created_at)).all())
+
+
+def test_managed_personal_run_leases_the_owners_provider_without_exposing_its_key(
+    app_client, monkeypatch
+) -> None:
+    from itsm.agent_integrations.providers import unseal_credential
+
+    catalog, client, settings = app_client
+    upstream_requests: list[httpx.Request] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        upstream_requests.append(request)
+        assert request.headers["Authorization"] == f"Bearer {PERSONAL_KEY}"
+        assert json.loads(request.content)["model"] == "personal-a"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "personal reply"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    admin, instance, _, leases = _managed_setup(catalog, client, settings, monkeypatch, upstream)
+    personal = _personal_provider(client, admin)
+    created = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={"instanceId": instance["id"], "model": "personal-a", "providerId": personal["id"]},
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["providerId"] == personal["id"]
+
+    events = _send(client, admin, created.json()["id"])
+    assert any(event.get("text") == "managed reply" for event in events), events
+    assert len(upstream_requests) == 1
+
+    rows = _lease_rows(catalog)
+    assert len(rows) == 1
+    lease = rows[0]
+    assert lease.provider_id == personal["id"]
+    assert lease.provider_scope == "personal"
+    assert lease.funding == "personal"
+    assert lease.model == "personal-a"
+    assert lease.revoked_at is not None
+    assert PERSONAL_KEY not in lease.selection_ciphertext
+    selection = json.loads(unseal_credential(settings, lease.selection_ciphertext))
+    assert selection == {
+        "base_url": "https://api.example.com/v1",
+        "model": "personal-a",
+        "api_key": PERSONAL_KEY,
+        "allow_private": False,
+    }
+
+    boundary = leases[0]
+    assert boundary["lease"].bearer_token != PERSONAL_KEY
+    assert boundary["profile"].mcp_token != PERSONAL_KEY
+    assert PERSONAL_KEY not in repr(boundary["profile"])
+    assert PERSONAL_KEY not in repr(boundary["lease"])
+    funding = _usage_funding(client, admin)
+    assert funding["personal"]["consumedTokens"] == 5
+    assert funding["company"]["consumedTokens"] == 0
+
+
+def test_managed_provider_selection_treats_another_persons_provider_as_missing(
+    app_client, monkeypatch
+) -> None:
+    catalog, client, settings = app_client
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "reply"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    admin, instance, _, _ = _managed_setup(catalog, client, settings, monkeypatch, upstream)
+    alice_provider = _personal_provider(client, admin, name="Alice personal")
+    bea = _second_owner(catalog, client, settings, "bea.admin")
+    missing_id = "00000000-0000-0000-0000-000000000000"
+
+    created = client.post(
+        f"{API}/agent/sessions",
+        headers=bea,
+        json={"instanceId": instance["id"], "model": "model-a"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+
+    foreign = client.patch(
+        f"{API}/agent/sessions/{session_id}",
+        headers=bea,
+        json={"providerId": alice_provider["id"]},
+    )
+    absent = client.patch(
+        f"{API}/agent/sessions/{session_id}",
+        headers=bea,
+        json={"providerId": missing_id},
+    )
+    assert foreign.status_code == 404, foreign.text
+    assert foreign.json() == absent.json()
+
+    foreign_create = client.post(
+        f"{API}/agent/sessions",
+        headers=bea,
+        json={
+            "instanceId": instance["id"],
+            "model": "personal-a",
+            "providerId": alice_provider["id"],
+        },
+    )
+    absent_create = client.post(
+        f"{API}/agent/sessions",
+        headers=bea,
+        json={"instanceId": instance["id"], "model": "personal-a", "providerId": missing_id},
+    )
+    assert foreign_create.status_code == 404, foreign_create.text
+    assert foreign_create.json() == absent_create.json()
+    assert (
+        client.get(f"{API}/agent/sessions/{session_id}", headers=bea).json()["providerId"] is None
+    )
+
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    disabled = client.patch(
+        f"{API}/agent/providers/{alice_provider['id']}",
+        headers=admin,
+        json={"enabled": False},
+    )
+    assert disabled.status_code == 200, disabled.text
+    rejected_disabled = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={
+            "instanceId": instance["id"],
+            "model": "personal-a",
+            "providerId": alice_provider["id"],
+        },
+    )
+    assert rejected_disabled.status_code == 422, rejected_disabled.text
+    assert rejected_disabled.json()["error"]["code"] == "validation_error"
+
+    deleted = client.delete(f"{API}/agent/providers/{alice_provider['id']}", headers=admin)
+    assert deleted.status_code in {200, 404}, deleted.text
+    deleted_create = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={
+            "instanceId": instance["id"],
+            "model": "personal-a",
+            "providerId": alice_provider["id"],
+        },
+    )
+    assert deleted_create.status_code == 404, deleted_create.text
+    assert deleted_create.json() == absent_create.json()
+
+
+def test_direct_engine_rejects_a_provider_selection(app_client, monkeypatch) -> None:
+    from pydantic import SecretStr
+
+    catalog, client, settings = app_client
+    settings.ai_credential_key = SecretStr("MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA=")
+    machine, token = catalog.add_machine("direct-client", "Direct Client")
+    monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", token)
+    build_service(
+        client,
+        catalog,
+        installer=FakeInstaller([{"skills": ["itsm-inventory"]}]),
+        catalog_api=FakeCatalog(),
+    )
+    admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
+    personal = _personal_provider(client, admin)
+    instance = configure_instance(client, admin, integrationIdentityId=machine.actor_id)
+    assert install_verified(client, admin, instance, machine.actor_id)["verified"]
+
+    rejected = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={
+            "instanceId": instance["id"],
+            "model": "personal-a",
+            "providerId": personal["id"],
+        },
+    )
+    assert rejected.status_code == 422, rejected.text
+    assert rejected.json()["error"]["message"] == "direct engines cannot select a provider"
+
+    with catalog.factory()() as db:
+        from itsm.agent_integrations.models import AgentSession
+        from sqlalchemy import select
+
+        assert db.scalars(select(AgentSession)).all() == []
+
+
+def test_managed_session_switching_attributes_each_turn_to_the_used_scope(
+    app_client, monkeypatch
+) -> None:
+    catalog, client, settings = app_client
+    seen_keys: list[str] = []
+
+    def upstream(request: httpx.Request) -> httpx.Response:
+        authorization = request.headers["Authorization"]
+        seen_keys.append(authorization)
+        body = json.loads(request.content)
+        expected = PERSONAL_KEY if body["model"] == "personal-a" else GLOBAL_KEY
+        assert authorization == f"Bearer {expected}"
+        return httpx.Response(
+            200,
+            json={
+                "choices": [{"message": {"role": "assistant", "content": "reply"}}],
+                "usage": {"prompt_tokens": 3, "completion_tokens": 2, "total_tokens": 5},
+            },
+        )
+
+    admin, instance, _, _ = _managed_setup(catalog, client, settings, monkeypatch, upstream)
+    personal = _personal_provider(client, admin)
+    created = client.post(
+        f"{API}/agent/sessions",
+        headers=admin,
+        json={"instanceId": instance["id"], "model": "model-a"},
+    )
+    assert created.status_code == 201, created.text
+    session_id = created.json()["id"]
+    assert created.json()["providerId"] is None
+
+    _send(client, admin, session_id)
+    company = _usage_funding(client, admin)
+    assert company["company"]["consumedTokens"] == 5
+    assert company["personal"]["consumedTokens"] == 0
+
+    switched = client.patch(
+        f"{API}/agent/sessions/{session_id}",
+        headers=admin,
+        json={"providerId": personal["id"]},
+    )
+    assert switched.status_code == 200, switched.text
+    assert switched.json()["providerId"] == personal["id"]
+    assert switched.json()["model"] == "personal-a"
+
+    _send(client, admin, session_id)
+    personal_usage = _usage_funding(client, admin)
+    assert personal_usage["company"]["consumedTokens"] == 5
+    assert personal_usage["personal"]["consumedTokens"] == 5
+
+    restored = client.patch(
+        f"{API}/agent/sessions/{session_id}",
+        headers=admin,
+        json={"providerId": None},
+    )
+    assert restored.status_code == 200, restored.text
+    assert restored.json()["providerId"] is None
+    assert restored.json()["model"] == "model-a"
+
+    _send(client, admin, session_id)
+    final = _usage_funding(client, admin)
+    assert final["company"]["consumedTokens"] == 10
+    assert final["personal"]["consumedTokens"] == 5
+
+    rows = _lease_rows(catalog)
+    assert [(row.funding, row.provider_scope, row.model) for row in rows] == [
+        ("company", "global", "model-a"),
+        ("personal", "personal", "personal-a"),
+        ("company", "global", "model-a"),
+    ]
+    assert all(row.revoked_at is not None for row in rows)
+    assert seen_keys == [
+        f"Bearer {GLOBAL_KEY}",
+        f"Bearer {PERSONAL_KEY}",
+        f"Bearer {GLOBAL_KEY}",
+    ]
