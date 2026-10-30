@@ -672,6 +672,7 @@ def test_preferences_and_installation_defaults(app_client) -> None:
             "name": "openai:gpt-4o-mini",
             "provider": "openai",
             "free": None,
+            "inputs": {"image": None, "file": None},
         }
     ]
     assert pydantic["capabilities"]["streaming"] is False

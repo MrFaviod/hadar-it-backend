@@ -60,7 +60,7 @@ def create_ai_gateway_router(service: AiGatewayService | None = None) -> APIRout
         try:
             gateway = selected(request)
             context = authenticate(gateway, request)
-            payload = await _read_json(request)
+            payload = await _read_json(request, MAX_REQUEST_BYTES + context.attachment_bytes)
             result = await gateway.chat(
                 context,
                 payload,
@@ -93,7 +93,7 @@ def create_ai_gateway_router(service: AiGatewayService | None = None) -> APIRout
     return router
 
 
-async def _read_json(request: Request) -> dict[str, Any]:
+async def _read_json(request: Request, limit: int = MAX_REQUEST_BYTES) -> dict[str, Any]:
     content_length = request.headers.get("content-length")
     if content_length:
         try:
@@ -104,7 +104,7 @@ async def _read_json(request: Request) -> dict[str, Any]:
             ) from exc
         if declared < 0:
             raise GatewayRejected("invalid_request", "Content-Length is invalid")
-        if declared > MAX_REQUEST_BYTES:
+        if declared > limit:
             raise GatewayRejected(
                 "request_too_large",
                 "The request body exceeds the gateway limit",
@@ -114,7 +114,7 @@ async def _read_json(request: Request) -> dict[str, Any]:
     body = bytearray()
     async for chunk in request.stream():
         body.extend(chunk)
-        if len(body) > MAX_REQUEST_BYTES:
+        if len(body) > limit:
             raise GatewayRejected(
                 "request_too_large",
                 "The request body exceeds the gateway limit",

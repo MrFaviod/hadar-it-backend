@@ -14,6 +14,8 @@ nothing in this process can grant permissions or change identity.
 from __future__ import annotations
 
 import asyncio
+import base64
+import binascii
 import contextlib
 import inspect
 import json
@@ -21,6 +23,7 @@ import sys
 from collections.abc import Callable
 from typing import Any, TextIO
 
+from itsm.agent_integrations.attachments import ChatAttachmentInput
 from itsm.agent_integrations.providers import (
     ProviderEndpointError,
     ProviderModelSelection,
@@ -30,6 +33,7 @@ from itsm.agent_integrations.providers import (
     provider_http_client,
 )
 from itsm.agents.isolation import RunStart, ToolSchema, WorkerFinal
+from itsm.agents.runtime import user_content
 from pydantic_ai import Agent
 from pydantic_ai.messages import (
     ModelMessage,
@@ -44,7 +48,8 @@ from pydantic_ai.tools import Tool
 from pydantic_ai.toolsets.function import FunctionToolset
 from pydantic_ai.usage import RunUsage, UsageLimits
 
-_MAX_LINE = 512 * 1024
+#: One bounded start line, large enough for one message's base64 attachments.
+_MAX_LINE = 8 * 1024 * 1024
 _MAX_TOOL_RESULT = 64 * 1024
 _MAX_TOOL_CALLS = 80
 
@@ -121,6 +126,26 @@ class _Bridge:
         if not isinstance(payload, dict):
             raise WorkerProtocolError("incoming frame is not an object")
         return payload
+
+
+def _attachments(start: RunStart) -> list[ChatAttachmentInput]:
+    """Decode the relayed base64 bodies; a malformed frame is a protocol error."""
+
+    decoded: list[ChatAttachmentInput] = []
+    for item in start.attachments:
+        try:
+            data = base64.b64decode(item.data, validate=True)
+        except binascii.Error, ValueError:
+            raise WorkerProtocolError("attachment data is not valid base64") from None
+        decoded.append(
+            ChatAttachmentInput(
+                filename=item.filename,
+                media_type=item.media_type,
+                kind=item.kind,
+                data=data,
+            )
+        )
+    return decoded
 
 
 def _history(start: RunStart) -> list[ModelMessage]:
@@ -251,7 +276,7 @@ async def _run(start: RunStart, bridge: _Bridge) -> tuple[RunUsage, str]:
         )
     try:
         result = await agent.run(
-            start.prompt,
+            user_content(start.prompt, _attachments(start)),
             message_history=_history(start),
             usage_limits=limits,
             usage=run_usage,

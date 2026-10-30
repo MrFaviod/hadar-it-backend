@@ -209,6 +209,32 @@ class AgentProvider(InventoryBase):
     )
 
 
+class ChatAttachment(InventoryBase):
+    """One chat attachment: owner and session scoped metadata over stored bytes.
+
+    The bytes live in the independent blob store exactly like asset documents;
+    this row only carries the bounded display metadata and the owner that may
+    read it. It references the session by id, without a cross-module foreign
+    key, so session deletion cleans it explicitly.
+    """
+
+    __tablename__ = "agent_chat_attachments"
+    __table_args__ = (UniqueConstraint("blob_key", name="uq_agent_chat_attachments_blob_key"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    session_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    blob_key: Mapped[str] = mapped_column(String(32), nullable=False)
+    filename: Mapped[str] = mapped_column(String(180), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(120), nullable=False)
+    kind: Mapped[str] = mapped_column(String(8), nullable=False)
+    size: Mapped[int] = mapped_column(Integer, nullable=False)
+    sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
+    )
+
+
 __all__ = [
     "AgentDailyUsage",
     "AgentInstallation",
@@ -219,4 +245,5 @@ __all__ = [
     "AgentProvider",
     "AgentRun",
     "AgentSession",
+    "ChatAttachment",
 ]

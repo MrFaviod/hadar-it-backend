@@ -45,6 +45,14 @@ class AiGatewayLease(InventoryBase):
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     engine: Mapped[str] = mapped_column(String(64), nullable=False)
     context_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
+    # Which non-text input kinds (comma separated, e.g. "image,file") this lease
+    # admits and the encoded byte budget their parts may consume.
+    input_modalities: Mapped[str] = mapped_column(
+        String(32), nullable=False, default="", server_default=""
+    )
+    attachment_bytes: Mapped[int] = mapped_column(
+        Integer, nullable=False, default=0, server_default="0"
+    )
     output_tokens: Mapped[int] = mapped_column(Integer, nullable=False)
     selection_ciphertext: Mapped[str] = mapped_column(Text, nullable=False)
     allow_private: Mapped[bool] = mapped_column(Boolean, nullable=False)

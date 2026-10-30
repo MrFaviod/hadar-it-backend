@@ -10,6 +10,7 @@ inference is used.
 from __future__ import annotations
 
 import asyncio
+import base64
 import inspect
 import json
 from datetime import UTC, datetime, timedelta
@@ -378,6 +379,8 @@ def issue(
     engine: str = "hermes",
     base_url: str | None = None,
     allow_private: bool | None = None,
+    input_modalities: tuple[str, ...] = (),
+    attachment_bytes: int = 0,
 ) -> tuple[Any, str]:
     if parent is None:
         parent = harness.ledger.seed(
@@ -418,6 +421,8 @@ def issue(
         context_tokens=context_tokens,
         output_tokens=output_tokens,
         ttl_seconds=ttl_seconds,
+        input_modalities=input_modalities,
+        attachment_bytes=attachment_bytes,
     )
     return lease, parent
 
@@ -1158,3 +1163,117 @@ def test_selection_policy_cannot_widen_the_deployment_allowlist(harness: Any) ->
 
     assert error.value.code == "invalid_provider_endpoint"
     assert harness.upstream.requests == []
+
+
+# ------------------------------------------------------- inline attachments
+IMAGE_B64 = base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 32).decode()
+PDF_B64 = base64.b64encode(b"%PDF-1.7\ndoc\n%%EOF").decode()
+
+
+def image_message(url: str) -> dict[str, Any]:
+    return {
+        "model": "model-a",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "qué ves"},
+                    {"type": "image_url", "image_url": {"url": url}},
+                ],
+            }
+        ],
+        "max_tokens": 40,
+    }
+
+
+def file_message(data: str) -> dict[str, Any]:
+    return {
+        "model": "model-a",
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "file",
+                        "file": {"filename": "informe.pdf", "file_data": data},
+                    }
+                ],
+            }
+        ],
+        "max_tokens": 40,
+    }
+
+
+def test_lease_admits_inline_image_only_when_declared(harness: Any) -> None:
+    lease, _ = issue(harness, input_modalities=("image",), attachment_bytes=len(IMAGE_B64) + 64)
+
+    response = harness.client.post(
+        CHAT, json=image_message(f"data:image/png;base64,{IMAGE_B64}"), headers=bearer(lease)
+    )
+
+    assert response.status_code == 200, response.text
+    forwarded = json.loads(harness.upstream.requests[0].content)
+    assert forwarded["messages"][0]["content"][1] == {
+        "type": "image_url",
+        "image_url": {"url": f"data:image/png;base64,{IMAGE_B64}"},
+    }
+    assert harness.ledger.reserve_calls
+
+
+def test_lease_without_image_modality_refuses_image_parts(harness: Any) -> None:
+    lease, _ = issue(harness)
+
+    response = harness.client.post(
+        CHAT, json=image_message(f"data:image/png;base64,{IMAGE_B64}"), headers=bearer(lease)
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_content"
+    assert harness.ledger.reserve_calls == []
+    assert harness.upstream.requests == []
+
+
+def test_remote_image_url_stays_refused_even_when_declared(harness: Any) -> None:
+    lease, _ = issue(harness, input_modalities=("image",), attachment_bytes=len(IMAGE_B64) + 64)
+
+    response = harness.client.post(
+        CHAT, json=image_message("https://evil.example/cat.png"), headers=bearer(lease)
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_content"
+    assert harness.ledger.reserve_calls == []
+    assert harness.upstream.requests == []
+
+
+def test_attachment_bytes_bound_the_lease(harness: Any) -> None:
+    lease, _ = issue(harness, input_modalities=("image",), attachment_bytes=8)
+
+    response = harness.client.post(
+        CHAT, json=image_message(f"data:image/png;base64,{IMAGE_B64}"), headers=bearer(lease)
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsupported_content"
+    assert harness.ledger.reserve_calls == []
+
+
+def test_lease_admits_inline_pdf_only_when_file_is_declared(harness: Any) -> None:
+    lease, _ = issue(harness, input_modalities=("file",), attachment_bytes=4096)
+    response = harness.client.post(
+        CHAT,
+        json=file_message(f"data:application/pdf;base64,{PDF_B64}"),
+        headers=bearer(lease),
+    )
+    assert response.status_code == 200, response.text
+    forwarded = json.loads(harness.upstream.requests[0].content)
+    assert forwarded["messages"][0]["content"][0]["file"]["filename"] == "informe.pdf"
+
+    text_only, _ = issue(harness, run_id="run-2", parent=harness.ledger.seed(run_id="run-2"))
+    refused = harness.client.post(
+        CHAT,
+        json=file_message(f"data:application/pdf;base64,{PDF_B64}"),
+        headers=bearer(text_only),
+    )
+    assert refused.status_code == 400
+    assert refused.json()["error"]["code"] == "unsupported_content"

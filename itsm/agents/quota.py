@@ -123,6 +123,7 @@ def reserve_run(
     run_id: str,
     engine: str = "pydantic",
     provider: Mapping[str, Any] | None = None,
+    attachment_tokens: int = 0,
 ) -> RunBudget:
     from itsm.ai_usage.service import AiUsageService
 
@@ -140,11 +141,15 @@ def reserve_run(
                 model=selected.model,
             )
     scope = attribution.get("provider_scope")
+    # Company-funded runs reserve a conservative attachment estimate up front;
+    # the measured provider usage still replaces it on settlement. Personal
+    # funding stays record-only, so the estimate never blocks that owner.
+    reserved = 1 + max(0, int(attachment_tokens or 0))
     service = AiUsageService(settings, session_factory)
     grant = service.reserve(
         principal.actor_id,
         funding="personal" if scope == "personal" else "company",
-        reserved_tokens=1,
+        reserved_tokens=reserved,
         engine=engine,
         run_id=run_id,
         provider_id=attribution.get("provider_id"),

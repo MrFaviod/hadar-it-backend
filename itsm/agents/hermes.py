@@ -15,7 +15,7 @@ import contextlib
 import json
 import math
 import re
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator, Mapping, Sequence
 from typing import Any
 from urllib.parse import urlencode, urlsplit, urlunsplit
 
@@ -139,15 +139,11 @@ def _turn_usage(
             delta[key] = None
             continue
         if after < before:
-            return unavailable_usage(
-                source="engine", output_includes_reasoning=True
-            ).event()
+            return unavailable_usage(source="engine", output_includes_reasoning=True).event()
         comparable = True
         delta[key] = after - before
     if not comparable:
-        return unavailable_usage(
-            source="engine", output_includes_reasoning=True
-        ).event()
+        return unavailable_usage(source="engine", output_includes_reasoning=True).event()
     return measured_usage(
         input_tokens=delta["input"],
         output_tokens=delta["output"],
@@ -250,6 +246,9 @@ class HermesEngine(_HTTPEngine):
             "tools": True,
             "usage": True,
             "history": False,
+            # Hermes accepts a text prompt only; there is no attachment field in
+            # its runtime protocol, so ITSM refuses attachments before spending.
+            "attachments": False,
         }
         self._capabilities = capabilities
         return EngineInfo(version=version, models=models, capabilities=dict(capabilities))
@@ -380,11 +379,20 @@ class HermesEngine(_HTTPEngine):
         session_id: str,
         model: str | None = None,
         history: object = None,
+        attachments: Sequence[Any] = (),
     ) -> AsyncIterator[dict[str, object]]:
         if not isinstance(message, str) or not message:
             raise EngineError("protocol", "message must not be empty", retryable=False)
         if not isinstance(session_id, str) or not session_id:
             raise EngineError("protocol", "session identifier is required", retryable=False)
+        if attachments:
+            # The Hermes runtime protocol carries a text prompt only; refusing
+            # here means no prompt, tool call or provider spend happens.
+            raise EngineError(
+                "engine_attachments_unsupported",
+                "the Hermes engine accepts text prompts only",
+                retryable=False,
+            )
         await self._connect()
         was_live = session_id in self._live
         runtime = await self._ensure_session(session_id)
@@ -486,9 +494,7 @@ class HermesEngine(_HTTPEngine):
                     or _error_text(payload)
                 )
                 break
-        final_usage = (
-            _cumulative_counters(usage_payload) if usage_payload is not None else None
-        )
+        final_usage = _cumulative_counters(usage_payload) if usage_payload is not None else None
         if final_usage is not None:
             self._usage_totals[session_id] = final_usage
         else:
@@ -591,9 +597,7 @@ class HermesEngine(_HTTPEngine):
 
     async def _ws_credential(self) -> tuple[str, str]:
         try:
-            response = await self._http.post(
-                self._url("/api/auth/ws-ticket"), timeout=_RPC_TIMEOUT
-            )
+            response = await self._http.post(self._url("/api/auth/ws-ticket"), timeout=_RPC_TIMEOUT)
         except httpx.HTTPError as exc:
             raise EngineError(
                 "authentication", f"Hermes ticket request failed: {type(exc).__name__}"
@@ -605,9 +609,11 @@ class HermesEngine(_HTTPEngine):
                 return "ticket", ticket
         root = await self._http.get(self._url("/"), timeout=_RPC_TIMEOUT)
         match = _TOKEN_PAGE.search(root.text) if root.status_code == 200 else None
-        gate = re.search(
-            r"__HERMES_AUTH_REQUIRED__\s*=\s*(true|false)", root.text
-        ) if root.status_code == 200 else None
+        gate = (
+            re.search(r"__HERMES_AUTH_REQUIRED__\s*=\s*(true|false)", root.text)
+            if root.status_code == 200
+            else None
+        )
         if match is None or gate is None or gate.group(1) != "false":
             raise EngineError(
                 "authentication",
@@ -639,7 +645,7 @@ class HermesEngine(_HTTPEngine):
                     raw = raw.decode("utf-8", "replace")
                 try:
                     frame = json.loads(raw)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
                 if not isinstance(frame, Mapping):
                     continue

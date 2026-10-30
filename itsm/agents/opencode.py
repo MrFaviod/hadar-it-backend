@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
 from contextlib import suppress
@@ -39,6 +40,9 @@ _V2_CAPABILITIES = {
     "tools": True,
     "usage": True,
     "history": True,
+    # The v2 prompt API accepts path/reference attachments only, so ITSM never
+    # sends inline bytes there.
+    "attachments": False,
 }
 
 _RECONNECT_ATTEMPTS = 2
@@ -171,7 +175,8 @@ class OpenCodeEngine(_HTTPEngine):
         self._model_refs = refs
         self._models = models
         self._variant = "v1"
-        self._capabilities = dict(_V2_CAPABILITIES)
+        # The documented v1 message API accepts ``file`` parts with a data URL.
+        self._capabilities = {**_V2_CAPABILITIES, "attachments": True}
         return EngineInfo(version=version, models=models, capabilities=dict(self._capabilities))
 
     async def create_session(self) -> str:
@@ -229,6 +234,7 @@ class OpenCodeEngine(_HTTPEngine):
         session_id: str,
         model: str | None = None,
         history: object = None,
+        attachments: Sequence[Any] = (),
     ) -> AsyncIterator[dict[str, object]]:
         if not isinstance(message, str) or not message:
             raise EngineError("protocol", "message must not be empty", retryable=False)
@@ -242,6 +248,7 @@ class OpenCodeEngine(_HTTPEngine):
                 session_id=session_id,
                 model=model,
                 history=history,
+                attachments=attachments,
             ):
                 yield event
             return
@@ -249,6 +256,14 @@ class OpenCodeEngine(_HTTPEngine):
             raise EngineError(
                 "unsupported",
                 "streaming is not available for this OpenCode API",
+                retryable=False,
+            )
+        if attachments:
+            # The v2 prompt API only accepts attachment references by path; ITSM
+            # never writes chat bytes to the engine filesystem, so it refuses.
+            raise EngineError(
+                "engine_attachments_unsupported",
+                "the OpenCode v2 prompt API accepts attachments by reference only",
                 retryable=False,
             )
 
@@ -346,9 +361,16 @@ class OpenCodeEngine(_HTTPEngine):
                                     yield event
                             elif event_type == "session.tool.success":
                                 tool_id = data.get("id")
-                                tool = _tool_name(data) or (
-                                    tool_names.get(tool_id) if isinstance(tool_id, str) else None
-                                ) or running_tool or "tool"
+                                tool = (
+                                    _tool_name(data)
+                                    or (
+                                        tool_names.get(tool_id)
+                                        if isinstance(tool_id, str)
+                                        else None
+                                    )
+                                    or running_tool
+                                    or "tool"
+                                )
                                 event = {
                                     "type": "tool",
                                     "tool": tool,
@@ -363,9 +385,16 @@ class OpenCodeEngine(_HTTPEngine):
                                 yield event
                             elif event_type == "session.tool.failed":
                                 tool_id = data.get("id")
-                                tool = _tool_name(data) or (
-                                    tool_names.get(tool_id) if isinstance(tool_id, str) else None
-                                ) or running_tool or "tool"
+                                tool = (
+                                    _tool_name(data)
+                                    or (
+                                        tool_names.get(tool_id)
+                                        if isinstance(tool_id, str)
+                                        else None
+                                    )
+                                    or running_tool
+                                    or "tool"
+                                )
                                 event = {
                                     "type": "tool",
                                     "tool": tool,
@@ -411,9 +440,7 @@ class OpenCodeEngine(_HTTPEngine):
                         failure = exc
                         break
                     await asyncio.sleep(_RECONNECT_DELAY)
-                    recovered = await self._recover_messages(
-                        session_id, prompt_message_id
-                    )
+                    recovered = await self._recover_messages(session_id, prompt_message_id)
                     if recovered:
                         final_messages = recovered
                     final_message = _select_final(final_messages, assistant_id)
@@ -425,9 +452,7 @@ class OpenCodeEngine(_HTTPEngine):
                 if terminal:
                     break
                 if attempt < _RECONNECT_ATTEMPTS:
-                    recovered = await self._recover_messages(
-                        session_id, prompt_message_id
-                    )
+                    recovered = await self._recover_messages(session_id, prompt_message_id)
                     if recovered:
                         final_messages = recovered
                     final_message = _select_final(final_messages, assistant_id)
@@ -444,9 +469,7 @@ class OpenCodeEngine(_HTTPEngine):
 
             if terminal:
                 if final_message is None:
-                    recovered = await self._recover_messages(
-                        session_id, prompt_message_id
-                    )
+                    recovered = await self._recover_messages(session_id, prompt_message_id)
                     if recovered:
                         final_messages = recovered
                     final_message = _select_final(final_messages, assistant_id)
@@ -482,6 +505,7 @@ class OpenCodeEngine(_HTTPEngine):
         session_id: str,
         model: str | None,
         history: object,
+        attachments: Sequence[Any] = (),
     ) -> AsyncIterator[dict[str, object]]:
         model_ref = self._resolve_model(model)
         prompt = _compose_prompt(message, history)
@@ -507,7 +531,7 @@ class OpenCodeEngine(_HTTPEngine):
                 async with self._open_sse("GET", "/event") as frames:
                     baseline_ids = await self._v1_message_ids(session_id)
                     body: dict[str, object] = {
-                        "parts": [{"type": "text", "text": prompt}],
+                        "parts": [*_file_parts(attachments), {"type": "text", "text": prompt}],
                     }
                     if model_ref is not None:
                         body["model"] = f"{model_ref[0]}/{model_ref[1]}"
@@ -672,11 +696,7 @@ class OpenCodeEngine(_HTTPEngine):
                     await post_task
             cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
-        messages = (
-            list(usage_messages.values())
-            if usage_messages
-            else list(usage_steps.values())
-        )
+        messages = list(usage_messages.values()) if usage_messages else list(usage_steps.values())
         reliable = baseline_ids is not None and not (
             messages_unreliable if usage_messages else steps_unreliable
         )
@@ -697,7 +717,7 @@ class OpenCodeEngine(_HTTPEngine):
                 expected=(200,),
             )
             payload = response.json()
-        except (EngineError, ValueError):
+        except EngineError, ValueError:
             return None
         data = payload.get("data") if isinstance(payload, Mapping) else payload
         if not isinstance(data, list):
@@ -934,6 +954,27 @@ class OpenCodeEngine(_HTTPEngine):
             return
 
 
+def _file_parts(attachments: Sequence[Any]) -> list[dict[str, str]]:
+    """Documented OpenCode v1 ``FilePartInput`` objects built from stored bytes."""
+
+    parts: list[dict[str, str]] = []
+    for item in attachments:
+        media_type = str(getattr(item, "media_type", "") or "")
+        data = getattr(item, "data", b"")
+        if not media_type or not isinstance(data, (bytes, bytearray)):
+            raise EngineError("protocol", "attachment payload is not supported", retryable=False)
+        encoded = base64.b64encode(bytes(data)).decode("ascii")
+        parts.append(
+            {
+                "type": "file",
+                "mime": media_type,
+                "filename": str(getattr(item, "filename", "") or "adjunto"),
+                "url": f"data:{media_type};base64,{encoded}",
+            }
+        )
+    return parts
+
+
 def _price(value: object) -> float | int | None:
     price = _money(value)
     if price is None or not math.isfinite(price) or price < 0:
@@ -1053,7 +1094,7 @@ def _select_final(
 def _token_count(value: object) -> int | None:
     try:
         return genuine_count(value)
-    except (TypeError, ValueError):
+    except TypeError, ValueError:
         return None
 
 

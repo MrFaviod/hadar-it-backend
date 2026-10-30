@@ -15,7 +15,13 @@ from itsm.attachments.models import Attachment
 from itsm.attachments.storage import BlobStorage, LocalBlobStorage
 from itsm.config import Settings
 from itsm.identity.clock import utcnow
-from itsm.identity.service import Conflict, IdentityService, NotFound, Principal, ValidationFailed
+from itsm.identity.service import (
+    Conflict,
+    IdentityService,
+    NotFound,
+    Principal,
+    ValidationFailed,
+)
 from itsm.inventory.codes import serialized
 from itsm.inventory.media import detect_image_type
 from itsm.inventory.service import InventoryService
@@ -25,7 +31,19 @@ class StorageUnavailable(Exception):
     """Blob storage is unavailable; do not expose filesystem details to callers."""
 
 
-def validate_document(filename: str, category: str, data: bytes, maximum: int) -> str:
+IMAGE_EXTENSIONS = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+CHAT_IMAGE_KIND = "image"
+CHAT_FILE_KIND = "file"
+CHAT_TEXT_KIND = "text"
+
+
+def _display_name(filename: str) -> str:
     if (
         not isinstance(filename, str)
         or not 1 <= len(filename) <= 180
@@ -34,23 +52,16 @@ def validate_document(filename: str, category: str, data: bytes, maximum: int) -
         or any(ord(c) < 32 or ord(c) == 127 for c in filename)
     ):
         raise ValidationFailed("filename must be a plain display name of 1-180 characters")
-    if category not in {"photo", "receipt", "manual", "document"}:
-        raise ValidationFailed("category must be photo, receipt, manual or document")
-    if not isinstance(data, bytes) or not data or len(data) > maximum:
-        raise ValidationFailed(f"file must contain 1-{maximum} bytes")
+    return filename
+
+
+def _sniff(filename: str, data: bytes) -> str | None:
+    """Return the media type the bytes and extension agree on, never a declared one."""
+
     suffix = PurePath(filename).suffix.lower()
     raster = detect_image_type(data)
-    extensions = {
-        ".png": "image/png",
-        ".jpg": "image/jpeg",
-        ".jpeg": "image/jpeg",
-        ".gif": "image/gif",
-        ".webp": "image/webp",
-    }
-    if raster and extensions.get(suffix) == raster:
+    if raster and IMAGE_EXTENSIONS.get(suffix) == raster:
         return raster
-    if category == "photo":
-        raise ValidationFailed("photo requires a PNG, JPEG, GIF or WebP file")
     if suffix == ".pdf" and data.startswith(b"%PDF-") and b"%%EOF" in data[-1024:]:
         return "application/pdf"
     if suffix in {".txt", ".csv"}:
@@ -60,7 +71,41 @@ def validate_document(filename: str, category: str, data: bytes, maximum: int) -
             raise ValidationFailed("text documents must use UTF-8") from None
         if not re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", text):
             return "text/plain; charset=utf-8" if suffix == ".txt" else "text/csv; charset=utf-8"
+    return None
+
+
+def validate_document(filename: str, category: str, data: bytes, maximum: int) -> str:
+    _display_name(filename)
+    if category not in {"photo", "receipt", "manual", "document"}:
+        raise ValidationFailed("category must be photo, receipt, manual or document")
+    if not isinstance(data, bytes) or not data or len(data) > maximum:
+        raise ValidationFailed(f"file must contain 1-{maximum} bytes")
+    media_type = _sniff(filename, data)
+    if media_type is not None:
+        return media_type
+    if category == "photo":
+        raise ValidationFailed("photo requires a PNG, JPEG, GIF or WebP file")
     raise ValidationFailed("unsupported document type or file content")
+
+
+def validate_chat_attachment(filename: str, data: bytes, maximum: int) -> tuple[str, str]:
+    """Chat attachments accept the same raster, PDF and UTF-8 text as asset files.
+
+    HTML, SVG, archives, executables and every other text format stay refused,
+    so the chat can never smuggle a document the asset storage would reject.
+    """
+
+    _display_name(filename)
+    if not isinstance(data, bytes) or not data or len(data) > maximum:
+        raise ValidationFailed(f"file must contain 1-{maximum} bytes")
+    media_type = _sniff(filename, data)
+    if media_type is None:
+        raise ValidationFailed("unsupported chat attachment type or file content")
+    if media_type.startswith("image/"):
+        return media_type, CHAT_IMAGE_KIND
+    if media_type.startswith("text/"):
+        return media_type, CHAT_TEXT_KIND
+    return media_type, CHAT_FILE_KIND
 
 
 class AttachmentService:
@@ -181,13 +226,31 @@ class AttachmentService:
     def download(self, principal: Principal, asset_id: str, attachment_id: str):
         self._authorize(principal, asset_id, "assets.view")
         row = self._row(asset_id, attachment_id)
+        return self._payload(row), self._bytes(row)
+
+    def read_for_chat(self, principal: Principal, attachment_id: str):
+        """Read one stored asset document by id for a chat the caller already owns.
+
+        The asset permission check runs before any byte access, so a chat can
+        never become a side channel into an asset the caller cannot view.
+        """
+
+        if not isinstance(attachment_id, str) or not attachment_id:
+            raise NotFound("attachment not found")
+        row = self._session.get(Attachment, attachment_id)
+        if row is None or row.deleted_at is not None:
+            raise NotFound("attachment not found")
+        self._authorize(principal, row.asset_id, "assets.view")
+        return self._payload(row), self._bytes(row)
+
+    def _bytes(self, row: Attachment) -> bytes:
         try:
             data = self._storage.read(row.blob_key, self._settings.attachment_max_bytes)
         except OSError:
             raise StorageUnavailable() from None
         if len(data) != row.size or hashlib.sha256(data).hexdigest() != row.sha256:
             raise StorageUnavailable()
-        return self._payload(row), data
+        return data
 
     @serialized
     def delete(self, principal: Principal, asset_id: str, attachment_id: str):
