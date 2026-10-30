@@ -22,7 +22,11 @@ import httpx
 import pydantic_ai.models
 import pytest
 from fastapi.testclient import TestClient
-from itsm.agent_integrations.providers import credential_fingerprint
+from itsm.agent_integrations.providers import (
+    DiscoveredModel,
+    ProviderProbe,
+    credential_fingerprint,
+)
 from itsm.agents.runtime import TOOL_NAMES, AgentRuntime
 from itsm.agents.usage import estimated_usage, measured_usage, unavailable_usage
 from itsm.credentials import rotate
@@ -611,7 +615,7 @@ def test_personal_providers_are_invisible_to_everyone_else(environment, monkeypa
     async def _must_not_probe(*args: Any, **kwargs: Any) -> tuple[str, int]:
         raise AssertionError("a foreign provider must never be probed")
 
-    monkeypatch.setattr("itsm.agent_integrations.service.probe_provider_models", _must_not_probe)
+    monkeypatch.setattr("itsm.agent_integrations.service.discover_provider_models", _must_not_probe)
 
     def indistinguishable(foreign: Any, absent: Any) -> None:
         assert foreign.status_code == absent.status_code == 404
@@ -660,10 +664,10 @@ def test_superadmin_cannot_obtain_any_personal_key_material(
     ada = create_provider(env.ada, scope="personal", name="Ada personal", api_key=ADA_KEY)
     create_provider(env.ugo, scope="personal", name="Ugo personal", api_key=UGO_KEY)
 
-    async def _ok_probe(*args: Any, **kwargs: Any) -> tuple[str, int]:
-        return ("ok", 1)
+    async def _ok_probe(*args: Any, **kwargs: Any) -> ProviderProbe:
+        return ProviderProbe("ok", (DiscoveredModel(PERSONAL_MODEL),))
 
-    monkeypatch.setattr("itsm.agent_integrations.service.probe_provider_models", _ok_probe)
+    monkeypatch.setattr("itsm.agent_integrations.service.discover_provider_models", _ok_probe)
     own_check = env.ada.post(f"{API}/agent/providers/{ada['id']}/check")
     assert own_check.status_code == 200, own_check.text
     assert own_check.json()["ok"] is True
@@ -887,7 +891,7 @@ def test_provider_with_unreadable_key_is_reported_and_never_crashes(
     async def _must_not_probe(*args: Any, **kwargs: Any) -> dict[str, Any]:
         raise AssertionError("an unreadable credential must not be sent over the network")
 
-    monkeypatch.setattr("itsm.agent_integrations.service.probe_provider_models", _must_not_probe)
+    monkeypatch.setattr("itsm.agent_integrations.service.discover_provider_models", _must_not_probe)
     env.settings.ai_credential_keys = SecretStr(KEY_FOREIGN)
 
     unreadable = provider_status(env.ada, ada["id"])
@@ -899,7 +903,10 @@ def test_provider_with_unreadable_key_is_reported_and_never_crashes(
     assert check.status_code == 200, check.text
     assert check.json()["ok"] is False
     assert check.json()["code"] == "credential_unavailable"
-    assert set(check.json()) == {"ok", "code", "checkedAt"}
+    assert set(check.json()) == {"ok", "code", "checkedAt", "provider"}
+    assert check.json()["provider"]["id"] == ada["id"]
+    assert check.json()["provider"]["credentialStatus"] == "unreadable"
+    assert_no_secret(check.json(), [ADA_KEY, KEY_OLD, KEY_FOREIGN, *ciphertext])
 
     # A turn fails closed before any stream or upstream call starts, and the
     # refusal carries no key material.
