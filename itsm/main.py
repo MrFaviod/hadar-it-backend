@@ -62,6 +62,7 @@ from itsm.notifications.api import create_notification_router
 from itsm.notifications.service import record_alert_event
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
+from itsm.release_identity import StartupMode, enforce_startup
 from itsm.reports.api import create_reports_router
 from itsm.reports.service import build_report_service
 from itsm.search.api import create_search_router
@@ -170,6 +171,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # The release mode and the database owner are validated before any
+        # service is built, so an invalid mode never reaches a dependency.
+        release: StartupMode = enforce_startup(settings)
+        app.state.release_mode = release.mode
+        app.state.release_capabilities = release.capabilities
         engine = create_engine_from_settings(settings)
         factory = create_session_factory(engine)
         sessions["factory"] = factory
@@ -213,6 +219,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             "app.started",
             app=settings.app_name,
             environment=settings.environment,
+            release_mode=release.mode,
             database=settings.safe_database_url(),
             task_storage=settings.task_storage,
         )
@@ -375,6 +382,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         payload = readiness.as_dict()
         payload["optional_services"] = _optional_services(settings)
+        payload["releaseMode"] = request.app.state.release_mode
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
     api.include_router(create_workflow_router())

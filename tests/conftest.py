@@ -16,10 +16,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from itsm.config import Settings
+from itsm.release_mode import RELEASE_MODE_ENV
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 WORKER_BOOT_TIMEOUT = 20.0
 POLL_INTERVAL = 0.1
+
+# The suite always runs in the permissive dev mode against isolated SQLite files.
+# Mode-specific tests pass an explicit ``environ`` mapping or monkeypatch this
+# value; no production rule is relaxed here.
+os.environ[RELEASE_MODE_ENV] = "dev"
 
 
 @pytest.fixture
@@ -54,6 +60,7 @@ def worker_environment(settings: Settings) -> dict[str, str]:
         {
             "PYTHONPATH": str(BACKEND_ROOT),
             "PYTHONUNBUFFERED": "1",
+            RELEASE_MODE_ENV: os.environ.get(RELEASE_MODE_ENV, "dev"),
             "ITSM_ENVIRONMENT": settings.environment,
             "ITSM_LOG_LEVEL": settings.log_level,
             "ITSM_DATABASE_URL": settings.database_url,

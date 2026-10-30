@@ -7,6 +7,7 @@ periodic maintenance reminder preparation. Arbitrary task names are not accepted
 from __future__ import annotations
 
 import logging
+import os
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -17,6 +18,8 @@ from huey.signals import SIGNAL_ERROR, SIGNAL_RETRYING
 
 from itsm.config import Settings, get_settings
 from itsm.logging import configure_logging, log_event
+from itsm.release_identity import enforce_startup
+from itsm.release_mode import ReleaseModeError
 from itsm.tasks.adapter import TaskState, TaskStorageUnavailable, write_task_state
 
 logger = logging.getLogger("itsm.tasks")
@@ -25,6 +28,9 @@ TASK_NAME_ECHO = "demo_echo"
 TASK_NAME_FAILURE = "demo_failure"
 TASK_NAME_PERIODIC = "demo_periodic"
 TASK_QUEUE_NAME = "itsm"
+
+#: Process exit code when the release mode or the database owner is refused.
+WORKER_REFUSED_EXIT_CODE = 2
 
 
 class DemoTaskFailure(RuntimeError):
@@ -126,10 +132,22 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
     @huey.on_startup()
     def on_worker_startup() -> None:
         configure_logging(settings.log_level, secrets=settings.sensitive_values())
+        # The worker refuses to consume work in an invalid mode or against a
+        # database owned by another mode, before any task is dequeued.
+        try:
+            release = enforce_startup(settings)
+        except ReleaseModeError as exc:
+            log_event(logger, "worker.refused", level=logging.ERROR, reason=str(exc))
+            # Huey logs startup-hook exceptions and keeps consuming, and hooks run
+            # in the worker thread or child process, so an exception cannot stop
+            # the consumer. Ending the process is the only refusal huey cannot
+            # swallow; with ``-k thread`` this stops the whole consumer.
+            os._exit(WORKER_REFUSED_EXIT_CODE)
         log_event(
             logger,
             "worker.started",
             app=settings.app_name,
+            release_mode=release.mode,
             task_storage=settings.task_storage,
         )
 
