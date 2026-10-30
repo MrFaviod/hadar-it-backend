@@ -352,6 +352,177 @@ def write_status(root: Path, data: dict[str, Any]) -> None:
     _fsync_directory(root)
 
 
+# --------------------------------------------------------------------------- #
+# Published summary (written here, read by the API, never written by it)
+# --------------------------------------------------------------------------- #
+# ``status.json`` under the backup root stays the private ops record and keeps its
+# raw locators for backward compatibility. The external copy that the API mounts
+# read-only carries only these allow-listed keys. Redaction happens at the source,
+# so a locator, digest or credential never reaches the browser document.
+
+PUBLISHED_SUMMARY_KEYS = (
+    "status",
+    "engine",
+    "backupCount",
+    "lastBackup",
+    "failures",
+    "lastUpgrade",
+    "updatedAt",
+)
+#: Fields the private ops record gains from publication. ``failures`` and
+#: ``lastUpgrade`` already live there as raw history and are never replaced by
+#: the sanitized browser copy.
+PUBLISHED_RECORD_KEYS = ("status", "engine", "backupCount", "lastBackup", "updatedAt")
+PUBLISHED_LAST_BACKUP_KEYS = (
+    "id",
+    "createdAt",
+    "size",
+    "engine",
+    "verified",
+    "checksum",
+    "alembicRevision",
+)
+PUBLISHED_LAST_UPGRADE_KEYS = ("status", "currentRevision", "headRevision", "backupId")
+PUBLISHED_TEXT_MAX = 200
+PUBLISHED_REASON_MAX = 500
+MAX_PUBLISHED_FAILURES = 10
+
+_URL_LIKE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*")
+_PATH_LIKE = re.compile(r"(?:[A-Za-z]:[\\/]|(?<![\w.])/)[^\s,;\"']*")
+_CREDENTIAL_PAIR = re.compile(
+    r"(?i)\b(password|passwd|secret|token|api[_-]?key|apikey|authorization|dsn|database_url|url)"
+    r"(\s*[=:]\s*)(\S+)"
+)
+_BEARER = re.compile(r"(?i)\bbearer\s+\S+")
+
+
+def scrub(text: str, secrets: tuple[str, ...] = ()) -> str:
+    """Sanitize operator-facing text at the source before it is published.
+
+    Configured credential values are masked first, then the recognizable
+    carriers a browser must never see: URLs/DSNs, ``key=value`` credentials,
+    bearer headers, filesystem paths and locators. Plain prose stays readable so
+    an operator can still tell what failed.
+    """
+    masked = sanitize(text, secrets)
+    masked = _URL_LIKE.sub(REDACTED, masked)
+    masked = _CREDENTIAL_PAIR.sub(rf"\1\2{REDACTED}", masked)
+    masked = _BEARER.sub(f"Bearer {REDACTED}", masked)
+    return _PATH_LIKE.sub(REDACTED, masked)
+
+
+def _published_text(
+    value: object, secrets: tuple[str, ...], *, limit: int = PUBLISHED_TEXT_MAX
+) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return scrub(value.strip(), secrets)[:limit]
+
+
+def _published_flag(value: object) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _published_count(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _published_last_backup(value: object, secrets: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    identifier = value.get("id")
+    summary: dict[str, Any] = {
+        "id": identifier if isinstance(identifier, str) and _IDENTIFIER.match(identifier) else None,
+        "createdAt": _published_text(value.get("createdAt"), secrets),
+        "size": _published_count(value.get("size")),
+        "engine": _published_text(value.get("engine"), secrets),
+        "verified": _published_flag(value.get("verified")),
+        "checksum": _published_flag(value.get("checksum")),
+        "alembicRevision": _published_text(value.get("alembicRevision"), secrets),
+    }
+    return None if all(item is None for item in summary.values()) else summary
+
+
+def _published_failures(value: object, secrets: tuple[str, ...]) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        entry: dict[str, Any] = {
+            "at": _published_text(item.get("at"), secrets),
+            "operation": _published_text(item.get("operation"), secrets),
+            "reason": _published_text(item.get("reason"), secrets, limit=PUBLISHED_REASON_MAX),
+        }
+        if entry["operation"] is None and entry["reason"] is None:
+            continue
+        entries.append(entry)
+        if len(entries) == MAX_PUBLISHED_FAILURES:
+            break
+    return entries
+
+
+def _published_last_upgrade(value: object, secrets: tuple[str, ...]) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    summary: dict[str, Any] = {
+        key: _published_text(value.get(key), secrets) for key in PUBLISHED_LAST_UPGRADE_KEYS
+    }
+    return None if all(item is None for item in summary.values()) else summary
+
+
+def public_summary(payload: Mapping[str, Any], secrets: tuple[str, ...] = ()) -> dict[str, Any]:
+    """Return the allow-listed, source-sanitized operational summary."""
+    return {
+        "status": _published_text(payload.get("status"), secrets),
+        "engine": _published_text(payload.get("engine"), secrets),
+        "backupCount": _published_count(payload.get("backupCount")),
+        "lastBackup": _published_last_backup(payload.get("lastBackup"), secrets),
+        "failures": _published_failures(payload.get("failures"), secrets),
+        "lastUpgrade": _published_last_upgrade(payload.get("lastUpgrade"), secrets),
+        "updatedAt": isoformat(utc_now()),
+    }
+
+
+def write_published_copy(path: Path, summary: Mapping[str, Any]) -> None:
+    """Write the public summary atomically (0600) into an existing owner directory.
+
+    The directory is provisioned by the deployment as owner-only (0700); this
+    function never creates it and never widens its mode.
+    """
+    directory = path.parent
+    if not directory.is_dir():
+        raise OpsError("published status directory does not exist")
+    temporary = directory / f".{path.name}-{uuid.uuid4().hex[:8]}.tmp"
+    try:
+        _write_private(temporary, json.dumps(dict(summary), indent=2, sort_keys=True).encode())
+        os.replace(temporary, path)
+        _fsync_directory(directory)
+    except BaseException:
+        temporary.unlink(missing_ok=True)
+        raise
+
+
+def publish_summary(
+    root: Path,
+    payload: Mapping[str, Any],
+    *,
+    secrets: tuple[str, ...] = (),
+    external_path: Path | None = None,
+) -> dict[str, Any]:
+    """Publish the summary, keeping failure/upgrade history and the private record."""
+    summary = public_summary(payload, secrets=secrets)
+    stored = read_status(root)
+    stored.update({key: summary[key] for key in PUBLISHED_RECORD_KEYS})
+    write_status(root, stored)
+    if external_path is not None:
+        write_published_copy(external_path, summary)
+    return summary
+
+
 def record_failure(
     root: Path,
     *,

@@ -9,7 +9,8 @@ COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --gid 10001 itsm \
     && useradd --uid 10001 --gid itsm --no-create-home itsm \
-    && mkdir -p /data/app /data/tasks /data/attachments /data/dev /data/demo /data/backups \
+    && mkdir -p /data/app /data/tasks /data/attachments /data/dev /data/demo /data/backups /data/backup-status \
+    && chmod 0700 /data/backup-status \
     && chown -R itsm:itsm /data
 COPY pyproject.toml alembic.ini ./
 COPY itsm ./itsm

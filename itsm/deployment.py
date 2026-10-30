@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import contextlib
 import json
 import os
 import secrets
@@ -17,6 +18,7 @@ from itsm.database import create_engine_from_settings
 from itsm.devtools.database import migrate_to_head
 from itsm.identity.models import Identity
 from itsm.ops import service, upgrade
+from itsm.ops.engines import OpsError
 from itsm.release_identity import (
     DeploymentIdentityError,
     enforce_startup,
@@ -71,18 +73,39 @@ def prepare() -> dict:
         engine.dispose()
 
 
+def _ops_status_path() -> Path | None:
+    """Optional external copy of the published summary; absolute and pre-provisioned."""
+    raw = os.environ.get("ITSM_OPS_STATUS_PATH", "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        raise DeploymentIdentityError("ITSM_OPS_STATUS_PATH must be an absolute path")
+    return path
+
+
 def backup_cycle() -> dict:
-    """Produce and verify a recoverable artifact before applying retention."""
+    """Produce and verify a recoverable artifact, apply retention and publish."""
     if read_release_mode() != "prod":
         raise DeploymentIdentityError("scheduled backups require RELEASE_MODE=prod")
     settings = get_settings()
     enforce_startup(settings, require_identity=True)
     context = service.OpsContext(
-        settings, Path(os.environ.get("ITSM_OPS_BACKUP_ROOT", "/data/backups"))
+        settings,
+        Path(os.environ.get("ITSM_OPS_BACKUP_ROOT", "/data/backups")),
+        status_path=_ops_status_path(),
     )
-    artifact = service.backup(context)
+    try:
+        artifact = service.backup(context)
+    except OpsError:
+        # Record the failure and publish the last healthy artifact's real state.
+        with contextlib.suppress(OpsError, OSError):
+            service.publish_status(context)
+        raise
     verified = service.verify(context, artifact.manifest.id)
     if not verified["verified"]:
+        with contextlib.suppress(OpsError, OSError):
+            service.publish_status(context)
         raise DeploymentIdentityError("backup verification failed; retention not applied")
     service.prune(
         context,
@@ -90,6 +113,7 @@ def backup_cycle() -> dict:
         max_age_days=None,
         dry_run=False,
     )
+    service.publish_status(context)
     return {"status": "ok", "backupId": artifact.manifest.id}
 
 

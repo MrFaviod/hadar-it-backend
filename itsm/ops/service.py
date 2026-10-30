@@ -20,7 +20,7 @@ import shutil
 import sqlite3
 import subprocess
 import tempfile
-from collections.abc import Iterator
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -56,10 +56,17 @@ class RestoreRefused(OpsError):
 
 @dataclass(frozen=True)
 class OpsContext:
-    """Settings plus the operator-selected backup root."""
+    """Settings plus the operator-selected backup root.
+
+    ``status_path`` is the optional external copy of the published summary: a
+    separate, deployment-provisioned file the API can mount read-only without
+    exposing the private backup volume. The backup root always keeps its own
+    private ``status.json``.
+    """
 
     settings: Settings
     backup_root: Path
+    status_path: Path | None = None
 
     def target(self) -> DatabaseTarget:
         return engines.database_target(self.settings.database_url)
@@ -686,6 +693,33 @@ def prune(
     }
 
 
+def _last_backup_payload(
+    artifacts: list[store.BackupArtifact],
+) -> dict[str, Any] | None:
+    """Describe the newest artifact, re-reading its dump instead of trusting metadata."""
+    if not artifacts:
+        return None
+    last = artifacts[0]
+    try:
+        checksum_ok = (
+            last.dump_path.is_file()
+            and store.digest_file(last.dump_path)[0] == last.manifest.sha256
+        )
+    except OSError:
+        checksum_ok = False
+    return {
+        "id": last.manifest.id,
+        "createdAt": last.manifest.created_at,
+        "size": last.manifest.size,
+        "engine": last.manifest.engine,
+        "sha256": last.manifest.sha256,
+        "verified": last.manifest.verified if checksum_ok else False,
+        "checksum": checksum_ok,
+        "alembicRevision": last.manifest.alembic_revision,
+        "path": str(last.directory),
+    }
+
+
 def status(context: OpsContext) -> dict[str, Any]:
     """Report the latest artifact, failures and last upgrade result."""
     root = context.backup_root
@@ -695,33 +729,50 @@ def status(context: OpsContext) -> dict[str, Any]:
         target = None
     artifacts = store.list_artifacts(root)
     stored = store.read_status(root)
-    last_payload: dict[str, Any] | None = None
-    if artifacts:
-        last = artifacts[0]
-        checksum_ok = (
-            last.dump_path.is_file()
-            and store.digest_file(last.dump_path)[0] == last.manifest.sha256
-        )
-        verified = last.manifest.verified if checksum_ok else False
-        last_payload = {
-            "id": last.manifest.id,
-            "createdAt": last.manifest.created_at,
-            "size": last.manifest.size,
-            "engine": last.manifest.engine,
-            "sha256": last.manifest.sha256,
-            "verified": verified,
-            "checksum": checksum_ok,
-            "alembicRevision": last.manifest.alembic_revision,
-            "path": str(last.directory),
-        }
     return {
         "status": "ok",
         "engine": None if target is None else target.engine,
         "database": None if target is None else target.describe(),
         "backupRoot": str(root),
         "backupCount": len(artifacts),
-        "lastBackup": last_payload,
+        "lastBackup": _last_backup_payload(artifacts),
         "failures": stored.get("failures", []),
         "lastUpgrade": stored.get("lastUpgrade"),
         "updatedAt": stored.get("updatedAt"),
     }
+
+
+def _publication_state(last_backup: Mapping[str, Any] | None) -> str | None:
+    """Operational health of the newest artifact as published to the browser."""
+    if last_backup is None:
+        return None
+    if last_backup.get("checksum") is False or last_backup.get("verified") is False:
+        return "failed"
+    return "ok" if last_backup.get("verified") is True else "unverified"
+
+
+def publish_status(context: OpsContext) -> dict[str, Any]:
+    """Publish the sanitized operational summary the read-only API serves.
+
+    Failure and upgrade history in the private status record is preserved and
+    sanitized at the source; the external copy (when configured) carries the same
+    allow-listed summary and no private locators.
+    """
+    root = context.backup_root
+    try:
+        target: DatabaseTarget | None = context.target()
+    except OpsError:
+        target = None
+    secrets = () if target is None else _secrets(target)
+    artifacts = store.list_artifacts(root)
+    stored = store.read_status(root)
+    last_backup = _last_backup_payload(artifacts)
+    payload: dict[str, Any] = {
+        "status": _publication_state(last_backup),
+        "engine": None if target is None else target.engine,
+        "backupCount": len(artifacts),
+        "lastBackup": last_backup,
+        "failures": stored.get("failures", []),
+        "lastUpgrade": stored.get("lastUpgrade"),
+    }
+    return store.publish_summary(root, payload, secrets=secrets, external_path=context.status_path)
