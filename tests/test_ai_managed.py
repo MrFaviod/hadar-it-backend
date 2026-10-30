@@ -1086,3 +1086,48 @@ def test_native_engine_factory_selects_both_adapters():
     asyncio.run(close())
     with pytest.raises(ManagedEngineError):
         native_engine("pydantic", EngineConfig(base_url="http://127.0.0.1:1"))
+
+
+def test_run_scoped_key_is_the_only_ai_credential_in_a_personal_run(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """S11 guard: a personal provider key in the parent environment never reaches
+    the disposable profile, the child environment or the native argv."""
+
+    personal_key = "sk-personal-provider-must-stay-out"
+    monkeypatch.setenv("OPENAI_API_KEY", personal_key)
+    monkeypatch.setenv("ITSM_PERSONAL_PROVIDER_KEY", personal_key)
+    binary = _write_fake_engine(tmp_path)
+    profile_root = tmp_path / "project"
+    profile_root.mkdir()
+    inputs = _profile_inputs(profile_root)
+
+    async def scenario() -> tuple[dict[str, Any], str]:
+        holder: dict[str, Any] = {}
+        runner = ManagedEngineRunner(
+            _settings(tmp_path, binary),
+            _instance("opencode"),
+            _Lease(),
+            GATEWAY,
+            profile=inputs,
+            engine_factory=_factory(holder),
+        )
+        async with runner as active:
+            record = holder["adapter"].record
+            while record is None:
+                await asyncio.sleep(0.02)
+                record = holder["adapter"].record
+            profile = active.profile_dir
+            assert profile is not None
+            written = _text_files(profile)
+            [event async for event in active.stream("hola", session_id="session-1")]
+            return record, written
+
+    record, written = asyncio.run(scenario())
+    assert record["env"][GATEWAY_KEY_ENV] == LEASE_TOKEN
+    assert not any("API_KEY" in name for name in record["envNames"])
+    assert all(value is None or personal_key not in value for value in record["env"].values())
+    assert all(personal_key not in argument for argument in record["argv"])
+    assert personal_key not in written
+    assert personal_key not in json.dumps(record["envNames"])
+    assert GATEWAY_KEY_ENV in written

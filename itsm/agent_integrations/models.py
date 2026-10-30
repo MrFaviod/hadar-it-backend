@@ -79,6 +79,7 @@ class AgentSession(InventoryBase):
     id: Mapped[str] = mapped_column(String(36), primary_key=True)
     owner_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
     instance_id: Mapped[str] = mapped_column(String(36), nullable=False, index=True)
+    provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     engine: Mapped[str] = mapped_column(String(32), nullable=False)
     model: Mapped[str] = mapped_column(String(200), nullable=False)
     status: Mapped[str] = mapped_column(String(16), nullable=False, default="idle")

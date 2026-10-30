@@ -153,6 +153,7 @@ class _SessionSnapshot:
     messages: list[dict[str, Any]]
     capabilities: dict[str, bool]
     asset_id: str | None
+    provider_id: str | None = None
 
 
 @dataclass
@@ -168,6 +169,9 @@ class Turn:
     engine: Any = None
     external_session_id: str | None = None
     provider_selection: ProviderModelSelection | None = None
+    provider_id: str | None = None
+    provider_scope: str | None = None
+    provider_name: str | None = None
     run_id: str | None = None
     quota: Any = None
     cancel_sent: bool = False
@@ -626,6 +630,34 @@ class AgentIntegrationService:
             api_key=credential,
             allow_private=row.scope != "personal",
         )
+
+    def _managed_provider(
+        self,
+        db: Session,
+        principal: Principal,
+        instance: AgentInstance,
+        provider_id: str | None,
+    ) -> AgentProvider:
+        """Resolve the provider a managed run may spend through.
+
+        An explicit selection is bounded by visibility: another person's provider
+        and a nonexistent one answer identically. Without a selection the
+        instance's configured global provider applies and must stay usable.
+        """
+
+        if provider_id is None:
+            bound = db.get(AgentProvider, instance.managed_provider_id or "")
+            if bound is None or bound.scope != "global" or not bound.enabled:
+                raise IntegrationUnavailable("the managed global provider is unavailable")
+            return bound
+        selected = db.get(AgentProvider, provider_id)
+        if selected is None or not self._provider_visible(selected, principal):
+            raise NotFound("provider not found")
+        if not selected.enabled:
+            raise ValidationFailed("the selected provider is disabled")
+        if selected.scope == "personal":
+            self._require_personal_provider(db, principal)
+        return selected
 
     def _admin_instance(self, row: AgentInstance) -> dict[str, Any]:
         return {
@@ -1329,6 +1361,7 @@ class AgentIntegrationService:
         return {
             "id": row.id,
             "instanceId": row.instance_id,
+            "providerId": row.provider_id,
             "engine": row.engine,
             "model": row.model,
             "status": row.status,
@@ -1345,6 +1378,7 @@ class AgentIntegrationService:
         return {
             "id": row.id,
             "instanceId": row.instance_id,
+            "providerId": row.provider_id,
             "engine": row.engine,
             "model": row.model,
             "status": row.status,
@@ -1521,9 +1555,11 @@ class AgentIntegrationService:
         model = _label(payload.get("model"), limit=200)
         if model is None:
             raise ValidationFailed("model is required")
+        provider_id = _label(payload.get("providerId"), limit=36)
         asset_id = _uuid_text(payload.get("assetId"), "assetId")
         context = self._context_messages(payload.get("context"))
 
+        selected_provider: AgentProvider | None = None
         with self._session() as db:
             self._ensure_builtin(db)
             snapshot, provider = self._resolve_instance(db, principal, instance_id)
@@ -1535,7 +1571,14 @@ class AgentIntegrationService:
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
+                if provider_id is not None:
+                    if snapshot.quota_mode != "managed":
+                        raise ValidationFailed("direct engines cannot select a provider")
+                    selected_provider = self._managed_provider(db, principal, instance, provider_id)
+                    model = self._validate_provider_model(selected_provider, model)
             else:
+                if provider_id is not None:
+                    raise ValidationFailed("providerId is only supported by managed engines")
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
                     self._validate_provider_model(provider, model)
@@ -1581,10 +1624,20 @@ class AgentIntegrationService:
                 raise Conflict("the selected provider changed while starting the session")
             if provider is not None and provider.scope == "personal":
                 self._require_personal_provider(db, principal)
+            if selected_provider is not None:
+                current_instance = self._instance(db, instance_id)
+                if current_instance.quota_mode != "managed":
+                    raise Conflict("the selected instance changed while starting the session")
+                current_selected = self._managed_provider(
+                    db, principal, current_instance, provider_id
+                )
+                if current_selected.id != selected_provider.id:
+                    raise Conflict("the selected provider changed while starting the session")
             row = AgentSession(
                 id=str(uuid4()),
                 owner_id=principal.actor_id,
                 instance_id=snapshot.id,
+                provider_id=selected_provider.id if selected_provider is not None else None,
                 engine=snapshot.engine,
                 model=model,
                 status="idle",
@@ -1613,6 +1666,10 @@ class AgentIntegrationService:
         self._require_human(principal)
         requested_model = _label(payload.get("model"), limit=200)
         instance_id = _label(payload.get("instanceId"), limit=36)
+        provider_supplied = "providerId" in payload
+        requested_provider_id = _label(payload.get("providerId"), limit=36)
+        selected_provider: AgentProvider | None = None
+        final_provider_id: str | None = None
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
@@ -1630,7 +1687,31 @@ class AgentIntegrationService:
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
                 value = requested_model
+                if snapshot.quota_mode == "managed":
+                    if provider_supplied:
+                        chosen_provider_id = requested_provider_id
+                    elif target_id == row.instance_id:
+                        chosen_provider_id = row.provider_id
+                    else:
+                        chosen_provider_id = None
+                    selected_provider = self._managed_provider(
+                        db, principal, instance, chosen_provider_id
+                    )
+                    configured = self._provider_models(selected_provider)
+                    if requested_model is not None:
+                        value = self._validate_provider_model(selected_provider, requested_model)
+                    elif current_model in configured and target_id == row.instance_id:
+                        value = current_model
+                    elif configured:
+                        value = configured[0]
+                    else:
+                        raise ValidationFailed("the selected provider has no configured models")
+                    final_provider_id = chosen_provider_id
+                elif provider_supplied:
+                    raise ValidationFailed("direct engines cannot select a provider")
             else:
+                if provider_supplied:
+                    raise ValidationFailed("providerId is only supported by managed engines")
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
                     configured = self._provider_models(provider)
@@ -1657,22 +1738,26 @@ class AgentIntegrationService:
         if snapshot.engine != PYDANTIC_ENGINE:
             if not capabilities.get("model_switch", True):
                 raise Conflict("the selected engine does not support changing models")
-            info = await self._discover(snapshot)
-            model_ids = [item["id"] for item in info["models"]]
-            available = set(model_ids)
-            if requested_model is not None:
-                value = requested_model
-            elif snapshot.default_model in available:
-                value = snapshot.default_model
-            elif current_model in available:
-                value = current_model
-            elif model_ids:
-                value = model_ids[0]
+            if snapshot.quota_mode == "managed":
+                # Managed runs never touch the shared instance; the gateway owns the models.
+                capabilities = dict(row.capabilities or {})
             else:
-                raise ValidationFailed("the selected instance exposes no models")
-            if value not in available:
-                raise ValidationFailed("the selected model is not available on this instance")
-            capabilities = self._session_capabilities(snapshot.engine, info)
+                info = await self._discover(snapshot)
+                model_ids = [item["id"] for item in info["models"]]
+                available = set(model_ids)
+                if requested_model is not None:
+                    value = requested_model
+                elif snapshot.default_model in available:
+                    value = snapshot.default_model
+                elif current_model in available:
+                    value = current_model
+                elif model_ids:
+                    value = model_ids[0]
+                else:
+                    raise ValidationFailed("the selected instance exposes no models")
+                if value not in available:
+                    raise ValidationFailed("the selected model is not available on this instance")
+                capabilities = self._session_capabilities(snapshot.engine, info)
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
@@ -1686,6 +1771,12 @@ class AgentIntegrationService:
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
+                if target.quota_mode == "managed" and selected_provider is not None:
+                    current_selected = self._managed_provider(
+                        db, principal, instance, final_provider_id
+                    )
+                    if current_selected.id != selected_provider.id:
+                        raise Conflict("the selected provider changed while switching engines")
             else:
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
@@ -1694,7 +1785,11 @@ class AgentIntegrationService:
                         self._require_personal_provider(db, principal)
                 elif value != self._settings.agent_model:
                     raise Conflict("the built-in instance uses the server-configured model")
-            values: dict[str, Any] = {"model": value, "updated_at": utcnow()}
+            values: dict[str, Any] = {
+                "model": value,
+                "provider_id": final_provider_id,
+                "updated_at": utcnow(),
+            }
             if target_id != row.instance_id:
                 values.update(
                     instance_id=target_id,
@@ -1702,6 +1797,11 @@ class AgentIntegrationService:
                     external_session_id=None,
                     capabilities=capabilities,
                 )
+            provider_guard = (
+                AgentSession.provider_id.is_(None)
+                if row.provider_id is None
+                else AgentSession.provider_id == row.provider_id
+            )
             claimed = db.execute(
                 update(AgentSession)
                 .where(
@@ -1710,6 +1810,7 @@ class AgentIntegrationService:
                     AgentSession.status == "idle",
                     AgentSession.instance_id == row.instance_id,
                     AgentSession.model == row.model,
+                    provider_guard,
                     AgentSession.updated_at == original_updated_at,
                 )
                 .values(**values)
@@ -1802,9 +1903,7 @@ class AgentIntegrationService:
                         "company-funded direct engines require an explicit quota exception"
                     )
                 if instance.quota_mode == "managed":
-                    provider = self._provider_row(db, instance.managed_provider_id or "")
-                    if provider.scope != "global" or not provider.enabled:
-                        raise IntegrationUnavailable("the managed global provider is unavailable")
+                    provider = self._managed_provider(db, principal, instance_row, row.provider_id)
                     provider_selection = self._provider_selection(
                         db, principal, provider, row.model
                     )
@@ -1822,10 +1921,13 @@ class AgentIntegrationService:
                 raise Conflict("a response is already running in this session")
             from itsm.agents.quota import reserve_run
 
+            turn_provider_id = provider.id if provider is not None else None
+            turn_provider_scope = provider.scope if provider is not None else None
+            turn_provider_name = provider.name if provider is not None else None
             attribution = {
-                "provider_id": provider.id if provider is not None else None,
-                "provider_scope": provider.scope if provider is not None else None,
-                "provider_name": provider.name if provider is not None else None,
+                "provider_id": turn_provider_id,
+                "provider_scope": turn_provider_scope,
+                "provider_name": turn_provider_name,
                 "model": row.model,
             }
             quota = reserve_run(
@@ -1882,6 +1984,7 @@ class AgentIntegrationService:
                 messages=messages,
                 capabilities=dict(row.capabilities or {}),
                 asset_id=asset_id,
+                provider_id=row.provider_id,
             )
             instance_snapshot = instance
         turn = Turn(
@@ -1893,6 +1996,9 @@ class AgentIntegrationService:
             asset_id=asset_id,
             external_session_id=snapshot.external_session_id,
             provider_selection=provider_selection,
+            provider_id=turn_provider_id,
+            provider_scope=turn_provider_scope,
+            provider_name=turn_provider_name,
             run_id=run_id,
             quota=quota,
         )
@@ -2061,6 +2167,8 @@ class AgentIntegrationService:
         gateway_url = settings.ai_managed_gateway_url
         if not gateway_url or turn.provider_selection is None or turn.quota is None:
             raise IntegrationUnavailable("the managed engine gateway is not configured")
+        if turn.provider_id is None or turn.provider_scope is None or turn.provider_name is None:
+            raise IntegrationUnavailable("the managed engine provider is not configured")
         with self._session() as db:
             row = db.get(AgentInstance, turn.instance.id)
             installation = self._verified_installation(db, row) if row else None
@@ -2075,7 +2183,6 @@ class AgentIntegrationService:
                 name: self._catalog_instance().get_skill(name)["files"]
                 for name in _skill_names(receipt.get("skills"))
             }
-            provider_name = self._provider_row(db, turn.instance.managed_provider_id).name
         profile = ManagedProfileInputs(
             mcp_url=mcp.get("url"), mcp_token=token, skill_packages=packages
         )
@@ -2086,9 +2193,9 @@ class AgentIntegrationService:
             funding=grant.funding,
             parent_reservation_id=grant.reservation_id,
             selection=turn.provider_selection,
-            provider_id=turn.instance.managed_provider_id,
-            provider_scope="global",
-            provider_name=provider_name,
+            provider_id=turn.provider_id,
+            provider_scope=turn.provider_scope,
+            provider_name=turn.provider_name,
             model=turn.session.model,
             engine=turn.session.engine,
             run_id=turn.run_id,

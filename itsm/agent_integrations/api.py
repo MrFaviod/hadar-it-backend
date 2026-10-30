@@ -101,6 +101,7 @@ class SessionCreatePayload(BaseModel):
 
     instanceId: str = Field(min_length=1, max_length=36)
     model: str = Field(min_length=1, max_length=200)
+    providerId: str | None = Field(default=None, min_length=1, max_length=36)
     context: list[ContextMessage] | None = Field(default=None, max_length=50)
     assetId: str | None = Field(default=None, max_length=36)
 
@@ -117,11 +118,12 @@ class SessionUpdatePayload(BaseModel):
 
     model: str | None = Field(default=None, min_length=1, max_length=200)
     instanceId: str | None = Field(default=None, min_length=1, max_length=36)
+    providerId: str | None = Field(default=None, min_length=1, max_length=36)
 
     @model_validator(mode="after")
     def _require_change(self) -> SessionUpdatePayload:
-        if self.model is None and self.instanceId is None:
-            raise ValueError("model or instanceId is required")
+        if not self.model_fields_set & {"model", "instanceId", "providerId"}:
+            raise ValueError("model, instanceId or providerId is required")
         return self
 
 
