@@ -44,11 +44,12 @@ from itsm.agent_integrations.providers import (
     ProviderEndpointError,
     ProviderModelSelection,
     ProviderNetworkPolicy,
+    ProviderProbe,
     credential_key_state,
     credential_key_values,
     credential_storage_available,
+    discover_provider_models,
     personal_endpoint_policy,
-    probe_provider_models,
     seal_credential,
     unseal_credential,
     validate_provider_endpoint,
@@ -92,7 +93,13 @@ INSTALL_STATUSES = frozenset(
 )
 INSTALLATION_PREFERENCE_ID = "installation"
 PROVIDER_SCOPES = frozenset({"global", "personal"})
+_MODEL_SELECTIONS = frozenset({"auto", "manual"})
 _MAX_PROVIDER_MODELS = 50
+# Discovered ids are kept up to this documented bound; the offered list stays at
+# ``_MAX_PROVIDER_MODELS`` so a chat selector remains usable.
+_MAX_DISCOVERED_MODELS = 500
+_MODEL_CAPABILITY_FIELDS = ("image", "file")
+_FILE_MODALITIES = frozenset({"file", "document", "pdf"})
 _KEYLESS_GLOBAL_CREDENTIAL = "local"
 SECRET_REF_PATTERN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,127}$")
 _MAX_TEXT = 4000
@@ -261,6 +268,46 @@ def _provider_values(
             raise ValidationFailed("enabled must be a boolean")
         values["enabled"] = enabled
     return values
+
+
+def _model_selection_value(payload: Mapping[str, Any], *, current: str) -> str:
+    """Validate the owner's choice between automatic and manual model lists."""
+    if "modelSelection" not in payload:
+        return current
+    value = payload["modelSelection"]
+    if value not in _MODEL_SELECTIONS:
+        raise ValidationFailed("modelSelection must be auto or manual")
+    return str(value)
+
+
+def _capability_values(payload: Mapping[str, Any]) -> dict[str, dict[str, bool | None]] | None:
+    """Validate owner capability marks, bounded by the discovery inventory size."""
+    if "modelCapabilities" not in payload:
+        return None
+    raw = payload["modelCapabilities"]
+    if raw is None:
+        return {}
+    if not isinstance(raw, Mapping):
+        raise ValidationFailed("modelCapabilities must be an object")
+    marks: dict[str, dict[str, bool | None]] = {}
+    for key, value in raw.items():
+        model_id = _label(key, limit=200)
+        if model_id is None:
+            raise ValidationFailed("modelCapabilities keys must be model identifiers")
+        if not isinstance(value, Mapping):
+            raise ValidationFailed("modelCapabilities entries must be objects")
+        if set(value) - set(_MODEL_CAPABILITY_FIELDS):
+            raise ValidationFailed("modelCapabilities entries accept image and file only")
+        entry: dict[str, bool | None] = {}
+        for capability in _MODEL_CAPABILITY_FIELDS:
+            flag = value.get(capability)
+            if flag is not None and not isinstance(flag, bool):
+                raise ValidationFailed("modelCapabilities marks must be booleans or null")
+            entry[capability] = flag
+        marks[model_id] = entry
+    if len(marks) > _MAX_DISCOVERED_MODELS:
+        raise ValidationFailed("modelCapabilities exceed the configured limit")
+    return marks
 
 
 def _provider_api_key(payload: Mapping[str, Any]) -> str | None:
@@ -545,11 +592,103 @@ class AgentIntegrationService:
         )
 
     @staticmethod
-    def _provider_models(row: AgentProvider) -> list[str]:
+    def _discovered_entries(row: AgentProvider) -> list[dict[str, Any]]:
+        """Stored discovery entries, bounded and normalized for every consumer."""
+        value = row.discovered_models if isinstance(row.discovered_models, list) else []
+        entries: list[dict[str, Any]] = []
+        for item in value:
+            if not isinstance(item, dict):
+                continue
+            model_id = _label(item.get("id"), limit=200)
+            if model_id is None:
+                continue
+            modalities = item.get("inputModalities")
+            entries.append(
+                {
+                    "id": model_id,
+                    "inputModalities": [entry for entry in modalities if isinstance(entry, str)]
+                    if isinstance(modalities, list)
+                    else None,
+                }
+            )
+            if len(entries) >= _MAX_DISCOVERED_MODELS:
+                break
+        return entries
+
+    def _provider_models(self, row: AgentProvider) -> list[str]:
+        """The offered list: discovery in ``auto`` mode, the owner's list otherwise."""
+        if (row.model_selection or "manual") == "auto":
+            return [entry["id"] for entry in self._discovered_entries(row)][:_MAX_PROVIDER_MODELS]
         value = row.models if isinstance(row.models, list) else []
         return [item for item in value if isinstance(item, str) and item.strip()][
             :_MAX_PROVIDER_MODELS
         ]
+
+    def _sync_offered(self, row: AgentProvider) -> None:
+        """Persist the offered list on the row so raw readers stay consistent."""
+        row.models = self._provider_models(row)
+
+    def _model_capabilities(self, row: AgentProvider) -> dict[str, dict[str, Any]]:
+        """Per-model image/file marks: owner override, else provider, else unknown."""
+        owner = row.model_capabilities if isinstance(row.model_capabilities, dict) else {}
+
+        def marks(model_id: str, modalities: list[str] | None) -> dict[str, Any]:
+            known = modalities is not None and isinstance(modalities, list)
+            image = "image" in modalities if known else None
+            file = bool(_FILE_MODALITIES.intersection(modalities)) if known else None
+            source = "provider" if known else "unknown"
+            declared = owner.get(model_id)
+            if isinstance(declared, dict):
+                for field in _MODEL_CAPABILITY_FIELDS:
+                    flag = declared.get(field)
+                    if isinstance(flag, bool):
+                        if field == "image":
+                            image = flag
+                        else:
+                            file = flag
+                        source = "owner"
+            return {"image": image, "file": file, "source": source}
+
+        capabilities: dict[str, dict[str, Any]] = {}
+        for entry in self._discovered_entries(row):
+            capabilities[entry["id"]] = marks(entry["id"], entry["inputModalities"])
+        for model_id in self._provider_models(row):
+            capabilities.setdefault(model_id, marks(model_id, None))
+        return capabilities
+
+    def _discovery_payload(self, row: AgentProvider) -> dict[str, Any]:
+        checked_at = row.discovery_checked_at
+        return {
+            "code": row.discovery_status,
+            "checkedAt": checked_at.isoformat() if checked_at is not None else None,
+            "count": len(self._discovered_entries(row)),
+        }
+
+    def _apply_discovery(self, row: AgentProvider, probe: ProviderProbe) -> None:
+        """Store one closed-code discovery result and refresh the offered list."""
+        row.discovery_status = probe.code
+        row.discovery_checked_at = utcnow()
+        row.discovered_models = (
+            [entry.as_payload() for entry in probe.models] if probe.code == "ok" else []
+        )
+        self._sync_offered(row)
+
+    def _validate_manual_models(self, row: AgentProvider) -> None:
+        """A manual list must stay inside the last successful discovery."""
+        if row.discovery_status != "ok":
+            # Discovery unavailable: the owner's identifiers are the only source.
+            return
+        discovered = {entry["id"].casefold() for entry in self._discovered_entries(row)}
+        reported = [model for model in self._provider_models(row) if model.casefold() in discovered]
+        if len(reported) != len(self._provider_models(row)):
+            raise ValidationFailed("the provider does not report the selected models")
+
+    async def _probe_models(self, base_url: str, credential: str, scope: str) -> ProviderProbe:
+        """Discover models through the same guarded transport as a chat turn."""
+        allow_private: bool | ProviderNetworkPolicy = (
+            personal_endpoint_policy(self._settings) if scope == "personal" else True
+        )
+        return await discover_provider_models(base_url, credential, allow_private=allow_private)
 
     @staticmethod
     def _provider_visible(row: AgentProvider, principal: Principal) -> bool:
@@ -581,7 +720,11 @@ class AgentIntegrationService:
             "name": row.name,
             "scope": row.scope,
             "baseUrl": row.base_url,
-            "models": list(row.models or []),
+            "models": self._provider_models(row),
+            "modelSelection": row.model_selection or "manual",
+            "discoveredModels": self._discovered_entries(row),
+            "modelCapabilities": self._model_capabilities(row),
+            "discovery": self._discovery_payload(row),
             "credentialConfigured": bool(row.api_key_ciphertext),
             "credentialStatus": credential_status,
             "enabled": bool(row.enabled),
@@ -831,7 +974,7 @@ class AgentIntegrationService:
                     raise IntegrationUnavailable("the managed provider is unavailable")
                 models = [
                     {"id": item, "name": item, "provider": provider.name, "free": None}
-                    for item in provider.models
+                    for item in self._provider_models(provider)
                 ]
             return {
                 "version": "managed",
@@ -1090,12 +1233,25 @@ class AgentIntegrationService:
             "credentialStorageAvailable": credential_storage_available(self._settings),
         }
 
-    def create_provider(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
+    async def create_provider(
+        self, principal: Principal, payload: Mapping[str, Any]
+    ) -> dict[str, Any]:
+        """Create a provider and discover its models in the same request.
+
+        A failed discovery never blocks saving: the row keeps the closed code
+        and no ids, and the credential, response body and address stay internal.
+        """
         self._require_human(principal)
         scope = payload.get("scope")
         if scope not in PROVIDER_SCOPES:
             raise ValidationFailed("scope must be global or personal")
         api_key = _provider_api_key(payload)
+        # A request that still sends only the historical ``models`` list keeps the
+        # manual behavior it meant before discovery existed; a request without a
+        # list asks for discovery.
+        default_selection = "manual" if payload.get("models") is not None else "auto"
+        selection = _model_selection_value(payload, current=default_selection)
+        capability_values = _capability_values(payload)
         with self._session() as db:
             self._ensure_builtin(db)
             if scope == "global":
@@ -1109,23 +1265,44 @@ class AgentIntegrationService:
                 raise ValidationFailed("provider base URL is required")
             values.setdefault("models", [])
             values.setdefault("enabled", True)
+            ciphertext = self._seal_credential(api_key) if api_key else None
+            base_url = str(values["base_url"])
+        credential = api_key
+        if credential is None and scope == "global":
+            credential = _KEYLESS_GLOBAL_CREDENTIAL
+        probe = (
+            ProviderProbe("credential_unavailable")
+            if credential is None
+            else await self._probe_models(base_url, credential, scope)
+        )
+        with self._session() as db:
             row = AgentProvider(
                 id=str(uuid4()),
                 scope=scope,
                 owner_id=principal.actor_id if scope == "personal" else None,
-                api_key_ciphertext=self._seal_credential(api_key) if api_key else None,
+                api_key_ciphertext=ciphertext,
+                model_selection=selection,
+                model_capabilities=capability_values,
                 **values,
             )
+            self._apply_discovery(row, probe)
+            if selection == "manual":
+                self._validate_manual_models(row)
+            self._sync_offered(row)
             db.add(row)
             db.commit()
             db.refresh(row)
             return self._provider_dto(row)
 
-    def update_provider(
+    async def update_provider(
         self, principal: Principal, provider_id: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
+        """Update a provider; an endpoint or credential change rediscovers models."""
         self._require_human(principal)
         api_key = _provider_api_key(payload)
+        selection: str | None = None
+        capability_values: dict[str, dict[str, bool | None]] | None = None
+        values: dict[str, Any] = {}
         with self._session() as db:
             row = self._provider_row(db, provider_id)
             if row.scope == "personal":
@@ -1140,10 +1317,37 @@ class AgentIntegrationService:
             values = _provider_values(
                 payload, scope=row.scope, policy=self._provider_policy(row.scope)
             )
+            selection = _model_selection_value(payload, current=row.model_selection or "manual")
+            capability_values = _capability_values(payload)
+            scope = row.scope
+            base_url = str(values.get("base_url", row.base_url))
+            credential: str | None = None
+            if "baseUrl" in payload or api_key is not None:
+                try:
+                    credential = api_key or self._provider_credential(row)
+                except IntegrationUnavailable:
+                    credential = None
+        probe: ProviderProbe | None = None
+        if "baseUrl" in payload or api_key is not None:
+            probe = (
+                ProviderProbe("credential_unavailable")
+                if credential is None
+                else await self._probe_models(base_url, credential, scope)
+            )
+        with self._session() as db:
+            row = self._provider_row(db, provider_id)
+            row.model_selection = selection
             for name, value in values.items():
                 setattr(row, name, value)
             if api_key:
                 row.api_key_ciphertext = self._seal_credential(api_key)
+            if capability_values is not None:
+                row.model_capabilities = capability_values
+            if probe is not None:
+                self._apply_discovery(row, probe)
+            if selection == "manual":
+                self._validate_manual_models(row)
+            self._sync_offered(row)
             row.updated_at = utcnow()
             db.commit()
             db.refresh(row)
@@ -1164,7 +1368,7 @@ class AgentIntegrationService:
         return {"id": provider_id, "deleted": True}
 
     async def check_provider(self, principal: Principal, provider_id: str) -> dict[str, Any]:
-        """Owner-authorized, bounded models probe for one stored provider.
+        """Owner-authorized, bounded models probe that also refreshes discovery.
 
         It uses the same guarded transport as a turn, records no usage and never
         returns the credential, an upstream body or a resolved address.
@@ -1183,24 +1387,29 @@ class AgentIntegrationService:
             try:
                 credential = self._provider_credential(row)
             except IntegrationUnavailable:
-                return {
-                    "ok": False,
-                    "code": "credential_unavailable",
-                    "checkedAt": utcnow().isoformat(),
-                }
-        allow_private: bool | ProviderNetworkPolicy = (
-            personal_endpoint_policy(self._settings) if scope == "personal" else True
+                credential = None
+        probe = (
+            ProviderProbe("credential_unavailable")
+            if credential is None
+            else await self._probe_models(base_url, credential, scope)
         )
-        code, model_count = await probe_provider_models(
-            base_url, credential, allow_private=allow_private
-        )
+        with self._session() as db:
+            row = self._provider_row(db, provider_id)
+            self._apply_discovery(row, probe)
+            self._sync_offered(row)
+            checked_at = row.discovery_checked_at or utcnow()
+            row.updated_at = utcnow()
+            db.commit()
+            db.refresh(row)
+            provider = self._provider_dto(row)
         checked: dict[str, Any] = {
-            "ok": code == "ok",
-            "code": code,
-            "checkedAt": utcnow().isoformat(),
+            "ok": probe.code == "ok",
+            "code": probe.code,
+            "checkedAt": checked_at.isoformat(),
+            "provider": provider,
         }
-        if model_count is not None:
-            checked["modelCount"] = model_count
+        if probe.code == "ok":
+            checked["modelCount"] = probe.count
         return checked
 
     # -------------------------------------------------------------- admin: instances

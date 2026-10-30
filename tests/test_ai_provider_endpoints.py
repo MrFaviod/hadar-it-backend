@@ -150,11 +150,16 @@ def _personal_provider(
             "name": "Personal endpoint",
             "baseUrl": base_url or upstream.base_url,
             "models": ["model-a"],
+            "modelSelection": "manual",
             "apiKey": api_key,
         },
         headers=headers,
     )
     assert created.status_code == 201, created.text
+    # Creating a provider already discovers its models; these tests describe the
+    # explicit check operation, so its own requests are counted from zero.
+    upstream.server.hits.clear()
+    upstream.server.authorization.clear()
     return headers, created.json()
 
 
@@ -179,9 +184,19 @@ def test_check_reports_models_for_an_allowlisted_personal_provider(
         assert body["ok"] is True
         assert body["code"] == "ok"
         assert body["modelCount"] == 2
-        assert set(body) == {"ok", "code", "modelCount", "checkedAt"}
+        assert set(body) == {"ok", "code", "modelCount", "checkedAt", "provider"}
+        assert [entry["id"] for entry in body["provider"]["discoveredModels"]] == [
+            "model-a",
+            "model-b",
+        ]
+        assert body["provider"]["discovery"]["code"] == "ok"
         assert "sk-check-secret" not in response.text
-        assert "127.0.0.1" not in response.text
+        # The public provider fields are returned, but discovery never reports a
+        # resolved address, the upstream body or the credential.
+        discovery_text = json.dumps(body["provider"]["discovery"]) + json.dumps(
+            body["provider"]["modelCapabilities"]
+        )
+        assert "127.0.0.1" not in discovery_text
         assert "sk-check-secret" not in caplog.text
         assert upstream.server.hits == ["/v1/models"]
         assert upstream.server.authorization == ["Bearer sk-check-secret"]
@@ -343,11 +358,18 @@ def test_global_provider_check_keeps_owner_trusted_private_access(
                 "name": "Global endpoint",
                 "baseUrl": upstream.base_url,
                 "models": ["model-a"],
+                "modelSelection": "auto",
                 "apiKey": "sk-global-secret",
             },
             headers=headers,
         )
         assert created.status_code == 201, created.text
+        # No selection is sent, so the default auto mode offers what the endpoint
+        # reports instead of the configured list.
+        assert created.json()["modelSelection"] == "auto"
+        assert created.json()["models"] == ["model-a", "model-b"]
+        assert created.json()["discovery"]["code"] == "ok"
+        upstream.server.hits.clear()
 
         response = _check(environment.client, headers, created.json()["id"])
 

@@ -190,6 +190,17 @@ class AgentProvider(InventoryBase):
     models: Mapped[list[str]] = mapped_column(JSON, nullable=False, default=list)
     api_key_ciphertext: Mapped[str | None] = mapped_column(String(4096), nullable=True)
     enabled: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    # Discovery state: rows written before automatic discovery are `manual`, so
+    # they keep offering exactly the list an owner configured by hand.
+    model_selection: Mapped[str] = mapped_column(
+        String(16), nullable=False, default="auto", server_default="auto"
+    )
+    discovered_models: Mapped[list[dict[str, Any]] | None] = mapped_column(JSON, nullable=True)
+    model_capabilities: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    discovery_status: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    discovery_checked_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
