@@ -15,11 +15,14 @@ The gateway is an explicitly bounded admission layer, not an arbitrary proxy:
 
 from __future__ import annotations
 
+import base64
+import binascii
 import hashlib
 import json
 import logging
+import re
 import secrets
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
@@ -58,6 +61,14 @@ from itsm.identity.clock import as_utc, utcnow
 logger = logging.getLogger(__name__)
 
 MAX_REQUEST_BYTES = 2 * 1024 * 1024
+#: Encoded (base64) budget a lease may declare for non-text content parts.
+MAX_ATTACHMENT_BYTES = 4 * 1024 * 1024
+_ALLOWED_INPUT_MODALITIES = frozenset({"image", "file"})
+_ALLOWED_IMAGE_MEDIA = frozenset({"image/png", "image/jpeg", "image/webp", "image/gif"})
+_MAX_CONTENT_PARTS = 256
+_DATA_URL = re.compile(
+    r"^data:(?P<mime>[a-z0-9][a-z0-9.+-]*/[a-z0-9][a-z0-9.+-]*);base64,(?P<data>[A-Za-z0-9+/=]*)$"
+)
 MAX_RESPONSE_BYTES = 8 * 1024 * 1024
 MAX_STREAM_BYTES = 8 * 1024 * 1024
 MAX_EVENT_BYTES = 1024 * 1024
@@ -196,6 +207,8 @@ class LeaseContext:
     context_tokens: int
     output_tokens: int
     expires_at: datetime
+    input_modalities: tuple[str, ...] = ()
+    attachment_bytes: int = 0
 
 
 @dataclass
@@ -434,6 +447,7 @@ class AiGatewayService:
             "contextBound": "operator_declared",
             "streamUsage": "include_usage_required",
             "requestBodyLimitBytes": MAX_REQUEST_BYTES,
+            "attachmentBytesLimit": MAX_ATTACHMENT_BYTES,
             "responseBodyLimitBytes": MAX_RESPONSE_BYTES,
             "streamBodyLimitBytes": MAX_STREAM_BYTES,
         }
@@ -454,7 +468,11 @@ class AiGatewayService:
         context_tokens: int,
         output_tokens: int,
         ttl_seconds: int = DEFAULT_TTL_SECONDS,
+        input_modalities: Sequence[str] = (),
+        attachment_bytes: int = 0,
     ) -> IssuedLease:
+        modalities = _input_modalities(input_modalities)
+        attachment_bytes = _attachment_bytes(attachment_bytes, modalities)
         actor_id = _bounded_text(actor_id, "actor id", 36)
         run_id = _bounded_text(run_id, "run id", 64)
         parent_reservation_id = _bounded_text(parent_reservation_id, "parent reservation id", 36)
@@ -550,6 +568,8 @@ class AiGatewayService:
             engine=engine,
             context_tokens=context_tokens,
             output_tokens=output_tokens,
+            input_modalities=",".join(modalities),
+            attachment_bytes=attachment_bytes,
             selection_ciphertext=ciphertext,
             allow_private=selection.allow_private is True,
             created_at=now,
@@ -1125,7 +1145,11 @@ class AiGatewayService:
             n = body["n"]
             if isinstance(n, bool) or not isinstance(n, int) or n != 1:
                 raise GatewayRejected("unsupported_parameter", "Only n=1 is supported")
-        _validate_messages(body.get("messages"))
+        _validate_messages(
+            body.get("messages"),
+            context.input_modalities,
+            context.attachment_bytes,
+        )
         if "tools" in body:
             _validate_tools(body["tools"])
         if "tool_choice" in body:
@@ -1224,6 +1248,10 @@ def _lease_context(lease: AiGatewayLease) -> LeaseContext:
         context_tokens=lease.context_tokens,
         output_tokens=lease.output_tokens,
         expires_at=as_utc(lease.expires_at),
+        input_modalities=_input_modalities(
+            [item for item in (lease.input_modalities or "").split(",") if item]
+        ),
+        attachment_bytes=int(lease.attachment_bytes or 0),
     )
 
 
@@ -1273,7 +1301,112 @@ def _validate_idempotency_key(value: str | None) -> None:
         raise GatewayRejected("invalid_idempotency_key", "Idempotency-Key is invalid")
 
 
-def _validate_messages(messages: Any) -> None:
+def _input_modalities(value: Any) -> tuple[str, ...]:
+    """Only the documented non-text kinds, bounded and duplicate free."""
+
+    if value is None:
+        return ()
+    if not isinstance(value, (list, tuple)) or isinstance(value, (str, bytes)):
+        raise GatewayRejected("invalid_selection", "input modalities must be a list")
+    bounded: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or item not in _ALLOWED_INPUT_MODALITIES:
+            raise GatewayRejected(
+                "invalid_selection", "input modalities are limited to image and file"
+            )
+        if item not in bounded:
+            bounded.append(item)
+    if len(bounded) > len(_ALLOWED_INPUT_MODALITIES):
+        raise GatewayRejected("invalid_selection", "input modalities exceed the limit")
+    return tuple(bounded)
+
+
+def _attachment_bytes(value: Any, modalities: Sequence[str]) -> int:
+    """Encoded byte budget for attachment parts; zero unless a kind is declared."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise GatewayRejected("invalid_selection", "attachment bytes must be a positive integer")
+    if value > MAX_ATTACHMENT_BYTES:
+        raise GatewayRejected("invalid_selection", "attachment bytes exceed the limit")
+    if value and not modalities:
+        raise GatewayRejected(
+            "invalid_selection", "attachment bytes require a declared input modality"
+        )
+    return int(value)
+
+
+def _part_size(encoded: str) -> int:
+    """Validate base64 and return its encoded size, the lease's budget unit."""
+
+    try:
+        base64.b64decode(encoded, validate=True)
+    except binascii.Error, ValueError:
+        raise GatewayRejected("unsupported_content", "Content part is not valid base64") from None
+    return len(encoded)
+
+
+def _image_part(part: Mapping[str, Any], budget: list[int]) -> None:
+    """Admit one inline image; remote URLs are always refused."""
+
+    if set(part) != {"type", "image_url"}:
+        raise GatewayRejected("unsupported_content", "Unsupported image content part")
+    image = part.get("image_url")
+    if not isinstance(image, Mapping) or set(image) - {"url", "detail"}:
+        raise GatewayRejected("unsupported_content", "Unsupported image content part")
+    if "detail" in image and image["detail"] not in {"auto", "low", "high"}:
+        raise GatewayRejected("unsupported_content", "Unsupported image detail")
+    url = image.get("url")
+    if not isinstance(url, str) or not url:
+        raise GatewayRejected("unsupported_content", "image_url.url must be a string")
+    if not url.startswith("data:"):
+        raise GatewayRejected(
+            "unsupported_content",
+            "Only inline data: image URLs are accepted; remote URLs are refused",
+        )
+    match = _DATA_URL.match(url)
+    if match is None or match.group("mime") not in _ALLOWED_IMAGE_MEDIA:
+        raise GatewayRejected("unsupported_content", "Unsupported image media type")
+    budget[0] += _part_size(match.group("data"))
+
+
+def _file_part(part: Mapping[str, Any], budget: list[int]) -> None:
+    """Admit one inline document; a path, URL or bare name is refused."""
+
+    if set(part) != {"type", "file"}:
+        raise GatewayRejected("unsupported_content", "Unsupported file content part")
+    document = part.get("file")
+    if not isinstance(document, Mapping) or set(document) - {"filename", "file_data"}:
+        raise GatewayRejected("unsupported_content", "Unsupported file content part")
+    filename = document.get("filename")
+    if filename is not None and (
+        not isinstance(filename, str) or not filename or len(filename) > 180
+    ):
+        raise GatewayRejected("unsupported_content", "file.filename is invalid")
+    file_data = document.get("file_data")
+    if not isinstance(file_data, str) or not file_data:
+        raise GatewayRejected("unsupported_content", "file.file_data must be inline base64")
+    if file_data.startswith("data:"):
+        match = _DATA_URL.match(file_data)
+        if match is None:
+            raise GatewayRejected("unsupported_content", "Unsupported file data URL")
+        mime = match.group("mime")
+        if mime != "application/pdf" and not mime.startswith("text/"):
+            raise GatewayRejected("unsupported_content", "Unsupported file media type")
+        budget[0] += _part_size(match.group("data"))
+        return
+    if not isinstance(filename, str) or not filename.lower().endswith((".pdf", ".txt", ".csv")):
+        raise GatewayRejected(
+            "unsupported_content",
+            "Bare base64 file data requires a supported filename",
+        )
+    budget[0] += _part_size(file_data)
+
+
+def _validate_messages(
+    messages: Any,
+    modalities: Sequence[str] = (),
+    attachment_bytes: int = 0,
+) -> None:
     if not isinstance(messages, list) or not messages:
         raise GatewayRejected("invalid_message", "messages must be a non-empty list")
     if len(messages) > 256:
@@ -1293,19 +1426,38 @@ def _validate_messages(messages: Any) -> None:
         if isinstance(content, str):
             pass
         elif isinstance(content, list):
-            if len(content) > 256:
+            if len(content) > _MAX_CONTENT_PARTS:
                 raise GatewayRejected("invalid_message", "Too many content parts")
+            budget = [0]
             for part in content:
-                if (
-                    not isinstance(part, Mapping)
-                    or part.get("type") != "text"
-                    or not isinstance(part.get("text"), str)
-                    or set(part) - {"type", "text"}
-                ):
+                if isinstance(part, Mapping) and part.get("type") == "text":
+                    if not isinstance(part.get("text"), str) or set(part) - {"type", "text"}:
+                        raise GatewayRejected(
+                            "unsupported_content", "Unsupported text content part"
+                        )
+                    continue
+                if not isinstance(part, Mapping):
+                    raise GatewayRejected("unsupported_content", "Unsupported content part")
+                kind = part.get("type")
+                if kind == "image_url" and "image" in modalities:
+                    _image_part(part, budget)
+                    continue
+                if kind == "file" and "file" in modalities:
+                    _file_part(part, budget)
+                    continue
+                if kind in {"image_url", "file"}:
                     raise GatewayRejected(
                         "unsupported_content",
-                        "Only text content parts are supported; files and images are refused",
+                        "This lease does not admit this content part kind",
                     )
+                raise GatewayRejected(
+                    "unsupported_content",
+                    "Only text, image and file content parts are supported",
+                )
+            if budget[0] > attachment_bytes:
+                raise GatewayRejected(
+                    "unsupported_content", "Attachment content exceeds the lease byte budget"
+                )
         elif content is not None:
             raise GatewayRejected("unsupported_content", "Unsupported message content")
         if role == "tool":
@@ -1471,6 +1623,7 @@ def _upstream_error(status_code: int, body: bytes) -> GatewayResult:
 
 
 __all__ = [
+    "MAX_ATTACHMENT_BYTES",
     "MAX_REQUEST_BYTES",
     "MAX_RESPONSE_BYTES",
     "MAX_STREAM_BYTES",
