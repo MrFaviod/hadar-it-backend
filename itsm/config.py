@@ -292,6 +292,18 @@ class Settings(BaseSettings):
             raise ValueError(f"log_level must be one of {sorted(LOG_LEVELS)}")
         return level
 
+    @field_validator(
+        "ai_broker_url",
+        "ai_broker_token",
+        "hermes_inspector_url",
+        "hermes_inspector_token",
+        mode="before",
+    )
+    @classmethod
+    def _empty_optional_runtime_adapter(cls, value: Any) -> Any:
+        """Compose exports empty optional adapter variables when disabled."""
+        return None if value == "" else value
+
     @field_validator("hermes_inspector_url")
     @classmethod
     def _validate_hermes_inspector_url(cls, value: str | None) -> str | None:
