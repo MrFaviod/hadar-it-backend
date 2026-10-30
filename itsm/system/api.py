@@ -58,6 +58,11 @@ def create_system_router() -> APIRouter:
     def status(request: Request, context: AuthDependency) -> dict[str, Any]:
         return _service(request).status(context.principal)
 
+    @router.get("/backups/status")
+    def backup_status(request: Request, context: AuthDependency) -> dict[str, Any]:
+        """Published backup summary; read-only, reserved to the installation owner."""
+        return _service(request).backup_status(context.principal)
+
     @router.get("/configuration")
     def configuration(request: Request, context: AuthDependency) -> dict[str, Any]:
         return _service(request).configuration(context.principal)

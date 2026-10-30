@@ -158,6 +158,11 @@ class Settings(BaseSettings):
     system_executor_url: str = ""
     system_executor_token: SecretStr | None = None
     system_executor_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+    # Optional maintenance-published backup summary. The API only reads this
+    # small JSON file: it never runs backup tools, never opens an engine socket
+    # and never mutates an artifact. Unset means the summary is honestly
+    # unavailable instead of fabricated.
+    backup_status_path: Path | None = None
 
     prometheus_url: str | None = None
     prometheus_token: SecretStr | None = None

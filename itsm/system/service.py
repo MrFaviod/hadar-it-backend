@@ -2,7 +2,11 @@
 
 from __future__ import annotations
 
+import json
+import re
+import stat
 from collections.abc import Callable, Mapping
+from pathlib import Path
 from typing import Any
 
 from sqlalchemy.engine import make_url
@@ -34,6 +38,154 @@ OPERATION_PERMISSIONS: dict[str, str] = {
     "update.prepare": "system.update",
     "backup.create": "system.backup",
 }
+
+
+# ----------------------------------------------------- backup status boundary
+# The maintenance service publishes a small JSON document next to its backup
+# artifacts. The API only reads that document: it never runs a dump or restore
+# tool, never opens an engine socket, never scans artifacts and never recomputes
+# a hash. Everything below is therefore a bounded read plus a strict allow-list
+# of summary fields; locators, filesystem paths, dump names, digests, tool
+# versions and restore commands stay out of the browser surface.
+BACKUP_STATUS_MAX_BYTES = 64 * 1024
+BACKUP_STATUS_MAX_FAILURES = 10
+BACKUP_STATUS_TEXT_MAX = 200
+BACKUP_STATUS_REASON_MAX = 500
+
+_URL_LIKE = re.compile(r"[A-Za-z][A-Za-z0-9+.\-]*://\S*")
+_PATH_LIKE = re.compile(r"(?:[A-Za-z]:[\\/]|(?<![\w.])/)[^\s,;\"']*")
+_CREDENTIAL_PAIR = re.compile(
+    r"(?i)\b(password|passwd|secret|token|api[_-]?key|apikey|authorization|dsn|database_url|url)"
+    r"(\s*[=:]\s*)(\S+)"
+)
+_BEARER = re.compile(r"(?i)\bbearer\s+\S+")
+
+
+def _redacted(value: str) -> str:
+    """Mask locators, filesystem paths and credential-shaped tokens.
+
+    Bare prose is left readable: the publisher already sanitizes configured
+    secrets at the source, and this API cannot recognize an arbitrary opaque
+    word as a secret. Recognizable carriers -- DSNs, URL userinfo, ``key=value``
+    credentials and bearer headers -- are masked entirely.
+    """
+    masked = _URL_LIKE.sub("[redacted]", value)
+    masked = _CREDENTIAL_PAIR.sub(r"\1\2[redacted]", masked)
+    masked = _BEARER.sub("Bearer [redacted]", masked)
+    return _PATH_LIKE.sub("[redacted]", masked)
+
+
+def _text(value: Any, limit: int = BACKUP_STATUS_TEXT_MAX) -> str | None:
+    """Return a bounded redacted string, or ``None`` for any other type."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    return _redacted(value.strip())[:limit]
+
+
+def _count(value: Any) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _flag(value: Any) -> bool | None:
+    return value if isinstance(value, bool) else None
+
+
+def _last_backup_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    summary: dict[str, Any] = {
+        "id": _text(value.get("id")),
+        "createdAt": _text(value.get("createdAt")),
+        "size": _count(value.get("size")),
+        "engine": _text(value.get("engine")),
+        "verified": _flag(value.get("verified")),
+        "checksum": _flag(value.get("checksum")),
+        "alembicRevision": _text(value.get("alembicRevision")),
+    }
+    return None if all(item is None for item in summary.values()) else summary
+
+
+def _failure_summaries(value: Any) -> list[dict[str, Any]]:
+    if not isinstance(value, list):
+        return []
+    entries: list[dict[str, Any]] = []
+    for item in value:
+        if not isinstance(item, Mapping):
+            continue
+        reason = _text(item.get("reason"), BACKUP_STATUS_REASON_MAX)
+        operation = _text(item.get("operation"))
+        if reason is None and operation is None:
+            continue
+        entries.append({"at": _text(item.get("at")), "operation": operation, "reason": reason})
+        if len(entries) == BACKUP_STATUS_MAX_FAILURES:
+            break
+    return entries
+
+
+def _last_upgrade_summary(value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, Mapping):
+        return None
+    summary: dict[str, Any] = {
+        "status": _text(value.get("status")),
+        "currentRevision": _text(value.get("currentRevision")),
+        "headRevision": _text(value.get("headRevision")),
+        "backupId": _text(value.get("backupId")),
+    }
+    return None if all(item is None for item in summary.values()) else summary
+
+
+def _empty_backup_summary() -> dict[str, Any]:
+    return {
+        "status": None,
+        "engine": None,
+        "backupCount": None,
+        "lastBackup": None,
+        "failures": [],
+        "lastUpgrade": None,
+        "updatedAt": None,
+    }
+
+
+def _backup_summary(document: Mapping[str, Any]) -> dict[str, Any]:
+    return {
+        "status": _text(document.get("status")),
+        "engine": _text(document.get("engine")),
+        "backupCount": _count(document.get("backupCount")),
+        "lastBackup": _last_backup_summary(document.get("lastBackup")),
+        "failures": _failure_summaries(document.get("failures")),
+        "lastUpgrade": _last_upgrade_summary(document.get("lastUpgrade")),
+        "updatedAt": _text(document.get("updatedAt")),
+    }
+
+
+def _read_published_status(path: Path) -> tuple[dict[str, Any] | None, str | None]:
+    """Read one bounded JSON object; the reason never echoes the path."""
+    try:
+        info = path.stat()
+    except FileNotFoundError:
+        return None, "missing"
+    except OSError:
+        return None, "unreadable"
+    if not stat.S_ISREG(info.st_mode):
+        return None, "not_a_file"
+    if info.st_size > BACKUP_STATUS_MAX_BYTES:
+        return None, "too_large"
+    try:
+        with path.open("rb") as handle:
+            raw = handle.read(BACKUP_STATUS_MAX_BYTES + 1)
+    except OSError:
+        return None, "unreadable"
+    if len(raw) > BACKUP_STATUS_MAX_BYTES:
+        return None, "too_large"
+    try:
+        document = json.loads(raw.decode("utf-8"))
+    except UnicodeDecodeError, ValueError:
+        return None, "malformed"
+    if not isinstance(document, dict):
+        return None, "malformed"
+    return document, None
 
 
 class SystemService:
@@ -140,6 +292,23 @@ class SystemService:
                 "head": migrations.head,
             },
             "executor": available,
+        }
+
+    def backup_status(self, principal: Principal) -> dict[str, Any]:
+        """Summarize the maintenance-published backup state; never execute backups."""
+        with self._session_factory() as session:
+            self._authorize(session, principal, "system.view", "system:backups")
+        path = self._settings.backup_status_path
+        document: Mapping[str, Any] | None = None
+        reason: str | None = "unconfigured"
+        if path is not None:
+            document, reason = _read_published_status(path)
+        summary = _empty_backup_summary() if document is None else _backup_summary(document)
+        return {
+            "available": document is not None,
+            "reason": reason,
+            "checkedAt": utcnow().isoformat(),
+            **summary,
         }
 
     # ----------------------------------------------------------- configuration
