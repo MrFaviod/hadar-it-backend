@@ -33,7 +33,7 @@ import shutil
 import signal
 import socket
 import tempfile
-from collections.abc import AsyncIterator, Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from types import MappingProxyType
@@ -125,8 +125,10 @@ class ManagedEngineSettings:
             ("startup_timeout_seconds", self.startup_timeout_seconds, 300.0),
             ("shutdown_timeout_seconds", self.shutdown_timeout_seconds, 120.0),
         ):
-            if isinstance(value, bool) or not isinstance(value, (int, float)) or not (
-                0 < value <= ceiling
+            if (
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not (0 < value <= ceiling)
             ):
                 raise ManagedEngineError(
                     "misconfigured", f"{label} must be a positive number up to {ceiling:g}"
@@ -191,9 +193,7 @@ class ManagedProfileInputs:
                     "misconfigured", f"duplicate managed skill name: {checked_name}"
                 )
             names.add(checked_name.casefold())
-            checked_packages[checked_name] = MappingProxyType(
-                _package_files(checked_name, files)
-            )
+            checked_packages[checked_name] = MappingProxyType(_package_files(checked_name, files))
         object.__setattr__(self, "skill_packages", MappingProxyType(checked_packages))
         if root is not None:
             object.__setattr__(self, "project_root", str(root))
@@ -233,8 +233,12 @@ class ManagedEngineRunner:
         self._settings = settings
         self._engine = _engine_name(instance)
         (
-            self._lease_id, self._run_id, self._token, self._model,
-            self._context_tokens, self._output_tokens,
+            self._lease_id,
+            self._run_id,
+            self._token,
+            self._model,
+            self._context_tokens,
+            self._output_tokens,
         ) = _lease_fields(lease)
         self._gateway_url = _gateway_url(gateway_url)
         self._profile_inputs = profile
@@ -364,6 +368,7 @@ class ManagedEngineRunner:
         session_id: str,
         model: str | None = None,
         history: object = None,
+        attachments: Sequence[Any] = (),
     ) -> AsyncIterator[dict[str, object]]:
         adapter = self._active()
         if model is not None and model != self.native_model:
@@ -376,6 +381,7 @@ class ManagedEngineRunner:
             session_id=session_id,
             model=None,
             history=history,
+            attachments=attachments,
         ):
             yield event
 
@@ -537,9 +543,7 @@ class ManagedEngineRunner:
             files = inputs.skill_packages[name]
             target = destination / name
             if target.exists():
-                raise ManagedEngineError(
-                    "misconfigured", f"duplicate managed skill name: {name}"
-                )
+                raise ManagedEngineError("misconfigured", f"duplicate managed skill name: {name}")
             budget = [_MAX_SKILL_BYTES, _MAX_SKILL_FILES]
             _write_skill_package(files, target, budget)
             total[0] += _MAX_SKILL_BYTES - budget[0]
@@ -696,9 +700,7 @@ class ManagedEngineRunner:
             return True
         self._kill_group(pgid, signal.SIGTERM)
         with contextlib.suppress(TimeoutError):
-            await asyncio.wait_for(
-                process.wait(), timeout=self._settings.shutdown_timeout_seconds
-            )
+            await asyncio.wait_for(process.wait(), timeout=self._settings.shutdown_timeout_seconds)
         # The leader can exit while descendants in its group survive and ignore
         # SIGTERM; the group, not the leader, is the teardown boundary.
         if self._group_alive(pgid):
@@ -714,9 +716,7 @@ class ManagedEngineRunner:
             return True
         self._signal_leader(process, signal.SIGTERM)
         try:
-            await asyncio.wait_for(
-                process.wait(), timeout=self._settings.shutdown_timeout_seconds
-            )
+            await asyncio.wait_for(process.wait(), timeout=self._settings.shutdown_timeout_seconds)
             return True
         except TimeoutError:
             pass
@@ -798,7 +798,8 @@ def _lease_fields(lease: ManagedLease) -> tuple[str, str, str, str, int, int]:
         raise ManagedEngineError("misconfigured", "the managed lease model is invalid")
     bounds: list[int] = []
     for name, ceiling in (
-        ("context_tokens", MAX_CONTEXT_TOKENS), ("output_tokens", MAX_OUTPUT_TOKENS)
+        ("context_tokens", MAX_CONTEXT_TOKENS),
+        ("output_tokens", MAX_OUTPUT_TOKENS),
     ):
         value = getattr(lease, name, None)
         if isinstance(value, bool) or not isinstance(value, int) or not 0 < value <= ceiling:
@@ -913,9 +914,7 @@ def _package_path(value: object) -> tuple[str, ...]:
     if "\\" in value or any(ord(char) < 32 or ord(char) == 127 for char in value):
         raise ManagedEngineError("misconfigured", "a managed skill file path is invalid")
     parts = tuple(value.split("/"))
-    if len(parts) > 20 or any(
-        not part or part in {".", ".."} or len(part) > 128 for part in parts
-    ):
+    if len(parts) > 20 or any(not part or part in {".", ".."} or len(part) > 128 for part in parts):
         raise ManagedEngineError("misconfigured", "a managed skill file path is invalid")
     return parts
 
@@ -929,9 +928,7 @@ def _package_files(name: str, files: object) -> dict[str, bytes]:
     for relative, content in files.items():
         key = "/".join(_package_path(relative))
         if key in checked:
-            raise ManagedEngineError(
-                "misconfigured", f"managed skill {name} repeats a file path"
-            )
+            raise ManagedEngineError("misconfigured", f"managed skill {name} repeats a file path")
         if isinstance(content, (bytearray, memoryview)):
             content = bytes(content)
         if not isinstance(content, bytes):
@@ -949,9 +946,7 @@ def _package_files(name: str, files: object) -> dict[str, bytes]:
             "misconfigured", f"managed skill {name} has conflicting file paths"
         )
     if "SKILL.md" not in checked:
-        raise ManagedEngineError(
-            "misconfigured", f"managed skill {name} must contain SKILL.md"
-        )
+        raise ManagedEngineError("misconfigured", f"managed skill {name} must contain SKILL.md")
     if len(checked) > _MAX_SKILL_FILES or sum(map(len, checked.values())) > _MAX_SKILL_BYTES:
         raise ManagedEngineError("misconfigured", f"managed skill {name} is too large")
     return checked
@@ -1009,9 +1004,7 @@ def _copy_skill_tree(source: Path, target: Path, budget: list[int]) -> None:
 def _resolve_binary(settings: ManagedEngineSettings, engine: str) -> str:
     configured = settings.hermes_binary if engine == "hermes" else settings.opencode_binary
     if not configured:
-        raise ManagedEngineError(
-            "misconfigured", f"the managed {engine} binary is not configured"
-        )
+        raise ManagedEngineError("misconfigured", f"the managed {engine} binary is not configured")
     candidate = Path(configured).expanduser()
     if not candidate.is_absolute():
         located = shutil.which(configured)
@@ -1021,9 +1014,7 @@ def _resolve_binary(settings: ManagedEngineSettings, engine: str) -> str:
             )
         candidate = Path(located)
     if not candidate.is_file() or not os.access(candidate, os.X_OK):
-        raise ManagedEngineError(
-            "misconfigured", f"the managed {engine} binary is not executable"
-        )
+        raise ManagedEngineError("misconfigured", f"the managed {engine} binary is not executable")
     return str(candidate)
 
 

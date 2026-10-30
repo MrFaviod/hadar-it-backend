@@ -173,9 +173,12 @@ def test_global_provider_is_owner_managed_and_secret_is_write_only(provider_env:
     assert owned.json()["scope"] == "personal"
     denied = _create_provider(client, plain, scope="global", baseUrl="https://api.example.com/v1")
     assert denied.status_code == 403, denied.text
-    assert client.patch(
-        f"{API}/agent/providers/{body['id']}", json={"name": "hijacked"}, headers=plain
-    ).status_code == 403
+    assert (
+        client.patch(
+            f"{API}/agent/providers/{body['id']}", json={"name": "hijacked"}, headers=plain
+        ).status_code
+        == 403
+    )
     assert client.delete(f"{API}/agent/providers/{body['id']}", headers=plain).status_code == 403
 
     admin = _admin_login(client, catalog.settings)
@@ -190,10 +193,7 @@ def test_global_provider_is_owner_managed_and_secret_is_write_only(provider_env:
     with catalog.session() as session:
         row = session.get(AgentProvider, body["id"])
         assert row is not None
-        assert (
-            Fernet(MASTER_KEY.encode()).decrypt(row.api_key_ciphertext.encode())
-            == b"sk-rotated"
-        )
+        assert Fernet(MASTER_KEY.encode()).decrypt(row.api_key_ciphertext.encode()) == b"sk-rotated"
 
 
 def test_personal_providers_require_explicit_permission_and_stay_owner_isolated(
@@ -225,9 +225,12 @@ def test_personal_providers_require_explicit_permission_and_stay_owner_isolated(
     bob = _login(client, catalog.settings, "bob.provider", MACHINE_PASSWORD)
     bob_items = client.get(f"{API}/agent/providers", headers=bob).json()["items"]
     assert [item["id"] for item in bob_items] == [global_id]
-    assert client.patch(
-        f"{API}/agent/providers/{personal_id}", json={"name": "stolen"}, headers=bob
-    ).status_code == 404
+    assert (
+        client.patch(
+            f"{API}/agent/providers/{personal_id}", json={"name": "stolen"}, headers=bob
+        ).status_code
+        == 404
+    )
     assert client.delete(f"{API}/agent/providers/{personal_id}", headers=bob).status_code == 404
 
     alice = _login(client, catalog.settings, "alice.provider", MACHINE_PASSWORD)
@@ -240,7 +243,13 @@ def test_personal_providers_require_explicit_permission_and_stay_owner_isolated(
     )
     assert provider_engine["engine"] == "pydantic"
     assert provider_engine["models"] == [
-        {"id": "alice-model", "name": "alice-model", "provider": "openai-compatible", "free": None}
+        {
+            "id": "alice-model",
+            "name": "alice-model",
+            "provider": "openai-compatible",
+            "free": None,
+            "inputs": {"image": None, "file": None},
+        }
     ]
     bob = _login(client, catalog.settings, "bob.provider", MACHINE_PASSWORD)
     bob_engines = client.get(f"{API}/agent/engines", headers=bob).json()
@@ -293,18 +302,24 @@ def test_builtin_admin_and_user_manage_only_their_own_personal_provider(
     assert client.get(f"{API}/agent/providers", headers=user).json()["items"] == [
         user_created.json()
     ]
-    assert client.patch(
-        f"{API}/agent/providers/{admin_id}", json={"name": "stolen"}, headers=user
-    ).status_code == 404
+    assert (
+        client.patch(
+            f"{API}/agent/providers/{admin_id}", json={"name": "stolen"}, headers=user
+        ).status_code
+        == 404
+    )
     assert client.delete(f"{API}/agent/providers/{admin_id}", headers=user).status_code == 404
 
     admin = _admin_login(client, catalog.settings)
     assert client.get(f"{API}/agent/providers", headers=admin).json()["items"] == [
         admin_created.json()
     ]
-    assert client.patch(
-        f"{API}/agent/providers/{user_id}", json={"name": "stolen"}, headers=admin
-    ).status_code == 404
+    assert (
+        client.patch(
+            f"{API}/agent/providers/{user_id}", json={"name": "stolen"}, headers=admin
+        ).status_code
+        == 404
+    )
     assert client.delete(f"{API}/agent/providers/{user_id}", headers=admin).status_code == 404
     assert _create_provider(client, user, scope="global").status_code == 403
 
@@ -432,14 +447,18 @@ def test_session_switches_engine_and_model_without_losing_transcript(provider_en
         headers=admin,
     )
     assert unknown_model.status_code == 422, unknown_model.text
-    assert client.patch(
-        f"{API}/agent/sessions/{session_id}", json={}, headers=admin
-    ).status_code == 422
-    assert client.patch(
-        f"{API}/agent/sessions/{session_id}",
-        json={"model": "model-a", "instanceId": "missing"},
-        headers=admin,
-    ).status_code == 404
+    assert (
+        client.patch(f"{API}/agent/sessions/{session_id}", json={}, headers=admin).status_code
+        == 422
+    )
+    assert (
+        client.patch(
+            f"{API}/agent/sessions/{session_id}",
+            json={"model": "model-a", "instanceId": "missing"},
+            headers=admin,
+        ).status_code
+        == 404
+    )
 
     with catalog.session() as db:
         from itsm.agent_integrations.models import AgentSession
@@ -502,9 +521,12 @@ def test_revoked_personal_grant_stops_switching_and_new_turns(provider_env: Any)
     assert still_readable.status_code == 200, still_readable.text
     assert still_readable.json()["status"] == "idle"
     assert still_readable.json()["messages"] == []
-    assert client.patch(
-        f"{API}/agent/providers/{provider_id}", json={"name": "nope"}, headers=headers
-    ).status_code == 403
+    assert (
+        client.patch(
+            f"{API}/agent/providers/{provider_id}", json={"name": "nope"}, headers=headers
+        ).status_code
+        == 403
+    )
 
 
 def test_provider_runtime_sends_selected_model_and_server_secret(
@@ -577,6 +599,7 @@ def test_personal_http_client_rechecks_dns_on_every_connect(
     def fake_resolve(host: str, port: int) -> list[str]:
         calls.append((host, port))
         return ["10.0.0.5"]
+
     monkeypatch.setattr(providers_module, "resolve_addresses", fake_resolve)
     client = provider_http_client(allow_private=False)
     assert client.follow_redirects is False
@@ -830,9 +853,7 @@ def test_global_addresses_remain_accepted(address: str) -> None:
     assert providers_module.is_public_address(address) is True
 
 
-@pytest.mark.parametrize(
-    "endpoint", ["https://100.64.0.1/v1", "https://[::ffff:100.64.0.1]/v1"]
-)
+@pytest.mark.parametrize("endpoint", ["https://100.64.0.1/v1", "https://[::ffff:100.64.0.1]/v1"])
 def test_personal_endpoint_rejects_cgnat_and_mapped_ipv6(endpoint: str) -> None:
     with pytest.raises(ProviderEndpointError):
         validate_provider_endpoint(endpoint, scope="personal")
@@ -1276,9 +1297,7 @@ def test_exact_hostname_entry_allows_http_but_keeps_other_private_hosts_out(
             "http://models.internal:9090/v1", scope="personal", policy=policy
         )
     with pytest.raises(ProviderEndpointError):
-        validate_provider_endpoint(
-            "http://other.internal:8080/v1", scope="personal", policy=policy
-        )
+        validate_provider_endpoint("http://other.internal:8080/v1", scope="personal", policy=policy)
 
 
 def test_private_policy_decides_on_the_resolved_address_not_the_hostname() -> None:

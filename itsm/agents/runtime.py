@@ -11,12 +11,13 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date
 from typing import Any, Literal, cast
 
+from itsm.agent_integrations.attachments import ChatAttachmentInput
 from itsm.agent_integrations.providers import (
     ProviderModelSelection,
     build_provider_model,
@@ -54,7 +55,7 @@ from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from itsm.reports.schemas import ReportRequest
 from itsm.system.tools import SYSTEM_TOOL_NAMES
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
     ModelMessage,
@@ -187,9 +188,16 @@ class ChatRequest(BaseModel):
 
     model_config = ConfigDict(extra="forbid")
 
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(default="", max_length=8000)
     conversation: list[ConversationTurn] = Field(default_factory=list, max_length=50)
     assetId: str | None = Field(default=None, max_length=36)
+    attachments: list[ChatAttachmentInput] = Field(default_factory=list, max_length=4)
+
+    @model_validator(mode="after")
+    def _require_content(self) -> ChatRequest:
+        if not self.message.strip() and not self.attachments:
+            raise ValueError("message or at least one attachment is required")
+        return self
 
     @field_validator("assetId")
     @classmethod
@@ -384,6 +392,7 @@ def _system_collect(
 def _extension_collect(deps: AgentDeps, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
     """Use the same SDK boundary as HTTP/MCP, including isolated proxy calls."""
     from itsm.extensions.host import ExtensionHostError
+
     if deps.extensions is None or deps.extension_development is None:
         from itsm.extensions.composition import create_extension_services
 
@@ -1931,6 +1940,53 @@ def resolve_model(
     raise AgentUnavailable()
 
 
+#: Inlined text/CSV is bounded; a longer document is truncated with an
+#: explicit marker so nothing is dropped silently.
+_MAX_INLINE_TEXT = 16_000
+
+
+def _inline_text(item: ChatAttachmentInput) -> str:
+    """Render a stored text attachment as a bounded, clearly fenced block."""
+
+    body = item.data.decode("utf-8-sig", errors="replace")
+    if len(body) > _MAX_INLINE_TEXT:
+        body = f"{body[:_MAX_INLINE_TEXT]}\n[contenido truncado]"
+    return f"Archivo adjunto {item.filename}:\n```\n{body}\n```"
+
+
+def user_content(prompt: str, attachments: Sequence[ChatAttachmentInput]) -> str | list[Any]:
+    """Prompt text plus validated attachment bytes; never a remote URL.
+
+    Images and documents travel as Pydantic AI ``BinaryContent`` built from the
+    stored bytes, so no provider ever fetches a URL supplied by a browser.
+    Text/CSV is inlined because every model accepts it.
+    """
+    from pydantic_ai.messages import BinaryContent
+
+    parts: list[Any] = []
+    for item in attachments:
+        if item.kind == "text":
+            block = _inline_text(item)
+            prompt = f"{prompt}\n\n{block}" if prompt else block
+        else:
+            parts.append(BinaryContent(data=item.data, media_type=item.media_type))
+    if not parts:
+        return prompt
+    if prompt:
+        parts.append(prompt)
+    return parts
+
+
+def user_prompt(request: ChatRequest) -> str | list[Any]:
+    """Full browser request as the user turn the provider receives."""
+
+    prompt = request.message
+    if request.assetId:
+        marker = f"Activo seleccionado: {request.assetId}"
+        prompt = f"{prompt}\n\n{marker}" if prompt else marker
+    return user_content(prompt, request.attachments)
+
+
 def _history(conversation: list[ConversationTurn]) -> list[ModelMessage]:
     history: list[ModelMessage] = []
     for turn in conversation:
@@ -2131,9 +2187,7 @@ class AgentRuntime:
                 extensions=self._extensions,
                 extension_development=self._extension_development,
             )
-            prompt = request.message
-            if request.assetId:
-                prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
+            prompt = user_prompt(request)
             tokens = usage if usage is not None else AgentUsage()
             run_usage = RunUsage()
             limits = UsageLimits(
@@ -2193,7 +2247,7 @@ class AgentRuntime:
     async def _run_provider_turn(
         self,
         agent: Agent[AgentDeps, str],
-        prompt: str,
+        prompt: str | list[Any],
         deps: AgentDeps,
         request: ChatRequest,
         limits: UsageLimits,
@@ -2231,6 +2285,7 @@ __all__ = [
     "AgentUsage",
     "BatchUpdateArg",
     "ChatAction",
+    "ChatAttachmentInput",
     "ChatReply",
     "ChatRequest",
     "ConversationTurn",
@@ -2238,4 +2293,6 @@ __all__ = [
     "ProviderModelSelection",
     "build_toolset",
     "resolve_model",
+    "user_content",
+    "user_prompt",
 ]

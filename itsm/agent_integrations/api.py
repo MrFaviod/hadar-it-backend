@@ -5,14 +5,17 @@ from __future__ import annotations
 import json
 from typing import Any, Literal
 
-from fastapi import APIRouter, HTTPException, Request
+from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
 
+from itsm.agent_integrations.attachments import ChatAttachmentService
 from itsm.agent_integrations.service import (
     AgentIntegrationService,
+    AttachmentsRefused,
     IntegrationUnavailable,
 )
+from itsm.attachments.service import StorageUnavailable
 from itsm.identity.api import AuthDependency, MutationDependency
 
 EngineName = Literal["opencode", "hermes"]
@@ -109,8 +112,16 @@ class SessionCreatePayload(BaseModel):
 class SessionMessagePayload(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    message: str = Field(min_length=1, max_length=8000)
+    message: str = Field(default="", max_length=8000)
     assetId: str | None = Field(default=None, max_length=36)
+    attachmentIds: list[str] | None = Field(default=None, max_length=4)
+    assetAttachmentIds: list[str] | None = Field(default=None, max_length=4)
+
+    @model_validator(mode="after")
+    def _require_content(self) -> SessionMessagePayload:
+        if not self.message.strip() and not self.attachmentIds and not self.assetAttachmentIds:
+            raise ValueError("message or at least one attachment is required")
+        return self
 
 
 class SessionUpdatePayload(BaseModel):
@@ -198,6 +209,59 @@ def create_agent_integrations_router() -> APIRouter:
             context.principal, session_id, payload.model_dump(exclude_unset=True)
         )
 
+    @router.delete("/agent/sessions/{session_id}", status_code=204)
+    def delete_session(session_id: str, request: Request, context: MutationDependency) -> None:
+        _service(request).delete_session(context.principal, session_id)
+
+    @router.post("/agent/sessions/{session_id}/attachments", status_code=201)
+    async def upload_chat_attachment(
+        session_id: str,
+        request: Request,
+        context: MutationDependency,
+        filename: str = Query(min_length=1, max_length=180),
+    ) -> Any:
+        settings = request.app.state.settings
+        maximum = ChatAttachmentService.maximum_for(settings)
+        data = bytearray()
+        async for chunk in request.stream():
+            if len(data) + len(chunk) > maximum:
+                return JSONResponse(
+                    status_code=413,
+                    content={
+                        "error": {
+                            "code": "payload_too_large",
+                            "message": f"file must contain 1-{maximum} bytes",
+                        }
+                    },
+                )
+            data.extend(chunk)
+        try:
+            with request.app.state.session_factory() as db:
+                service = ChatAttachmentService(db, settings)
+                payload = service.upload(
+                    context.principal, session_id, filename=filename, data=bytes(data)
+                )
+                db.commit()
+                return payload
+        except StorageUnavailable:
+            raise HTTPException(status_code=503, detail="attachment storage unavailable") from None
+
+    @router.delete("/agent/sessions/{session_id}/attachments/{attachment_id}", status_code=204)
+    def delete_chat_attachment(
+        session_id: str,
+        attachment_id: str,
+        request: Request,
+        context: MutationDependency,
+    ) -> None:
+        try:
+            with request.app.state.session_factory() as db:
+                ChatAttachmentService(db, request.app.state.settings).delete(
+                    context.principal, session_id, attachment_id
+                )
+                db.commit()
+        except StorageUnavailable:
+            raise HTTPException(status_code=503, detail="attachment storage unavailable") from None
+
     @router.post("/agent/sessions/{session_id}/messages")
     def send_message(
         session_id: str,
@@ -206,7 +270,14 @@ def create_agent_integrations_router() -> APIRouter:
         context: MutationDependency,
     ) -> StreamingResponse:
         service = _service(request)
-        turn = service.prepare_turn(context.principal, session_id, payload.message, payload.assetId)
+        turn = service.prepare_turn(
+            context.principal,
+            session_id,
+            payload.message,
+            payload.assetId,
+            attachment_ids=payload.attachmentIds,
+            asset_attachment_ids=payload.assetAttachmentIds,
+        )
         return StreamingResponse(
             _sse(turn.stream()),
             media_type="text/event-stream",
@@ -351,6 +422,15 @@ def install_agent_integration_error_handlers(app: Any) -> None:
         return JSONResponse(
             status_code=503,
             content={"error": {"code": "unavailable", "message": str(exc)}},
+        )
+
+    @app.exception_handler(AttachmentsRefused)
+    async def on_attachments_refused(request: Request, exc: AttachmentsRefused) -> JSONResponse:
+        # A modality or engine refusal keeps its own stable code so a client can
+        # tell "this model cannot take a PDF" from a malformed request.
+        return JSONResponse(
+            status_code=422,
+            content={"error": {"code": exc.code, "message": str(exc)}},
         )
 
 

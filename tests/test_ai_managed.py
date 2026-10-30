@@ -40,7 +40,7 @@ LEASE_TOKEN = "run-scoped-opaque-token"
 MCP_TOKEN = "integration-identity-token"
 MODEL = "gpt-5-mini"
 
-_FAKE_ENGINE = '''#!{python}
+_FAKE_ENGINE = """#!{python}
 import json
 import os
 import base64
@@ -180,7 +180,7 @@ def main():
 
 
 main()
-'''
+"""
 
 
 def _write_fake_engine(
@@ -434,8 +434,15 @@ def test_opencode_run_is_disposable_and_isolated(tmp_path: Path, monkeypatch: py
 @pytest.mark.parametrize(
     "config_case",
     [
-        "foreign_directory", "foreign_document", "system", "pathless", "duplicate",
-        "missing_directory", "nested_directory", "malformed", "unknown_kind",
+        "foreign_directory",
+        "foreign_document",
+        "system",
+        "pathless",
+        "duplicate",
+        "missing_directory",
+        "nested_directory",
+        "malformed",
+        "unknown_kind",
     ],
 )
 def test_opencode_foreign_config_fails_before_discovery_or_dispatch(
@@ -446,7 +453,10 @@ def test_opencode_foreign_config_fails_before_discovery_or_dispatch(
     async def scenario() -> None:
         holder: dict[str, Any] = {}
         runner = ManagedEngineRunner(
-            _settings(tmp_path, binary), _instance("opencode"), _Lease(), GATEWAY,
+            _settings(tmp_path, binary),
+            _instance("opencode"),
+            _Lease(),
+            GATEWAY,
             engine_factory=_factory(holder),
         )
         try:
@@ -476,16 +486,23 @@ def test_opencode_rechecks_origins_before_dispatch(tmp_path: Path):
     async def scenario() -> None:
         holder: dict[str, Any] = {}
         runner = ManagedEngineRunner(
-            _settings(tmp_path, binary), _instance("opencode"), _Lease(), GATEWAY,
+            _settings(tmp_path, binary),
+            _instance("opencode"),
+            _Lease(),
+            GATEWAY,
             engine_factory=_factory(holder),
         )
         async with runner:
             profile = runner.profile_dir
             assert profile is not None
             assert await runner.create_session() == "session-1"
-            (profile / "config-evidence.json").write_text(json.dumps([
-                {"type": "directory", "path": "/etc/opencode"},
-            ]))
+            (profile / "config-evidence.json").write_text(
+                json.dumps(
+                    [
+                        {"type": "directory", "path": "/etc/opencode"},
+                    ]
+                )
+            )
             with pytest.raises(ManagedEngineError):
                 async for _ in runner.stream("do not dispatch", session_id="session-1"):
                     pass
@@ -500,18 +517,25 @@ def test_opencode_rechecks_origins_before_dispatch(tmp_path: Path):
 @pytest.mark.parametrize("value", [None, True, 0, -1, "10", 1.5, 10_000_001])
 def test_lease_bounds_fail_before_native_launch(tmp_path: Path, field: str, value: Any):
     fields = {
-        "lease_id": "lease-1", "run_id": "run-1", "bearer_token": LEASE_TOKEN,
-        "model": MODEL, "context_tokens": 20_000, "output_tokens": 1_000,
+        "lease_id": "lease-1",
+        "run_id": "run-1",
+        "bearer_token": LEASE_TOKEN,
+        "model": MODEL,
+        "context_tokens": 20_000,
+        "output_tokens": 1_000,
     }
     fields[field] = value
     with pytest.raises(ManagedEngineError) as error:
         ManagedEngineRunner(
-            _settings(tmp_path, _write_fake_engine(tmp_path)), _instance("opencode"),
-            SimpleNamespace(**fields), GATEWAY,
+            _settings(tmp_path, _write_fake_engine(tmp_path)),
+            _instance("opencode"),
+            SimpleNamespace(**fields),
+            GATEWAY,
         )
     assert error.value.code == "misconfigured"
     assert not (tmp_path / "profiles").exists()
     assert not (tmp_path / "native-observed.json").exists()
+
 
 def test_each_run_gets_a_fresh_profile(tmp_path: Path):
     binary = _write_fake_engine(tmp_path)
@@ -649,9 +673,7 @@ def test_stream_is_pinned_to_the_lease_model(tmp_path: Path):
             ]
             assert events
             with pytest.raises(ManagedEngineError):
-                async for _ in runner.stream(
-                    "hola", session_id="session-1", model="other-model"
-                ):
+                async for _ in runner.stream("hola", session_id="session-1", model="other-model"):
                     pass
             await runner.cancel("session-1")
             adapter = holder["adapter"]
@@ -680,9 +702,7 @@ def test_missing_binary_fails_closed_before_any_profile(tmp_path: Path):
         assert runner.profile_dir is None
 
     asyncio.run(scenario())
-    assert not (tmp_path / "profiles").exists() or list(
-        (tmp_path / "profiles").iterdir()
-    ) == []
+    assert not (tmp_path / "profiles").exists() or list((tmp_path / "profiles").iterdir()) == []
 
 
 def test_unconfigured_native_engine_fails_closed(tmp_path: Path):
@@ -780,9 +800,7 @@ def test_skill_packages_materialize_exact_bytes_without_project_root(tmp_path: P
             profile = runner.profile_dir
             assert profile is not None
             body = (profile / "config.yaml").read_text(encoding="utf-8")
-            written = (
-                profile / "skills" / "itsm-catalog" / "references" / "data.bin"
-            ).read_bytes()
+            written = (profile / "skills" / "itsm-catalog" / "references" / "data.bin").read_bytes()
             assert holder["adapter"].record is not None
         assert not profile.exists()
         return body, written
@@ -1131,3 +1149,75 @@ def test_run_scoped_key_is_the_only_ai_credential_in_a_personal_run(
     assert personal_key not in written
     assert personal_key not in json.dumps(record["envNames"])
     assert GATEWAY_KEY_ENV in written
+
+
+# ------------------------------------------------------- multimodal delivery
+def _attachment(filename: str, media_type: str) -> Any:
+    from itsm.agent_integrations.attachments import ChatAttachmentInput
+
+    return ChatAttachmentInput(
+        filename=filename, media_type=media_type, kind="image", data=b"\x89PNG\r\n\x1a\n"
+    )
+
+
+def test_opencode_v1_prompt_carries_documented_file_parts() -> None:
+    from itsm.agents.opencode import _file_parts
+
+    parts = _file_parts(
+        [_attachment("foto.png", "image/png"), _attachment("informe.pdf", "application/pdf")]
+    )
+
+    assert parts == [
+        {
+            "type": "file",
+            "mime": "image/png",
+            "filename": "foto.png",
+            "url": "data:image/png;base64,iVBORw0KGgo=",
+        },
+        {
+            "type": "file",
+            "mime": "application/pdf",
+            "filename": "informe.pdf",
+            "url": "data:application/pdf;base64,iVBORw0KGgo=",
+        },
+    ]
+
+
+def test_opencode_v2_refuses_attachments_before_prompting(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    calls: list[str] = []
+
+    async def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(request.url.path)
+        raise AssertionError("a refused attachment must not reach the engine")
+
+    async def run() -> None:
+        async with httpx.AsyncClient(transport=httpx.MockTransport(handler)) as client:
+            engine = OpenCodeEngine(EngineConfig("http://127.0.0.1:9999"), client=client)
+            engine._variant = "v2"
+            stream = engine.stream(
+                "mirá",
+                session_id="ses_1",
+                attachments=[_attachment("foto.png", "image/png")],
+            )
+            with pytest.raises(EngineError) as refused:
+                await stream.__anext__()
+            assert refused.value.code == "engine_attachments_unsupported"
+
+    asyncio.run(run())
+    assert calls == []
+
+
+def test_hermes_refuses_attachments_instead_of_inventing_a_field() -> None:
+    async def run() -> None:
+        engine = HermesEngine(EngineConfig("http://127.0.0.1:9999"))
+        stream = engine.stream(
+            "mirá", session_id="ses_1", attachments=[_attachment("foto.png", "image/png")]
+        )
+        with pytest.raises(EngineError) as refused:
+            await stream.__anext__()
+        assert refused.value.code == "engine_attachments_unsupported"
+        assert "text prompts only" in str(refused.value)
+
+    asyncio.run(run())

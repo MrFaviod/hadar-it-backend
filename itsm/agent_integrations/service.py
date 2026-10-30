@@ -28,6 +28,14 @@ from sqlalchemy import inspect, select, update
 from sqlalchemy.exc import IntegrityError, InterfaceError, OperationalError
 from sqlalchemy.orm import Session
 
+from itsm.agent_integrations.attachments import (
+    ChatAttachmentInput,
+    ChatAttachmentService,
+    bounded_attachment_ids,
+    check_message_bytes,
+    encoded_attachment_bytes,
+    estimate_attachment_tokens,
+)
 from itsm.agent_integrations.models import (
     AgentInstallation,
     AgentInstallationPreference,
@@ -60,6 +68,7 @@ from itsm.agents.runtime import (
     AgentUsage,
     ChatRequest,
     ConversationTurn,
+    user_content,
 )
 from itsm.config import Settings
 from itsm.identity.clock import utcnow
@@ -134,6 +143,18 @@ class IntegrationUnavailable(Exception):
         self.message = message
 
 
+class AttachmentsRefused(ValidationFailed):
+    """The selected model or engine cannot accept an attached kind.
+
+    Raised before any reservation, lease or persisted turn, so a refused
+    attachment never spends budget and never leaves a half-started run.
+    """
+
+    def __init__(self, code: str, message: str) -> None:
+        self.code = code
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class InstanceSnapshot:
     id: str
@@ -187,6 +208,7 @@ class Turn:
     run_id: str | None = None
     quota: Any = None
     cancel_sent: bool = False
+    attachments: list[ChatAttachmentInput] = field(default_factory=list)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def stream(self) -> AsyncIterator[dict[str, Any]]:
@@ -397,6 +419,41 @@ def _bounded_payload(value: Any) -> Any:
     if len(encoded) > _MAX_TOOL_JSON:
         return "[truncated]"
     return safe
+
+
+def _unknown_inputs() -> dict[str, bool | None]:
+    """Non-text input marks when nothing authoritative is known about a model."""
+
+    return {"image": None, "file": None}
+
+
+def _input_marks(entry: Mapping[str, Any] | None) -> dict[str, bool | None]:
+    """Public per-model marks; a missing or unknown entry stays ``null``."""
+
+    if not isinstance(entry, Mapping):
+        return _unknown_inputs()
+    image = entry.get("image")
+    document = entry.get("file")
+    return {
+        "image": image if isinstance(image, bool) else None,
+        "file": document if isinstance(document, bool) else None,
+    }
+
+
+def _lease_modalities(items: Sequence[ChatAttachmentInput]) -> tuple[str, ...]:
+    """Gateway lease input kinds, the documented image/file pair only."""
+
+    return tuple(sorted({item.kind for item in items if item.kind in {"image", "file"}}))
+
+
+def _attachment_kind(media_type: str) -> str:
+    """Classify an asset document for the chat: image, document or inlined text."""
+
+    if media_type.startswith("image/"):
+        return "image"
+    if media_type.startswith("text/"):
+        return "text"
+    return "file"
 
 
 def _engine_error(exc: BaseException) -> tuple[str, str, bool] | None:
@@ -858,6 +915,7 @@ class AgentIntegrationService:
         version: str | None,
         capabilities: dict[str, bool],
         error: str | None,
+        attachments_supported: bool = False,
     ) -> dict[str, Any]:
         return {
             "id": row.id,
@@ -869,6 +927,7 @@ class AgentIntegrationService:
             "version": version,
             "models": models,
             "error": error,
+            "attachmentsSupported": attachments_supported,
             "quota": self._quota_capability(row),
         }
 
@@ -953,7 +1012,15 @@ class AgentIntegrationService:
             models: list[dict[str, Any]] = []
             if model:
                 provider = model.split(":", 1)[0] if ":" in model else "configured"
-                models.append({"id": model, "name": model, "provider": provider, "free": None})
+                models.append(
+                    {
+                        "id": model,
+                        "name": model,
+                        "provider": provider,
+                        "free": None,
+                        "inputs": _unknown_inputs(),
+                    }
+                )
             return {
                 "version": _package_version("pydantic-ai-slim"),
                 "models": models,
@@ -965,6 +1032,9 @@ class AgentIntegrationService:
                     "tools": True,
                     "usage": True,
                     "history": True,
+                    # The server-configured model has no provider record, so its
+                    # non-text modalities stay unknown and are refused at send time.
+                    "attachments": False,
                 },
             }
         if row.quota_mode == "managed":
@@ -972,8 +1042,15 @@ class AgentIntegrationService:
                 provider = self._provider_row(db, row.managed_provider_id or "")
                 if not provider.enabled or provider.scope != "global":
                     raise IntegrationUnavailable("the managed provider is unavailable")
+                marks = self._model_capabilities(provider)
                 models = [
-                    {"id": item, "name": item, "provider": provider.name, "free": None}
+                    {
+                        "id": item,
+                        "name": item,
+                        "provider": provider.name,
+                        "free": None,
+                        "inputs": _input_marks(marks.get(item)),
+                    }
                     for item in self._provider_models(provider)
                 ]
             return {
@@ -987,6 +1064,9 @@ class AgentIntegrationService:
                     "cancel": True,
                     "tools": True,
                     "usage": True,
+                    # Only the engine adapter knows whether its prompt protocol
+                    # carries inline bytes; an unreachable engine stays unknown.
+                    "attachments": await self._engine_attachments(row),
                 },
             }
         engine = self._build_engine(row)
@@ -1016,6 +1096,7 @@ class AgentIntegrationService:
                     "name": _label(data.get("name"), limit=200) or identifier,
                     "provider": _label(data.get("provider"), limit=80) or "unknown",
                     "free": free if isinstance(free, bool) else None,
+                    "inputs": _unknown_inputs(),
                 }
             )
         capabilities = {
@@ -1024,6 +1105,21 @@ class AgentIntegrationService:
         }
         version = _label(getattr(info, "version", None), limit=64)
         return {"version": version, "models": models, "capabilities": capabilities}
+
+    async def _engine_attachments(self, row: InstanceSnapshot) -> bool:
+        """Whether the managed engine's prompt protocol carries inline bytes."""
+
+        engine = None
+        try:
+            engine = self._build_engine(row)
+            async with asyncio.timeout(self._settings.agent_engine_timeout_seconds):
+                info = await engine.discover()
+            return bool(dict(getattr(info, "capabilities", {}) or {}).get("attachments"))
+        except Exception:
+            return False
+        finally:
+            if engine is not None:
+                await _quiet_close(engine)
 
     async def _safe_discover(self, row: InstanceSnapshot) -> dict[str, Any]:
         try:
@@ -1098,7 +1194,12 @@ class AgentIntegrationService:
                 if self._provider_visible(row, principal)
             ]
             provider_snapshots = [
-                (self._provider_snapshot(row), self._provider_models(row)) for row in provider_rows
+                (
+                    self._provider_snapshot(row),
+                    self._provider_models(row),
+                    self._model_capabilities(row),
+                )
+                for row in provider_rows
             ]
             preference = self._effective_preference(db, principal)
             if not privileged and self._external_instance(db, preference[0]):
@@ -1125,9 +1226,12 @@ class AgentIntegrationService:
                     version=info["version"],
                     capabilities=info["capabilities"],
                     error=info.get("error"),
+                    attachments_supported=bool(
+                        dict(info.get("capabilities") or {}).get("attachments")
+                    ),
                 )
             )
-        for snapshot, models in provider_snapshots:
+        for snapshot, models, marks in provider_snapshots:
             if not snapshot.enabled:
                 instances.append(
                     self._public_instance(
@@ -1148,12 +1252,14 @@ class AgentIntegrationService:
                             "name": model,
                             "provider": "openai-compatible",
                             "free": None,
+                            "inputs": _input_marks(marks.get(model)),
                         }
                         for model in models
                     ],
                     version=_package_version("pydantic-ai-slim"),
                     capabilities=self._session_capabilities(PYDANTIC_ENGINE, None),
                     error=None,
+                    attachments_supported=True,
                 )
             )
         return {
@@ -2141,17 +2247,109 @@ class AgentIntegrationService:
             run.finished_at = now
         db.commit()
 
+    def _chat_marks(
+        self, instance: InstanceSnapshot, provider: AgentProvider | None, model: str
+    ) -> dict[str, bool | None]:
+        """Non-text input marks for this turn's model; ``None`` means unknown.
+
+        A provider instance answers with the provider-reported (or owner-marked)
+        capabilities persisted for that model. The built-in server-configured
+        Pydantic AI instance has no provider record, so its marks stay unknown
+        and images or documents are refused there instead of guessed.
+        """
+
+        if instance.engine != PYDANTIC_ENGINE or provider is None:
+            return {"image": None, "file": None}
+        entry = self._model_capabilities(provider).get(model) or {}
+        return {"image": entry.get("image"), "file": entry.get("file")}
+
+    def _require_attachment_support(
+        self,
+        instance: InstanceSnapshot,
+        provider: AgentProvider | None,
+        model: str,
+        attachments: Sequence[ChatAttachmentInput],
+    ) -> None:
+        """Refuse unsupported kinds before any reservation, lease or turn row."""
+
+        if not attachments:
+            return
+        if instance.engine in EXTERNAL_ENGINES:
+            if instance.engine == "hermes":
+                raise AttachmentsRefused(
+                    "engine_attachments_unsupported",
+                    "the Hermes engine accepts text prompts only",
+                )
+            if instance.quota_mode != "managed":
+                raise AttachmentsRefused(
+                    "engine_attachments_unsupported",
+                    "a direct engine run cannot carry attachments",
+                )
+        marks = self._chat_marks(instance, provider, model)
+        for item in attachments:
+            if item.kind == "image" and marks.get("image") is not True:
+                raise AttachmentsRefused(
+                    "model_modality_unsupported",
+                    "the selected model does not accept images",
+                )
+            if item.kind == "file" and marks.get("file") is not True:
+                raise AttachmentsRefused(
+                    "model_modality_unsupported",
+                    "the selected model does not accept documents",
+                )
+
+    def _turn_attachments(
+        self,
+        db: Session,
+        principal: Principal,
+        session_id: str,
+        chat_ids: Sequence[str],
+        stored_ids: Sequence[str],
+    ) -> list[ChatAttachmentInput]:
+        """Owner/session scoped chat bytes plus asset documents the caller may view."""
+
+        attachments = ChatAttachmentService(db, self._settings).inputs(
+            principal, session_id, chat_ids
+        )
+        if stored_ids:
+            from itsm.attachments.service import AttachmentService
+
+            documents = AttachmentService(
+                db, self._settings, identity=IdentityService(db, self._settings)
+            )
+            for identifier in stored_ids:
+                metadata, data = documents.read_for_chat(principal, identifier)
+                media_type = str(metadata["contentType"])
+                attachments.append(
+                    ChatAttachmentInput(
+                        filename=str(metadata["filename"]),
+                        media_type=media_type,
+                        kind=_attachment_kind(media_type),
+                        data=data,
+                        identifier=str(metadata["id"]),
+                        asset_id=str(metadata["assetId"]),
+                    )
+                )
+        check_message_bytes(attachments)
+        return attachments
+
     def prepare_turn(
         self,
         principal: Principal,
         session_id: str,
         message: str,
         asset_id: str | None,
+        *,
+        attachment_ids: Sequence[str] | None = None,
+        asset_attachment_ids: Sequence[str] | None = None,
     ) -> Turn:
         self._require_human(principal)
-        if not isinstance(message, str) or not message.strip():
-            raise ValidationFailed("message is required")
-        if len(message) > self._settings.agent_message_max_length:
+        text = message if isinstance(message, str) else ""
+        chat_ids = bounded_attachment_ids(attachment_ids)
+        stored_ids = bounded_attachment_ids(asset_attachment_ids)
+        if not text.strip() and not chat_ids and not stored_ids:
+            raise ValidationFailed("message or at least one attachment is required")
+        if len(text) > self._settings.agent_message_max_length:
             raise ValidationFailed(
                 f"message must be at most {self._settings.agent_message_max_length} characters"
             )
@@ -2186,6 +2384,8 @@ class AgentIntegrationService:
                     )
                 elif not self._runtime_configured():
                     raise IntegrationUnavailable("agent model is not configured")
+            attachments = self._turn_attachments(db, principal, session_id, chat_ids, stored_ids)
+            self._require_attachment_support(instance, provider, row.model, attachments)
             run_id = str(uuid4())
             self._recover_stale(db, now)
             if row.status == "running":
@@ -2208,10 +2408,14 @@ class AgentIntegrationService:
                 run_id=run_id,
                 engine=instance.engine,
                 provider=attribution,
+                attachment_tokens=estimate_attachment_tokens(attachments),
             )
             original_updated_at = row.updated_at
             messages = list(row.messages or [])
-            messages.append({"role": "user", "content": message})
+            entry: dict[str, Any] = {"role": "user", "content": text}
+            if attachments:
+                entry["attachments"] = [item.metadata() for item in attachments]
+            messages.append(entry)
             claimed = db.execute(
                 update(AgentSession)
                 .where(
@@ -2263,7 +2467,7 @@ class AgentIntegrationService:
             principal=principal,
             session=snapshot,
             instance=instance_snapshot,
-            message=message,
+            message=text,
             asset_id=asset_id,
             external_session_id=snapshot.external_session_id,
             provider_selection=provider_selection,
@@ -2272,6 +2476,7 @@ class AgentIntegrationService:
             provider_name=turn_provider_name,
             run_id=run_id,
             quota=quota,
+            attachments=attachments,
         )
         with self._active_lock:
             self._active[session_id] = turn
@@ -2393,6 +2598,7 @@ class AgentIntegrationService:
             message=turn.message,
             conversation=history,
             assetId=turn.asset_id,
+            attachments=list(turn.attachments),
         )
         usage = AgentUsage()
         options: dict[str, Any] = {
@@ -2425,6 +2631,18 @@ class AgentIntegrationService:
         if reply.message:
             yield {"type": "delta", "text": reply.message}
         yield {"type": "done", "cancelled": False}
+
+    def delete_session(self, principal: Principal, session_id: str) -> None:
+        """Delete an owned conversation and the bytes of its chat attachments."""
+
+        self._require_human(principal)
+        with self._session() as db:
+            row = self._owned(db, principal, session_id)
+            if row.status == "running":
+                raise Conflict("a response is still running in this session")
+            ChatAttachmentService(db, self._settings).delete_for_session(principal, session_id)
+            db.delete(row)
+            db.commit()
 
     async def _managed_events(self, turn: Turn) -> AsyncIterator[dict[str, Any]]:
         from itsm.agents.managed import (
@@ -2459,6 +2677,11 @@ class AgentIntegrationService:
         )
         gateway = AiGatewayService(settings, self._session_factory, self._usage)
         grant = turn.quota.reservation
+        # Only bytes-bearing kinds travel to the engine; text is inlined below.
+        binary = [item for item in turn.attachments if item.kind != "text"]
+        prompt = user_content(
+            turn.message, [item for item in turn.attachments if item.kind == "text"]
+        )
         lease = gateway.issue_lease(
             actor_id=turn.principal.actor_id,
             funding=grant.funding,
@@ -2472,6 +2695,8 @@ class AgentIntegrationService:
             run_id=turn.run_id,
             context_tokens=turn.instance.managed_context_tokens,
             output_tokens=settings.agent_max_output_tokens,
+            input_modalities=_lease_modalities(binary),
+            attachment_bytes=encoded_attachment_bytes(binary),
         )
         runner = None
         try:
@@ -2506,8 +2731,13 @@ class AgentIntegrationService:
                 ]
                 count = settings.agent_max_history_messages
                 history = history[-count:] if count else []
+                delivery: dict[str, Any] = {"attachments": binary} if binary else {}
                 async for raw in runner.stream(
-                    turn.message, session_id=session_id, model=runner.native_model, history=history
+                    prompt,
+                    session_id=session_id,
+                    model=runner.native_model,
+                    history=history,
+                    **delivery,
                 ):
                     event = self._normalize_event(raw, turn)
                     if event is not None:

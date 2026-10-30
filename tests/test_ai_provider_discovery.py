@@ -584,7 +584,14 @@ def test_discovery_migration_round_trips_on_sqlite(settings_factory: Any, tmp_pa
             column["name"] for column in inspect(engine).get_columns("agent_providers")
         }
         downgraded = run_cli(
-            ["-m", "alembic", "-c", str(settings.alembic_config_path), "downgrade", "-1"],
+            [
+                "-m",
+                "alembic",
+                "-c",
+                str(settings.alembic_config_path),
+                "downgrade",
+                LEGACY_REVISION,
+            ],
             settings,
         )
         assert downgraded.returncode == 0, downgraded.stderr

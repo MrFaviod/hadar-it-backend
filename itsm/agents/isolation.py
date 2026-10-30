@@ -28,6 +28,7 @@ from dataclasses import dataclass
 from typing import Any, Final, Literal
 from uuid import UUID
 
+from itsm.agent_integrations.attachments import ChatAttachmentInput
 from itsm.agent_integrations.providers import ProviderModelSelection
 from itsm.agents.runtime import (
     INSTRUCTIONS,
@@ -43,7 +44,7 @@ from itsm.config import Settings
 from itsm.identity.permissions import HUMAN_ACTOR_KIND, ROLE_ADMIN, ROLE_SUPERADMIN
 from itsm.identity.service import IdentityService, Principal
 from itsm.system.providers import effective_selection
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 from pydantic.alias_generators import to_camel
 from pydantic_ai import RunContext
 from pydantic_ai.models.function import FunctionModel
@@ -56,7 +57,9 @@ logger = logging.getLogger("itsm.agent.isolation")
 PRIVILEGED_ROLES: Final[frozenset[str]] = frozenset({ROLE_ADMIN, ROLE_SUPERADMIN})
 
 _RUN_TIMEOUT_SECONDS: Final[int] = 180
-_MAX_MESSAGE_BYTES: Final[int] = 512 * 1024
+#: Bounded protocol frame. Enough for one message's base64 attachments (at most
+#: four files of the documented chat ceiling) plus tools and instructions.
+_MAX_MESSAGE_BYTES: Final[int] = 8 * 1024 * 1024
 _MAX_TOOL_RESULT_BYTES: Final[int] = 48 * 1024
 _MAX_TOOLS: Final[int] = 100
 _UNAVAILABLE: Final[str] = "the isolated agent runtime is unavailable"
@@ -103,6 +106,15 @@ class HistoryMessage(_Strict):
     content: str = Field(min_length=1, max_length=8000)
 
 
+class RunAttachment(_Strict):
+    """One stored attachment relayed to the worker as base64 bytes, never a URL."""
+
+    filename: str = Field(min_length=1, max_length=180)
+    media_type: str = Field(min_length=1, max_length=120)
+    kind: Literal["image", "file", "text"]
+    data: str = Field(min_length=1, max_length=6_000_000)
+
+
 class ToolSchema(_Strict):
     name: str = Field(min_length=1, max_length=120, pattern=r"^[a-z][a-z0-9_]*$")
     description: str = Field(default="", max_length=4000)
@@ -118,7 +130,8 @@ class RunStart(_Strict):
     timeout_seconds: int = Field(default=_RUN_TIMEOUT_SECONDS, ge=1, le=900)
     provider: ProviderSpec
     instructions: str = Field(max_length=12000)
-    prompt: str = Field(min_length=1, max_length=20000)
+    prompt: str = Field(default="", max_length=20000)
+    attachments: list[RunAttachment] = Field(default_factory=list, max_length=4)
     history: list[HistoryMessage] = Field(default_factory=list, max_length=50)
     tools: list[ToolSchema] = Field(default_factory=list, max_length=_MAX_TOOLS)
     max_steps: int = Field(default=8, ge=1, le=20)
@@ -135,6 +148,12 @@ class RunStart(_Strict):
         except ValueError:
             raise ValueError("identifier must be a UUID") from None
         return value
+
+    @model_validator(mode="after")
+    def _require_content(self) -> RunStart:
+        if not self.prompt.strip() and not self.attachments:
+            raise ValueError("prompt or at least one attachment is required")
+        return self
 
 
 class WorkerReady(_Strict):
@@ -268,6 +287,19 @@ class _PreparedTools:
     schemas: list[ToolSchema]
 
 
+def _attachment_spec(item: ChatAttachmentInput) -> RunAttachment:
+    """Relay stored bytes as base64; no path, URL or digest leaves this process."""
+
+    import base64
+
+    return RunAttachment(
+        filename=item.filename,
+        media_type=item.media_type,
+        kind=item.kind,
+        data=base64.b64encode(item.data).decode("ascii"),
+    )
+
+
 def _never_model(messages: Any, info: Any) -> Any:  # pragma: no cover - never called
     raise IsolationUnavailable(_UNAVAILABLE)
 
@@ -335,7 +367,8 @@ class IsolatedRuntime:
         prepared = self._prepare_tools(deps)
         prompt = request.message
         if request.assetId:
-            prompt = f"{prompt}\n\nActivo seleccionado: {request.assetId}"
+            marker = f"Activo seleccionado: {request.assetId}"
+            prompt = f"{prompt}\n\n{marker}" if prompt else marker
         start = RunStart(
             run_id=(quota.reservation.run_id if quota is not None else str(uuid.uuid4())),
             user_id=_uuid_text(principal.actor_id, "principal"),
@@ -343,6 +376,7 @@ class IsolatedRuntime:
             provider=provider,
             instructions=INSTRUCTIONS,
             prompt=prompt,
+            attachments=[_attachment_spec(item) for item in request.attachments],
             history=_history(request),
             tools=prepared.schemas,
             max_steps=self._settings.agent_max_steps,
