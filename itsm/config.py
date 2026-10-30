@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
+from cryptography.fernet import Fernet
 from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
@@ -148,9 +149,13 @@ class Settings(BaseSettings):
     # Fixed host launch inspector, separate from engine credentials and user input.
     hermes_inspector_url: str | None = None
     hermes_inspector_token: SecretStr | None = None
-    # Externally supplied Fernet key for provider credentials. Absent or blank
-    # means credential writing is honestly unavailable; the process never
-    # generates a key or stores it in the database.
+    # Externally supplied Fernet key ring for provider credentials, as a
+    # comma-separated list where the first entry encrypts and the rest only
+    # decrypt. Absent or blank means credential writing is honestly unavailable;
+    # the process never generates a key or stores one in the database.
+    ai_credential_keys: SecretStr | None = None
+    # Legacy single key, kept for deployments and rows that still use it: it is
+    # appended to the ring as a decryption-only key when not already present.
     ai_credential_key: SecretStr | None = None
 
     # Operator-configured external executor. ITSM never receives host, shell or
@@ -416,6 +421,30 @@ class Settings(BaseSettings):
             return None
         return value if value.get_secret_value().strip() else None
 
+    @field_validator("ai_credential_keys")
+    @classmethod
+    def _validate_ai_credential_keys(cls, value: SecretStr | None) -> SecretStr | None:
+        """Reject a malformed ring by position without echoing any key text.
+
+        Compose exports an empty optional variable when the feature is disabled,
+        so an exactly blank value means ``disabled`` rather than an error.
+        """
+        if value is None:
+            return None
+        raw = value.get_secret_value().strip()
+        if not raw:
+            return None
+        for position, entry in enumerate((part.strip() for part in raw.split(",")), start=1):
+            if not entry:
+                raise ValueError(f"ai_credential_keys entry {position} is empty")
+            try:
+                Fernet(entry.encode("ascii"))
+            except ValueError, TypeError, UnicodeEncodeError:
+                raise ValueError(
+                    f"ai_credential_keys entry {position} is not a valid Fernet key"
+                ) from None
+        return value
+
     @field_validator("system_executor_url")
     @classmethod
     def _validate_system_executor_url(cls, value: str) -> str:
@@ -513,6 +542,11 @@ class Settings(BaseSettings):
             values.add(self.task_redis_url)
         if self.service_redis_url:
             values.add(self.service_redis_url)
+        if self.ai_credential_keys is not None:
+            raw_ring = self.ai_credential_keys.get_secret_value()
+            if raw_ring:
+                values.add(raw_ring)
+                values.update(part.strip() for part in raw_ring.split(",") if part.strip())
         for secret in (
             self.prometheus_token,
             self.alertmanager_token,

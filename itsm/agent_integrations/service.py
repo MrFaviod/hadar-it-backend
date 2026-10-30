@@ -43,6 +43,8 @@ from itsm.agent_integrations.providers import (
     CredentialUnavailable,
     ProviderEndpointError,
     ProviderModelSelection,
+    credential_key_state,
+    credential_key_values,
     credential_storage_available,
     seal_credential,
     unseal_credential,
@@ -552,8 +554,14 @@ class AgentIntegrationService:
             raise NotFound("agent instance not found")
         return self._provider_snapshot(provider), provider
 
-    @staticmethod
-    def _provider_dto(row: AgentProvider) -> dict[str, Any]:
+    def _provider_dto(self, row: AgentProvider) -> dict[str, Any]:
+        # The owner sees whether a stored credential is still readable by this
+        # process; the credential itself is never returned in any form.
+        credential_status = (
+            credential_key_state(self._settings, row.api_key_ciphertext)
+            if row.api_key_ciphertext
+            else "missing"
+        )
         return {
             "id": row.id,
             "name": row.name,
@@ -561,6 +569,7 @@ class AgentIntegrationService:
             "baseUrl": row.base_url,
             "models": list(row.models or []),
             "credentialConfigured": bool(row.api_key_ciphertext),
+            "credentialStatus": credential_status,
             "enabled": bool(row.enabled),
         }
 
@@ -729,13 +738,8 @@ class AgentIntegrationService:
             text = text.replace(engine_secret, _REDACTED)
         if secret:
             text = text.replace(secret, _REDACTED)
-        master = (
-            self._settings.ai_credential_key.get_secret_value()
-            if self._settings.ai_credential_key
-            else None
-        )
-        if master:
-            text = text.replace(master, _REDACTED)
+        for credential_key in credential_key_values(self._settings):
+            text = text.replace(credential_key, _REDACTED)
         text = re.sub(r"Bearer\s+\S+", "Bearer " + _REDACTED, text)
         text = re.sub(
             r"(?i)\b(token|secret|password|api[_-]?key)\b\s*[:=]?\s+[^\s,;]+",

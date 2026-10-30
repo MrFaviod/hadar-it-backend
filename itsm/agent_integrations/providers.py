@@ -4,8 +4,9 @@ The module owns three boundaries that must never be reimplemented elsewhere:
 
 * endpoint validation, where personal records are public HTTPS only while
   operator-managed global records may use a private HTTP engine;
-* credential sealing with the externally supplied Fernet key
-  (``ITSM_AI_CREDENTIAL_KEY``), never generated or stored in the database;
+* credential sealing with the externally supplied Fernet key ring
+  (``ITSM_AI_CREDENTIAL_KEYS``, legacy ``ITSM_AI_CREDENTIAL_KEY``), never generated
+  or stored in the database;
 * the HTTP stack used to execute a personal provider, which resolves and
   filters the destination again for every connection it opens.
 
@@ -20,6 +21,7 @@ forwarded elsewhere.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import ipaddress
 import socket
 from dataclasses import dataclass
@@ -27,12 +29,21 @@ from urllib.parse import urlsplit, urlunsplit
 
 import httpcore
 import httpx
-from cryptography.fernet import Fernet, InvalidToken
+from cryptography.fernet import Fernet, InvalidToken, MultiFernet
 
 from itsm.config import Settings
 
 _MAX_ENDPOINT = 500
 _LOCAL_HOSTNAMES = frozenset({"localhost", "localhost.localdomain", "ip6-localhost"})
+
+KEY_STATE_PRIMARY = "primary"
+KEY_STATE_OLDER = "older"
+KEY_STATE_UNREADABLE = "unreadable"
+KEY_STATE_UNAVAILABLE = "unavailable"
+
+# Fingerprints are a domain-separated digest prefix, never a key fragment.
+_FINGERPRINT_DOMAIN = b"itsm.ai-credential-key.v1\x00"
+_FINGERPRINT_HEX = 12
 
 
 class ProviderEndpointError(ValueError):
@@ -158,41 +169,122 @@ def ensure_public_endpoint(url: str) -> None:
         raise ProviderEndpointError("provider endpoint resolves to a non-public address")
 
 
-def _cipher(settings: Settings) -> Fernet:
-    key = settings.ai_credential_key
-    if key is None:
-        raise CredentialUnavailable("credential storage is not configured")
-    value = key.get_secret_value().strip()
-    if not value:
+def credential_key_values(settings: Settings) -> list[str]:
+    """Ordered key ring: configured keys first, then the legacy decrypt key.
+
+    The first value encrypts; every later value only decrypts. The legacy
+    ``ITSM_AI_CREDENTIAL_KEY`` is appended when it is not already in the ring so
+    an installation can migrate to the ring without losing old ciphertext.
+    """
+    values: list[str] = []
+    ring = settings.ai_credential_keys
+    if ring is not None:
+        for entry in ring.get_secret_value().split(","):
+            value = entry.strip()
+            if value and value not in values:
+                values.append(value)
+    legacy = settings.ai_credential_key
+    if legacy is not None:
+        value = legacy.get_secret_value().strip()
+        if value and value not in values:
+            values.append(value)
+    return values
+
+
+def credential_fingerprint(value: str) -> str:
+    """Short, non-reversible identifier for one key; never the key itself."""
+    digest = hashlib.sha256(_FINGERPRINT_DOMAIN + value.encode("utf-8")).hexdigest()
+    return digest[:_FINGERPRINT_HEX]
+
+
+def credential_key_fingerprints(settings: Settings) -> list[str]:
+    """Ring fingerprints in encrypting order; the first is the active key."""
+    return [credential_fingerprint(value) for value in credential_key_values(settings)]
+
+
+def primary_fingerprint(settings: Settings) -> str | None:
+    fingerprints = credential_key_fingerprints(settings)
+    return fingerprints[0] if fingerprints else None
+
+
+def _fernets(settings: Settings) -> list[Fernet]:
+    values = credential_key_values(settings)
+    if not values:
         raise CredentialUnavailable("credential storage is not configured")
     try:
-        return Fernet(value.encode("ascii"))
+        return [Fernet(value.encode("ascii")) for value in values]
     except (ValueError, TypeError, UnicodeEncodeError) as exc:
         raise CredentialUnavailable("credential storage is not configured") from exc
 
 
+def _cipher(settings: Settings) -> MultiFernet:
+    return MultiFernet(_fernets(settings))
+
+
+def primary_cipher(settings: Settings) -> Fernet:
+    """The encrypting key; older ring entries decrypt but never encrypt."""
+    return _fernets(settings)[0]
+
+
 def credential_storage_available(settings: Settings) -> bool:
     try:
-        _cipher(settings)
+        _fernets(settings)
     except CredentialUnavailable:
         return False
     return True
 
 
+def credential_key_state(settings: Settings, token: str) -> str:
+    """Classify one stored ciphertext against the current ring.
+
+    ``primary`` means the encrypting key reads it, ``older`` means only a
+    decryption-only ring entry does, ``unreadable`` means no configured key
+    does and ``unavailable`` means the process has no ring at all.
+    """
+    try:
+        primary = primary_cipher(settings)
+    except CredentialUnavailable:
+        return KEY_STATE_UNAVAILABLE
+    try:
+        encoded = token.encode("ascii")
+    except AttributeError, UnicodeEncodeError:
+        return KEY_STATE_UNREADABLE
+    try:
+        primary.decrypt(encoded)
+        return KEY_STATE_PRIMARY
+    except InvalidToken:
+        pass
+    try:
+        _cipher(settings).decrypt(encoded)
+    except InvalidToken:
+        return KEY_STATE_UNREADABLE
+    return KEY_STATE_OLDER
+
+
 def seal_credential(settings: Settings, value: str) -> str:
-    """Encrypt one provider credential for storage; the key never leaves process env."""
+    """Encrypt one provider credential for storage; keys never leave process env."""
     try:
         return _cipher(settings).encrypt(value.encode("utf-8")).decode("ascii")
-    except (CredentialUnavailable, UnicodeEncodeError):
+    except CredentialUnavailable, UnicodeEncodeError:
         raise CredentialUnavailable("credential storage is not configured") from None
 
 
 def unseal_credential(settings: Settings, token: str) -> str:
     try:
         return _cipher(settings).decrypt(token.encode("ascii")).decode("utf-8")
-    except (CredentialUnavailable, UnicodeEncodeError):
+    except CredentialUnavailable, UnicodeEncodeError:
         raise CredentialUnavailable("credential storage is not configured") from None
     except InvalidToken as exc:
+        raise CredentialInvalid("the stored provider credential cannot be read") from exc
+
+
+def rotate_credential(settings: Settings, token: str) -> str:
+    """Re-encrypt one ciphertext under the primary key, keeping its timestamp."""
+    try:
+        return _cipher(settings).rotate(token.encode("ascii")).decode("ascii")
+    except CredentialUnavailable, UnicodeEncodeError:
+        raise CredentialUnavailable("credential storage is not configured") from None
+    except (InvalidToken, AttributeError, TypeError) as exc:
         raise CredentialInvalid("the stored provider credential cannot be read") from exc
 
 
@@ -303,16 +395,27 @@ def build_provider_model(
 
 
 __all__ = [
+    "KEY_STATE_OLDER",
+    "KEY_STATE_PRIMARY",
+    "KEY_STATE_UNAVAILABLE",
+    "KEY_STATE_UNREADABLE",
     "CredentialInvalid",
     "CredentialUnavailable",
     "ProviderEndpointError",
     "ProviderModelSelection",
     "build_provider_model",
+    "credential_fingerprint",
+    "credential_key_fingerprints",
+    "credential_key_state",
+    "credential_key_values",
     "credential_storage_available",
     "ensure_public_endpoint",
     "is_public_address",
+    "primary_cipher",
+    "primary_fingerprint",
     "provider_http_client",
     "resolve_addresses",
+    "rotate_credential",
     "seal_credential",
     "unseal_credential",
     "validate_provider_endpoint",
