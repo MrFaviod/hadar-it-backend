@@ -79,6 +79,22 @@ class Settings(BaseSettings):
     demo_max_delay_seconds: int = Field(default=30, ge=0, le=300)
     demo_periodic_minutes: int = Field(default=0, ge=0, le=60)
 
+    # Public demo exposure limits. They are only built when the release mode
+    # capability set is the public demo (``itsm.limits``); ``prod`` and ``dev``
+    # never construct a limiter, so these values cannot change their behaviour.
+    # ``trusted_proxy`` is the single opt-in for honouring ``X-Forwarded-For``:
+    # without it the header is attacker-controlled and ignored.
+    demo_rate_limit_per_minute: int = Field(default=60, ge=1, le=100_000)
+    demo_rate_limit_burst: int = Field(default=20, ge=1, le=100_000)
+    demo_login_rate_per_minute: int = Field(default=10, ge=1, le=10_000)
+    demo_login_rate_burst: int = Field(default=5, ge=1, le=10_000)
+    demo_max_request_body_bytes: int = Field(default=1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    demo_attachment_max_bytes: int = Field(default=2 * 1024 * 1024, ge=1024, le=64 * 1024 * 1024)
+    demo_attachment_quota_bytes: int = Field(default=100 * 1024 * 1024, ge=0, le=1024 * 1024 * 1024)
+    demo_max_active_sessions: int = Field(default=50, ge=1, le=10_000)
+    demo_max_in_flight: int = Field(default=8, ge=1, le=1024)
+    trusted_proxy: bool = False
+
     # Identity and authentication. ``auth_origin`` is the browser origin allowed
     # to call the API with cookies; ``auth_cookie_secure`` must be disabled
     # explicitly for plain-HTTP local development.

@@ -41,6 +41,10 @@ from itsm.database import (
     create_engine_from_settings,
     create_session_factory,
 )
+from itsm.demo.restrictions import (
+    DemoRestrictionMiddleware,
+    build_demo_restrictions,
+)
 from itsm.directory.api import create_directory_router
 from itsm.directory.media_api import create_directory_media_router
 from itsm.identity.api import (
@@ -54,6 +58,7 @@ from itsm.identity.service import AuthContext, IdentityService
 from itsm.interventions.api import create_intervention_router
 from itsm.inventory.api import create_inventory_router
 from itsm.inventory.catalog_api import create_catalog_router
+from itsm.limits import DemoLimits, DemoLimitsMiddleware
 from itsm.logging import configure_logging, log_event
 from itsm.maintenance.api import create_maintenance_router
 from itsm.mcp.server import TOOL_NAMES, create_mcp_server
@@ -63,6 +68,7 @@ from itsm.notifications.service import record_alert_event
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
 from itsm.release_identity import StartupMode, enforce_startup
+from itsm.release_mode import capabilities_for, read_release_mode
 from itsm.reports.api import create_reports_router
 from itsm.reports.service import build_report_service
 from itsm.search.api import create_search_router
@@ -145,6 +151,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the API application for one settings snapshot."""
     settings = settings or get_settings()
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
+
+    # The release capabilities are the single authority for the public-demo
+    # guard and its limit set. They are resolved before the app is built because
+    # middleware cannot be added from the lifespan; the lifespan still validates
+    # the same mode against the database owner.
+    capabilities = capabilities_for(read_release_mode())
+    demo_restrictions = build_demo_restrictions(settings, capabilities)
+    demo_limits = DemoLimits(settings) if demo_restrictions is not None else None
 
     sessions: dict[str, Callable[[], Session]] = {}
     services: dict[str, SystemService] = {}
@@ -235,6 +249,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         version=__version__,
         lifespan=lifespan,
     )
+    app.state.demo_restrictions = demo_restrictions
+    app.state.demo_limits = demo_limits
+    if demo_restrictions is not None:
+        # Installed inner-first so limits reject abusive traffic before the guard
+        # inspects a payload; both are outer to every router and the MCP mount.
+        app.add_middleware(DemoRestrictionMiddleware, restrictions=demo_restrictions)
+    if demo_limits is not None:
+        app.add_middleware(DemoLimitsMiddleware, limits=demo_limits)
     install_error_handlers(app)
     install_agent_integration_error_handlers(app)
     install_extension_error_handlers(app)

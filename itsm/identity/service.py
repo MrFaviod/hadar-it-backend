@@ -213,10 +213,17 @@ class IdentityService:
         settings: Settings,
         *,
         now: Callable[[], datetime] = utcnow,
+        session_cap: int | None = None,
+        password_waiver: str | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._now = now
+        # Public-demo policy. Both are supplied by the caller that holds the
+        # release capabilities; ``None`` keeps the ordinary production rules and
+        # no other code path can enable the waiver by setting a flag.
+        self._session_cap = session_cap
+        self._password_waiver = password_waiver
 
     # ------------------------------------------------------------------ views
     def _user_view(self, identity: Identity) -> UserView:
@@ -345,11 +352,36 @@ class IdentityService:
         return normalized
 
     def _validate_password(self, password: str) -> str:
+        if self._password_waiver is not None and password == self._password_waiver:
+            # The public demonstration accepts exactly its published visitor
+            # password. Every other password still follows the production length
+            # rule and ``prod``/``dev`` never receive a waiver at all.
+            return password
         minimum = self._settings.auth_password_min_length
         maximum = self._settings.auth_password_max_length
         if not isinstance(password, str) or not minimum <= len(password) <= maximum:
             raise ValidationFailed(f"password must be {minimum}-{maximum} characters")
         return password
+
+    def _enforce_session_cap(self, now: datetime) -> None:
+        """Keep at most ``session_cap`` active sessions by revoking the oldest.
+
+        The public demo has one shared state (D1) and an anonymous visitor can
+        mint a session per request, so unbounded growth is a real exposure.
+        Survivors are kept newest-first; only the demo capability set supplies a
+        cap, so production session behaviour is unchanged.
+        """
+        cap = self._session_cap
+        if cap is None:
+            return
+        rows = self._session.scalars(
+            select(IdentitySession)
+            .where(IdentitySession.revoked_at.is_(None))
+            .order_by(IdentitySession.created_at, IdentitySession.id)
+        ).all()
+        active = [row for row in rows if as_utc(row.expires_at) > now]
+        for row in active[: max(len(active) - (cap - 1), 0)]:
+            row.revoked_at = now
 
     def _validate_actor_kind(self, actor_kind: str) -> str:
         if actor_kind not in ACTOR_KINDS:
@@ -592,6 +624,7 @@ class IdentityService:
         raw_token = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
         session_id = str(uuid4())
+        self._enforce_session_cap(now)
         self._session.add(
             IdentitySession(
                 id=session_id,

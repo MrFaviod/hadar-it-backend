@@ -14,6 +14,7 @@ from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response, statu
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.demo.restrictions import visitor_password_waiver
 from itsm.demo.state import is_demo
 from itsm.identity.service import (
     AccountThrottled,
@@ -209,10 +210,21 @@ def audit_dto(event: AuditView) -> AuditEventDTO:
 
 # ---------------------------------------------------------------- dependencies
 def get_identity_service(request: Request) -> Iterator[IdentityService]:
-    factory = request.app.state.session_factory
+    state = request.app.state
+    factory = state.session_factory
     session = factory()
+    # The demo policy travels with the release capabilities resolved at startup,
+    # so every request-scoped service validates passwords and bounds sessions the
+    # same way the guard does. ``prod`` and ``dev`` pass ``None`` for both.
+    capabilities = getattr(state, "release_capabilities", None)
+    limits = getattr(state, "demo_limits", None)
     try:
-        yield IdentityService(session, request.app.state.settings)
+        yield IdentityService(
+            session,
+            state.settings,
+            session_cap=None if limits is None else limits.session_cap,
+            password_waiver=None if capabilities is None else visitor_password_waiver(capabilities),
+        )
     finally:
         session.close()
 
