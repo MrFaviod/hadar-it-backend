@@ -5,14 +5,14 @@ selects one of the providers visible to them, so the column is nullable and no
 existing row changes meaning.
 
 Revision ID: 0032_managed_personal_provider
-Revises: 0030_demo_cycle
+Revises: 0031_personal_provider_grants
 """
 
 import sqlalchemy as sa
 from alembic import op
 
 revision = "0032_managed_personal_provider"
-down_revision = "0030_demo_cycle"
+down_revision = "0031_personal_provider_grants"
 branch_labels = None
 depends_on = None
 
