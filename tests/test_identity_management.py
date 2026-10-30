@@ -501,6 +501,9 @@ def test_limited_user_manager_can_administer_permissions_it_holds(harness: Harne
                 "users.edit",
                 "assets.view",
                 "people.view",
+                # The built-in user profile now carries the personal-provider
+                # right, so assigning it needs it inside the manager's ceiling.
+                "agents.providers.personal",
             ],
         )
         service.create_user(

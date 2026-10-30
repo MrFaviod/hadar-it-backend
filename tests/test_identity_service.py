@@ -40,7 +40,7 @@ SYSTEM_PERMISSIONS = frozenset(
     }
 )
 OWNER_PERMISSIONS = frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
-ADMIN_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS - {"agents.providers.personal"}
+ADMIN_PERMISSIONS = OWNER_PERMISSIONS - SYSTEM_PERMISSIONS
 
 
 @pytest.fixture
@@ -702,7 +702,7 @@ def test_admin_profile_has_business_authority_but_no_installation_authority(
         grant = service.login("beto.admin", PASSWORD)
         assert grant.permissions == ADMIN_PERMISSIONS
         assert not grant.permissions & SYSTEM_PERMISSIONS
-        assert "agents.providers.personal" not in grant.permissions
+        assert "agents.providers.personal" in grant.permissions
 
         with pytest.raises(PermissionDenied):
             service.create_user(
@@ -763,7 +763,11 @@ def test_user_profile_is_read_only_until_a_business_grant_is_assigned(
             password=PASSWORD,
         )
         grant = service.login("rita.user", PASSWORD)
-        assert grant.permissions == {"assets.view", "people.view"}
+        assert grant.permissions == {
+            "assets.view",
+            "people.view",
+            "agents.providers.personal",
+        }
         service.authorize(grant.principal, "assets.view", resource="asset:1")
         service.authorize(grant.principal, "people.view", resource="person:1")
         for denied in ("assets.edit", "users.view", "system.view"):

@@ -217,7 +217,11 @@ def test_migration_keeps_admins_and_operators_and_migrates_readers_to_user(
         "user": True,
     }
     assert owners == 0
-    assert user_permissions == {"assets.view", "people.view"}
+    assert user_permissions == {
+        "agents.providers.personal",
+        "assets.view",
+        "people.view",
+    }
     assert operator_permissions == {
         "assets.view",
         "assets.edit",

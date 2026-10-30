@@ -256,7 +256,11 @@ def test_state_returns_authorized_subsets_for_every_authenticated_actor(env) -> 
     }
     assert admin_state["sessionMinutes"] == 480
     role = next(entry for entry in admin_state["roles"] if entry["id"] == "user")
-    assert role["permissions"] == ["assets.view", "people.view"]
+    assert role["permissions"] == [
+        "agents.providers.personal",
+        "assets.view",
+        "people.view",
+    ]
     assert role["builtIn"] is True
 
     with TestClient(create_app(harness.settings)) as reader_client:
@@ -264,7 +268,11 @@ def test_state_returns_authorized_subsets_for_every_authenticated_actor(env) -> 
         state = reader_client.get(f"{API}/identity/state")
     assert state.status_code == 200
     assert state.json() == {"users": [], "roles": [], "sessionMinutes": 480}
-    assert reader["permissions"] == ["assets.view", "people.view"]
+    assert reader["permissions"] == [
+        "agents.providers.personal",
+        "assets.view",
+        "people.view",
+    ]
 
 
 def test_user_lifecycle_over_http(env) -> None:

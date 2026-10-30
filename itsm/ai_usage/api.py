@@ -13,7 +13,7 @@ from fastapi import APIRouter, Depends, Query, Request
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, StrictInt
 
-from itsm.ai_usage.service import UNSET, AiUsageService
+from itsm.ai_usage.service import UNSET, AiUsageService, PersonalBudgetUnsupported
 from itsm.identity.api import AuthDependency, MutationDependency
 
 NO_STORE = {"Cache-Control": "no-store"}
@@ -28,6 +28,15 @@ ServiceDependency = Annotated[AiUsageService, Depends(_service)]
 
 def _json(payload: dict[str, Any]) -> JSONResponse:
     return JSONResponse(content=payload, headers=NO_STORE)
+
+
+def _personal_budget_rejected(exc: PersonalBudgetUnsupported) -> JSONResponse:
+    """Stable contract: personal daily limits are not part of the quota API."""
+    return JSONResponse(
+        status_code=422,
+        content={"error": {"code": exc.code, "message": str(exc)}},
+        headers=NO_STORE,
+    )
 
 
 class PolicyUpdateRequest(BaseModel):
@@ -83,7 +92,10 @@ def create_agent_usage_router() -> APIRouter:
             kwargs["personal_daily_limit"] = payload.personalDailyLimit
         if "timezone" in fields:
             kwargs["timezone"] = payload.timezone if payload.timezone is not None else UNSET
-        return _json(service.update_policy(context.principal, **kwargs))
+        try:
+            return _json(service.update_policy(context.principal, **kwargs))
+        except PersonalBudgetUnsupported as exc:
+            return _personal_budget_rejected(exc)
 
     @router.get("/overrides")
     def overrides(context: AuthDependency, service: ServiceDependency) -> JSONResponse:
@@ -96,14 +108,17 @@ def create_agent_usage_router() -> APIRouter:
         context: MutationDependency,
         service: ServiceDependency,
     ) -> JSONResponse:
-        return _json(
-            service.set_override(
-                context.principal,
-                user_id,
-                daily_limit=payload.dailyLimit,
-                scope=payload.scope,
+        try:
+            return _json(
+                service.set_override(
+                    context.principal,
+                    user_id,
+                    daily_limit=payload.dailyLimit,
+                    scope=payload.scope,
+                )
             )
-        )
+        except PersonalBudgetUnsupported as exc:
+            return _personal_budget_rejected(exc)
 
     @router.delete("/overrides/{user_id}")
     def delete_override(
@@ -112,7 +127,10 @@ def create_agent_usage_router() -> APIRouter:
         service: ServiceDependency,
         scope: Annotated[Literal["company", "personal"], Query()] = "company",
     ) -> JSONResponse:
-        return _json(service.delete_override(context.principal, user_id, scope=scope))
+        try:
+            return _json(service.delete_override(context.principal, user_id, scope=scope))
+        except PersonalBudgetUnsupported as exc:
+            return _personal_budget_rejected(exc)
 
     @router.get("/report")
     def report(

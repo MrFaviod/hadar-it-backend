@@ -12,9 +12,16 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from itsm.agent_integrations.models import AgentDailyUsage, AgentProvider
-from itsm.ai_usage.models import AiUsageReservation
+from itsm.ai_usage.models import (
+    POLICY_ID,
+    AiUsageQuotaOverride,
+    AiUsageQuotaPolicy,
+    AiUsageReceipt,
+    AiUsageReservation,
+)
 from itsm.ai_usage.service import (
     AiUsageService,
+    PersonalBudgetUnsupported,
     QuotaExceeded,
     UsageEvidence,
 )
@@ -157,6 +164,48 @@ def _measured(total: int, **overrides: Any) -> dict[str, Any]:
 
 def _company(service: AiUsageService, actor_id: str) -> dict[str, Any]:
     return service.me(actor_id)["funding"]["company"]
+
+
+def _add_user(h: Harness, username: str, name: str) -> Principal:
+    """Create one more ordinary person with the built-in ``user`` role."""
+    with h.with_session() as session:
+        identities = IdentityService(session, h.settings)
+        identities.create_user(
+            h.admin,
+            username=username,
+            name=name,
+            role_id="user",
+            password=USER_PASSWORD,
+        )
+        identity = identities._identity_by_username(username)
+        assert identity is not None
+        return identities.resolve_actor(identity.id)
+
+
+def _seed_legacy_personal_limits(
+    h: Harness, *, policy_limit: int | None, override_limit: int | None
+) -> None:
+    """Write pre-record-only personal limit rows straight to SQL.
+
+    The API no longer accepts personal limits; these rows simulate an
+    installation that configured them before personal funding became
+    record-only. They must stay inert and never deny a personal call.
+    """
+    h.service.policy(h.admin)
+    with h.with_session() as session:
+        policy = session.get(AiUsageQuotaPolicy, POLICY_ID)
+        assert policy is not None
+        policy.personal_daily_limit = policy_limit
+        policy.personal_configured = True
+        session.add(
+            AiUsageQuotaOverride(
+                id=f"personal:{h.user.actor_id}",
+                user_id=h.user.actor_id,
+                scope="personal",
+                daily_limit=override_limit,
+            )
+        )
+        session.commit()
 
 
 def test_two_independent_sessions_never_over_admit(harness: Callable[..., Harness]) -> None:
@@ -803,6 +852,185 @@ def test_policy_reduction_never_hides_consumption(
         _reserve(h.service, h.user.actor_id, tokens=1)
     report = h.service.report(h.admin)
     assert report["totals"]["settledTokens"] == 80
+
+
+def test_personal_funding_is_record_only_and_ignores_legacy_limits(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness(agent_daily_token_budget=100)
+    _seed_legacy_personal_limits(h, policy_limit=1, override_limit=0)
+
+    company = _reserve(h.service, h.user.actor_id, tokens=100)
+    h.service.settle(company.reservation_id, _measured(100))
+    with pytest.raises(QuotaExceeded):
+        _reserve(h.service, h.user.actor_id, tokens=1)
+
+    personal = _reserve(
+        h.service,
+        h.user.actor_id,
+        funding="personal",
+        tokens=500,
+        provider_id="provider-personal",
+        provider_scope="personal",
+        provider_name="Personal key",
+        model="gpt-4o-mini",
+        engine="pydantic",
+        run_id="run-personal",
+    )
+    assert personal.funding == "personal"
+    assert personal.limit_tokens is None
+    assert personal.remaining_tokens is None
+    h.service.settle(personal.reservation_id, _measured(400))
+
+    summary = h.service.me(h.user.actor_id)["funding"]
+    assert summary["company"]["consumedTokens"] == 100
+    assert summary["company"]["limitTokens"] == 100
+    assert summary["company"]["availableTokens"] == 0
+    personal_summary = summary["personal"]
+    assert personal_summary["consumedTokens"] == 400
+    assert personal_summary["reservedTokens"] == 0
+    assert personal_summary["limitTokens"] is None
+    assert personal_summary["availableTokens"] is None
+    assert personal_summary["unlimited"] is True
+    assert personal_summary["limitSource"] == "record_only"
+
+    with h.with_session() as session:
+        stored = session.get(AiUsageReservation, personal.reservation_id)
+        assert stored is not None
+        assert stored.funding == "personal"
+        assert stored.provider_scope == "personal"
+        assert stored.provider_id == "provider-personal"
+        receipt = session.scalar(
+            select(AiUsageReceipt).where(AiUsageReceipt.reservation_id == personal.reservation_id)
+        )
+        assert receipt is not None
+        assert receipt.funding == "personal"
+        assert receipt.provider_id == "provider-personal"
+        assert receipt.provider_scope == "personal"
+        assert receipt.precision == "measured"
+        assert receipt.total_tokens == 400
+
+    personal_report = h.service.report(h.admin, funding="personal")
+    assert personal_report["totals"]["settledTokens"] == 400
+    company_report = h.service.report(h.admin, funding="company")
+    assert company_report["totals"]["settledTokens"] == 100
+
+
+def test_two_users_with_own_keys_never_spend_company_quota(
+    harness: Callable[..., Harness],
+) -> None:
+    h = harness(agent_daily_token_budget=100)
+    second = _add_user(h, "quota.second", "Quota Second")
+    h.service.set_override(h.admin, h.user.actor_id, daily_limit=100)
+    h.service.set_override(h.admin, second.actor_id, daily_limit=0)
+
+    first_company = _reserve(h.service, h.user.actor_id, tokens=100)
+    h.service.settle(first_company.reservation_id, _measured(100))
+    with pytest.raises(QuotaExceeded):
+        _reserve(h.service, h.user.actor_id, tokens=1)
+    with pytest.raises(QuotaExceeded):
+        _reserve(h.service, second.actor_id, tokens=1)
+
+    first_personal = _reserve(
+        h.service,
+        h.user.actor_id,
+        funding="personal",
+        tokens=250,
+        provider_id="provider-first",
+        provider_scope="personal",
+        run_id="run-first",
+    )
+    second_personal = _reserve(
+        h.service,
+        second.actor_id,
+        funding="personal",
+        tokens=300,
+        provider_id="provider-second",
+        provider_scope="personal",
+        run_id="run-second",
+    )
+    h.service.settle(first_personal.reservation_id, _measured(200))
+    h.service.settle(second_personal.reservation_id, _measured(280))
+
+    first_company_summary = _company(h.service, h.user.actor_id)
+    assert first_company_summary["consumedTokens"] == 100
+    assert first_company_summary["reservedTokens"] == 0
+    second_company_summary = _company(h.service, second.actor_id)
+    assert second_company_summary["consumedTokens"] == 0
+    assert second_company_summary["reservedTokens"] == 0
+    assert second_company_summary["availableTokens"] == 0
+    assert h.service.me(h.user.actor_id)["funding"]["personal"]["consumedTokens"] == 200
+    assert h.service.me(second.actor_id)["funding"]["personal"]["consumedTokens"] == 280
+
+    report = h.service.report(h.admin, funding="personal", group_by=("user", "provider"))
+    assert {
+        (item["userId"], item["providerId"], item["settledTokens"]) for item in report["items"]
+    } == {
+        (h.user.actor_id, "provider-first", 200),
+        (second.actor_id, "provider-second", 280),
+    }
+
+
+def test_personal_limit_inputs_are_rejected_without_mutating_data(
+    harness: Callable[..., Harness],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+) -> None:
+    h = harness(agent_daily_token_budget=100)
+    before = h.service.policy(h.admin)
+
+    with pytest.raises(PersonalBudgetUnsupported) as rejected:
+        h.service.update_policy(h.admin, personal_daily_limit=5)
+    assert rejected.value.code == "personal_budget_unsupported"
+    with pytest.raises(PersonalBudgetUnsupported):
+        h.service.set_override(h.admin, h.user.actor_id, daily_limit=0, scope="personal")
+
+    _seed_legacy_personal_limits(h, policy_limit=None, override_limit=0)
+    with pytest.raises(PersonalBudgetUnsupported):
+        h.service.delete_override(h.admin, h.user.actor_id, scope="personal")
+
+    after = h.service.policy(h.admin)
+    assert {key: value for key, value in after.items() if key != "serverTime"} == {
+        key: value for key, value in before.items() if key != "serverTime"
+    }
+    assert after["personalDailyLimit"] is None
+    assert after["personalLimitSource"] == "not_applicable"
+    assert after["companyDailyLimit"] == 100
+    assert h.service.list_overrides(h.admin)["overrides"] == []
+
+    client, headers = signed_in_client(h.settings)
+    prefix = h.settings.api_prefix
+    policy_rejected = client.put(
+        f"{prefix}/agent/usage/policy",
+        json={"personalDailyLimit": 5},
+        headers=headers,
+    )
+    assert policy_rejected.status_code == 422, policy_rejected.text
+    assert policy_rejected.json()["error"]["code"] == "personal_budget_unsupported"
+    override_rejected = client.put(
+        f"{prefix}/agent/usage/overrides/{h.user.actor_id}",
+        json={"dailyLimit": 5, "scope": "personal"},
+        headers=headers,
+    )
+    assert override_rejected.status_code == 422, override_rejected.text
+    assert override_rejected.json()["error"]["code"] == "personal_budget_unsupported"
+    delete_rejected = client.delete(
+        f"{prefix}/agent/usage/overrides/{h.user.actor_id}?scope=personal", headers=headers
+    )
+    assert delete_rejected.status_code == 422, delete_rejected.text
+    assert delete_rejected.json()["error"]["code"] == "personal_budget_unsupported"
+
+    policy = client.get(f"{prefix}/agent/usage/policy").json()
+    assert policy["companyDailyLimit"] == 100
+    assert policy["personalDailyLimit"] is None
+    assert policy["personalLimitSource"] == "not_applicable"
+    assert client.get(f"{prefix}/agent/usage/overrides").json()["overrides"] == []
+
+    with h.with_session() as session:
+        policy_row = session.get(AiUsageQuotaPolicy, POLICY_ID)
+        assert policy_row is not None
+        assert policy_row.personal_daily_limit is None
+        assert policy_row.company_daily_limit is None
+        assert session.get(AiUsageQuotaOverride, f"personal:{h.user.actor_id}") is not None
 
 
 def test_evidence_requires_explicit_inclusion_for_derived_totals(

@@ -154,8 +154,17 @@ def test_global_provider_is_owner_managed_and_secret_is_write_only(provider_env:
     assert visible.status_code == 200, visible.text
     assert [item["id"] for item in visible.json()["items"]] == [body["id"]]
     assert visible.json()["canManageGlobal"] is False
-    assert visible.json()["canManagePersonal"] is False
-    denied = _create_provider(client, plain, scope="personal", baseUrl="https://api.example.com/v1")
+    assert visible.json()["canManagePersonal"] is True
+    owned = _create_provider(
+        client,
+        plain,
+        scope="personal",
+        baseUrl="https://api.example.com/v1",
+        apiKey="sk-plain-secret",
+    )
+    assert owned.status_code == 201, owned.text
+    assert owned.json()["scope"] == "personal"
+    denied = _create_provider(client, plain, scope="global", baseUrl="https://api.example.com/v1")
     assert denied.status_code == 403, denied.text
     assert client.patch(
         f"{API}/agent/providers/{body['id']}", json={"name": "hijacked"}, headers=plain
@@ -240,6 +249,57 @@ def test_personal_providers_require_explicit_permission_and_stay_owner_isolated(
             Fernet(MASTER_KEY.encode()).decrypt(alice_row.api_key_ciphertext.encode())
             == b"sk-alice"
         )
+
+
+def test_builtin_admin_and_user_manage_only_their_own_personal_provider(
+    provider_env: Any,
+) -> None:
+    catalog, client = provider_env
+    catalog.add_user("builtin.user", "Builtin User", "user")
+    admin = _admin_login(client, catalog.settings)
+    admin_created = _create_provider(
+        client,
+        admin,
+        scope="personal",
+        name="Admin endpoint",
+        baseUrl="https://api.admin.example/v1",
+        apiKey="sk-admin",
+    )
+    assert admin_created.status_code == 201, admin_created.text
+    admin_id = admin_created.json()["id"]
+
+    user = _login(client, catalog.settings, "builtin.user", MACHINE_PASSWORD)
+    listed = client.get(f"{API}/agent/providers", headers=user)
+    assert listed.status_code == 200, listed.text
+    assert listed.json()["canManagePersonal"] is True
+    assert listed.json()["canManageGlobal"] is False
+    user_created = _create_provider(
+        client,
+        user,
+        scope="personal",
+        name="User endpoint",
+        baseUrl="https://api.user.example/v1",
+        apiKey="sk-user",
+    )
+    assert user_created.status_code == 201, user_created.text
+    user_id = user_created.json()["id"]
+    assert client.get(f"{API}/agent/providers", headers=user).json()["items"] == [
+        user_created.json()
+    ]
+    assert client.patch(
+        f"{API}/agent/providers/{admin_id}", json={"name": "stolen"}, headers=user
+    ).status_code == 404
+    assert client.delete(f"{API}/agent/providers/{admin_id}", headers=user).status_code == 404
+
+    admin = _admin_login(client, catalog.settings)
+    assert client.get(f"{API}/agent/providers", headers=admin).json()["items"] == [
+        admin_created.json()
+    ]
+    assert client.patch(
+        f"{API}/agent/providers/{user_id}", json={"name": "stolen"}, headers=admin
+    ).status_code == 404
+    assert client.delete(f"{API}/agent/providers/{user_id}", headers=admin).status_code == 404
+    assert _create_provider(client, user, scope="global").status_code == 403
 
 
 @pytest.mark.parametrize(

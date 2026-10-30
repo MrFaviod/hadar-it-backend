@@ -108,15 +108,16 @@ _OPERATOR_PERMISSIONS: Final[frozenset[str]] = frozenset(
 
 _USER_PERMISSIONS: Final[frozenset[str]] = frozenset({"assets.view", "people.view"})
 
-# Adding personal OpenAI-compatible providers is an explicit grant: no built-in
-# business profile receives it implicitly. The 0023 migration grants it to the
-# installation owner so it can be handed to a custom role.
+# Adding personal OpenAI-compatible providers is a personal-funding right, not a
+# business administration grant. The built-in Admin and User profiles hold it so
+# every person can register their own key; the operator profile does not, and a
+# custom role only holds it when it is granted explicitly.
 PERSONAL_PROVIDER_PERMISSION: Final[str] = "agents.providers.personal"
 
 BUILT_IN_ROLE_PERMISSIONS: Final[dict[str, frozenset[str]]] = {
     ROLE_SUPERADMIN: PERMISSION_CODES,
-    ROLE_ADMIN: PERMISSION_CODES - SYSTEM_PERMISSIONS - {PERSONAL_PROVIDER_PERMISSION},
-    ROLE_USER: _USER_PERMISSIONS,
+    ROLE_ADMIN: PERMISSION_CODES - SYSTEM_PERMISSIONS,
+    ROLE_USER: _USER_PERMISSIONS | {PERSONAL_PROVIDER_PERMISSION},
 }
 
 # Machines never receive identity/policy administration, even when a role that
@@ -147,7 +148,7 @@ def split_permission(code: str) -> tuple[str, str]:
     return resource, operation
 
 
-def is_known_permission(code: str, session: "Session | None" = None) -> bool:
+def is_known_permission(code: str, session: Session | None = None) -> bool:
     """Static core code, or an installed namespaced code read from this session.
 
     The session parameter is optional so transport/catalog callers that only

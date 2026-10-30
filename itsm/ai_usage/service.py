@@ -51,6 +51,10 @@ SOURCES = ("provider", "engine", "estimate", "none")
 DEFAULT_GROUP_BY = ("user", "provider", "model", "engine", "funding", "day")
 GROUPABLE = set(DEFAULT_GROUP_BY)
 PROVIDER_SCOPES = ("global", "personal")
+# Personal-funded work has no token limit at all; the legacy personal policy
+# columns and override rows stay stored but are never consulted for admission.
+PERSONAL_LIMIT_SOURCE = "record_only"
+PERSONAL_LIMIT_NOT_APPLICABLE = "not_applicable"
 PERMISSION = "system.providers"
 _DAY_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
@@ -72,6 +76,15 @@ class QuotaExceeded(Exception):
         super().__init__("daily AI usage quota exhausted")
         self.remaining_tokens = remaining_tokens
         self.period_day = period_day
+
+
+class PersonalBudgetUnsupported(ValidationFailed):
+    """Personal-funded work is record-only; a personal daily limit is not a contract."""
+
+    code = "personal_budget_unsupported"
+
+    def __init__(self, message: str = "personal daily token limits are not supported") -> None:
+        super().__init__(message)
 
 
 @dataclass(frozen=True)
@@ -426,6 +439,10 @@ class AiUsageService:
         return Period(today.isoformat(), active, pending, effective)
 
     def _effective_limit(self, db: Session, actor_id: str, funding: str) -> LimitState:
+        if funding == PERSONAL:
+            # Record-only funding: no company policy, legacy personal policy or
+            # personal override may ever deny a personal-funded call.
+            return LimitState(None, PERSONAL_LIMIT_SOURCE)
         override = db.scalar(
             select(AiUsageQuotaOverride).where(
                 AiUsageQuotaOverride.user_id == actor_id,
@@ -435,13 +452,11 @@ class AiUsageService:
         if override is not None:
             return LimitState(override.daily_limit, "override")
         policy = self._policy(db)
-        if funding == COMPANY:
-            if policy.company_configured:
-                return LimitState(policy.company_daily_limit, "default")
-            configured = self._settings.agent_daily_token_budget
-            # Preserve legacy config semantics: <= 0 was unlimited.
-            return LimitState(configured if configured > 0 else None, "legacy_config")
-        return LimitState(policy.personal_daily_limit, "default")
+        if policy.company_configured:
+            return LimitState(policy.company_daily_limit, "default")
+        configured = self._settings.agent_daily_token_budget
+        # Preserve legacy config semantics: <= 0 was unlimited.
+        return LimitState(configured if configured > 0 else None, "legacy_config")
 
     def _legacy_tokens(self, db: Session, actor_id: str, day: str, timezone: str) -> int:
         days = _legacy_utc_days(day, timezone)
@@ -470,8 +485,8 @@ class AiUsageService:
         payload: dict[str, Any] = {
             "companyDailyLimit": company_limit,
             "companyLimitSource": "policy" if policy.company_configured else "legacy_config",
-            "personalDailyLimit": policy.personal_daily_limit,
-            "personalLimitSource": "policy",
+            "personalDailyLimit": None,
+            "personalLimitSource": PERSONAL_LIMIT_NOT_APPLICABLE,
             "timezone": period.timezone,
             "pendingTimezone": period.pending_timezone,
             "pendingEffectiveDay": period.pending_effective_day,
@@ -483,9 +498,9 @@ class AiUsageService:
 
     def _override_rows(self, db: Session) -> list[dict[str, Any]]:
         rows = db.scalars(
-            select(AiUsageQuotaOverride).order_by(
-                AiUsageQuotaOverride.user_id, AiUsageQuotaOverride.scope
-            )
+            select(AiUsageQuotaOverride)
+            .where(AiUsageQuotaOverride.scope == COMPANY)
+            .order_by(AiUsageQuotaOverride.user_id, AiUsageQuotaOverride.scope)
         ).all()
         return [
             {
@@ -530,15 +545,14 @@ class AiUsageService:
     ) -> dict[str, Any]:
         with self._session() as db:
             self._require_admin(db, principal, "ai-usage:policy")
+            if personal_daily_limit is not UNSET:
+                raise PersonalBudgetUnsupported()
             policy = self._policy(db)
             now = self._now_utc()
             self._period(db)
             if company_daily_limit is not UNSET:
                 policy.company_daily_limit = _validate_limit(company_daily_limit)
                 policy.company_configured = True
-            if personal_daily_limit is not UNSET:
-                policy.personal_daily_limit = _validate_limit(personal_daily_limit)
-                policy.personal_configured = True
             if cancel_timezone_change and timezone is not UNSET:
                 raise ValidationFailed("timezone and cancelTimezoneChange cannot be combined")
             if cancel_timezone_change:
@@ -581,6 +595,8 @@ class AiUsageService:
         with self._session() as db:
             self._require_admin(db, principal, f"ai-usage:override:{scope}:{user_id}")
             self._validate_scope(scope)
+            if scope == PERSONAL:
+                raise PersonalBudgetUnsupported()
             limit = _validate_limit(daily_limit)
             if not isinstance(user_id, str) or not user_id.strip():
                 raise ValidationFailed("user id is required")
@@ -615,6 +631,8 @@ class AiUsageService:
         with self._session() as db:
             self._require_admin(db, principal, f"ai-usage:override:{scope}:{user_id}")
             self._validate_scope(scope)
+            if scope == PERSONAL:
+                raise PersonalBudgetUnsupported()
             row = db.get(AiUsageQuotaOverride, f"{scope}:{user_id}")
             if row is not None:
                 db.delete(row)
