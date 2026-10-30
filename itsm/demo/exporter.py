@@ -56,20 +56,21 @@ def _phase(asset_id: str) -> float:
 def exposition(asset_id: str, elapsed: float) -> str:
     """Return a node-exporter-shaped body for one fictional asset."""
     phase = _phase(asset_id)
-    idle_share = 0.80 + 0.06 * math.sin(elapsed / 45 + phase)
-    total_seconds = elapsed * CPU_COUNT
+    # Integrate positive rates; elapsed * current share eventually decreases.
+    idle_seconds = 0.80 * elapsed + 0.06 * 45 * (math.cos(phase) - math.cos(elapsed / 45 + phase))
+    busy_seconds = elapsed - idle_seconds
     lines: list[str] = []
     lines.append("# HELP node_cpu_seconds_total Seconds the CPUs spent in each mode.")
     lines.append("# TYPE node_cpu_seconds_total counter")
-    shares = {
-        "idle": idle_share,
-        "user": (1 - idle_share) * 0.62,
-        "system": (1 - idle_share) * 0.28,
-        "iowait": (1 - idle_share) * 0.10,
+    counters = {
+        "idle": idle_seconds,
+        "user": busy_seconds * 0.62,
+        "system": busy_seconds * 0.28,
+        "iowait": busy_seconds * 0.10,
     }
     for cpu in range(CPU_COUNT):
         for mode in _CPU_MODES:
-            seconds = total_seconds * shares[mode]
+            seconds = counters[mode]
             lines.append(
                 f"node_cpu_seconds_total{{{_labels(cpu=str(cpu), mode=mode)}}} {_number(seconds)}"
             )

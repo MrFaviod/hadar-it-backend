@@ -112,12 +112,16 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
 
 def test_demo_directory_special_characters_cannot_redirect_database(tmp_path: Path) -> None:
     directory = tmp_path / "demo?query#fragment"
+    sibling = tmp_path / "demo"
+    sibling.mkdir()
+    existing = sibling / "demo.db"
+    existing.write_bytes(b"existing database must not change")
     result = initialize(directory, ITSM_DATABASE_ECHO="true")
-    assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(result.stdout)["mode"] == "demo"
-    assert result.stderr == ""
-    assert (directory / "demo.db").is_file()
-    assert list(tmp_path.iterdir()) == [directory]
+    assert result.returncode == 1, result.stdout + result.stderr
+    assert result.stdout == ""
+    assert json.loads(result.stderr)["message"] == "demo directory contains URL delimiters"
+    assert list(tmp_path.iterdir()) == [sibling]
+    assert existing.read_bytes() == b"existing database must not change"
     assert PASSWORD not in result.stdout
 
 
