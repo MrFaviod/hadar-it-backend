@@ -57,6 +57,8 @@ def refuse_production() -> None:
 @contextlib.contextmanager
 def demo_settings(directory: Path) -> Iterator[Settings]:
     """Ignore ambient ``ITSM_*`` configuration; the demo owns only its own database."""
+    if any(delimiter in str(directory) for delimiter in ("?", "#")):
+        raise DemoRefused("demo directory contains URL delimiters")
     with contextlib.ExitStack() as restore:
         for key in tuple(os.environ):
             if key.startswith("ITSM_"):

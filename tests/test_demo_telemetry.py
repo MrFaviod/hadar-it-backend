@@ -414,3 +414,18 @@ def test_exporter_refuses_production_environment_and_remote_binding(tmp_path: Pa
     assert rejected.stdout == ""
     assert "unrecognized arguments: --host 0.0.0.0" in rejected.stderr
     assert _state(directory) == before
+
+
+def test_cpu_counters_remain_monotonic_over_sustained_operation():
+    from itsm.demo.exporter import exposition
+
+    for asset in ["00000000-0000-4000-8000-000000000001", "ffffffff-0000-4000-8000-000000000001"]:
+        previous = {}
+        for elapsed in range(0, 7201, 15):
+            counters = {
+                line.split()[0]: float(line.split()[1])
+                for line in exposition(asset, elapsed).splitlines()
+                if line.startswith("node_cpu_seconds_total{")
+            }
+            assert all(value >= previous.get(key, 0) for key, value in counters.items())
+            previous = counters
