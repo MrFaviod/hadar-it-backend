@@ -178,6 +178,29 @@ def test_init_creates_schema_dev_marker_admin_and_dataset(tmp_path: Path) -> Non
     assert "password" not in result["admin"]
 
 
+def test_dev_seed_preserves_superadmin_and_excludes_public_credentials(tmp_path: Path) -> None:
+    from fastapi.testclient import TestClient
+    from itsm.main import create_app
+
+    initialise(tmp_path)
+    settings = dev_settings(tmp_path)
+    with TestClient(create_app(settings)) as client:
+        response = client.post(
+            "/api/v1/auth/login",
+            json={"username": "dev.admin", "password": PASSWORD},
+            headers={"Origin": "http://testserver"},
+        )
+        assert response.status_code == 200, response.text
+        assert response.json()["user"]["roleId"] == "superadmin"
+        assert response.json()["demoMode"] is False
+        rejected = client.post(
+            "/api/v1/auth/login",
+            json={"username": "admin", "password": "admin"},
+            headers={"Origin": "http://testserver"},
+        )
+        assert rejected.status_code == 401, rejected.text
+
+
 def test_second_init_is_idempotent(tmp_path: Path) -> None:
     first = initialise(tmp_path)
     first_assets, first_users = login_and_count(dev_settings(tmp_path), "dev.admin", PASSWORD)
@@ -477,18 +500,17 @@ def test_error_output_is_actionable_and_verbose_shows_a_traceback(tmp_path: Path
     assert "Traceback (most recent call last)" in verbose.stderr
 
 
-def test_init_keeps_the_demo_marker_limitation_documented(tmp_path: Path) -> None:
-    """The canonical seed writes the demo marker; the tool reports that honestly."""
+def test_init_does_not_mark_development_as_public_demo(tmp_path: Path) -> None:
+    """Shared fictional data must not turn development into a public demo."""
     result = initialise(tmp_path)
 
-    assert result["dataset"]["demoMarker"] is True
+    assert result["dataset"]["demoMarker"] is False
     assert result["identity"]["marker"] == "dev"
     settings = dev_settings(tmp_path)
     engine = create_engine_from_settings(settings)
     try:
         with Session(engine) as session:
             marker = session.get(DemoInstallation, 1)
-            assert marker is not None
-            assert marker.dataset == "fictional-infrastructure-v1"
+            assert marker is None
     finally:
         engine.dispose()

@@ -28,7 +28,7 @@ from itsm.demo.state import DemoInstallation
 from itsm.directory.service import DirectoryService
 from itsm.identity.clock import utcnow
 from itsm.identity.permissions import ROLE_ADMIN, ROLE_OPERATOR
-from itsm.identity.service import IdentityService
+from itsm.identity.service import IdentityService, Principal
 from itsm.interventions.service import InterventionService
 from itsm.inventory.service import InventoryService
 from itsm.maintenance.service import MaintenanceService
@@ -37,7 +37,36 @@ from itsm.release_mode import capabilities_for
 from itsm.workflows.warranties import WarrantyService
 
 
-def seed(session: Session, settings: Settings, username: str, password: str) -> dict:
+def seed(
+    session: Session, settings: Settings, username: str, password: str, *, development: bool = False
+) -> dict:
+    if development:
+        # Reuse fictional business data, never demo credentials or password exemptions.
+        identity = IdentityService(session, settings)
+        identity.bootstrap_superadmin(username, "Administrador de desarrollo", password)
+        principal = identity.login(username, password).principal
+        identity.create_user(
+            principal,
+            username="dev.operator",
+            name="Operadora de desarrollo",
+            role_id=ROLE_OPERATOR,
+            password=password,
+        )
+    else:
+        principal = _demo_principal(session, settings, username, password)
+    return _seed_business_data(
+        session,
+        settings,
+        identity if development else IdentityService(session, settings),
+        principal,
+        username,
+        development,
+    )
+
+
+def _demo_principal(
+    session: Session, settings: Settings, username: str, password: str
+) -> Principal:
     session.add(DemoInstallation(id=1, dataset="fictional-infrastructure-v1", created_at=utcnow()))
     session.commit()  # Safety marker precedes every service commit, including partial failures.
     identity = IdentityService(
@@ -63,13 +92,14 @@ def seed(session: Session, settings: Settings, username: str, password: str) -> 
         role_id=ROLE_ADMIN,
         password=VISITOR_PASSWORD,
     )
-    identity.create_user(
-        owner,
-        username=username,
-        name="Responsable de demostración",
-        role_id=ROLE_ADMIN,
-        password=password,
-    )
+    if username != VISITOR_USERNAME:
+        identity.create_user(
+            owner,
+            username=username,
+            name="Responsable de demostración",
+            role_id=ROLE_ADMIN,
+            password=password,
+        )
     identity.create_user(
         owner,
         username="demo.operator",
@@ -79,7 +109,17 @@ def seed(session: Session, settings: Settings, username: str, password: str) -> 
     )
     # The dataset is authored by the demonstration administrator so the demo
     # history never points at the internal owner.
-    principal = identity.login(VISITOR_USERNAME, VISITOR_PASSWORD).principal
+    return identity.login(VISITOR_USERNAME, VISITOR_PASSWORD).principal
+
+
+def _seed_business_data(
+    session: Session,
+    settings: Settings,
+    identity: IdentityService,
+    principal: Principal,
+    username: str,
+    development: bool,
+) -> dict:
     directory = DirectoryService(session, settings, identity=identity)
     department = directory.create_department(principal, {"name": "Operaciones de demostración"})
     sites, rooms, people = [], [], []
@@ -206,7 +246,7 @@ def seed(session: Session, settings: Settings, username: str, password: str) -> 
             },
         )
     return {
-        "mode": "demo",
+        "mode": "dev" if development else "demo",
         "dataset": "fictional-infrastructure-v1",
         "assets": len(assets),
         "sites": 2,
@@ -214,7 +254,7 @@ def seed(session: Session, settings: Settings, username: str, password: str) -> 
         "incidents": 2,
         "relationships": 6,
         "externalNotifications": "blocked",
-        "visitorUsername": VISITOR_USERNAME,
-        "visitorRole": ROLE_ADMIN,
+        "visitorUsername": None if development else VISITOR_USERNAME,
+        "visitorRole": None if development else ROLE_ADMIN,
         "operatorUsername": username,
     }

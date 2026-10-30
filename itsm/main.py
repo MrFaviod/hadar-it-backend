@@ -67,7 +67,7 @@ from itsm.notifications.api import create_notification_router
 from itsm.notifications.service import record_alert_event
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
-from itsm.release_identity import StartupMode, enforce_startup
+from itsm.release_identity import DeploymentIdentityError, StartupMode, enforce_startup
 from itsm.release_mode import capabilities_for, read_release_mode
 from itsm.reports.api import create_reports_router
 from itsm.reports.service import build_report_service
@@ -190,6 +190,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         release: StartupMode = enforce_startup(settings)
         app.state.release_mode = release.mode
         app.state.release_capabilities = release.capabilities
+        app.state.release_identity_verified = release.identity_verified
         engine = create_engine_from_settings(settings)
         factory = create_session_factory(engine)
         sessions["factory"] = factory
@@ -265,6 +266,37 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def log_requests(request: Request, call_next: Any) -> Any:
         started = time.perf_counter()
         status_code = 500
+        if not app.state.release_identity_verified and request.url.path != (
+            settings.api_prefix + "/health/live"
+        ):
+            try:
+                verified = enforce_startup(
+                    settings,
+                    engine=app.state.engine,
+                    environ={"RELEASE_MODE": app.state.release_mode},
+                    require_identity=True,
+                )
+                app.state.release_identity_verified = verified.identity_verified
+            except DeploymentIdentityError:
+                if request.url.path == settings.api_prefix + "/health/ready":
+                    payload = check_readiness(
+                        app.state.engine,
+                        settings,
+                        task_storage_ok=_task_storage_ok(app.state.task_queue),
+                    ).as_dict()
+                    payload["status"] = "unavailable"
+                    payload["releaseMode"] = app.state.release_mode
+                    return JSONResponse(status_code=503, content=payload)
+                return JSONResponse(
+                    status_code=503,
+                    content={
+                        "error": {
+                            "code": "release_identity_unavailable",
+                            "message": "deployment identity cannot be verified",
+                        }
+                    },
+                    headers={"Cache-Control": "no-store"},
+                )
         try:
             response = await call_next(request)
             status_code = response.status_code

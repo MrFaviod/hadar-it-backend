@@ -248,16 +248,12 @@ def _seed(
     username: str,
     password: str,
 ) -> dict[str, Any]:
-    """Build the fictional dataset with the canonical demo seed.
+    """Reuse fictional business data with a strict development Superadmin.
 
-    The canonical seed writes the durable demo marker before any service
-    commit; demo code is out of this task's edit surface, so the marker is kept
-    and reported instead of removed. A marker can never be promoted to
-    production, so the safety direction is unchanged, but the database reports
-    ``demoMarker: true`` in ``status``.
+    Development creates no public demo credentials or demo installation marker.
     """
     try:
-        seeded = seed(session, settings, username, password)
+        seeded = seed(session, settings, username, password, development=True)
     except IdentityError as exc:
         raise DevToolsRefused(
             f"the dev administrator could not be created: {exc}; next: choose a "
@@ -267,7 +263,7 @@ def _seed(
         **seeded,
         "mode": guard.DEV_MODE,
         "seed": SEED_SOURCE,
-        "demoMarker": True,
+        "demoMarker": False,
     }
 
 

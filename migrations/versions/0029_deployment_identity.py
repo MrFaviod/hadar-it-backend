@@ -20,7 +20,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "deployment_identity",
-        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=False),
         sa.Column("release_mode", sa.String(8), nullable=False),
         sa.Column("instance_id", sa.String(64), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),

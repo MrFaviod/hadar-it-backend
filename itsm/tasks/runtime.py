@@ -135,7 +135,7 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
         # The worker refuses to consume work in an invalid mode or against a
         # database owned by another mode, before any task is dequeued.
         try:
-            release = enforce_startup(settings)
+            release = enforce_startup(settings, require_identity=True)
         except ReleaseModeError as exc:
             log_event(logger, "worker.refused", level=logging.ERROR, reason=str(exc))
             # Huey logs startup-hook exceptions and keeps consuming, and hooks run

@@ -26,7 +26,8 @@ pointing at, and resetting, a production database over the network (S5).
 
 Migrations stay an explicit prerequisite: when the ``deployment_identity``
 table or the database itself is not reachable yet, startup continues and
-``/health/ready`` reports the real state, so the API never races migrations.
+``/health/ready`` reports the real state. Business requests remain blocked until
+identity is verified; workers require identity before consuming any task.
 
 Public interface:
 
@@ -96,6 +97,7 @@ class StartupMode:
 
     mode: ReleaseMode
     capabilities: ModeCapabilities
+    identity_verified: bool = True
 
 
 def read_identity(session: Session) -> DeploymentIdentity | None:
@@ -282,6 +284,7 @@ def enforce_startup(
     *,
     engine: Engine | None = None,
     environ: Mapping[str, str] | None = None,
+    require_identity: bool = False,
 ) -> StartupMode:
     """Validate the release mode and the deployment identity before serving.
 
@@ -304,12 +307,18 @@ def enforce_startup(
         require_local_database(settings, mode)
     own_engine = engine is None
     resolved = engine or create_engine_from_settings(settings)
+    verified = False
     try:
         if identity_table_available(resolved):
             with create_session_factory(resolved)() as session:
                 ensure_identity(session, mode)
                 session.commit()
+                verified = True
         else:
+            if require_identity:
+                raise DeploymentIdentityError(
+                    "deployment identity cannot be verified; migrate the database before starting"
+                )
             log_event(
                 logger,
                 "release.identity.pending_migrations",
@@ -321,7 +330,7 @@ def enforce_startup(
         if own_engine:
             resolved.dispose()
     log_event(logger, "release.mode.active", mode=mode, database=settings.safe_database_url())
-    return StartupMode(mode=mode, capabilities=capabilities_for(mode))
+    return StartupMode(mode=mode, capabilities=capabilities_for(mode), identity_verified=verified)
 
 
 def _mismatch_message(recorded: str, mode: ReleaseMode) -> str:

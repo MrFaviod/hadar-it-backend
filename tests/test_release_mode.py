@@ -477,6 +477,42 @@ def test_readiness_reports_the_effective_release_mode(
     assert response.json()["releaseMode"] == "dev"
 
 
+def test_pending_identity_cannot_serve_a_later_mismatched_database(
+    settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    settings = settings_factory()
+    with started(settings, monkeypatch, "dev") as client:
+        # The process starts before migration; health may be served, not business data.
+        assert run_migrations(settings).returncode == 0
+        claim_for(settings, "prod")
+        before = identity_row(settings).instance_id
+        response = client.post(
+            f"{API}/auth/login",
+            json={"username": "admin", "password": "admin"},
+            headers={"Origin": settings.auth_origin},
+        )
+        assert response.status_code == 503, response.text
+        assert response.json()["error"]["code"] == "release_identity_unavailable"
+        assert client.get(f"{API}/health/ready").status_code == 503
+        assert client.get(f"{API}/health/live").status_code == 200
+        assert identity_row(settings).release_mode == "prod"
+        assert identity_row(settings).instance_id == before
+
+
+def test_worker_requires_identity_before_consuming(
+    settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    settings = settings_factory()
+    apply_mode(monkeypatch, "dev")
+    log_path = tmp_path / "unmigrated-worker.log"
+    with running_worker(settings, log_path) as process:
+        code = process.wait(timeout=20)
+    assert code == WORKER_REFUSED_EXIT_CODE, read_worker_log(log_path)
+    assert worker_events(log_path, "worker.refused")
+    assert not worker_events(log_path, "worker.started")
+    assert "Executing " not in read_worker_log(log_path)
+
+
 # --- Migrations remain an explicit prerequisite -----------------------------
 
 

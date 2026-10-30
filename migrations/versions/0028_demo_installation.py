@@ -16,7 +16,7 @@ depends_on = None
 def upgrade() -> None:
     op.create_table(
         "demo_installation",
-        sa.Column("id", sa.Integer(), primary_key=True),
+        sa.Column("id", sa.Integer(), primary_key=True, autoincrement=False),
         sa.Column("dataset", sa.String(48), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.CheckConstraint("id = 1", name="ck_demo_installation_singleton"),
