@@ -382,6 +382,9 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
 
     api = APIRouter(prefix=settings.api_prefix)
+    from itsm.demo.telemetry_api import create_demo_telemetry_router
+
+    api.include_router(create_demo_telemetry_router())
 
     @api.get("/health/live")
     def live() -> dict[str, str]:

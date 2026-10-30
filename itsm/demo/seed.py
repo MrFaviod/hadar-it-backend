@@ -245,6 +245,25 @@ def _seed_business_data(
                 "notes": "Sin contrato real ni documento adjunto.",
             },
         )
+    if not development and settings.demo_data_directory is not None:
+        from itsm.demo.telemetry import NODE_METRICS, NODE_THRESHOLDS, node_assets
+        from itsm.monitoring.service import MonitoringService
+
+        monitoring = MonitoringService(session, settings, identity=identity)
+        for asset in node_assets(inventory, principal):
+            monitoring.update_asset(
+                principal,
+                asset.id,
+                {
+                    "enabled": True,
+                    "checkType": "node",
+                    "target": "backend:8000",
+                    "intervalSeconds": 30,
+                    "minimumDurationSeconds": 60,
+                    "metrics": list(NODE_METRICS),
+                    "thresholds": NODE_THRESHOLDS,
+                },
+            )
     return {
         "mode": "dev" if development else "demo",
         "dataset": "fictional-infrastructure-v1",
