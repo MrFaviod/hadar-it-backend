@@ -16,6 +16,7 @@ import pytest
 from fastapi.testclient import TestClient
 from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
+from itsm.demo.state import DemoBase
 from itsm.directory.models import DirectoryBase
 from itsm.identity.clock import utcnow
 from itsm.identity.models import IdentityBase, IdentityRole, IdentityRolePolicy
@@ -29,6 +30,7 @@ from itsm.inventory.catalog_defaults import installation_catalog
 from itsm.inventory.catalog_models import InventoryCatalogEntry
 from itsm.inventory.models import InventoryBase
 from itsm.maintenance.service import add_months
+from itsm.release_identity import DeploymentBase, claim_identity
 from sqlalchemy import Engine, text
 from starlette.routing import Mount
 from tests.conftest import ADMIN_NAME, ADMIN_PASSWORD, ADMIN_USERNAME, sign_in
@@ -53,9 +55,10 @@ def _schema(settings: Settings) -> None:
     import itsm.workflows.models  # noqa: F401
 
     engine = create_engine_from_settings(settings)
-    for base in (IdentityBase, DirectoryBase, InventoryBase):
+    for base in (IdentityBase, DirectoryBase, InventoryBase, DeploymentBase, DemoBase):
         base.metadata.create_all(engine)
     with create_session_factory(engine)() as session:
+        claim_identity(session, "dev")
         for role_id in BUILT_IN_ROLE_IDS:
             session.add(
                 IdentityRole(
