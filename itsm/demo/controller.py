@@ -14,7 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from itsm.config import Settings
 from itsm.demo.cycle import cycle_status, reset_demo
-from itsm.demo.reset import validate_reset_paths
+from itsm.demo.reset import recovery_hint, validate_reset_paths
 from itsm.logging import log_event
 
 logger = logging.getLogger("itsm.demo")
@@ -79,10 +79,33 @@ class DemoController:
         self.unavailable = False
         self.engine: Engine | None = None
         self.factory: Callable[[], Session] | None = None
+        self._stuck_reported = False
 
     @property
     def resetting(self) -> bool:
         return self.gate.resetting
+
+    def prepare(self) -> None:
+        """Refuse a directory whose previous reset stopped halfway, and say how to fix it."""
+        try:
+            status = self.status()
+        except Exception:
+            # Readiness failures are reported by the scheduler tick, not hidden here.
+            return
+        if status["resetting"]:
+            self._mark_stuck()
+
+    def _mark_stuck(self) -> None:
+        self.unavailable = True
+        if self._stuck_reported:
+            return
+        self._stuck_reported = True
+        log_event(
+            logger,
+            "demo.reset_stuck",
+            level=logging.ERROR,
+            recovery=recovery_hint(self.settings),
+        )
 
     def status(self) -> dict:
         if self.factory is None:
@@ -101,8 +124,7 @@ class DemoController:
             log_event(logger, "demo.reset_failed", level=logging.ERROR)
             return
         if status["resetting"]:
-            self.unavailable = True
-            log_event(logger, "demo.reset_stuck", level=logging.ERROR)
+            self._mark_stuck()
             return
         deadline = datetime.fromisoformat(status["nextResetAt"])
         if (now or datetime.now(UTC)) < deadline:

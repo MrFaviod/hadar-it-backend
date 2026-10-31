@@ -253,6 +253,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             validate_reset_paths(settings)
             demo_controller.engine = engine
             demo_controller.factory = factory
+            demo_controller.prepare()
             cycle_task = asyncio.create_task(demo_controller.run())
         try:
             async with mcp_app.lifespan(app):
