@@ -372,3 +372,32 @@ def test_declarative_list_filter_on_the_asset_field_returns_only_that_asset(env)
     )
     assert listed["total"] == 1
     assert [item["id"] for item in listed["items"]] == [first["id"]]
+
+
+def test_declarative_write_kinds_require_the_mutation_flag() -> None:
+    """A declarative write must declare ``mutation``: it runs under a write store."""
+    checked(declarative_manifest())  # the shipped template is consistent
+
+    write_without_mutation = declarative_manifest()
+    for operation in write_without_mutation["operations"]:
+        if operation["name"] == "put_note":
+            operation["mutation"] = False
+    with pytest.raises(ManifestError) as failure:
+        checked(write_without_mutation)
+    assert any("mutation" in error for error in failure.value.errors)
+
+    write_missing_mutation = declarative_manifest()
+    for operation in write_missing_mutation["operations"]:
+        if operation["name"] == "delete_note":
+            operation.pop("mutation")
+    with pytest.raises(ManifestError) as failure:
+        checked(write_missing_mutation)
+    assert any("mutation" in error for error in failure.value.errors)
+
+    read_with_mutation = declarative_manifest()
+    for operation in read_with_mutation["operations"]:
+        if operation["name"] == "list_notes":
+            operation["mutation"] = True
+    with pytest.raises(ManifestError) as failure:
+        checked(read_with_mutation)
+    assert any("mutation" in error for error in failure.value.errors)

@@ -962,8 +962,13 @@ class ExtensionHostService:
         extra = sorted(set(arguments) - allowed)
         if extra:
             raise ExtensionValidationFailed("unsupported argument: " + ", ".join(extra[:8]))
+        allow_write = bool(declaration.get("mutation"))
+        if kind in sdk_contract.DECLARATIVE_WRITE_KINDS and not allow_write:
+            # Admission already refuses this manifest; the check keeps a stored
+            # declaration from ever opening a read-write store on its own word.
+            raise ExtensionValidationFailed(f"declarative kind {kind} requires mutation: true")
         connection = self._connect(loaded.extension_id)
-        store = self._store(connection, loaded, allow_write=True)
+        store = self._store(connection, loaded, allow_write=allow_write)
         try:
             result = self._declarative_result(store, kind, collection, schema, arguments)
         except BaseException:

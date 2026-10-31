@@ -87,6 +87,14 @@ _SQL_KEYWORD = re.compile(
     re.IGNORECASE,
 )
 _SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+# A keyword alone is not a statement.  The identifier checks below only run when
+# the literal also carries SQL structure, so a capability label such as
+# ``assets.create`` (or a description mentioning "created") is not read as SQL.
+_SQL_STRUCTURE = re.compile(
+    r"\b(?:FROM|INTO|TABLE|DATABASE|WHERE|SET|VALUES|JOIN)\b",
+    re.IGNORECASE,
+)
+_CAPABILITY_LITERAL = re.compile(r"(?:assets|incidents|store|notify)(?:\.[a-z][a-z0-9_]*)+\Z")
 _FRONTEND_IMPORT = re.compile(
     r"(?:\bimport\b[^\"']*?\bfrom\s+|\bimport\s*|\brequire\s*\(\s*)[\"']([^\"']+)[\"']"
 )
@@ -324,11 +332,15 @@ def _check_sql_literal(value: str) -> None:
     """Refuse module SQL that reaches core tables or another database file."""
     if not _SQL_KEYWORD.search(value):
         return
+    if _CAPABILITY_LITERAL.match(value.strip()):
+        return
     if re.search(r"\b(?:ATTACH|DETACH)\s+DATABASE\b", value, re.IGNORECASE):
         raise _gap("a second database attachment", "direct core database access")
     identifiers = {item.lower() for item in _SQL_IDENTIFIER.findall(value)}
     if "sqlite_master" in identifiers or "sqlite_schema" in identifiers:
         raise _gap("sqlite_master", "core schema introspection")
+    if not _SQL_STRUCTURE.search(value):
+        return
     forbidden = sorted(identifiers & _CORE_TABLES)
     if forbidden:
         raise _gap(", ".join(forbidden), "direct core table access")
@@ -351,9 +363,7 @@ def _check_frontend_source(source: str, manifest: Mapping[str, Any]) -> None:
         and isinstance(item["view"].get("isolated"), Mapping)
     }
     missing = sorted(
-        name
-        for name in components
-        if re.search(rf"\b{re.escape(name)}\s*:", source) is None
+        name for name in components if re.search(rf"\b{re.escape(name)}\s*:", source) is None
     )
     if missing:
         raise _gap(
@@ -361,7 +371,6 @@ def _check_frontend_source(source: str, manifest: Mapping[str, Any]) -> None:
             "an unregistered isolated component in frontend.js",
             member="frontend.js",
         )
-
 
 
 def _call_name(node: ast.AST) -> str | None:

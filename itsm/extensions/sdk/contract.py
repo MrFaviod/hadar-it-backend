@@ -37,6 +37,10 @@ RUNTIMES = ("declarative", "sandboxed")
 CAPABILITIES = ("assets.read", "assets.write", "incidents.read", "incidents.write", "notify")
 OPERATION_KINDS = ("handler", "list", "get", "put", "delete")
 DECLARATIVE_KINDS = ("list", "get", "put", "delete")
+# Kinds that mutate the module collection.  They must declare ``mutation: true``
+# so the host opens the store read-write only for an operation that says it
+# writes; the read kinds must never claim otherwise.
+DECLARATIVE_WRITE_KINDS = ("put", "delete")
 CONTRIBUTION_MODES = ("add", "hide", "replace")
 SUBSCRIPTION_EVENTS = (
     "asset.created",
@@ -311,6 +315,17 @@ def _validate_runtime(manifest: Mapping[str, Any], collection_names: Collection[
             if missing:
                 errors.append(
                     f"operation {name}: declarative kind {kind} must declare {', '.join(missing)}"
+                )
+            if kind in DECLARATIVE_WRITE_KINDS:
+                if operation.get("mutation") is not True:
+                    errors.append(
+                        f"operation {name}: declarative kind {kind} writes to the collection "
+                        "and must declare mutation: true"
+                    )
+            elif operation.get("mutation") is True:
+                errors.append(
+                    f"operation {name}: declarative kind {kind} is read-only and cannot "
+                    "declare mutation: true"
                 )
         else:
             if kind != "handler":

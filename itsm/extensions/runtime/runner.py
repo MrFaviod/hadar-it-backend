@@ -20,9 +20,9 @@ import sdk
 from protocol import ModuleError
 
 
-def _fail(channel: sdk._Channel, code: str, message: str) -> int:
+def _fail(channel: sdk._Channel, code: str, message: str, token: str = "") -> int:
     with contextlib.suppress(OSError):
-        channel.send({"type": "error", "code": code, "message": message[:400]})
+        channel.send({"type": "error", "code": code, "message": message[:400], "token": token})
     return 1
 
 
@@ -49,9 +49,7 @@ def _resolve(module_sdk: sdk.ModuleSDK, kind: str, name: str) -> sdk.Handler:
     elif kind == "subscription":
         handler = module_sdk.subscriptions.get(name)
     elif kind == "reconcile":
-        handler = (
-            module_sdk.reconcile_handler[1] if module_sdk.reconcile_handler else None
-        )
+        handler = module_sdk.reconcile_handler[1] if module_sdk.reconcile_handler else None
     else:
         handler = None
     if handler is None:
@@ -82,8 +80,7 @@ def _check_declared(module_sdk: sdk.ModuleSDK, declared: dict[str, list[str]]) -
     ]
     reconcile = declared.get("reconcile") or []
     if reconcile and (
-        not module_sdk.reconcile_handler
-        or module_sdk.reconcile_handler[0] != reconcile[0]
+        not module_sdk.reconcile_handler or module_sdk.reconcile_handler[0] != reconcile[0]
     ):
         missing.append(f"reconcile {reconcile[0]}")
     if missing:
@@ -103,6 +100,9 @@ def main() -> int:
         return 1
     if init.get("type") != "run":
         return _fail(channel, "protocol_error", "first frame must be a run request")
+    # The host only accepts terminal frames that quote this per-run token; the
+    # module never sees it, so it cannot author a result or an error.
+    token = str(init.get("token") or "")
     try:
         sandbox.enforce(
             read_paths=[str(path) for path in init.get("readOnlyPaths", [])],
@@ -113,7 +113,7 @@ def main() -> int:
             open_files=int(init.get("limits", {}).get("openFiles", 64)),
         )
     except sandbox.SandboxUnavailable as exc:
-        return _fail(channel, "sandbox_unavailable", str(exc))
+        return _fail(channel, "sandbox_unavailable", str(exc), token)
     try:
         module_sdk = _load_module(
             str(init.get("packageDir")), str(init.get("backend", "backend.py"))
@@ -136,16 +136,16 @@ def main() -> int:
         )
         arguments = request.get("arguments") or {}
         result = handler(context, **arguments)
-        channel.send({"type": "result", "ok": True, "result": result})
+        channel.send({"type": "result", "ok": True, "result": result, "token": token})
         return 0
     except ModuleError as exc:
-        return _fail(channel, exc.code, str(exc) or "module refused the request")
+        return _fail(channel, exc.code, str(exc) or "module refused the request", token)
     except MemoryError:
-        return _fail(channel, "resource_limit", "module exceeded its memory limit")
+        return _fail(channel, "resource_limit", "module exceeded its memory limit", token)
     except BaseException:
         detail = traceback.format_exc(limit=2)
         sys.stderr.write(detail[-2000:])
-        return _fail(channel, "handler_failed", "extension handler failed")
+        return _fail(channel, "handler_failed", "extension handler failed", token)
 
 
 if __name__ == "__main__":

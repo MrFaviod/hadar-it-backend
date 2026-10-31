@@ -16,6 +16,7 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import selectors
 import signal
 import subprocess
@@ -46,6 +47,11 @@ RUNNER_PATH = Path(__file__).resolve().parent / "runtime" / "runner.py"
 PACKAGE_CACHE_DIRNAME = ".packages"
 MAX_PACKAGE_MEMBERS = 400
 MAX_MEMBER_BYTES = 4 * 1024 * 1024
+
+
+# Frames that end an invocation: only the runner may send them, and only with
+# the token the host generated for this run.
+_TERMINAL_FRAMES = frozenset({"fatal", "error", "result"})
 
 
 @dataclass(frozen=True)
@@ -220,8 +226,13 @@ def run_module(
         raise ExtensionSandboxUnavailable("sandboxed module execution is unavailable on this host")
     package_dir = prepare_package(settings, digest, package_bytes)
     read_paths = _read_paths(package_dir)
+    # Only the runner may end the invocation: every terminal frame must quote
+    # this per-invocation token, so a module that reaches the pipe cannot forge
+    # a ``result``/``error`` frame of its own.
+    token = secrets.token_hex(16)
     init = {
         "type": "run",
+        "token": token,
         "packageDir": str(package_dir),
         "backend": "backend.py",
         "dataDir": str(data_dir),
@@ -259,6 +270,7 @@ def run_module(
             deadline=deadline,
             limits=limits,
             handle_call=handle_call,
+            token=token,
         )
     finally:
         _terminate(process)
@@ -303,6 +315,7 @@ def _serve(
     deadline: float,
     limits: SandboxLimits,
     handle_call: Callable[[str, Mapping[str, Any]], Any],
+    token: str,
 ) -> Any:
     assert process.stdin is not None
     assert process.stdout is not None
@@ -311,6 +324,7 @@ def _serve(
     buffer = bytearray()
     total = 0
     calls = 0
+    denied = False
     try:
         while True:
             remaining = deadline - time.monotonic()
@@ -337,19 +351,26 @@ def _serve(
                 del buffer[: newline + 1]
                 message = _decode(line)
                 kind = message.get("type")
+                if kind in _TERMINAL_FRAMES and message.get("token") != token:
+                    LOGGER.warning("extension sent an unsolicited protocol frame: %s", kind)
+                    raise ExtensionHandlerFailed("extension sent an unsolicited protocol frame")
                 if kind == "fatal":
                     raise ExtensionSandboxUnavailable(
                         str(message.get("message") or "sandbox unavailable")
                     )
                 if kind == "error":
+                    code = str(message.get("code"))
+                    if code == "permission_denied" and not denied:
+                        # A module may relay the host's own denial; it cannot
+                        # invent one to relabel its failure as a host 403.
+                        LOGGER.warning("extension forged a permission denial")
+                        code = "handler_failed"
                     LOGGER.warning(
                         "extension sandbox error frame: %s %s",
-                        message.get("code"),
+                        code,
                         str(message.get("message"))[:300],
                     )
-                    raise _error_from_code(
-                        str(message.get("code")), str(message.get("message") or "")
-                    )
+                    raise _error_from_code(code, str(message.get("message") or ""))
                 if kind == "result":
                     return message.get("result")
                 if kind == "call":
@@ -358,7 +379,8 @@ def _serve(
                         raise ExtensionHandlerFailed(
                             "extension exceeded its capability call budget"
                         )
-                    _answer(process.stdin, message, handle_call)
+                    if _answer(process.stdin, message, handle_call) == "permission_denied":
+                        denied = True
                     continue
                 if kind == "log":
                     LOGGER.info(
@@ -386,32 +408,40 @@ def _answer(
     stream: Any,
     message: Mapping[str, Any],
     handle_call: Callable[[str, Mapping[str, Any]], Any],
-) -> None:
+) -> str | None:
+    """Answer one capability call and report the refusal code, if any."""
     request_id = message.get("id")
     capability = str(message.get("capability"))
     request = message.get("request") or {}
     if not isinstance(request, dict):
         _reply(stream, request_id, None, "capability_denied", "request must be an object")
-        return
+        return "capability_denied"
     try:
         result = handle_call(capability, request)
     except ExtensionStoreConflict as exc:
         _reply(stream, request_id, None, "store_conflict", str(exc))
+        return "store_conflict"
     except ExtensionStoreValidation as exc:
         _reply(stream, request_id, None, "store_validation", str(exc))
+        return "store_validation"
     except ExtensionValidationFailed as exc:
         _reply(stream, request_id, None, "capability_denied", str(exc))
+        return "capability_denied"
     except ExtensionIdempotencyConflict as exc:
         _reply(stream, request_id, None, "idempotency_conflict", str(exc))
+        return "idempotency_conflict"
     except NotFound as exc:
         _reply(stream, request_id, None, "not_found", str(exc))
+        return "not_found"
     except PermissionDenied as exc:
         _reply(stream, request_id, None, "permission_denied", str(exc))
+        return "permission_denied"
     except Exception:
         LOGGER.exception("extension capability failed", extra={"capability": capability})
         _reply(stream, request_id, None, "handler_failed", "capability failed")
-    else:
-        _reply(stream, request_id, _jsonable(result), None, "")
+        return "handler_failed"
+    _reply(stream, request_id, _jsonable(result), None, "")
+    return None
 
 
 def _reply(
