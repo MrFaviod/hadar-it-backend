@@ -1,5 +1,7 @@
 """SDK v2 admission rules, static contract-gap rules and the schema constant."""
 
+# ruff: noqa: F811 - the `env` fixture is imported and also named in signatures.
+
 from __future__ import annotations
 
 import json
@@ -166,7 +168,7 @@ def test_argument_validation_still_rejects_unknown_keys() -> None:
         )
 
 
-def test_candidate_detail_reports_v2_trust_and_runtime(env) -> None:  # noqa: F811
+def test_candidate_detail_reports_v2_trust_and_runtime(env) -> None:
     candidate = env.candidate(build_package(probe_manifest()))
     assert candidate["manifest"]["sdkVersion"] == 2
     assert candidate["trust"]["sandboxed"] is True

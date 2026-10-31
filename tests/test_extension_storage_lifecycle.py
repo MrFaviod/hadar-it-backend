@@ -4,6 +4,8 @@ Every assertion goes through the public host/CLI surface and inspects only the
 module data file, the core schema fingerprint or the recorded HTTP contract.
 """
 
+# ruff: noqa: F811 - the `env` fixture is imported and also named in signatures.
+
 from __future__ import annotations
 
 import json
@@ -169,7 +171,7 @@ def test_store_semantics_stay_identical_on_the_module_file(env) -> None:
 def test_failed_handler_rolls_back_module_transaction(env) -> None:
     env.install(build_package(probe_manifest()))
     env.invoke("put_record", {"record_id": "kept", "label": "Keep"})
-    with pytest.raises(ExtensionHandlerFailed, match="^extension operation failed$"):
+    with pytest.raises(ExtensionHandlerFailed, match=r"^extension operation failed$"):
         env.invoke("fail_after_write")
     assert [row["record_id"] for row in module_rows(env.database())] == ["kept"]
     with pytest.raises(ExtensionStoreValidation, match="read-only"):

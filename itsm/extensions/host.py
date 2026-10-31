@@ -39,41 +39,7 @@ from itsm.config import Settings
 from itsm.extensions import manifest as package_contract
 from itsm.extensions import sandbox, storage
 from itsm.extensions.capabilities import CapabilityBroker
-from itsm.extensions.models import (
-    ExtensionCandidate,
-    ExtensionCollectionRecord,
-    ExtensionEvent,
-    ExtensionMigration,
-    ExtensionModule,
-    ExtensionPermission,
-    ExtensionScheduleState,
-    ExtensionVersion,
-)
-from itsm.extensions.runtime import sqlite_store
-from itsm.extensions.sdk import contract as sdk_contract
-from itsm.identity.clock import as_utc, utcnow
-from itsm.identity.models import Identity, IdentityRolePolicy
-from itsm.identity.permissions import (
-    HUMAN_ACTOR_KIND,
-    PERMISSION_CODES,
-    ROLE_SUPERADMIN,
-)
-from itsm.identity.service import IdentityService, PermissionDenied, Principal
-
-logger = logging.getLogger(__name__)
-
-SDK_VERSION = 2
-CANDIDATE_LIMIT = 200
-EVENT_LIMIT = 100
-MAX_COLLECTION_DATA_BYTES = 256 * 1024
-MAX_RECIPIENTS = 100
-MAX_REPORT_BYTES = 32 * 1024
-_CANDIDATE_STATES = frozenset({"pending", "installing", "installed", "superseded"})
-
-NotifyCallback = Callable[..., None]
-
-
-from itsm.extensions.errors import (  # noqa: E402 - re-exported host contract
+from itsm.extensions.errors import (
     ExtensionConflict as ExtensionConflict,
 )
 from itsm.extensions.errors import (
@@ -127,8 +93,38 @@ from itsm.extensions.errors import (
 from itsm.extensions.errors import (
     ExtensionValidationFailed as ExtensionValidationFailed,
 )
+from itsm.extensions.models import (
+    ExtensionCandidate,
+    ExtensionCollectionRecord,
+    ExtensionEvent,
+    ExtensionMigration,
+    ExtensionModule,
+    ExtensionPermission,
+    ExtensionScheduleState,
+    ExtensionVersion,
+)
+from itsm.extensions.runtime import sqlite_store
+from itsm.extensions.sdk import contract as sdk_contract
+from itsm.identity.clock import as_utc, utcnow
+from itsm.identity.models import Identity, IdentityRolePolicy
+from itsm.identity.permissions import (
+    HUMAN_ACTOR_KIND,
+    PERMISSION_CODES,
+    ROLE_SUPERADMIN,
+)
+from itsm.identity.service import IdentityService, PermissionDenied, Principal
 
-_SNAPSHOT_REVISION_LABEL = "data schema version"
+logger = logging.getLogger(__name__)
+
+SDK_VERSION = 2
+CANDIDATE_LIMIT = 200
+EVENT_LIMIT = 100
+MAX_COLLECTION_DATA_BYTES = 256 * 1024
+MAX_RECIPIENTS = 100
+MAX_REPORT_BYTES = 32 * 1024
+_CANDIDATE_STATES = frozenset({"pending", "installing", "installed", "superseded"})
+
+NotifyCallback = Callable[..., None]
 
 
 @dataclass(frozen=True)

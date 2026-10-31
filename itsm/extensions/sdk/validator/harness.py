@@ -31,11 +31,11 @@ from pathlib import Path
 from typing import Any
 
 try:
-    from ..contract import ManifestError, validate_manifest
+    from ..contract import ManifestError, validate_manifest  # noqa: F401
     from ..package import (
         DEFAULT_LIMITS,
         ArchiveLimits,
-        PackageError,
+        PackageError,  # noqa: F401
         load_manifest,
         read_zip,
         validate_layout,

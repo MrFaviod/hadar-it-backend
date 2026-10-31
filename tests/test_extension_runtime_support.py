@@ -290,7 +290,8 @@ def probe_manifest(
     permissions = [
         {"code": READ, "label": "Consultar", "description": "Consulta los registros"},
         {"code": WRITE, "label": "Editar", "description": "Edita los registros"},
-    ] + list(extra_permissions or [])
+        *(extra_permissions or []),
+    ]
     declaration: dict[str, Any] = {
         "sdkVersion": 2,
         "id": MODULE_ID,

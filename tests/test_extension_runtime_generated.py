@@ -6,6 +6,8 @@ host-side with no module code. Both keep their business data in their own SQLite
 file and leave the core database untouched.
 """
 
+# ruff: noqa: F811 - the `env` fixture is imported and also named in signatures.
+
 from __future__ import annotations
 
 import sqlite3

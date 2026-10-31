@@ -5,6 +5,8 @@ assertions read only observable results plus the untouched core database and
 source tree.
 """
 
+# ruff: noqa: F811 - the `env` fixture is imported and also named in signatures.
+
 from __future__ import annotations
 
 import json

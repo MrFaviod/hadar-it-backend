@@ -5,6 +5,8 @@ and the 409 upgrade gate for modules installed by SDK v1. Every request is
 authenticated and every mutation carries the CSRF header.
 """
 
+# ruff: noqa: F811 - the `env` fixture is imported and also named in signatures.
+
 from __future__ import annotations
 
 from fastapi import FastAPI
@@ -46,7 +48,7 @@ def _headers(environment, client: TestClient) -> dict[str, str]:
     }
 
 
-def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:  # noqa: F811
+def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:
     prefix = env.settings.api_prefix + "/extensions"
     with _client(env) as client:
         assert client.get(prefix + "/" + MODULE_ID + "/status").status_code == 401
@@ -82,7 +84,7 @@ def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:  # 
         assert client.get(prefix + "/" + MODULE_ID + "/status").status_code == 404
 
 
-def test_v1_module_is_never_executed_over_http(env, tmp_path) -> None:  # noqa: F811
+def test_v1_module_is_never_executed_over_http(env, tmp_path) -> None:
     marker = tmp_path / "v1-executed.txt"
     seed_installed_v1_module(env, marker)
     prefix = env.settings.api_prefix + "/extensions"
