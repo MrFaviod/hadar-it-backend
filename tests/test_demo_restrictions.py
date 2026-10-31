@@ -453,3 +453,21 @@ def test_demo_guard_is_installed_only_for_the_demo_capability_set(
     assert demo_client.app.state.demo_limits is not None
     assert build_demo_restrictions(demo_installation.settings, capabilities_for("prod")) is None
     assert build_demo_restrictions(demo_installation.settings, capabilities_for("dev")) is None
+
+
+def test_demo_mode_does_not_publish_its_api_description(demo_installation: Installation):
+    """R1-05: the public demo must not serve its schema or interactive docs."""
+    with started(demo_installation.settings, "demo") as client:
+        for path in ("/openapi.json", "/docs", "/redoc", "/docs/oauth2-redirect"):
+            assert client.get(path).status_code == 404, path
+        # The deny-list guard still builds the description internally.
+        assert client.app.openapi()["paths"]
+
+
+def test_ordinary_mode_still_publishes_the_api_description(tmp_path: Path):
+    settings = demo_settings(tmp_path / "ordinary")
+    applied = run_migrations(settings)
+    assert applied.returncode == 0, applied.stderr
+    with started(settings, "dev") as client:
+        assert client.get("/openapi.json").status_code == 200
+        assert client.get("/docs").status_code == 200

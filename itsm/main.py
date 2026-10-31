@@ -266,10 +266,17 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             engine.dispose()
             log_event(logger, "app.stopped", app=settings.app_name)
 
+    # The public demo advertises nothing it does not offer: schema and interactive
+    # docs are a private-deployment surface (R1-05). The app still builds its
+    # description internally, so the deny-list guard keeps working.
+    public_demo = demo_restrictions is not None
     app = FastAPI(
         title="ITSM backend",
         version=__version__,
         lifespan=lifespan,
+        docs_url=None if public_demo else "/docs",
+        redoc_url=None if public_demo else "/redoc",
+        openapi_url=None if public_demo else "/openapi.json",
     )
     app.state.demo_restrictions = demo_restrictions
     app.state.demo_limits = demo_limits
