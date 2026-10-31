@@ -21,7 +21,12 @@ from itsm.database import check_readiness, create_engine_from_settings
 from itsm.logging import configure_logging, log_event
 from itsm.release_identity import enforce_startup
 from itsm.release_mode import ReleaseModeError
-from itsm.tasks.adapter import TaskState, TaskStorageUnavailable, write_task_state
+from itsm.tasks.adapter import (
+    TaskState,
+    TaskStorageUnavailable,
+    reconcile_interrupted_tasks,
+    write_task_state,
+)
 
 logger = logging.getLogger("itsm.tasks")
 
@@ -149,6 +154,9 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
                 readiness = check_readiness(engine, settings, task_storage_ok=True)
             finally:
                 engine.dispose()
+            reconciled = reconcile_interrupted_tasks(huey)
+            if reconciled:
+                log_event(logger, "worker.reconciled", count=reconciled)
             if not readiness.is_ready:
                 migrations = readiness.migrations
                 raise ReleaseModeError(

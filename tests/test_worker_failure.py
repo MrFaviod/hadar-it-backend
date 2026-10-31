@@ -149,3 +149,40 @@ def test_the_worker_refuses_a_database_behind_the_code_head(
     log = log_path.read_text()
     assert "worker.refused" in log
     assert "migrat" in log.lower()
+
+
+def test_the_worker_reconciles_a_task_a_crashed_worker_left_running(
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """R4-F7: a task whose worker died must not stay "running" forever."""
+    import subprocess
+    import sys
+    import uuid
+
+    from itsm.tasks.adapter import INTERRUPTED_ERROR, record_task_owner
+    from itsm.tasks.runtime import build_runtime
+
+    settings = settings_factory()
+    test_client, _ = signed_in_client(settings)
+
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait(timeout=30)
+    crashed_pid = finished.pid
+
+    runtime = build_runtime(settings)
+    task_id = uuid.uuid4().hex
+    # Exactly what a worker writes when it starts a task and then dies.
+    runtime.huey.put_result(task_id, {"state": "running"})
+    record_task_owner(runtime.huey, task_id, pid=crashed_pid)
+
+    before = test_client.get(f"/api/v1/tasks/{task_id}")
+    assert before.status_code == 200
+    assert before.json()["state"] == "running"
+
+    with running_worker(settings):
+        reconciled = wait_for_status(test_client, task_id, {"error"}, timeout=30)
+
+    assert reconciled["error"] == INTERRUPTED_ERROR
+    assert reconciled["result"] is None
+    assert reconciled["retries_remaining"] == 0
