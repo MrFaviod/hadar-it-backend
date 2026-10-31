@@ -20,7 +20,7 @@ import re
 import shutil
 import uuid
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -43,6 +43,7 @@ _BLOB_KEY = re.compile(r"^[a-f0-9]{32}$")
 #: Extension module ids are lowercase hyphen identifiers (``software-license``).
 _EXTENSION_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PARTIAL_PREFIX = ".partial-"
+_VERSION_INFO_KEYS = ("client", "clientMajor", "server", "serverMajor")
 _MANIFEST_KEYS = (
     "id",
     "engine",
@@ -113,6 +114,7 @@ class BackupManifest:
     dump_file: str
     tool_versions: dict[str, str]
     credential_key_fingerprints: tuple[str, ...] = ()
+    version_info: dict[str, Any] = field(default_factory=dict)
     extensions: tuple[ExtensionBackupEntry, ...] = ()
     attachments: tuple[AttachmentEntry, ...] = ()
     ignored_extensions: tuple[str, ...] = ()
@@ -132,6 +134,7 @@ class BackupManifest:
             "format": self.format,
             "dumpFile": self.dump_file,
             "toolVersions": dict(self.tool_versions),
+            "versionInfo": dict(self.version_info),
             # Fingerprints only: a backup never carries the key material itself.
             "aiCredentialKeyFingerprints": list(self.credential_key_fingerprints),
             "extensions": [entry.as_dict() for entry in self.extensions],
@@ -204,6 +207,7 @@ class BackupManifest:
             format=raw["format"],
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
+            version_info=_manifest_version_info(raw.get("versionInfo")),
             credential_key_fingerprints=tuple(fingerprints),
             extensions=_manifest_extensions(raw.get("extensions", [])),
             attachments=_manifest_attachments(raw.get("attachments", [])),
@@ -286,6 +290,39 @@ def _manifest_attachments(raw: object) -> tuple[AttachmentEntry, ...]:
             )
         entries.append(AttachmentEntry(key=key, sha256=digest, size=size))
     return tuple(entries)
+
+
+def _manifest_version_info(raw: object) -> dict[str, Any]:
+    """Validate the optional client/server version record of a manifest.
+
+    Only the client and server major numbers are used for a restore decision;
+    the full version strings stay for diagnostics. An artifact written before the
+    record existed has no key and keeps an empty record, which is never a claim
+    that the majors match.
+    """
+    if raw is None:
+        return {}
+    if not isinstance(raw, dict):
+        raise OpsError("invalid backup manifest: versionInfo must be an object")
+    unknown = set(raw) - set(_VERSION_INFO_KEYS)
+    if unknown:
+        raise OpsError("invalid backup manifest: unknown versionInfo key")
+    info: dict[str, Any] = {}
+    for key in ("client", "server"):
+        value = raw.get(key)
+        if value is not None and not isinstance(value, str):
+            raise OpsError(f"invalid backup manifest: versionInfo.{key} must be text or null")
+        info[key] = value
+    for key in ("clientMajor", "serverMajor"):
+        value = raw.get(key)
+        if value is not None and (
+            isinstance(value, bool) or not isinstance(value, int) or value <= 0
+        ):
+            raise OpsError(
+                f"invalid backup manifest: versionInfo.{key} must be a positive integer or null"
+            )
+        info[key] = value
+    return info
 
 
 def _manifest_notes(raw: object) -> tuple[str, ...]:
@@ -384,6 +421,7 @@ def create_artifact(
     app_version: str,
     dump_file: str,
     tool_versions: Mapping[str, str],
+    version_info: Mapping[str, Any] | None = None,
     write_dump: Callable[[Path], None],
     write_extensions: (
         Callable[[Path], tuple[Sequence[ExtensionBackupEntry], Sequence[str]]] | None
@@ -430,6 +468,7 @@ def create_artifact(
             format=engine,
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
+            version_info=dict(version_info or {}),
             credential_key_fingerprints=tuple(credential_key_fingerprints),
             extensions=extensions,
             attachments=attachments,

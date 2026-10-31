@@ -25,7 +25,9 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
+from sqlalchemy import inspect
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import SQLAlchemyError
 
@@ -254,6 +256,48 @@ def _tool_versions(target: DatabaseTarget) -> dict[str, str]:
     return {"sqlcmd": _tool_version(("sqlcmd", "-?"))}
 
 
+def _client_version(target: DatabaseTarget) -> str | None:
+    versions = _tool_versions(target)
+    return next(iter(versions.values()), None)
+
+
+def _server_version(settings: Settings, target: DatabaseTarget) -> str | None:
+    """Read the server version string, or ``None`` when it cannot be read.
+
+    The record is diagnostic metadata, never a reason to fail a backup that the
+    engine itself completed; a missing major is handled as "unknown" by verify.
+    """
+    if target.engine == "sqlite":
+        return f"sqlite {sqlite3.sqlite_version}"
+    statement = {
+        "postgresql": "SHOW server_version",
+        "mysql": "SELECT VERSION()",
+    }.get(target.engine)
+    if statement is None:
+        return None
+    engine = create_engine_from_settings(settings)
+    try:
+        with engine.connect() as connection:
+            value = connection.exec_driver_sql(statement).scalar()
+        return None if value is None else str(value)[:120]
+    except DatabaseUnavailable, SQLAlchemyError, OSError:
+        return None
+    finally:
+        engine.dispose()
+
+
+def _engine_versions(settings: Settings, target: DatabaseTarget) -> dict[str, Any]:
+    """Record the client and server majors beside the backup they describe."""
+    client = _client_version(target)
+    server = _server_version(settings, target)
+    return {
+        "client": client,
+        "clientMajor": engines.version_major(client),
+        "server": server,
+        "serverMajor": engines.version_major(server),
+    }
+
+
 # --------------------------------------------------------------------------- #
 # Backup
 # --------------------------------------------------------------------------- #
@@ -297,6 +341,7 @@ def backup(context: OpsContext) -> store.BackupArtifact:
             app_version=__version__,
             dump_file=engines.dump_filename(target.engine),
             tool_versions=_tool_versions(target),
+            version_info=_engine_versions(context.settings, target),
             write_dump=lambda path: _write_dump(context, target, path),
             write_extensions=lambda directory: extensions.archive(
                 context.settings.extension_data_path, directory / extensions.DATA_ROOT_DIR
@@ -317,32 +362,162 @@ def backup(context: OpsContext) -> store.BackupArtifact:
 # --------------------------------------------------------------------------- #
 
 
-def _integrity(context: OpsContext, target: DatabaseTarget, dump_path: Path) -> str:
+class TrialRestoreUnavailable(OpsError):
+    """The trial restore could not run, so restorability stays unproven."""
+
+
+class TrialRestoreFailed(OpsError):
+    """The trial restore ran and failed: the artifact is not restorable."""
+
+
+def _scratch_database_url(settings: Settings, database: str) -> str:
+    return (
+        make_url(settings.database_url).set(database=database).render_as_string(hide_password=False)
+    )
+
+
+def _drop_scratch_database(settings: Settings, database: str) -> None:
+    """Best-effort removal of a trial database; never masks the trial outcome."""
+    engine = create_engine_from_settings(settings)
+    try:
+        with engine.connect() as connection:
+            connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+            with contextlib.suppress(SQLAlchemyError):
+                connection.exec_driver_sql(f'DROP DATABASE IF EXISTS "{database}"')
+    except DatabaseUnavailable, SQLAlchemyError, OSError:
+        return
+    finally:
+        engine.dispose()
+
+
+def _postgres_trial_restore(
+    context: OpsContext, target: DatabaseTarget, dump_path: Path
+) -> dict[str, Any]:
+    """Restore the archive into a throwaway database and drop it.
+
+    ``pg_restore --list`` reads the archive header without a server and therefore
+    certifies archives a server cannot accept. The only honest proof that a
+    PostgreSQL backup is restorable is a real restore; this runs one against a
+    scratch database and reports how many tables it produced.
+    """
+    scratch = f"itsm_verify_{uuid4().hex[:12]}"
+    engine = create_engine_from_settings(context.settings)
+    try:
+        with engine.connect() as connection:
+            connection = connection.execution_options(isolation_level="AUTOCOMMIT")
+            try:
+                connection.exec_driver_sql(f'CREATE DATABASE "{scratch}"')
+            except SQLAlchemyError as exc:
+                raise TrialRestoreUnavailable(
+                    "the database role cannot create a scratch database for a trial restore; "
+                    "grant CREATEDB to the ops role (or run the trial restore where it is "
+                    f"allowed) ({type(exc).__name__})"
+                ) from exc
+    except TrialRestoreUnavailable:
+        raise
+    except (DatabaseUnavailable, SQLAlchemyError, OSError) as exc:
+        raise TrialRestoreUnavailable(
+            f"the database server is not reachable for a trial restore ({type(exc).__name__})"
+        ) from exc
+    finally:
+        engine.dispose()
+    tables = 0
+    try:
+        try:
+            _run_tool(engines.postgres_restore_command(target, dump_path, scratch), target)
+        except OpsError as exc:
+            raise TrialRestoreFailed(f"the trial restore failed: {exc}") from exc
+        try:
+            scratch_engine = create_engine_from_settings(
+                settings_for(database_url=_scratch_database_url(context.settings, scratch))
+            )
+            try:
+                tables = len(inspect(scratch_engine).get_table_names())
+            finally:
+                scratch_engine.dispose()
+        except (DatabaseUnavailable, SQLAlchemyError, OSError) as exc:
+            raise TrialRestoreUnavailable(
+                f"the trial restore could not be inspected ({type(exc).__name__})"
+            ) from exc
+    finally:
+        _drop_scratch_database(context.settings, scratch)
+    return {"status": "ok", "tables": tables}
+
+
+def _postgres_integrity(
+    context: OpsContext,
+    target: DatabaseTarget,
+    dump_path: Path,
+    manifest: store.BackupManifest,
+) -> tuple[str, dict[str, Any]]:
+    """Compare the recorded majors, then prove restorability with a real restore."""
+    client_major = manifest.version_info.get("clientMajor")
+    server_major = manifest.version_info.get("serverMajor")
+    installed = engines.version_major(_tool_version(("pg_restore", "--version")))
+    detail: dict[str, Any] = {
+        "compatibility": {
+            "clientMajor": client_major,
+            "serverMajor": server_major,
+            "installedClientMajor": installed,
+        }
+    }
+    mismatch = engines.postgres_major_mismatch(client_major, server_major)
+    if mismatch is not None:
+        return "incompatible", {**detail, "error": mismatch}
+    if installed is None:
+        return "incompatible", {
+            **detail,
+            "error": (
+                "pg_restore is not available on this host; install the PostgreSQL "
+                f"{server_major} client tools to verify that this backup is restorable"
+            ),
+        }
+    installed_error = engines.postgres_major_mismatch(installed, server_major, tool="pg_restore")
+    if installed_error is not None:
+        return "incompatible", {**detail, "error": installed_error}
+    try:
+        trial = _postgres_trial_restore(context, target, dump_path)
+    except TrialRestoreUnavailable as exc:
+        return "unavailable", {
+            **detail,
+            "trialRestore": {"status": "unavailable", "reason": str(exc)},
+            "error": f"restorability cannot be proven: {exc}",
+        }
+    except TrialRestoreFailed as exc:
+        return "failed", {
+            **detail,
+            "trialRestore": {"status": "failed", "reason": str(exc)},
+            "error": str(exc),
+        }
+    return "ok", {**detail, "trialRestore": trial}
+
+
+def _integrity(
+    context: OpsContext,
+    target: DatabaseTarget,
+    dump_path: Path,
+    manifest: store.BackupManifest,
+) -> tuple[str, dict[str, Any]]:
     if target.engine == "sqlite":
-        return sqlite_ops.integrity(dump_path)
+        return sqlite_ops.integrity(dump_path), {}
     if target.engine == "postgresql":
-        completed = _run_tool(engines.postgres_list_command(dump_path), target)
-        entries = [
-            line
-            for line in completed.stdout.splitlines()
-            if line.strip() and not line.lstrip().startswith(";")
-        ]
-        return "ok" if entries else "failed"
+        return _postgres_integrity(context, target, dump_path, manifest)
     if target.engine == "mysql":
         try:
             with dump_path.open("r", encoding="utf-8", errors="replace") as stream:
                 tail = stream.read()[-4096:]
         except OSError:
-            return "failed"
-        return "ok" if MYSQL_DUMP_COMPLETION_MARKER in tail else "failed"
+            return "failed", {}
+        return ("ok" if MYSQL_DUMP_COMPLETION_MARKER in tail else "failed"), {}
     _run_tool(engines.mssql_verify_command(target, dump_path), target)
-    return "ok"
+    return "ok", {}
 
 
 def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dict[str, Any]:
     target = context.target()
     dump_path = artifact.dump_path
     checks: dict[str, Any] = {"checksum": False, "size": False, "integrity": "skipped"}
+    detail: dict[str, Any] = {}
     error: str | None = None
     if dump_path.is_file():
         digest, size = store.digest_file(dump_path)
@@ -352,12 +527,15 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
         error = "backup dump file is missing"
     if checks["checksum"] and checks["size"]:
         try:
-            checks["integrity"] = _integrity(context, target, dump_path)
+            checks["integrity"], detail = _integrity(context, target, dump_path, artifact.manifest)
         except OpsError as exc:
             checks["integrity"] = "unavailable"
             error = str(exc)
-        if checks["integrity"] == "failed":
-            error = "backup failed the engine integrity check"
+        else:
+            if detail.get("error"):
+                error = str(detail["error"])
+            elif checks["integrity"] != "ok":
+                error = "backup failed the engine integrity check"
     elif error is None:
         error = "backup checksum or size does not match the manifest"
     extensions_ok, extension_reports, extension_errors = extensions.verify(
@@ -387,7 +565,7 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
             reason=error or "verification failed",
             target=target,
         )
-    payload = {
+    payload: dict[str, Any] = {
         "status": "ok" if verified else "failed",
         "backupId": artifact.manifest.id,
         "checks": checks,
@@ -396,6 +574,9 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
         "verified": verified,
         "error": None if verified else (error or "verification failed"),
     }
+    for key in ("compatibility", "trialRestore"):
+        if key in detail:
+            payload[key] = detail[key]
     return _attach_credential_report(context, artifact, payload)
 
 
@@ -663,10 +844,18 @@ def restore(
     """
     store.prepare_root(context.backup_root)
     artifact = store.load_artifact(context.backup_root, identifier)
+    target = context.target()
+    if target.engine == "postgresql":
+        refusal = engines.postgres_restore_refusal(
+            artifact.manifest.version_info.get("clientMajor"),
+            artifact.manifest.version_info.get("serverMajor"),
+            engines.version_major(_tool_version(("pg_restore", "--version"))),
+        )
+        if refusal is not None:
+            raise RestoreRefused(f"backup {identifier} cannot be restored: {refusal}")
     verification = _verify_artifact(context, artifact)
     if not verification["verified"]:
         raise OpsError(f"backup {identifier} failed verification: {verification['error']}")
-    target = context.target()
     payload: dict[str, Any] = {}
     core_requested = target_file is not None or target_database is not None
     if core_requested:
