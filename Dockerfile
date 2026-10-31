@@ -17,4 +17,4 @@ COPY itsm ./itsm
 COPY migrations ./migrations
 USER 10001:10001
 EXPOSE 8000
-CMD ["uvicorn", "itsm.main:app", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]
+CMD ["python", "-m", "itsm.main", "--host", "0.0.0.0", "--port", "8000", "--no-access-log"]

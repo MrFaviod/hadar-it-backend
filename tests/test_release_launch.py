@@ -52,8 +52,7 @@ def test_real_three_mode_launch_and_all_cross_mode_refusals(tmp_path):
                 [
                     sys.executable,
                     "-m",
-                    "uvicorn",
-                    "itsm.main:app",
+                    "itsm.main",
                     "--host",
                     "127.0.0.1",
                     "--port",
