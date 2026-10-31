@@ -76,14 +76,37 @@ class _Channel:
             raise ExtensionError(str(message.get("message") or "capability denied"), code=code)
 
 
+class _HostBridge:
+    """The only host surface module code can reach: a call, never a frame.
+
+    The protocol channel stays in the runner, so a handler cannot author a
+    ``result``/``error`` frame.  In-process Python cannot make the channel
+    unreachable from determined code, which is why the host also refuses any
+    terminal frame that does not carry the per-invocation token.
+    """
+
+    __slots__ = ("_call",)
+
+    def __init__(self, channel: _Channel) -> None:
+        def call(capability: str, request: Mapping[str, Any]) -> Any:
+            return channel.call(capability, request)
+
+        self._call = call
+
+    def call(self, capability: str, request: Mapping[str, Any]) -> Any:
+        return self._call(capability, request)
+
+
 class Store:
     """Declared collections persisted in the module's own SQLite file."""
 
-    def __init__(self, channel: _Channel) -> None:
-        self._channel = channel
+    __slots__ = ("_bridge",)
+
+    def __init__(self, bridge: _HostBridge) -> None:
+        self._bridge = bridge
 
     def get(self, collection: str, record_id: str) -> dict[str, Any] | None:
-        return self._channel.call("store.get", {"collection": collection, "recordId": record_id})
+        return self._bridge.call("store.get", {"collection": collection, "recordId": record_id})
 
     def list(
         self,
@@ -92,7 +115,7 @@ class Store:
         offset: int = 0,
         filters: Mapping[str, Any] | None = None,
     ) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "store.list",
             {
                 "collection": collection,
@@ -109,7 +132,7 @@ class Store:
         data: Mapping[str, Any],
         expected_version: int | None = None,
     ) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "store.put",
             {
                 "collection": collection,
@@ -120,7 +143,7 @@ class Store:
         )
 
     def delete(self, collection: str, record_id: str, expected_version: int | None = None) -> bool:
-        return self._channel.call(
+        return self._bridge.call(
             "store.delete",
             {
                 "collection": collection,
@@ -133,27 +156,29 @@ class Store:
 class Assets:
     """Canonical asset operations; the host applies Casbin for the principal."""
 
-    def __init__(self, channel: _Channel) -> None:
-        self._channel = channel
+    __slots__ = ("_bridge",)
+
+    def __init__(self, bridge: _HostBridge) -> None:
+        self._bridge = bridge
 
     def get(self, asset_id: str) -> dict[str, Any]:
-        return self._channel.call("assets.get", {"assetId": asset_id})
+        return self._bridge.call("assets.get", {"assetId": asset_id})
 
     def search(self, **filters: Any) -> dict[str, Any]:
-        return self._channel.call("assets.search", dict(filters))
+        return self._bridge.call("assets.search", dict(filters))
 
     def resolve(self, entity: str, ids: list[str]) -> dict[str, Any]:
-        return self._channel.call("assets.resolve", {"entity": entity, "ids": list(ids)})
+        return self._bridge.call("assets.resolve", {"entity": entity, "ids": list(ids)})
 
     def create(self, values: Mapping[str, Any], *, idempotencyKey: str) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "assets.create", {"values": dict(values), "idempotencyKey": idempotencyKey}
         )
 
     def update(
         self, asset_id: str, changes: Mapping[str, Any], *, idempotencyKey: str
     ) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "assets.update",
             {"assetId": asset_id, "changes": dict(changes), "idempotencyKey": idempotencyKey},
         )
@@ -161,7 +186,7 @@ class Assets:
     def archive(
         self, asset_id: str, *, idempotencyKey: str, reason: str | None = None
     ) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "assets.archive",
             {"assetId": asset_id, "reason": reason, "idempotencyKey": idempotencyKey},
         )
@@ -170,23 +195,40 @@ class Assets:
 class Incidents:
     """Canonical incident operations through the public intervention service."""
 
-    def __init__(self, channel: _Channel) -> None:
-        self._channel = channel
+    __slots__ = ("_bridge",)
+
+    def __init__(self, bridge: _HostBridge) -> None:
+        self._bridge = bridge
 
     def get(self, incident_id: str) -> dict[str, Any]:
-        return self._channel.call("incidents.get", {"incidentId": incident_id})
+        return self._bridge.call("incidents.get", {"incidentId": incident_id})
 
     def list(self, **filters: Any) -> dict[str, Any]:
-        return self._channel.call("incidents.list", dict(filters))
+        return self._bridge.call("incidents.list", dict(filters))
 
     def create(self, values: Mapping[str, Any], *, idempotencyKey: str) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "incidents.create", {"values": dict(values), "idempotencyKey": idempotencyKey}
         )
 
 
 class Context:
     """Per-invocation context.  One instance per handler call."""
+
+    __slots__ = (
+        "_bridge",
+        "_data_path",
+        "_db",
+        "assets",
+        "event",
+        "extension_id",
+        "incidents",
+        "operation",
+        "principal",
+        "schedule",
+        "store",
+        "version",
+    )
 
     def __init__(
         self,
@@ -200,7 +242,7 @@ class Context:
         schedule: str | None,
         data_path: str,
     ) -> None:
-        self._channel = channel
+        self._bridge = _HostBridge(channel)
         self._data_path = data_path
         self._db: sqlite3.Connection | None = None
         self.principal = dict(principal)
@@ -209,9 +251,9 @@ class Context:
         self.operation = operation
         self.event = dict(event) if event is not None else None
         self.schedule = schedule
-        self.store = Store(channel)
-        self.assets = Assets(channel)
-        self.incidents = Incidents(channel)
+        self.store = Store(self._bridge)
+        self.assets = Assets(self._bridge)
+        self.incidents = Incidents(self._bridge)
 
     @property
     def db(self) -> sqlite3.Connection:
@@ -232,7 +274,7 @@ class Context:
         url: str | None = None,
         idempotency_key: str | None = None,
     ) -> dict[str, Any]:
-        return self._channel.call(
+        return self._bridge.call(
             "notify",
             {
                 "key": key,
@@ -247,7 +289,7 @@ class Context:
         )
 
     def authorize(self, permission: str) -> bool:
-        return bool(self._channel.call("authorize", {"permission": permission}))
+        return bool(self._bridge.call("authorize", {"permission": permission}))
 
 
 class ModuleSDK:
