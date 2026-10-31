@@ -551,7 +551,7 @@ def test_chat_attachment_migration_round_trips_on_fresh_sqlite(
             "-c",
             str(Path(__file__).resolve().parents[1] / "alembic.ini"),
             "downgrade",
-            "-1",
+            "0033_provider_model_discovery",
         ],
         settings,
     )
