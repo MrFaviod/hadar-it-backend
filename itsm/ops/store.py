@@ -738,6 +738,69 @@ def publish_summary(
     return summary
 
 
+UPGRADE_ATTEMPT_NAME = "upgrade-attempt.json"
+
+
+def upgrade_attempt_path(root: Path) -> Path:
+    return root / UPGRADE_ATTEMPT_NAME
+
+
+def write_upgrade_attempt(root: Path, attempt: Mapping[str, Any]) -> None:
+    """Record the attempt before the first migration statement runs."""
+    prepare_root(root)
+    payload = json.dumps(dict(attempt), sort_keys=True).encode()
+    _write_private(upgrade_attempt_path(root), payload)
+
+
+def read_upgrade_attempt(root: Path) -> dict[str, Any] | None:
+    try:
+        raw = json.loads(upgrade_attempt_path(root).read_text())
+    except OSError, ValueError:
+        return None
+    return raw if isinstance(raw, dict) else None
+
+
+def clear_upgrade_attempt(root: Path) -> None:
+    with contextlib.suppress(OSError):
+        upgrade_attempt_path(root).unlink()
+
+
+def upgrade_attempt_partial(
+    attempt: Mapping[str, Any] | None,
+    *,
+    observed_revision: str | None,
+    database_digest: str | None,
+) -> str | None:
+    """Return the refusal when an earlier attempt left an unknown schema behind."""
+    if attempt is None:
+        return None
+    recorded_status = attempt.get("schemaStatus")
+    if recorded_status == "complete":
+        return None
+    from_revision = attempt.get("fromRevision")
+    recorded_digest = attempt.get("databaseDigest")
+    changed = observed_revision not in (None, from_revision)
+    if isinstance(recorded_digest, str) and database_digest is not None:
+        changed = changed or database_digest != recorded_digest
+    if recorded_status != "partial" and not changed:
+        return None
+    backup = attempt.get("backupId")
+    command = attempt.get("restoreCommand")
+    if not isinstance(command, str) or not command:
+        command = (
+            f"python -m itsm.ops restore {backup} --replace-live --confirm {backup}"
+            if backup
+            else "restore the pre-upgrade backup"
+        )
+    return (
+        "a previous upgrade attempt left this database partially migrated "
+        f"(attempted {from_revision} -> {attempt.get('headRevision')}, "
+        f"found {observed_revision}); the schema is unknown and a plain re-run "
+        f"would fail on objects the attempt already created. Restore the "
+        f"pre-upgrade backup and retry: {command}"
+    )
+
+
 def record_failure(
     root: Path,
     *,

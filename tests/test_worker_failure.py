@@ -3,12 +3,23 @@
 from __future__ import annotations
 
 import json
+import sqlite3
+import subprocess
+import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 
 from fastapi.testclient import TestClient
 from itsm.config import Settings
-from tests.conftest import run_cli, running_worker, wait_for_status
+from tests.conftest import (
+    BACKEND_ROOT,
+    run_cli,
+    run_migrations,
+    running_worker,
+    wait_for_status,
+    worker_environment,
+)
 
 
 def submit_failure(settings: Settings, message: str) -> str:
@@ -70,3 +81,71 @@ def test_cli_reports_persisted_status_for_the_failed_job(
     assert payload["task_id"] == task_id
     assert payload["state"] == "error"
     assert payload["retries_remaining"] == 0
+
+
+def worker_check(settings: Settings, log_path: Path, timeout: float = 20.0) -> int:
+    """Run one real consumer and return its exit code, never leaving it running."""
+    environment = worker_environment(settings)
+    with log_path.open("w") as log:
+        process = subprocess.Popen(
+            [
+                sys.executable,
+                "-m",
+                "huey.bin.huey_consumer",
+                "itsm.tasks.runtime.huey",
+                "-w",
+                "1",
+                "-k",
+                "thread",
+            ],
+            cwd=BACKEND_ROOT,
+            env=environment,
+            stdout=log,
+            stderr=subprocess.STDOUT,
+            text=True,
+        )
+        try:
+            return process.wait(timeout=timeout)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait()
+            raise AssertionError(
+                "the consumer kept running against a database the code cannot use: "
+                + log_path.read_text()
+            ) from None
+
+
+def test_the_worker_refuses_to_consume_an_unmigrated_database(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = settings_factory()
+    log_path = tmp_path / "worker-unmigrated.log"
+
+    returncode = worker_check(settings, log_path)
+
+    assert returncode == 2
+    log = log_path.read_text()
+    assert "worker.refused" in log
+    assert "migrat" in log.lower()
+
+
+def test_the_worker_refuses_a_database_behind_the_code_head(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = settings_factory()
+    applied = run_migrations(settings)
+    assert applied.returncode == 0, applied.stderr
+    connection = sqlite3.connect(settings.database_url.removeprefix("sqlite:///"))
+    try:
+        connection.execute("UPDATE alembic_version SET version_num = '0035_extension_isolation'")
+        connection.commit()
+    finally:
+        connection.close()
+    log_path = tmp_path / "worker-stale.log"
+
+    returncode = worker_check(settings, log_path)
+
+    assert returncode == 2
+    log = log_path.read_text()
+    assert "worker.refused" in log
+    assert "migrat" in log.lower()

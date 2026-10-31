@@ -17,6 +17,7 @@ from huey import Huey, PostgresHuey, RedisHuey, SqliteHuey, crontab
 from huey.signals import SIGNAL_ERROR, SIGNAL_RETRYING
 
 from itsm.config import Settings, get_settings
+from itsm.database import check_readiness, create_engine_from_settings
 from itsm.logging import configure_logging, log_event
 from itsm.release_identity import enforce_startup
 from itsm.release_mode import ReleaseModeError
@@ -139,6 +140,23 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
             if release.mode == "demo" and settings.demo_data_directory is not None:
                 raise ReleaseModeError(
                     "external consumers are forbidden for an automatically resetting demo"
+                )
+            # The worker writes the same schema the API reads, so it refuses a
+            # database that is behind the code head instead of retrying every
+            # task against an unknown schema.
+            engine = create_engine_from_settings(settings)
+            try:
+                readiness = check_readiness(engine, settings, task_storage_ok=True)
+            finally:
+                engine.dispose()
+            if not readiness.is_ready:
+                migrations = readiness.migrations
+                raise ReleaseModeError(
+                    "the database is not ready for this release: migrations "
+                    f"{migrations.status if migrations else 'unavailable'}, "
+                    f"revision {migrations.current if migrations else None}, "
+                    f"head {migrations.head if migrations else None}; "
+                    "run `python -m itsm.ops upgrade` before starting the worker"
                 )
         except ReleaseModeError as exc:
             log_event(logger, "worker.refused", level=logging.ERROR, reason=str(exc))

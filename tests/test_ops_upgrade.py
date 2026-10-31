@@ -338,3 +338,83 @@ def test_upgrade_refuses_a_broken_backup_root_and_preserves_the_database(
     assert "not a directory" in outcome.payload["error"]
     assert "data preserved" in outcome.payload["message"]
     assert current_revision(settings) == EARLIER_REVISION
+
+
+def partial_migration(settings: Settings) -> Callable[[], None]:
+    """A migration that commits one DDL statement and then fails."""
+    database = settings.database_url.removeprefix("sqlite:///")
+
+    def apply() -> None:
+        connection = sqlite3.connect(database)
+        try:
+            connection.execute("CREATE TABLE probe_partial (id INTEGER PRIMARY KEY)")
+            connection.commit()
+        finally:
+            connection.close()
+        raise RuntimeError("injected failure after the first DDL statement")
+
+    return apply
+
+
+def test_a_partially_applied_migration_is_detected_and_a_silent_rerun_is_refused(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = database_at_earlier_revision(settings_factory)
+    backup_root = tmp_path / "backups"
+    context = service.OpsContext(settings=settings, backup_root=backup_root)
+
+    first = upgrade.run_upgrade(context, apply_migrations=partial_migration(settings))
+
+    assert first.exit_code == 1
+    assert first.payload["stage"] == "migration"
+    assert first.payload["schemaStatus"] == "partial"
+    assert "probe_partial" in table_names(settings)
+
+    # A plain re-run would fail on "table probe_partial already exists" and hide
+    # the real state, so it must be refused with the restore instruction.
+    second = upgrade.run_upgrade(context)
+
+    assert second.exit_code == 1
+    assert second.payload["stage"] == "preflight"
+    assert second.payload["schemaStatus"] == "partial"
+    assert "partial" in second.payload["error"]
+    assert first.payload["backupId"] in second.payload["error"]
+    assert "--replace-live" in second.payload["error"]
+    assert current_revision(settings) == EARLIER_REVISION
+    assert marker_rows(settings) == 4
+    assert len(list(backup_root.glob("*T*Z-*"))) == 1
+
+    status = payload(run_ops(["status"], settings, backup_root))
+    assert status["upgradeAttempt"]["schemaStatus"] == "partial"
+
+
+def test_restoring_the_pre_upgrade_backup_clears_the_partial_state(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = database_at_earlier_revision(settings_factory)
+    backup_root = tmp_path / "backups"
+    context = service.OpsContext(settings=settings, backup_root=backup_root)
+    first = upgrade.run_upgrade(context, apply_migrations=partial_migration(settings))
+    assert first.payload["schemaStatus"] == "partial"
+    database = settings.database_url.removeprefix("sqlite:///")
+
+    restored = run_ops(
+        [
+            "restore",
+            first.payload["backupId"],
+            "--target-file",
+            database,
+            "--replace-live",
+            "--confirm",
+            first.payload["backupId"],
+        ],
+        settings,
+        backup_root,
+    )
+
+    assert restored.returncode == 0, restored.stdout + restored.stderr
+    assert "probe_partial" not in table_names(settings)
+    retry = run_ops(["upgrade"], settings, backup_root)
+    assert retry.returncode == 0, retry.stdout + retry.stderr
+    assert payload(retry)["status"] == "upgraded"
+    assert payload(run_ops(["status"], settings, backup_root))["upgradeAttempt"] is None

@@ -878,6 +878,10 @@ def restore(
                 replace_live=replace_live,
                 confirm=confirm,
             )
+    if replace_live and core_requested:
+        # A consented live restore is the documented recovery step for a database
+        # a failed upgrade left behind; the partial marker must not survive it.
+        store.clear_upgrade_attempt(context.backup_root)
     if target_attachments is not None:
         destination = Path(target_attachments).expanduser()
         if not destination.is_absolute():
@@ -1033,7 +1037,28 @@ def status(context: OpsContext) -> dict[str, Any]:
         "lastBackup": _last_backup_payload(artifacts),
         "failures": stored.get("failures", []),
         "lastUpgrade": stored.get("lastUpgrade"),
+        "upgradeAttempt": _upgrade_attempt_payload(root),
         "updatedAt": stored.get("updatedAt"),
+    }
+
+
+def _upgrade_attempt_payload(root: Path) -> dict[str, Any] | None:
+    """Report an unfinished or partial upgrade so automation can see it."""
+    attempt = store.read_upgrade_attempt(root)
+    if attempt is None:
+        return None
+    return {
+        key: attempt.get(key)
+        for key in (
+            "fromRevision",
+            "headRevision",
+            "observedRevision",
+            "schemaStatus",
+            "startedAt",
+            "backupId",
+            "restoreCommand",
+        )
+        if key in attempt
     }
 
 

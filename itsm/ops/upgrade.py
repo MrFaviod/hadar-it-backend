@@ -199,6 +199,45 @@ def run_upgrade(
         store.release_lock(lock)
 
 
+def _fingerprint(context: service.OpsContext, target: DatabaseTarget) -> str | None:
+    """Cheap schema-independent fingerprint of a SQLite database file."""
+    if target.engine != "sqlite":
+        return None
+    try:
+        return store.digest_file(Path(target.database))[0]
+    except OSError:
+        return None
+
+
+def _schema_status(
+    context: service.OpsContext,
+    target: DatabaseTarget,
+    attempt: dict[str, Any],
+    observed: str | None,
+) -> str:
+    """Classify the schema after a failed step and persist the attempt state."""
+    from_revision = attempt.get("fromRevision")
+    recorded_digest = attempt.get("databaseDigest")
+    digest = _fingerprint(context, target)
+    changed = observed not in (None, from_revision)
+    if isinstance(recorded_digest, str) and digest is not None:
+        changed = changed or digest != recorded_digest
+    if observed == attempt.get("headRevision"):
+        store.write_upgrade_attempt(
+            context.backup_root,
+            {**attempt, "schemaStatus": "complete", "observedRevision": observed},
+        )
+        return "complete"
+    if changed:
+        store.write_upgrade_attempt(
+            context.backup_root,
+            {**attempt, "schemaStatus": "partial", "observedRevision": observed},
+        )
+        return "partial"
+    store.clear_upgrade_attempt(context.backup_root)
+    return "unchanged"
+
+
 def _upgrade_locked(
     context: service.OpsContext,
     target: DatabaseTarget,
@@ -220,6 +259,33 @@ def _upgrade_locked(
                 "headRevision": head,
                 "error": error,
                 "message": "no migration was attempted; data preserved",
+            },
+            secrets=secrets,
+        )
+    previous = store.read_upgrade_attempt(root)
+    partial = store.upgrade_attempt_partial(
+        previous,
+        observed_revision=current,
+        database_digest=_fingerprint(context, target),
+    )
+    if partial is not None:
+        carried = previous or {}
+        return _fail(
+            context,
+            target,
+            {
+                "status": "failed",
+                "stage": "preflight",
+                "schemaStatus": "partial",
+                "fromRevision": current,
+                "headRevision": head,
+                "backupId": carried.get("backupId"),
+                "restoreCommand": carried.get("restoreCommand"),
+                "error": partial,
+                "message": (
+                    "no migration was attempted; restore the pre-upgrade backup "
+                    "before retrying a partially migrated database"
+                ),
             },
             secrets=secrets,
         )
@@ -286,6 +352,16 @@ def _upgrade_locked(
             secrets=secrets,
         )
 
+    attempt: dict[str, Any] = {
+        "fromRevision": current,
+        "headRevision": head,
+        "startedAt": store.isoformat(store.utc_now()),
+        "databaseDigest": _fingerprint(context, target),
+        "backupId": artifact.manifest.id,
+        "restoreCommand": restore,
+        "schemaStatus": "in progress",
+    }
+    store.write_upgrade_attempt(root, attempt)
     try:
         if apply_migrations is None:
             command.upgrade(alembic_config(context.settings), "head")
@@ -293,12 +369,14 @@ def _upgrade_locked(
             apply_migrations()
     except Exception as exc:
         observed = service.try_revision(context.settings, target)
+        schema_status = _schema_status(context, target, attempt, observed)
         return _fail(
             context,
             target,
             {
                 "status": "failed",
                 "stage": "migration",
+                "schemaStatus": schema_status,
                 "fromRevision": current,
                 "observedRevision": observed,
                 "headRevision": head,
@@ -315,12 +393,14 @@ def _upgrade_locked(
 
     observed = service.try_revision(context.settings, target)
     if observed != head:
+        schema_status = _schema_status(context, target, attempt, observed)
         return _fail(
             context,
             target,
             {
                 "status": "failed",
                 "stage": "verification",
+                "schemaStatus": schema_status,
                 "fromRevision": current,
                 "observedRevision": observed,
                 "headRevision": head,
@@ -363,5 +443,6 @@ def _upgrade_locked(
         "restoreCommand": restore,
         "smoke": smoke,
     }
+    store.clear_upgrade_attempt(root)
     store.record_upgrade(root, payload, engine=target.engine, database=target.describe())
     return UpgradeOutcome(payload=payload, exit_code=0)
