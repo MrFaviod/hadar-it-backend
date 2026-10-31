@@ -14,6 +14,7 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from itsm.config import Settings
 from itsm.demo.cycle import cycle_status, reset_demo
+from itsm.demo.lock import DemoDirectoryLock, DemoProcessConflict
 from itsm.demo.reset import recovery_hint, validate_reset_paths
 from itsm.logging import log_event
 
@@ -80,13 +81,28 @@ class DemoController:
         self.engine: Engine | None = None
         self.factory: Callable[[], Session] | None = None
         self._stuck_reported = False
+        self._lock: DemoDirectoryLock | None = None
 
     @property
     def resetting(self) -> bool:
         return self.gate.resetting
 
     def prepare(self) -> None:
-        """Refuse a directory whose previous reset stopped halfway, and say how to fix it."""
+        """Claim the directory for this process and report a stuck previous reset."""
+        directory = self.settings.demo_data_directory
+        if directory is not None:
+            lock = DemoDirectoryLock(directory)
+            try:
+                lock.acquire()
+            except DemoProcessConflict as conflict:
+                log_event(
+                    logger,
+                    "demo.process_conflict",
+                    level=logging.ERROR,
+                    reason=str(conflict),
+                )
+                raise
+            self._lock = lock
         try:
             status = self.status()
         except Exception:
@@ -94,6 +110,12 @@ class DemoController:
             return
         if status["resetting"]:
             self._mark_stuck()
+
+    def release(self) -> None:
+        """Release the directory so the next process (or recover) can own it."""
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
 
     def _mark_stuck(self) -> None:
         self.unavailable = True

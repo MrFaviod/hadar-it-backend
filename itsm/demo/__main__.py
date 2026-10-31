@@ -13,6 +13,7 @@ from pathlib import Path
 
 from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.demo import exporter, telemetry
+from itsm.demo.lock import DemoDirectoryLock, DemoProcessConflict
 from itsm.demo.reset import recover_demo
 from itsm.demo.seed import seed
 from itsm.demo.telemetry import demo_settings
@@ -104,6 +105,11 @@ def recover(directory: Path) -> dict:
                 "attachment_storage_path": directory / "attachments",
             }
         )
+    lock = DemoDirectoryLock(directory)
+    try:
+        lock.acquire()
+    except DemoProcessConflict as conflict:
+        raise DemoRefused(str(conflict)) from None
     engine = create_engine_from_settings(settings)
     try:
         with create_session_factory(engine)() as session:
@@ -122,6 +128,7 @@ def recover(directory: Path) -> dict:
             payload = recover_demo(settings, engine)
     finally:
         engine.dispose()
+        lock.release()
     return {"status": "recovered", "directory": str(directory), **payload}
 
 

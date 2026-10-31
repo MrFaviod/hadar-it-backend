@@ -263,6 +263,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cycle_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await cycle_task
+            if demo_controller is not None:
+                demo_controller.release()
             engine.dispose()
             log_event(logger, "app.stopped", app=settings.app_name)
 
