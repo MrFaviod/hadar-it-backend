@@ -334,8 +334,92 @@ def _validate_runtime(manifest: Mapping[str, Any], collection_names: Collection[
             errors.append("declarative runtime cannot declare reconcile; use the sandboxed runtime")
         if manifest["frontend"].get("entry"):
             errors.append(
-                "declarative runtime cannot declare frontend.entry; isolated views need the sandboxed runtime"
+                "declarative runtime cannot declare frontend.entry; "
+                "isolated views need the sandboxed runtime"
             )
+    return errors
+
+
+def _view_asset_field_errors(
+    label: str,
+    view_id: str,
+    surface: str,
+    field: str,
+    operation_name: str,
+    *,
+    declarative_kind: str,
+    operations: Mapping[str, Mapping[str, Any]],
+    collection_properties: Mapping[str, frozenset[str]],
+) -> list[str]:
+    """Check a view asset field against the operation it names (D10).
+
+    A handler operation receives the selected asset's permanent id as a declared
+    top-level argument (a parameter), while a declarative operation keeps it in
+    its own collection, so the host sends it inside ``filters`` (list) or
+    ``data`` (put). Either way the manifest names a field that must exist on that
+    exact operation, never a boolean flag or a free-form name.
+    """
+    prefix = f"{label} {view_id}: {surface} field {field}"
+    operation = operations.get(operation_name)
+    if operation is None:
+        return [f"{label} {view_id}: {surface} operation {operation_name} is not declared"]
+    kind = operation_kind(operation)
+    if kind == "handler":
+        declared = set((operation.get("parameters") or {}).get("properties") or {})
+        if field not in declared:
+            return [f"{prefix} is not a declared parameter of operation {operation_name}"]
+        return []
+    if kind == declarative_kind:
+        collection = operation.get("collection")
+        if not collection:
+            return []
+        if field not in collection_properties.get(str(collection), frozenset()):
+            return [f"{prefix} is not a declared property of collection {collection}"]
+        return []
+    return [
+        f"{label} {view_id}: {surface} operation {operation_name} must be a handler or "
+        f"a declarative {declarative_kind}, not {kind}"
+    ]
+
+
+def _declaration_asset_field_errors(
+    label: str,
+    view_id: str,
+    declaration: Mapping[str, Any],
+    *,
+    operations: Mapping[str, Mapping[str, Any]],
+    collection_properties: Mapping[str, frozenset[str]],
+) -> list[str]:
+    """Check the asset field of a declarative table or form view, if declared."""
+    errors: list[str] = []
+    table = declaration.get("table")
+    if isinstance(table, Mapping) and "filterAsset" in table:
+        errors.extend(
+            _view_asset_field_errors(
+                label,
+                view_id,
+                "filterAsset",
+                str(table["filterAsset"]),
+                str(table.get("operation")),
+                declarative_kind="list",
+                operations=operations,
+                collection_properties=collection_properties,
+            )
+        )
+    form = declaration.get("form")
+    if isinstance(form, Mapping) and "assetField" in form:
+        errors.extend(
+            _view_asset_field_errors(
+                label,
+                view_id,
+                "assetField",
+                str(form["assetField"]),
+                str(form.get("operation")),
+                declarative_kind="put",
+                operations=operations,
+                collection_properties=collection_properties,
+            )
+        )
     return errors
 
 
@@ -382,6 +466,7 @@ def _semantic_errors(
         _unique(list(manifest.get("capabilities", [])), "capability")
 
         collection_names: list[str] = []
+        collection_properties: dict[str, frozenset[str]] = {}
         for collection in manifest["collections"]:
             name = collection["name"]
             collection_names.append(name)
@@ -391,6 +476,7 @@ def _semantic_errors(
             schema = collection.get("schema")
             if schema is not None:
                 errors.extend(collection_schema_errors(name, schema))
+            collection_properties[name] = frozenset((schema or {}).get("properties") or {})
             for reference in collection.get("references", []):
                 field = reference["field"]
                 properties = (schema or {}).get("properties") or {}
@@ -399,13 +485,16 @@ def _semantic_errors(
         _unique(collection_names, "collection name")
 
         operation_names: list[str] = []
+        operations: dict[str, Mapping[str, Any]] = {}
         for operation in manifest["operations"]:
             name = operation["name"]
             operation_names.append(name)
+            operations[name] = operation
             _text(operation["description"], f"operation {name} description", max_length=1024)
             if operation["permission"] not in codes:
                 errors.append(
-                    f"operation {name}: permission {operation['permission']} is not declared permission"
+                    f"operation {name}: permission {operation['permission']} "
+                    "is not declared permission"
                 )
             try:
                 _validate_parameters(operation["parameters"], name)
@@ -482,7 +571,8 @@ def _semantic_errors(
             contribution_ids.append(view["id"])
             if view["permission"] not in codes:
                 errors.append(
-                    f"{label} {view['id']}: permission {view['permission']} is not declared permission"
+                    f"{label} {view['id']}: permission {view['permission']} "
+                    "is not declared permission"
                 )
             _text(view["label"], f"{label} {view['id']} label", max_length=120)
             if view.get("component") is not None:
@@ -498,11 +588,22 @@ def _semantic_errors(
                     errors.append(
                         f"{label} {view['id']}: isolated views need the sandboxed runtime"
                     )
+            if declaration:
+                errors.extend(
+                    _declaration_asset_field_errors(
+                        label,
+                        view["id"],
+                        declaration,
+                        operations=operations,
+                        collection_properties=collection_properties,
+                    )
+                )
         for action in frontend.get("actions", []):
             contribution_ids.append(action["id"])
             if action["permission"] not in codes:
                 errors.append(
-                    f"action {action['id']}: permission {action['permission']} is not declared permission"
+                    f"action {action['id']}: permission {action['permission']} "
+                    "is not declared permission"
                 )
             if action["target"] != "asset.action":
                 errors.append(f"action {action['id']}: target must be asset.action")

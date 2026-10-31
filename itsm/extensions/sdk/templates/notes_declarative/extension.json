@@ -139,7 +139,7 @@
           "table": {
             "operation": "list_notes",
             "columns": [{"field": "title", "label": "Título"}],
-            "filterAsset": true
+            "filterAsset": "assetId"
           }
         }
       }

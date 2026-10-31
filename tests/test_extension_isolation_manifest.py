@@ -18,6 +18,7 @@ from itsm.extensions.sdk.contract import (
     validate_manifest,
 )
 from tests.test_extension_runtime_support import (  # noqa: F401 - fixtures
+    DECLARATIVE_ID,
     PROBE_BACKEND,
     build_package,
     declarative_manifest,
@@ -207,3 +208,167 @@ def test_package_digest_rejects_legacy_v1_manifests_before_storage(tmp_path: Pat
     message = str(failure.value)
     assert "sdkVersion" in message and "2" in message
     assert json.dumps(checked(probe_manifest())) != ""
+
+
+ASSET_PANEL_ID = "asset-records"
+
+
+def asset_panel_declaration(operation: str, filter_asset: Any) -> dict[str, Any]:
+    """A sandboxed module whose asset panel filters a table by the selected asset."""
+    declaration = probe_manifest()
+    declaration["frontend"] = {
+        "pages": [],
+        "assetPanels": [
+            {
+                "id": ASSET_PANEL_ID,
+                "label": "Registros del activo",
+                "permission": "ext_probe.read",
+                "view": {
+                    "table": {
+                        "operation": operation,
+                        "columns": [{"field": "value", "label": "Valor"}],
+                        "filterAsset": filter_asset,
+                    }
+                },
+            }
+        ],
+        "contributions": [],
+    }
+    return declaration
+
+
+def filterable_declarative_declaration() -> dict[str, Any]:
+    """A declarative module whose table filters the collection's own ``assetId``."""
+    declaration = declarative_manifest()
+    collection = declaration["collections"][0]
+    collection["schema"]["properties"]["assetId"] = {"type": "string", "maxLength": 64}
+    collection["references"] = [
+        {"field": "assetId", "entity": "asset", "onArchive": "keep", "onDelete": "flag"}
+    ]
+    declaration["frontend"]["pages"][0]["view"]["table"]["filterAsset"] = "assetId"
+    return declaration
+
+
+def test_table_filter_asset_must_be_a_field_name_not_a_boolean() -> None:
+    declaration = asset_panel_declaration("probe_asset_get", True)
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert "filterAsset" in joined and "string" in joined
+
+
+def test_table_filter_asset_must_name_a_declared_handler_parameter() -> None:
+    declaration = asset_panel_declaration("probe_asset_get", "missing_id")
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert ASSET_PANEL_ID in joined
+    assert "probe_asset_get" in joined
+    assert "missing_id" in joined
+
+
+def test_table_filter_asset_operation_must_be_declared() -> None:
+    declaration = asset_panel_declaration("missing_operation", "asset_id")
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert ASSET_PANEL_ID in joined and "missing_operation" in joined
+
+
+def test_table_filter_asset_accepts_a_declared_handler_parameter() -> None:
+    manifest = checked(asset_panel_declaration("probe_asset_get", "asset_id"))
+    table = manifest["frontend"]["assetPanels"][0]["view"]["table"]
+    assert table["filterAsset"] == "asset_id"
+
+
+def test_table_filter_asset_accepts_a_declared_declarative_collection_field() -> None:
+    manifest = checked(filterable_declarative_declaration())
+    table = manifest["frontend"]["pages"][0]["view"]["table"]
+    assert table["filterAsset"] == "assetId"
+    declaration = filterable_declarative_declaration()
+    declaration["frontend"]["pages"][0]["view"]["table"]["filterAsset"] = "asset_id"
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert "asset_id" in joined and "records" in joined
+
+
+def test_table_filter_asset_requires_a_handler_or_declarative_list_operation() -> None:
+    declaration = declarative_manifest()
+    declaration["frontend"]["pages"][0]["view"]["table"] = {
+        "operation": "put_note",
+        "columns": [{"field": "label", "label": "Etiqueta"}],
+        "filterAsset": "label",
+    }
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert "put_note" in joined and "filterAsset" in joined
+
+
+def form_declaration(operation: str, asset_field: Any) -> dict[str, Any]:
+    declaration = probe_manifest()
+    declaration["frontend"] = {
+        "pages": [
+            {
+                "id": "new-record",
+                "label": "Nuevo registro",
+                "permission": "ext_probe.read",
+                "view": {
+                    "form": {
+                        "operation": operation,
+                        "assetField": asset_field,
+                        "fields": [{"field": "value", "label": "Valor", "input": "text"}],
+                    }
+                },
+            }
+        ],
+        "assetPanels": [],
+        "contributions": [],
+    }
+    return declaration
+
+
+def test_form_asset_field_must_name_a_declared_handler_parameter() -> None:
+    manifest = checked(form_declaration("probe_asset_get", "asset_id"))
+    assert manifest["frontend"]["pages"][0]["view"]["form"]["assetField"] == "asset_id"
+    with pytest.raises(ManifestError) as failure:
+        checked(form_declaration("probe_asset_get", "missing_id"))
+    joined = " ".join(failure.value.errors)
+    assert "new-record" in joined and "probe_asset_get" in joined and "missing_id" in joined
+
+
+def test_form_asset_field_accepts_a_declared_declarative_put_collection_field() -> None:
+    declaration = filterable_declarative_declaration()
+    declaration["frontend"]["pages"][0]["view"] = {
+        "form": {
+            "operation": "put_note",
+            "assetField": "assetId",
+            "fields": [{"field": "label", "label": "Etiqueta", "input": "text"}],
+        }
+    }
+    checked(declaration)
+    declaration["frontend"]["pages"][0]["view"]["form"]["assetField"] = "asset_id"
+    with pytest.raises(ManifestError) as failure:
+        checked(declaration)
+    joined = " ".join(failure.value.errors)
+    assert "asset_id" in joined and "records" in joined
+
+
+def test_declarative_list_filter_on_the_asset_field_returns_only_that_asset(env) -> None:
+    env.install(build_package(filterable_declarative_declaration(), backend=None))
+    first = env.invoke(
+        "put_note",
+        {"data": {"label": "Primera", "assetId": "asset-1"}},
+        extension_id=DECLARATIVE_ID,
+    )
+    env.invoke(
+        "put_note",
+        {"data": {"label": "Segunda", "assetId": "asset-2"}},
+        extension_id=DECLARATIVE_ID,
+    )
+    listed = env.invoke(
+        "list_notes", {"filters": {"assetId": "asset-1"}}, extension_id=DECLARATIVE_ID
+    )
+    assert listed["total"] == 1
+    assert [item["id"] for item in listed["items"]] == [first["id"]]

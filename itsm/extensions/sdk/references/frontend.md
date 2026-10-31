@@ -31,7 +31,7 @@ only for an explicitly isolated iframe component.
       "table": {
         "operation": "list_records",
         "columns": [{"field": "title", "label": "Título"}],
-        "filterAsset": true
+        "filterAsset": "asset_id"
       }
     }
   }],
@@ -43,13 +43,19 @@ Three view shapes are allowed:
 
 | Shape | Fields |
 | --- | --- |
-| `table` | `operation` (a declared operation), `columns` (`field`, `label`, optional `format`: `text`, `date`, `date-time`, `number`, `boolean`), optional `filterAsset`, optional `form` |
-| `form` | `operation`, `fields` (`field`, `label`, `input`: `text`, `textarea`, `number`, `date`, `select`, `checkbox`, optional `required`, `options`), optional `assetField` |
+| `table` | `operation` (a declared operation), `columns` (`field`, `label`, optional `format`: `text`, `date`, `date-time`, `number`, `boolean`), optional `filterAsset` (a field name), optional `form` |
+| `form` | `operation`, `fields` (`field`, `label`, `input`: `text`, `textarea`, `number`, `date`, `select`, `checkbox`, optional `required`, `options`), optional `assetField` (a field name) |
 | `isolated` | `component` and optional `height` (120–2000) |
 
 Every view declares `id`, `label`, a declared `permission` and optionally
-`icon`. `filterAsset: true` passes the selected asset's permanent id to the
-operation as `assetId`; the module decides what to store. The host renders
+`icon`. `filterAsset` is a field name, never a boolean: it says where the host
+puts the selected asset's permanent id, and the manifest is rejected unless that
+field exists on the operation the view names. For a handler operation it is a
+declared top-level parameter (`"asset_id"`); for a declarative `list` it is a
+declared collection property and the host sends it inside `filters`
+(`{"assetId": "<id>"}`). `assetField` follows the same rule for a form: a
+declared handler parameter, or a collection property written into `data` by a
+declarative `put`. The module decides what to store. The host renders
 labels, inputs, tables, empty states, errors and loading with its own components,
 so the module cannot inject markup, CSS or a second design system.
 

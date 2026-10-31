@@ -1575,7 +1575,7 @@ def test_generated_asset_panel_is_a_declarative_filtered_view() -> None:
     assert "entry" not in manifest["frontend"]
     panel = manifest["frontend"]["assetPanels"][0]
     table = panel["view"]["table"]
-    assert table["filterAsset"] is True
+    assert table["filterAsset"] == "asset_id"
     assert table["operation"] == "list_records"
     assert [column["field"] for column in table["columns"]] == ["title"]
     operations = {item["name"]: item for item in manifest["operations"]}

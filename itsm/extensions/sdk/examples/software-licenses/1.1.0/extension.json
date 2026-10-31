@@ -384,7 +384,7 @@
                 "format": "boolean"
               }
             ],
-            "filterAsset": true
+            "filterAsset": "asset_id"
           }
         }
       },
