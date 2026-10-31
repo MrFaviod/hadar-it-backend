@@ -530,5 +530,8 @@ def install_error_handlers(app: FastAPI) -> None:
         request: Request, exc: AuthenticationRequired
     ) -> JSONResponse:
         response = json_error(401, "unauthorized", "authentication required")
-        clear_session_cookie(request, response)
+        # A rejected machine credential says nothing about the browser session; only
+        # a request that relied on the cookie may have that cookie cleared.
+        if "authorization" not in request.headers:
+            clear_session_cookie(request, response)
         return response

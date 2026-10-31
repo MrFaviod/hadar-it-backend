@@ -29,8 +29,12 @@ def test_demo_discovery_and_metrics_follow_reset(settings_factory, monkeypatch, 
         async def reset():
             from itsm.demo.cycle import reset_demo
 
-            async with client.app.state.demo_controller.lock:
+            gate = client.app.state.demo_controller.gate
+            await gate.begin_reset()
+            try:
                 reset_demo(settings, client.app.state.engine)
+            finally:
+                gate.end_reset()
 
         client.portal.call(reset)
         assert client.get(metrics_path).status_code == 404

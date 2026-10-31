@@ -1,4 +1,4 @@
-"""One-process demo reset scheduler and full-response request quiescence."""
+"""One-process demo reset scheduler and counted request quiescence."""
 
 from __future__ import annotations
 
@@ -14,22 +14,120 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from itsm.config import Settings
 from itsm.demo.cycle import cycle_status, reset_demo
-from itsm.demo.reset import validate_reset_paths
+from itsm.demo.lock import DemoDirectoryLock, DemoProcessConflict
+from itsm.demo.reset import recovery_hint, validate_reset_paths
 from itsm.logging import log_event
 
 logger = logging.getLogger("itsm.demo")
 
 
+class DemoRequestGate:
+    """Counted shared access for requests and exclusive access for the reset.
+
+    Every ordinary request enters once and leaves when its response (including
+    streaming and background work) is finished, so concurrent visitors no longer
+    wait for each other. The reset takes the exclusive side: it stops admitting
+    new requests, waits until the in-flight count drains, and only then touches
+    the database, so no response can race the cleanup.
+
+    The gate is process-local and single-loop by design: it is created and used
+    inside the API event loop, and never awaited from another loop.
+    """
+
+    def __init__(self) -> None:
+        self._in_flight = 0
+        self._resetting = False
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    @property
+    def in_flight(self) -> int:
+        return self._in_flight
+
+    @property
+    def resetting(self) -> bool:
+        return self._resetting
+
+    async def enter(self) -> bool:
+        """Admit one request; ``False`` while a reset owns the gate."""
+        if self._resetting:
+            return False
+        self._in_flight += 1
+        self._idle.clear()
+        return True
+
+    def leave(self) -> None:
+        if self._in_flight:
+            self._in_flight -= 1
+        if self._in_flight == 0:
+            self._idle.set()
+
+    async def begin_reset(self) -> None:
+        """Stop admitting requests, then wait for the ones in flight to finish."""
+        self._resetting = True
+        await self._idle.wait()
+
+    def end_reset(self) -> None:
+        self._resetting = False
+
+
 class DemoController:
-    """Serialize demo requests and reset; never race an active streaming response."""
+    """Own the persisted deadline and the reset's exclusive request gate."""
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
-        self.lock = asyncio.Lock()
+        self.gate = DemoRequestGate()
         self.unavailable = False
-        self.resetting = False
         self.engine: Engine | None = None
         self.factory: Callable[[], Session] | None = None
+        self._stuck_reported = False
+        self._lock: DemoDirectoryLock | None = None
+
+    @property
+    def resetting(self) -> bool:
+        return self.gate.resetting
+
+    def prepare(self) -> None:
+        """Claim the directory for this process and report a stuck previous reset."""
+        directory = self.settings.demo_data_directory
+        if directory is not None:
+            lock = DemoDirectoryLock(directory)
+            try:
+                lock.acquire()
+            except DemoProcessConflict as conflict:
+                log_event(
+                    logger,
+                    "demo.process_conflict",
+                    level=logging.ERROR,
+                    reason=str(conflict),
+                )
+                raise
+            self._lock = lock
+        try:
+            status = self.status()
+        except Exception:
+            # Readiness failures are reported by the scheduler tick, not hidden here.
+            return
+        if status["resetting"]:
+            self._mark_stuck()
+
+    def release(self) -> None:
+        """Release the directory so the next process (or recover) can own it."""
+        if self._lock is not None:
+            self._lock.release()
+            self._lock = None
+
+    def _mark_stuck(self) -> None:
+        self.unavailable = True
+        if self._stuck_reported:
+            return
+        self._stuck_reported = True
+        log_event(
+            logger,
+            "demo.reset_stuck",
+            level=logging.ERROR,
+            recovery=recovery_hint(self.settings),
+        )
 
     def status(self) -> dict:
         if self.factory is None:
@@ -41,24 +139,28 @@ class DemoController:
         """Run one due cycle; clock injection allows deterministic scheduler tests."""
         if self.unavailable:
             return
-        async with self.lock:
-            try:
-                status = await asyncio.to_thread(self.status)
-                if status["resetting"]:
-                    self.unavailable = True
-                    return
-                deadline = datetime.fromisoformat(status["nextResetAt"])
-                if (now or datetime.now(UTC)) < deadline:
-                    return
-                self.resetting = True
-                if self.engine is None:
-                    raise RuntimeError("demo controller is not initialized")
-                await asyncio.to_thread(reset_demo, self.settings, self.engine)
-            except Exception:
-                self.unavailable = True
-                log_event(logger, "demo.reset_failed", level=logging.ERROR)
-            finally:
-                self.resetting = False
+        try:
+            status = await asyncio.to_thread(self.status)
+        except Exception:
+            self.unavailable = True
+            log_event(logger, "demo.reset_failed", level=logging.ERROR)
+            return
+        if status["resetting"]:
+            self._mark_stuck()
+            return
+        deadline = datetime.fromisoformat(status["nextResetAt"])
+        if (now or datetime.now(UTC)) < deadline:
+            return
+        await self.gate.begin_reset()
+        try:
+            if self.engine is None:
+                raise RuntimeError("demo controller is not initialized")
+            await asyncio.to_thread(reset_demo, self.settings, self.engine)
+        except Exception:
+            self.unavailable = True
+            log_event(logger, "demo.reset_failed", level=logging.ERROR)
+        finally:
+            self.gate.end_reset()
 
     async def run(self) -> None:
         validate_reset_paths(self.settings)
@@ -68,7 +170,7 @@ class DemoController:
 
 
 class DemoCycleMiddleware:
-    """An exclusive gate covers response streaming, background tasks and resets."""
+    """A counted gate: requests run concurrently, a reset drains and excludes them."""
 
     def __init__(self, app: ASGIApp, controller: DemoController) -> None:
         self.app = app
@@ -78,17 +180,21 @@ class DemoCycleMiddleware:
         if scope["type"] != "http":
             return await self.app(scope, receive, send)
         controller = self.controller
-        if controller.unavailable or controller.resetting:
-            response = JSONResponse(
-                {"error": {"code": "demo_reset_unavailable", "message": "demo reset unavailable"}},
-                status_code=503,
-                headers={"Retry-After": "5", "Cache-Control": "no-store"},
-            )
-            return await response(scope, receive, send)
-        async with controller.lock:
-            if controller.unavailable:
-                response = JSONResponse(
-                    {"error": {"code": "demo_reset_unavailable"}}, status_code=503
-                )
-                return await response(scope, receive, send)
+        if controller.unavailable:
+            return await self._unavailable(scope, receive, send)
+        gate = controller.gate
+        if not await gate.enter():
+            return await self._unavailable(scope, receive, send)
+        try:
             await self.app(scope, receive, send)
+        finally:
+            gate.leave()
+
+    @staticmethod
+    async def _unavailable(scope: Scope, receive: Receive, send: Send) -> None:
+        response = JSONResponse(
+            {"error": {"code": "demo_reset_unavailable", "message": "demo reset unavailable"}},
+            status_code=503,
+            headers={"Retry-After": "5", "Cache-Control": "no-store"},
+        )
+        await response(scope, receive, send)

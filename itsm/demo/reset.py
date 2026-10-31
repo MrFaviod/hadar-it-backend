@@ -1,4 +1,4 @@
-"""Contained SQLite reset implementation; caller owns the API quiescence lock."""
+"""Contained SQLite reset implementation; the caller owns the API request gate."""
 
 from __future__ import annotations
 
@@ -19,6 +19,14 @@ from itsm.devtools.database import MIGRATION_REFERENCE_TABLES
 from itsm.identity.clock import utcnow
 from itsm.release_identity import DeploymentIdentityError, read_identity
 from itsm.release_mode import read_release_mode
+
+RECOVERY_COMMAND = "python -m itsm.demo recover --directory"
+
+
+def recovery_hint(settings: Settings) -> str:
+    """The exact command an operator runs after a failed or stuck reset."""
+    directory = settings.demo_data_directory or "<demo-directory>"
+    return f"{RECOVERY_COMMAND} {directory}"
 
 
 def _owned(path: Path, root: Path) -> Path:
@@ -62,15 +70,54 @@ def validate_reset_paths(settings: Settings) -> tuple[Path, Path]:
     return attachments, tasks
 
 
+def _assert_demo_owner(session: Session) -> None:
+    owner = read_identity(session)
+    if owner is None or owner.release_mode != "demo":
+        raise DeploymentIdentityError("demo reset requires demo-owned database")
+
+
+def _assert_sqlite(engine: Engine) -> None:
+    if engine.dialect.name != "sqlite":
+        raise DeploymentIdentityError("demo reset only supports owned SQLite")
+
+
+def clear_stuck_reset(settings: Settings, engine: Engine) -> bool:
+    """Clear the flag a failed reset left behind; report whether it was set.
+
+    The flag stays persisted on purpose, so a crash cannot silently resume on a
+    partially deleted dataset. Only an explicit maintainer command clears it.
+    """
+    validate_reset_paths(settings)
+    _assert_sqlite(engine)
+    with Session(engine) as session:
+        _assert_demo_owner(session)
+        row = session.get(DemoCycle, 1)
+        if row is None or not row.resetting:
+            return False
+        row.resetting = False
+        session.commit()
+        return True
+
+
+def recover_demo(settings: Settings, engine: Engine) -> dict:
+    """Clear a stuck reset and reseed the canonical dataset through the guarded reset."""
+    cleared = clear_stuck_reset(settings, engine)
+    reset_demo(settings, engine)
+    with Session(engine) as session:
+        status = cycle_status(session)
+    return {
+        "cleared": cleared,
+        "generation": status["generation"],
+        "nextResetAt": status["nextResetAt"],
+    }
+
+
 def reset_demo(settings: Settings, engine: Engine) -> None:
     """Reset a demo only; preserve a durable unavailable flag on any partial failure."""
     attachments, tasks = validate_reset_paths(settings)
-    if engine.dialect.name != "sqlite":
-        raise DeploymentIdentityError("demo reset only supports owned SQLite")
+    _assert_sqlite(engine)
     with Session(engine) as session:
-        owner = read_identity(session)
-        if owner is None or owner.release_mode != "demo":
-            raise DeploymentIdentityError("demo reset requires demo-owned database")
+        _assert_demo_owner(session)
         cycle_status(session)
         row = session.get(DemoCycle, 1)
         assert row is not None

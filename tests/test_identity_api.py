@@ -178,6 +178,30 @@ def test_me_requires_a_session_and_clears_the_cookie_on_401(env) -> None:
     assert body["sessionMinutes"] == 480
 
 
+def test_invalid_bearer_does_not_clear_a_valid_cookie_session(env) -> None:
+    """R2-O1: a failed machine credential is not a reason to drop the visitor's session."""
+    client, _ = env
+    login(client)
+    rejected = client.get(
+        f"{API}/auth/me", headers={"Authorization": "Bearer itsm_mk_not-a-real-token"}
+    )
+    assert rejected.status_code == 401
+    assert "set-cookie" not in rejected.headers
+    still_signed_in = client.get(f"{API}/auth/me")
+    assert still_signed_in.status_code == 200, still_signed_in.text
+    assert still_signed_in.json()["user"]["username"] == "ana.admin"
+
+
+def test_unauthorized_cookie_session_is_still_cleared(env) -> None:
+    client, _ = env
+    client.cookies.set("itsm_session", "itsm_s_not-a-real-session")
+    rejected = client.get(f"{API}/auth/me")
+    assert rejected.status_code == 401
+    set_cookie = rejected.headers["set-cookie"]
+    assert set_cookie.startswith('itsm_session=""')
+    assert "Max-Age=0" in set_cookie
+
+
 def test_logout_requires_origin_and_csrf_and_invalidates_the_session(env) -> None:
     client, harness = env
     payload = login(client)
