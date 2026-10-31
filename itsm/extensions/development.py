@@ -51,6 +51,11 @@ REFERENCE_INDEX: tuple[tuple[str, str, str], ...] = (
         "Declarative host-rendered views; isolated iframe components only.",
     ),
     ("collections", "Collections", "Namespaced durable data and optimistic versions."),
+    (
+        "events",
+        "Events and reconcile",
+        "Core change subscriptions, declarative references and repair paths.",
+    ),
     ("migrations", "Migrations", "Ordered explicit data migrations and rollback."),
     ("security", "Security", "Trusted native code, permissions and package safety."),
     ("validation", "Validation", "Fixed offline container checks and report."),
