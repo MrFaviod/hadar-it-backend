@@ -534,7 +534,7 @@ class ExtensionHostService:
             ),
             operations={item["name"]: item for item in manifest["operations"]},
             migrations={item["handler"]: item for item in manifest["migrations"]},
-            schedules={item["name"]: item for item in manifest["schedules"]},
+            schedules={item["name"]: item for item in manifest.get("schedules") or []},
         )
         with self._cache_lock:
             self._cache[key] = loaded
@@ -678,7 +678,7 @@ class ExtensionHostService:
             "permissionDelta": {
                 "added": added,
                 "removed": removed,
-                "core": list(manifest["corePermissions"]),
+                "core": list(manifest.get("corePermissions") or []),
                 "grantedTo": "superadmin",
                 "note": (
                     "Installation adds only the declared namespaced codes to the persisted "
@@ -885,7 +885,7 @@ class ExtensionHostService:
                     kind="operation",
                     name=operation,
                     arguments=dict(arguments),
-                    allow_write=bool(declaration["mutation"]),
+                    allow_write=bool(declaration.get("mutation")),
                 )
         self._record_invocation(
             principal, action="extensions.invoke", resource=f"extension:{extension_id}:{operation}"
@@ -1097,7 +1097,7 @@ class ExtensionHostService:
                         )
                     ).scalars()
                 }
-                for schedule in manifest["schedules"]:
+                for schedule in manifest.get("schedules") or []:
                     state = states.get(schedule["name"])
                     items.append(
                         ScheduleView(
@@ -1194,7 +1194,7 @@ class ExtensionHostService:
         owner_id: str,
         now: datetime,
     ) -> None:
-        for schedule in manifest["schedules"]:
+        for schedule in manifest.get("schedules") or []:
             row = session.execute(
                 select(ExtensionScheduleState).where(
                     ExtensionScheduleState.extension_id == extension_id,
@@ -1309,7 +1309,7 @@ class ExtensionHostService:
                         continue
                     manifest = json.loads(version_row.manifest_json)
                     declaration = next(
-                        (item for item in manifest["schedules"] if item["name"] == name),
+                        (item for item in manifest.get("schedules") or [] if item["name"] == name),
                         None,
                     )
                     if declaration is None or row.next_due_at is None:
@@ -2295,9 +2295,7 @@ class ExtensionHostService:
     # -------------------------------------------------- events & reconcile
     def _event_principal(self, session: Session, version_row: ExtensionVersion) -> Principal:
         owner = (
-            session.get(Identity, version_row.installed_by)
-            if version_row.installed_by
-            else None
+            session.get(Identity, version_row.installed_by) if version_row.installed_by else None
         )
         if not _is_human_superadmin(owner):
             raise PermissionDenied(
@@ -2346,9 +2344,7 @@ class ExtensionHostService:
         closed failure code and resumes after backoff or an explicit reset.
         """
         current = as_utc(now) if now is not None else as_utc(self._now())
-        feed = EntityEventFeed(
-            self._session_factory, lag=lag, grace_seconds=grace_seconds
-        )
+        feed = EntityEventFeed(self._session_factory, lag=lag, grace_seconds=grace_seconds)
         counts = {"modules": 0, "delivered": 0, "failed": 0, "skipped": 0}
         with self._session_factory() as session:
             modules = list(
@@ -2473,6 +2469,7 @@ class ExtensionHostService:
         version_row: ExtensionVersion,
         manifest: Mapping[str, Any],
     ) -> dict[str, Any]:
+        result: dict[str, Any] = {"references": 0}
         if reference_policy.references_for(manifest):
             connection = self._connect(module.id)
             changed = 0
@@ -2494,20 +2491,19 @@ class ExtensionHostService:
                 connection.commit()
             finally:
                 connection.close()
-            return {"references": changed}
+            result["references"] = changed
         declaration = manifest.get("reconcile")
-        if not declaration:
-            return {"references": 0}
-        loaded = self._load_module(version_row)
-        result = self._invoke_sandboxed(
-            principal,
-            loaded,
-            kind="reconcile",
-            name=declaration["handler"],
-            arguments={},
-            allow_write=True,
-        )
-        return {"reconcile": result}
+        if declaration:
+            loaded = self._load_module(version_row)
+            result["reconcile"] = self._invoke_sandboxed(
+                principal,
+                loaded,
+                kind="reconcile",
+                name=declaration["handler"],
+                arguments={},
+                allow_write=True,
+            )
+        return result
 
     def reconcile(
         self, principal: Principal, extension_id: str, *, expected_version: int
@@ -2624,9 +2620,7 @@ class ExtensionHostService:
                 counts["claimed"] += 1
                 principal = IdentityService(session, self._settings).resolve_actor(owner.id)
                 try:
-                    self._reconcile_manifest(
-                        principal, session, module, version_row, manifest
-                    )
+                    self._reconcile_manifest(principal, session, module, version_row, manifest)
                     session.commit()
                     counts["succeeded"] += 1
                 except Exception as exc:  # recorded as a bounded reconcile error

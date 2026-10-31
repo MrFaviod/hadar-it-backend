@@ -110,12 +110,13 @@ def test_declarative_operations_need_a_declared_collection() -> None:
         checked(declaration)
 
 
-def test_unknown_capabilities_are_rejected_with_the_declared_set() -> None:
+def test_unknown_capabilities_are_rejected_as_a_named_contract_gap() -> None:
     declaration = probe_manifest(capabilities=["assets.read", "root"])
     with pytest.raises(ManifestError) as failure:
         checked(declaration)
     joined = " ".join(failure.value.errors)
-    assert "capabilities" in joined and "assets.read" in joined
+    assert "contract_gap_required" in joined
+    assert "root" in joined and "extension_contract_gap" in joined
 
 
 def test_references_are_validated_against_the_declared_schema() -> None:

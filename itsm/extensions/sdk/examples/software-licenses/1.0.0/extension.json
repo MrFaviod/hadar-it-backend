@@ -1,0 +1,405 @@
+{
+  "sdkVersion": 2,
+  "id": "software-licenses",
+  "name": "Licencias de software",
+  "description": "Registro de licencias y de sus asignaciones a activos existentes.",
+  "version": "1.0.0",
+  "runtime": "sandboxed",
+  "storage": {
+    "engine": "sqlite"
+  },
+  "capabilities": [
+    "assets.read"
+  ],
+  "permissions": [
+    {
+      "code": "ext_software_licenses.read",
+      "label": "Ver licencias",
+      "description": "Consulta licencias y asignaciones."
+    },
+    {
+      "code": "ext_software_licenses.write",
+      "label": "Administrar licencias",
+      "description": "Crea, edita y asigna licencias."
+    }
+  ],
+  "collections": [
+    {
+      "name": "licenses",
+      "description": "Licencias compradas, con sus puestos y vencimiento.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "product",
+          "vendor",
+          "seats"
+        ],
+        "properties": {
+          "product": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "vendor": {
+            "type": "string",
+            "maxLength": 200
+          },
+          "seats": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "expiresOn": {
+            "type": "string",
+            "format": "date"
+          }
+        }
+      }
+    },
+    {
+      "name": "assignments",
+      "description": "Asignaciones de una licencia a un activo por id permanente.",
+      "schema": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "licenseId",
+          "assetId"
+        ],
+        "properties": {
+          "licenseId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "assetId": {
+            "type": "string",
+            "format": "uuid"
+          },
+          "flagged": {
+            "type": "boolean"
+          },
+          "orphaned": {
+            "type": "boolean"
+          },
+          "referenceState": {
+            "type": "string",
+            "enum": [
+              "active",
+              "archived",
+              "missing"
+            ]
+          }
+        }
+      },
+      "references": [
+        {
+          "field": "assetId",
+          "entity": "asset",
+          "onArchive": "flag",
+          "onDelete": "flag"
+        }
+      ]
+    }
+  ],
+  "operations": [
+    {
+      "name": "list_licenses",
+      "description": "Lista licencias con filtros por producto y proveedor.",
+      "permission": "ext_software_licenses.read",
+      "kind": "handler",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          },
+          "product": {
+            "type": "string"
+          },
+          "vendor": {
+            "type": "string"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "get_license",
+      "description": "Obtiene una licencia por id.",
+      "permission": "ext_software_licenses.read",
+      "kind": "handler",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "license_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "license_id"
+        ]
+      }
+    },
+    {
+      "name": "create_license",
+      "description": "Crea una licencia en la base SQLite del módulo.",
+      "permission": "ext_software_licenses.write",
+      "kind": "handler",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "product": {
+            "type": "string"
+          },
+          "vendor": {
+            "type": "string"
+          },
+          "seats": {
+            "type": "integer"
+          },
+          "expires_on": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "product",
+          "vendor",
+          "seats"
+        ]
+      }
+    },
+    {
+      "name": "update_license",
+      "description": "Actualiza una licencia con control de versión.",
+      "permission": "ext_software_licenses.write",
+      "kind": "handler",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "license_id": {
+            "type": "string"
+          },
+          "data": {
+            "type": "object"
+          },
+          "expected_version": {
+            "type": "integer"
+          }
+        },
+        "required": [
+          "license_id",
+          "data",
+          "expected_version"
+        ]
+      }
+    },
+    {
+      "name": "assign_license",
+      "description": "Asigna una licencia a un activo existente por id permanente.",
+      "permission": "ext_software_licenses.write",
+      "kind": "handler",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "license_id": {
+            "type": "string"
+          },
+          "asset_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "license_id",
+          "asset_id"
+        ]
+      }
+    },
+    {
+      "name": "unassign_license",
+      "description": "Quita una asignación de licencia.",
+      "permission": "ext_software_licenses.write",
+      "kind": "handler",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "assignment_id": {
+            "type": "string"
+          }
+        },
+        "required": [
+          "assignment_id"
+        ]
+      }
+    },
+    {
+      "name": "list_assignments",
+      "description": "Lista asignaciones, filtradas por activo.",
+      "permission": "ext_software_licenses.read",
+      "kind": "handler",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "asset_id": {
+            "type": "string"
+          },
+          "limit": {
+            "type": "integer"
+          },
+          "offset": {
+            "type": "integer"
+          }
+        },
+        "required": []
+      }
+    },
+    {
+      "name": "compliance_summary",
+      "description": "Resumen de cumplimiento de licencias y asignaciones.",
+      "permission": "ext_software_licenses.read",
+      "kind": "handler",
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    },
+    {
+      "name": "unauthorized_asset_write",
+      "description": "Prueba de frontera: intenta escribir un activo sin capability.",
+      "permission": "ext_software_licenses.write",
+      "kind": "handler",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {},
+        "required": []
+      }
+    }
+  ],
+  "subscriptions": [
+    {
+      "event": "asset.archived",
+      "handler": "on_asset_archived"
+    },
+    {
+      "event": "asset.deleted",
+      "handler": "on_asset_deleted"
+    },
+    {
+      "event": "asset.restored",
+      "handler": "on_asset_restored"
+    }
+  ],
+  "reconcile": {
+    "handler": "reconcile_assignments",
+    "intervalSeconds": 300
+  },
+  "schemaVersion": 1,
+  "compatibleSchemaVersions": [
+    1
+  ],
+  "migrations": [],
+  "frontend": {
+    "pages": [
+      {
+        "id": "licenses",
+        "label": "Licencias",
+        "permission": "ext_software_licenses.read",
+        "view": {
+          "table": {
+            "operation": "list_licenses",
+            "columns": [
+              {
+                "field": "product",
+                "label": "Producto"
+              },
+              {
+                "field": "vendor",
+                "label": "Proveedor"
+              },
+              {
+                "field": "seats",
+                "label": "Puestos",
+                "format": "number"
+              },
+              {
+                "field": "expiresOn",
+                "label": "Vence",
+                "format": "date"
+              }
+            ]
+          }
+        }
+      }
+    ],
+    "assetPanels": [
+      {
+        "id": "asset-licenses",
+        "label": "Licencias",
+        "permission": "ext_software_licenses.read",
+        "view": {
+          "table": {
+            "operation": "list_assignments",
+            "columns": [
+              {
+                "field": "licenseId",
+                "label": "Licencia"
+              },
+              {
+                "field": "referenceState",
+                "label": "Estado"
+              },
+              {
+                "field": "orphaned",
+                "label": "Huérfana",
+                "format": "boolean"
+              }
+            ],
+            "filterAsset": true
+          }
+        }
+      },
+      {
+        "id": "asset-assign-license",
+        "label": "Asignar licencia",
+        "permission": "ext_software_licenses.write",
+        "view": {
+          "form": {
+            "operation": "assign_license",
+            "assetField": "asset_id",
+            "fields": [
+              {
+                "field": "license_id",
+                "label": "Licencia",
+                "input": "text",
+                "required": true
+              }
+            ]
+          }
+        }
+      }
+    ]
+  },
+  "skills": [
+    {
+      "name": "license-guide",
+      "path": "skills/license-guide/SKILL.md",
+      "description": "Cómo trabajar con licencias y sus referencias a activos."
+    }
+  ]
+}

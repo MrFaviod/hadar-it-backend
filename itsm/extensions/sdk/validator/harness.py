@@ -416,10 +416,14 @@ class _Binder:
     def __init__(self, manifest: dict[str, Any]):
         self.operations = {item["name"]: item for item in manifest["operations"]}
         self.migrations = {item["handler"]: item for item in manifest["migrations"]}
-        self.schedules = {item["name"]: item for item in manifest["schedules"]}
+        self.schedules = {item["name"]: item for item in manifest.get("schedules") or []}
+        self.subscriptions = {item["event"]: item for item in manifest.get("subscriptions") or []}
+        self.reconcile_declaration = manifest.get("reconcile")
         self.bound_operations: dict[str, Any] = {}
         self.bound_migrations: dict[str, Any] = {}
         self.bound_schedules: dict[str, Any] = {}
+        self.bound_subscriptions: dict[str, Any] = {}
+        self.bound_reconcile: str | None = None
 
     def operation(self, name: str, handler: Any) -> None:
         self._bind(name, handler, self.operations, self.bound_operations, "operation")
@@ -429,6 +433,22 @@ class _Binder:
 
     def schedule(self, name: str, handler: Any) -> None:
         self._bind(name, handler, self.schedules, self.bound_schedules, "schedule")
+
+    def subscribe(self, name: str, handler: Any) -> None:
+        self._bind(name, handler, self.subscriptions, self.bound_subscriptions, "subscription")
+
+    def reconcile(self, name: str, handler: Any) -> None:
+        self.set_reconcile(name, handler)
+
+    def set_reconcile(self, name: str, handler: Any) -> None:
+        declared = (self.reconcile_declaration or {}).get("handler")
+        if declared is None or name != declared:
+            raise RuntimeError(f"reconcile {name!r} is not declared by the manifest")
+        if self.bound_reconcile is not None:
+            raise RuntimeError(f"reconcile {name!r} is registered twice")
+        if not callable(handler):
+            raise RuntimeError(f"reconcile {name!r} handler is not callable")
+        self.bound_reconcile = name
 
     @staticmethod
     def _bind(
@@ -690,14 +710,19 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
             ("operations", binder.operations, binder.bound_operations),
             ("migrations", binder.migrations, binder.bound_migrations),
             ("schedules", binder.schedules, binder.bound_schedules),
+            ("subscriptions", binder.subscriptions, binder.bound_subscriptions),
         ):
             if set(bound) != set(expected):
                 raise ValidationFailure(
                     label + " not registered: " + ", ".join(sorted(set(expected) - set(bound)))
                 )
+        declared_reconcile = (binder.reconcile_declaration or {}).get("handler")
+        if declared_reconcile is not None and binder.bound_reconcile != declared_reconcile:
+            raise ValidationFailure(f"reconcile not registered: {declared_reconcile}")
         return (
             f"backend imported; {len(binder.operations)} operations; "
-            f"{len(binder.migrations)} migrations; {len(binder.schedules)} schedules"
+            f"{len(binder.migrations)} migrations; {len(binder.schedules)} schedules; "
+            f"{len(binder.subscriptions)} subscriptions"
         )
 
     if not record("registration", registration_check):
@@ -705,7 +730,7 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
 
     def context() -> Context:
         permissions = {item["code"] for item in manifest["permissions"]}
-        permissions.update(manifest["corePermissions"])
+        permissions.update(manifest.get("corePermissions") or [])
         return Context(
             permissions, {item["name"] for item in manifest["collections"]}, manifest["id"]
         )
@@ -758,7 +783,7 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
     def schedules_check() -> str:
         current = context()
         names: list[str] = []
-        for schedule in manifest["schedules"]:
+        for schedule in manifest.get("schedules") or []:
             current.authorize(schedule["permission"])
             _json_bound(binder.bound_schedules[schedule["name"]](current), schedule["name"])
             names.append(schedule["name"])
