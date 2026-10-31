@@ -49,8 +49,12 @@ def test_reset_restores_dataset_files_jobs_and_invalidates_old_session(
             queue.execute("INSERT INTO queued VALUES ('pending')")
 
         async def reset_under_gate():
-            async with client.app.state.demo_controller.lock:
+            gate = client.app.state.demo_controller.gate
+            await gate.begin_reset()
+            try:
                 reset_demo(settings, client.app.state.engine)
+            finally:
+                gate.end_reset()
 
         client.portal.call(reset_under_gate)
         assert not list(settings.attachment_storage_path.iterdir())
