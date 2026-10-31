@@ -12,7 +12,7 @@ from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
 from fastapi.exceptions import RequestValidationError
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
@@ -386,7 +386,22 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 headers={"Cache-Control": "no-store"},
             )
         try:
-            response = await call_next(request)
+            try:
+                response = await call_next(request)
+            except RuntimeError as error:
+                # Starlette raises this when the client went away before the
+                # route produced a response; logging a traceback for a visitor
+                # that closed the tab is noise, not an incident.
+                if str(error) != "No response returned.":
+                    raise
+                log_event(
+                    logger,
+                    "request.disconnected",
+                    method=request.method,
+                    path=request.url.path,
+                    duration_ms=round((time.perf_counter() - started) * 1000, 2),
+                )
+                return Response(status_code=499)
             status_code = response.status_code
             return response
         finally:

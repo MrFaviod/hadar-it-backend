@@ -208,7 +208,7 @@ def main() -> int:
             payload = recover(args.directory)
         else:
             return exporter.serve(args.directory, args.port)
-    except (DemoRefused, IdentityError, OSError, subprocess.TimeoutExpired) as exc:
+    except (DemoRefused, IdentityError, OSError, ValueError, subprocess.TimeoutExpired) as exc:
         message = str(exc) if isinstance(exc, DemoRefused) else _FAILURES[args.command]
         print(
             json.dumps({"status": "error", "code": "demo_refused", "message": message}),

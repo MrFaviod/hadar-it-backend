@@ -62,10 +62,19 @@ class DemoRequestGate:
         if self._in_flight == 0:
             self._idle.set()
 
-    async def begin_reset(self) -> None:
-        """Stop admitting requests, then wait for the ones in flight to finish."""
+    async def begin_reset(self, drain_seconds: float = 10.0) -> bool:
+        """Stop admitting requests, then wait at most ``drain_seconds`` to drain.
+
+        Returns ``True`` when every in-flight request finished. A client that
+        holds a request open must not keep the demo in permanent 503: the caller
+        is told the drain timed out and decides whether to reset anyway.
+        """
         self._resetting = True
-        await self._idle.wait()
+        try:
+            await asyncio.wait_for(self._idle.wait(), timeout=drain_seconds)
+        except TimeoutError:
+            return False
+        return True
 
     def end_reset(self) -> None:
         self._resetting = False
@@ -73,6 +82,10 @@ class DemoRequestGate:
 
 class DemoController:
     """Own the persisted deadline and the reset's exclusive request gate."""
+
+    # A client holding a request open cannot postpone the hourly reset forever;
+    # after this long the reset proceeds and logs ``demo.reset_drain_timeout``.
+    DRAIN_SECONDS = 10.0
 
     def __init__(self, settings: Settings) -> None:
         self.settings = settings
@@ -151,7 +164,13 @@ class DemoController:
         deadline = datetime.fromisoformat(status["nextResetAt"])
         if (now or datetime.now(UTC)) < deadline:
             return
-        await self.gate.begin_reset()
+        if not await self.gate.begin_reset(self.DRAIN_SECONDS):
+            log_event(
+                logger,
+                "demo.reset_drain_timeout",
+                level=logging.WARNING,
+                inFlight=self.gate.in_flight,
+            )
         try:
             if self.engine is None:
                 raise RuntimeError("demo controller is not initialized")

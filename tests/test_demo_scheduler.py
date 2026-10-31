@@ -190,3 +190,39 @@ def test_due_reset_drains_in_flight_requests_and_rejects_new_ones(settings_facto
         assert response_status(await call(app)) == 200
 
     asyncio.run(scenario())
+
+
+def test_a_stuck_request_cannot_hold_the_reset_off_forever(settings_factory, monkeypatch):
+    """A client that keeps a body open must not turn the whole demo into 503."""
+
+    async def scenario():
+        controller = DemoController(settings_factory())
+        controller.engine = object()
+        monkeypatch.setattr(controller, "DRAIN_SECONDS", 0.05)
+        monkeypatch.setattr(
+            controller,
+            "status",
+            lambda: {
+                "enabled": True,
+                "nextResetAt": "2000-01-01T00:00:00+00:00",
+                "generation": 1,
+                "resetting": False,
+            },
+        )
+        monkeypatch.setattr(
+            "itsm.demo.controller.reset_demo",
+            lambda settings, engine: controller.__dict__.setdefault("resets", []).append(1),
+        )
+        blocked = asyncio.Event()
+        release = asyncio.Event()
+        app = DemoCycleMiddleware(blocking_app(blocked, release), controller)
+        stuck = asyncio.create_task(call(app))
+        await blocked.wait()
+        await asyncio.wait_for(controller.tick(), timeout=2.0)
+        assert controller.__dict__["resets"] == [1]
+        assert not controller.resetting
+        assert response_status(await asyncio.wait_for(call(app), timeout=2.0)) == 200
+        release.set()
+        await stuck
+
+    asyncio.run(scenario())
