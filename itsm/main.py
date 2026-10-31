@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import os
 import time
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager, suppress
-import asyncio
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Path, Request
@@ -27,8 +28,6 @@ from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
 from itsm.ai_gateway.router import create_ai_gateway_router
-from itsm.extensions.api import create_extension_router, install_extension_error_handlers
-from itsm.extensions.composition import create_extension_services
 from itsm.ai_gateway.service import AiGatewayService
 from itsm.ai_usage.api import create_agent_usage_router
 from itsm.ai_usage.service import AiUsageService, QuotaExceeded
@@ -48,6 +47,8 @@ from itsm.demo.restrictions import (
 )
 from itsm.directory.api import create_directory_router
 from itsm.directory.media_api import create_directory_media_router
+from itsm.extensions.api import create_extension_router, install_extension_error_handlers
+from itsm.extensions.composition import create_extension_services
 from itsm.identity.api import (
     authenticated_actor,
     create_identity_router,
@@ -512,5 +513,43 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     return app
 
 
+def serve(argv: list[str] | None = None) -> int:
+    """Run the API with proxy-header trust derived from ``ITSM_TRUSTED_PROXY``.
+
+    Plain ``uvicorn itsm.main:app`` trusts ``X-Forwarded-For`` from a loopback peer
+    by default, so a visitor could rewrite their own client address and mint a
+    fresh rate-limit bucket. This launcher (``python -m itsm.main``) passes the
+    same value to the server that the application already uses: forwarded headers
+    are ignored unless the deployment explicitly declares a trusted proxy, and
+    ``FORWARDED_ALLOW_IPS``/``forwarded_allow_ips`` names that proxy.
+    """
+    import argparse
+
+    import uvicorn
+
+    parser = argparse.ArgumentParser(
+        prog="python -m itsm.main",
+        description="Serve the ITSM API with an explicit proxy-trust decision.",
+    )
+    parser.add_argument("--host", default="127.0.0.1")
+    parser.add_argument("--port", type=int, default=8000)
+    parser.add_argument("--log-level", default=os.environ.get("ITSM_LOG_LEVEL", "info"))
+    parser.add_argument("--no-access-log", action="store_true")
+    arguments = parser.parse_args(argv)
+    uvicorn.run(
+        "itsm.main:app",
+        host=arguments.host,
+        port=arguments.port,
+        log_level=arguments.log_level.lower(),
+        access_log=not arguments.no_access_log,
+        proxy_headers=get_settings().trusted_proxy,
+    )
+    return 0
+
+
 # ASGI entrypoint: uvicorn itsm.main:app
 app = create_app()
+
+
+if __name__ == "__main__":
+    raise SystemExit(serve())
