@@ -39,6 +39,7 @@ PUBLIC_KEYS = {
     "failures",
     "lastUpgrade",
     "updatedAt",
+    "credentialKeys",
 }
 LAST_BACKUP_KEYS = {
     "id",

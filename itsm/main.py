@@ -169,8 +169,15 @@ def _schema_allows(app: FastAPI, settings: Settings, path: str) -> bool:
         return True
     checked = getattr(app.state, "schema_checked_at", None)
     now = time.monotonic()
-    if checked is not None and now - checked < SCHEMA_REVALIDATE_SECONDS:
-        return bool(getattr(app.state, "schema_current", False))
+    # A current schema is cached for the revalidation window; a refused one is
+    # re-read on every request so the API starts serving immediately after the
+    # operator finishes `python -m itsm.ops upgrade`.
+    if (
+        getattr(app.state, "schema_current", False)
+        and checked is not None
+        and now - checked < SCHEMA_REVALIDATE_SECONDS
+    ):
+        return True
     try:
         current = migration_state(app.state.engine, settings).is_current
     except Exception:

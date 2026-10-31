@@ -16,22 +16,11 @@ import pytest
 from fastapi.testclient import TestClient
 from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
-from itsm.demo.state import DemoBase
-from itsm.directory.models import DirectoryBase
 from itsm.identity.clock import utcnow
-from itsm.identity.models import IdentityBase, IdentityRole, IdentityRolePolicy
-from itsm.identity.permissions import (
-    BUILT_IN_ROLE_IDS,
-    BUILT_IN_ROLE_NAMES,
-    BUILT_IN_ROLE_PERMISSIONS,
-)
 from itsm.identity.service import IdentityService
-from itsm.inventory.catalog_defaults import installation_catalog
-from itsm.inventory.catalog_models import InventoryCatalogEntry
-from itsm.inventory.models import InventoryBase
 from itsm.maintenance.service import add_months
-from itsm.release_identity import DeploymentBase, claim_identity
-from sqlalchemy import Engine, text
+from itsm.release_identity import claim_identity
+from sqlalchemy import Engine
 from starlette.routing import Mount
 from tests.conftest import ADMIN_NAME, ADMIN_PASSWORD, ADMIN_USERNAME, sign_in
 from tests.inventory_support import sign_in_as
@@ -44,50 +33,20 @@ READER_PASSWORD = "reader-password-2026"
 
 
 def _schema(settings: Settings) -> None:
-    """Create every focused table without the sibling 0013 migration."""
+    """Apply the real migration chain the API now refuses to serve without.
 
-    import itsm.attachments.models
-    import itsm.interventions.models
-    import itsm.inventory.catalog_models
-    import itsm.maintenance.models
-    import itsm.redundancy.models
-    import itsm.relationships.models
-    import itsm.workflows.models  # noqa: F401
+    The routes are gated on the schema being at the migration head, so a schema
+    assembled with ``create_all`` is correctly rejected; this fixture therefore
+    migrates like a deployment does and only claims the mode identity afterwards.
+    """
 
+    from tests.conftest import run_migrations
+
+    applied = run_migrations(settings)
+    assert applied.returncode == 0, applied.stderr
     engine = create_engine_from_settings(settings)
-    for base in (IdentityBase, DirectoryBase, InventoryBase, DeploymentBase, DemoBase):
-        base.metadata.create_all(engine)
     with create_session_factory(engine)() as session:
         claim_identity(session, "dev")
-        for role_id in BUILT_IN_ROLE_IDS:
-            session.add(
-                IdentityRole(
-                    id=role_id,
-                    name=BUILT_IN_ROLE_NAMES[role_id],
-                    built_in=True,
-                    created_at=utcnow(),
-                )
-            )
-            for code in BUILT_IN_ROLE_PERMISSIONS[role_id]:
-                resource, _, operation = code.partition(".")
-                session.add(
-                    IdentityRolePolicy(role_id=role_id, resource=resource, operation=operation)
-                )
-        catalog = installation_catalog()
-        for kind, entries in catalog.items():
-            for entry in entries:
-                session.add(
-                    InventoryCatalogEntry(
-                        kind=kind,
-                        key=entry.get("id") or entry["key"],
-                        payload=dict(entry),
-                    )
-                )
-        session.execute(
-            text("INSERT INTO inventory_code_sequences (key, next_value) VALUES ('__lock__', 0)")
-        )
-        session.commit()
-    engine.dispose()
 
 
 def _bootstrap(settings: Settings) -> None:

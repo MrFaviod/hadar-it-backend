@@ -80,11 +80,20 @@ def probe_migrations_ini(tmp_path: Path) -> Path:
 
 def write_probe_revision(tmp_path: Path, name: str, body: str) -> None:
     versions = tmp_path / "probe-migrations" / "versions"
+    # Chain after whatever the tree's current head is: a new migration must not
+    # turn the probe into a second head and crash every other migration test.
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    head = ScriptDirectory.from_config(
+        Config(str(tmp_path / "probe-alembic.ini"))
+    ).get_current_head()
+    assert head
     (versions / f"0099_{name}.py").write_text(
         '"""Probe revision (test only)."""\n\n'
         "from alembic import op\n\n"
         'revision = "0099_probe"\n'
-        'down_revision = "0036_entity_change_events"\n'
+        f'down_revision = "{head}"\n'
         "branch_labels = None\n"
         "depends_on = None\n\n\n"
         f"def upgrade() -> None:\n{body}\n\n\n"
@@ -131,7 +140,7 @@ def test_a_failed_sqlite_revision_rolls_back_its_ddl(
     tables, revision = sqlite_state(settings.database_url)
     assert "probe_partial" not in tables
     assert "itsm_infrastructure" in tables
-    assert revision == "0036_entity_change_events"
+    assert revision == "0037_extension_core_call_principal"
 
 
 def test_a_successful_sqlite_revision_commits_its_ddl(
@@ -185,7 +194,19 @@ def test_business_routes_are_refused_while_migrations_are_pending(
     assert ready.status_code == 503
     assert ready.json()["checks"]["migrations"] == "pending"
 
-    set_recorded_revision(settings.database_url, "0036_entity_change_events")
+    set_recorded_revision(settings.database_url, "0037_extension_core_call_principal")
 
     served = test_client.get("/api/v1/assets")
     assert served.status_code in {401, 403}
+
+
+def _head_revision(tmp_path: Path) -> str:
+    """The tree's current head without the probe revision, for re-run assertions."""
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    versions = ScriptDirectory.from_config(Config(str(tmp_path / "probe-alembic.ini")))
+    heads = [head for head in versions.get_heads() if head != "0099_probe"]
+    assert len(heads) == 1, heads
+    return heads[0]

@@ -497,7 +497,7 @@ def test_backup_manifest_records_key_fingerprints_but_never_keys(
     assert LEGACY not in serialized
 
 
-def test_verify_warns_when_the_current_ring_lacks_a_recorded_fingerprint(
+def test_verify_fails_when_the_current_ring_lacks_a_recorded_fingerprint(
     settings_factory: Callable[..., Settings], tmp_path: Path
 ) -> None:
     settings = migrated(settings_factory)
@@ -518,9 +518,14 @@ def test_verify_warns_when_the_current_ring_lacks_a_recorded_fingerprint(
         ["verify", backup_id], settings, backup_root, extra_env={CREDENTIALS_KEY: PRIMARY}
     )
 
-    assert checked.returncode == 0, checked.stdout + checked.stderr
+    # A recorded key the running ring cannot provide means artifacts sealed with
+    # it stay unreadable: that is a failed verification, not a warning inside a
+    # passing one. Restoring data is still allowed (see the restore tests).
+    assert checked.returncode == 1, checked.stdout + checked.stderr
     body = payload(checked)
-    assert body["verified"] is True
+    assert body["verified"] is False
+    assert body["integrityVerified"] is True
+    assert body["checks"]["credentialKeys"] == "missing"
     assert body["credentialKeys"]["missing"] == [recorded_legacy]
     assert any("fingerprint" in warning for warning in body["warnings"])
 
