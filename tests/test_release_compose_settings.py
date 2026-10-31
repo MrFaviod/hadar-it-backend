@@ -56,3 +56,11 @@ def test_the_demo_overlay_initializes_the_demonstration():
     initialize = overlay.split("  initialize:", 1)[1].split("\n  backend:", 1)[0]
     assert "itsm.demo init" in initialize
     assert "/data/demo" in initialize
+    # The volume must be mounted at the parent: Docker creates the mount point,
+    # and the initializer refuses an existing directory (verified by F-N1).
+    mount = [
+        line
+        for line in overlay.splitlines()
+        if "volumes: !override" in line and "demo-data:" in line
+    ]
+    assert mount == ["  volumes: !override [demo-data:/data]"], mount
