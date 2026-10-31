@@ -130,6 +130,14 @@ def test_frontend_registered_component_is_accepted() -> None:
     assert package.frontend_source.startswith("(function")
 
 
+def test_unknown_capability_is_a_named_contract_gap() -> None:
+    with pytest.raises(PackageError) as failure:
+        inspect_package(sandboxed_package(capabilities=["assets.export"]))
+    message = str(failure.value)
+    assert "contract_gap_required" in message
+    assert "assets.export" in message
+
+
 def test_collection_references_are_validated_for_both_runtimes() -> None:
     declaration = declarative_manifest()
     declaration["collections"][0]["references"] = [

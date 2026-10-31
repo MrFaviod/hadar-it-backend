@@ -113,6 +113,14 @@ def _schema_errors(manifest: Any) -> list[str]:
     for error in sorted(validator.iter_errors(manifest), key=lambda item: list(item.absolute_path)):
         if error.validator == "additionalProperties":
             errors.append(f"{_path(error)}: unknown field ({error.message})")
+        elif error.validator == "enum" and list(error.absolute_path)[:1] == ["capabilities"]:
+            requested = error.instance
+            errors.append(
+                "contract_gap_required: capability "
+                f"{requested} is not part of the public SDK; declare a public capability "
+                "or record the gap with extension_contract_gap instead of reaching "
+                "private core structures"
+            )
         else:
             errors.append(f"{_path(error)}: {error.message}")
         if len(errors) >= MAX_ERRORS:
@@ -366,8 +374,10 @@ def _semantic_errors(
         for capability in manifest.get("capabilities", []):
             if capability not in CAPABILITIES:
                 errors.append(
-                    f"capabilities: {capability} is not a known capability "
-                    f"({', '.join(CAPABILITIES)})"
+                    "contract_gap_required: capability "
+                    f"{capability} is not part of the public SDK; declare a public "
+                    "capability or record the gap with extension_contract_gap instead "
+                    "of reaching private core structures"
                 )
         _unique(list(manifest.get("capabilities", [])), "capability")
 
