@@ -231,6 +231,7 @@ class Settings(BaseSettings):
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
     extension_workspace_path: Path = Path("/data/extensions/workspaces")
+    extension_data_path: Path = Path("/data/extensions/data")
     extension_validator_image: str = "itsm-extension-validator:1"
     extension_validation_timeout_seconds: int = Field(default=60, ge=5, le=300)
     # Optional fixed host validator: application containers never receive Docker authority.

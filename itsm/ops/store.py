@@ -37,6 +37,9 @@ MAX_FAILURES = 10
 
 _IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,120}$")
 _FINGERPRINT = re.compile(r"^[0-9a-f]{12}$")
+_DIGEST = re.compile(r"^[0-9a-f]{64}$")
+#: Extension module ids are lowercase hyphen identifiers (``software-license``).
+_EXTENSION_ID = re.compile(r"^[a-z0-9]+(?:-[a-z0-9]+)*$")
 _PARTIAL_PREFIX = ".partial-"
 _MANIFEST_KEYS = (
     "id",
@@ -58,6 +61,29 @@ class UpgraderBusy(OpsError):
 
 
 @dataclass(frozen=True)
+class ExtensionFileEntry:
+    """One archived extension file, relative to its module directory."""
+
+    path: str
+    sha256: str
+    size: int
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"path": self.path, "sha256": self.sha256, "size": self.size}
+
+
+@dataclass(frozen=True)
+class ExtensionBackupEntry:
+    """The archived data files of one installed extension module."""
+
+    id: str
+    files: tuple[ExtensionFileEntry, ...] = ()
+
+    def as_dict(self) -> dict[str, Any]:
+        return {"id": self.id, "files": [item.as_dict() for item in self.files]}
+
+
+@dataclass(frozen=True)
 class BackupManifest:
     """Validated metadata describing one backup artifact."""
 
@@ -73,6 +99,8 @@ class BackupManifest:
     dump_file: str
     tool_versions: dict[str, str]
     credential_key_fingerprints: tuple[str, ...] = ()
+    extensions: tuple[ExtensionBackupEntry, ...] = ()
+    ignored_extensions: tuple[str, ...] = ()
     verified: bool | None = None
     verified_at: str | None = None
 
@@ -91,6 +119,8 @@ class BackupManifest:
             "toolVersions": dict(self.tool_versions),
             # Fingerprints only: a backup never carries the key material itself.
             "aiCredentialKeyFingerprints": list(self.credential_key_fingerprints),
+            "extensions": [entry.as_dict() for entry in self.extensions],
+            "ignoredExtensions": list(self.ignored_extensions),
             "verified": self.verified,
             "verifiedAt": self.verified_at,
         }
@@ -159,9 +189,73 @@ class BackupManifest:
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
             credential_key_fingerprints=tuple(fingerprints),
+            extensions=_manifest_extensions(raw.get("extensions", [])),
+            ignored_extensions=_manifest_notes(raw.get("ignoredExtensions", [])),
             verified=verified,
             verified_at=verified_at,
         )
+
+
+def _manifest_extensions(raw: object) -> tuple[ExtensionBackupEntry, ...]:
+    """Validate the optional ``extensions`` list of a manifest.
+
+    An artifact written before extension data existed has no such key and stays
+    valid: absence means "no extension data", never "unverified".
+    """
+    if not isinstance(raw, list):
+        raise OpsError("invalid backup manifest: extensions must be a list")
+    entries: list[ExtensionBackupEntry] = []
+    seen: set[str] = set()
+    for item in raw:
+        if not isinstance(item, dict):
+            raise OpsError("invalid backup manifest: extension entry must be an object")
+        identifier = item.get("id")
+        if not isinstance(identifier, str) or not _EXTENSION_ID.match(identifier):
+            raise OpsError("invalid backup manifest: unsafe extension id")
+        if identifier in seen:
+            raise OpsError("invalid backup manifest: duplicate extension id")
+        seen.add(identifier)
+        raw_files = item.get("files", [])
+        if not isinstance(raw_files, list):
+            raise OpsError("invalid backup manifest: extension files must be a list")
+        files: list[ExtensionFileEntry] = []
+        paths: set[str] = set()
+        for raw_file in raw_files:
+            if not isinstance(raw_file, dict):
+                raise OpsError("invalid backup manifest: extension file must be an object")
+            path = _archive_relative_path(raw_file.get("path"))
+            if path in paths:
+                raise OpsError("invalid backup manifest: duplicate extension file path")
+            paths.add(path)
+            digest = raw_file.get("sha256")
+            if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
+                raise OpsError("invalid backup manifest: extension sha256 must be a hex digest")
+            size = raw_file.get("size")
+            if isinstance(size, bool) or not isinstance(size, int) or size < 0:
+                raise OpsError(
+                    "invalid backup manifest: extension size must be a non-negative integer"
+                )
+            files.append(ExtensionFileEntry(path=path, sha256=digest, size=size))
+        entries.append(ExtensionBackupEntry(id=identifier, files=tuple(files)))
+    return tuple(entries)
+
+
+def _manifest_notes(raw: object) -> tuple[str, ...]:
+    """Validate the optional operator-facing skip notes recorded during backup."""
+    if not isinstance(raw, list):
+        raise OpsError("invalid backup manifest: ignoredExtensions must be a list")
+    if any(not isinstance(note, str) for note in raw):
+        raise OpsError("invalid backup manifest: ignoredExtensions must be text")
+    return tuple(raw)
+
+
+def _archive_relative_path(value: object) -> str:
+    """Accept only a plain relative POSIX path inside the artifact."""
+    if not isinstance(value, str) or not value or "\\" in value or value.startswith("/"):
+        raise OpsError("invalid backup manifest: extension file path must be relative")
+    if any(part in {"", ".", ".."} for part in value.split("/")):
+        raise OpsError("invalid backup manifest: extension file path must be relative")
+    return value
 
 
 @dataclass(frozen=True)
@@ -243,6 +337,9 @@ def create_artifact(
     dump_file: str,
     tool_versions: Mapping[str, str],
     write_dump: Callable[[Path], None],
+    write_extensions: (
+        Callable[[Path], tuple[Sequence[ExtensionBackupEntry], Sequence[str]]] | None
+    ) = None,
     credential_key_fingerprints: Sequence[str] = (),
     now: datetime | None = None,
 ) -> BackupArtifact:
@@ -260,6 +357,12 @@ def create_artifact(
         write_dump(dump_path)
         os.chmod(dump_path, ARTIFACT_FILE_MODE)
         digest, size = digest_file(dump_path)
+        extensions: tuple[ExtensionBackupEntry, ...] = ()
+        ignored_extensions: tuple[str, ...] = ()
+        if write_extensions is not None:
+            archived, skipped = write_extensions(partial)
+            extensions = tuple(archived)
+            ignored_extensions = tuple(skipped)
         manifest = BackupManifest(
             id=identifier,
             engine=engine,
@@ -273,6 +376,8 @@ def create_artifact(
             dump_file=dump_file,
             tool_versions=dict(tool_versions),
             credential_key_fingerprints=tuple(credential_key_fingerprints),
+            extensions=extensions,
+            ignored_extensions=ignored_extensions,
         )
         _write_private(partial / MANIFEST_NAME, json.dumps(manifest.as_dict()).encode())
         _fsync_directory(partial)

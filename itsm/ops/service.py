@@ -38,7 +38,8 @@ from itsm.database import (
     current_revision,
     probe_database,
 )
-from itsm.ops import engines, store
+from itsm.ops import engines, extensions, store
+from itsm.ops import sqlite as sqlite_ops
 from itsm.ops.engines import DatabaseTarget, OpsError, ToolCommand
 
 TOOL_TIMEOUT_SECONDS = 3600.0
@@ -100,58 +101,10 @@ def _record_failure(
 # --------------------------------------------------------------------------- #
 
 
-def _sqlite_uri(path: Path, *, read_only: bool) -> str:
-    suffix = "?mode=ro" if read_only else ""
-    return f"file:{path.expanduser().resolve().as_posix()}{suffix}"
-
-
-def sqlite_snapshot(path: Path) -> dict[str, Any] | None:
-    """Read revision and row totals from a SQLite file without creating it."""
-    if not path.is_file():
-        return None
-    connection = sqlite3.connect(_sqlite_uri(path, read_only=True), uri=True)
-    try:
-        revision: str | None = None
-        try:
-            row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
-            revision = None if row is None else str(row[0])
-        except sqlite3.Error:
-            revision = None
-        tables = [
-            str(row[0])
-            for row in connection.execute(
-                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
-            )
-        ]
-        rows = 0
-        for table in tables:
-            quoted = table.replace('"', '""')
-            rows += int(connection.execute(f'SELECT COUNT(*) FROM "{quoted}"').fetchone()[0])
-    finally:
-        connection.close()
-    return {"revision": revision, "tables": len(tables), "rows": rows}
-
-
-def _sqlite_integrity(path: Path) -> str:
-    if not path.is_file():
-        return "failed"
-    try:
-        connection = sqlite3.connect(_sqlite_uri(path, read_only=True), uri=True)
-    except sqlite3.Error:
-        return "failed"
-    try:
-        row = connection.execute("PRAGMA integrity_check").fetchone()
-    except sqlite3.Error:
-        return "failed"
-    finally:
-        connection.close()
-    return "ok" if row is not None and str(row[0]).lower() == "ok" else "failed"
-
-
 def try_revision(settings: Settings, target: DatabaseTarget) -> str | None:
     """Read the applied Alembic revision, returning ``None`` when unreadable."""
     if target.engine == "sqlite":
-        snapshot = sqlite_snapshot(Path(target.database))
+        snapshot = sqlite_ops.snapshot(Path(target.database))
         return None if snapshot is None else snapshot["revision"]
     engine = create_engine_from_settings(settings)
     try:
@@ -178,7 +131,7 @@ def revision_for_database_url(url: str) -> str | None:
     """Read the revision of a restore target without touching the live settings."""
     target = engines.database_target(url)
     if target.engine == "sqlite":
-        snapshot = sqlite_snapshot(Path(target.database))
+        snapshot = sqlite_ops.snapshot(Path(target.database))
         return None if snapshot is None else snapshot["revision"]
     engine = create_engine_from_settings(settings_for(database_url=url))
     try:
@@ -307,21 +260,7 @@ def _tool_versions(target: DatabaseTarget) -> dict[str, str]:
 
 
 def _sqlite_dump(source_path: Path, destination: Path) -> None:
-    if not source_path.is_file():
-        raise OpsError(f"sqlite database file not found: {source_path}")
-    source = sqlite3.connect(_sqlite_uri(source_path, read_only=True), uri=True)
-    destination_connection = sqlite3.connect(str(destination))
-    try:
-        source.backup(destination_connection)
-        destination_connection.execute("PRAGMA journal_mode=DELETE")
-        destination_connection.commit()
-    except sqlite3.Error as exc:
-        raise OpsError(f"sqlite online backup failed: {exc}") from exc
-    finally:
-        destination_connection.close()
-        source.close()
-    if _sqlite_integrity(destination) != "ok":
-        raise OpsError("sqlite backup failed the integrity check")
+    sqlite_ops.copy_online(source_path, destination)
 
 
 def _write_dump(context: OpsContext, target: DatabaseTarget, dump_path: Path) -> None:
@@ -359,6 +298,9 @@ def backup(context: OpsContext) -> store.BackupArtifact:
             dump_file=engines.dump_filename(target.engine),
             tool_versions=_tool_versions(target),
             write_dump=lambda path: _write_dump(context, target, path),
+            write_extensions=lambda directory: extensions.archive(
+                context.settings.extension_data_path, directory / extensions.DATA_ROOT_DIR
+            ),
             credential_key_fingerprints=credential_key_fingerprints(context.settings),
         )
     except OpsError as exc:
@@ -374,7 +316,7 @@ def backup(context: OpsContext) -> store.BackupArtifact:
 
 def _integrity(context: OpsContext, target: DatabaseTarget, dump_path: Path) -> str:
     if target.engine == "sqlite":
-        return _sqlite_integrity(dump_path)
+        return sqlite_ops.integrity(dump_path)
     if target.engine == "postgresql":
         completed = _run_tool(engines.postgres_list_command(dump_path), target)
         entries = [
@@ -415,7 +357,15 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
             error = "backup failed the engine integrity check"
     elif error is None:
         error = "backup checksum or size does not match the manifest"
-    verified = checks["checksum"] and checks["size"] and checks["integrity"] == "ok"
+    extensions_ok, extension_reports, extension_errors = extensions.verify(
+        artifact.directory, artifact.manifest.extensions
+    )
+    if extension_errors:
+        combined = "; ".join(extension_errors)
+        error = combined if error is None else f"{error}; {combined}"
+    verified = (
+        checks["checksum"] and checks["size"] and checks["integrity"] == "ok" and extensions_ok
+    )
     store.update_verification(artifact, verified=verified)
     if not verified:
         _record_failure(
@@ -428,6 +378,7 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
         "status": "ok" if verified else "failed",
         "backupId": artifact.manifest.id,
         "checks": checks,
+        "extensions": extension_reports,
         "verified": verified,
         "error": None if verified else (error or "verification failed"),
     }
@@ -526,10 +477,10 @@ def _restore_sqlite(
             raise RestoreRefused(f"restore target already exists: {destination}")
     if not destination.parent.is_dir():
         raise OpsError(f"restore target directory does not exist: {destination.parent}")
-    source_snapshot = sqlite_snapshot(live) if live.is_file() else None
+    source_snapshot = sqlite_ops.snapshot(live) if live.is_file() else None
     temporary = _copy_private(artifact.dump_path, destination)
     try:
-        if _sqlite_integrity(temporary) != "ok":
+        if sqlite_ops.integrity(temporary) != "ok":
             raise OpsError("restored copy failed the sqlite integrity check")
         os.replace(temporary, destination)
     except BaseException:
@@ -547,7 +498,7 @@ def _restore_sqlite(
         "target": str(destination),
         "live": is_live,
         "source": source_snapshot,
-        "restored": sqlite_snapshot(destination),
+        "restored": sqlite_ops.snapshot(destination),
     }
 
 
@@ -621,41 +572,97 @@ def _external_payload(
     }
 
 
+def _extension_target(
+    destination: Path, artifact: store.BackupArtifact, *, replace_live: bool, confirm: str | None
+) -> bool:
+    """Decide whether the extension data target may be written.
+
+    An existing target follows the same explicit consent rule as the live core
+    database: ``--replace-live`` plus the repeated backup id. A new target is
+    created, never implicitly overwritten.
+    """
+    if not destination.exists():
+        if replace_live:
+            raise RestoreRefused("--replace-live only applies to an existing extension data target")
+        return False
+    if destination.is_symlink() or not destination.is_dir():
+        raise RestoreRefused(f"extension restore target is not a directory: {destination}")
+    if not replace_live:
+        raise RestoreRefused(
+            "extension restore target already exists; pass --replace-live and "
+            "--confirm <backup id> to write into it"
+        )
+    if confirm != artifact.manifest.id:
+        raise RestoreRefused(
+            "--confirm must repeat the backup id to write into the extension data target"
+        )
+    return True
+
+
 def restore(
     context: OpsContext,
     identifier: str,
     *,
     target_file: str | None = None,
     target_database: str | None = None,
+    target_extensions: str | None = None,
     replace_live: bool = False,
     confirm: str | None = None,
 ) -> dict[str, Any]:
-    """Restore one verified backup into a new target, or the live one with consent."""
+    """Restore one verified backup into a new target, or the live one with consent.
+
+    The core database and the extension data files are restored independently:
+    ``--target-file``/``--target-database`` select the database target, and
+    ``--target-extensions`` selects the extension data path.
+    """
     store.prepare_root(context.backup_root)
     artifact = store.load_artifact(context.backup_root, identifier)
     verification = _verify_artifact(context, artifact)
     if not verification["verified"]:
         raise OpsError(f"backup {identifier} failed verification: {verification['error']}")
     target = context.target()
-    if target.engine == "sqlite":
-        payload = _restore_sqlite(
-            context,
-            artifact,
-            target_file=target_file,
-            target_database=target_database,
-            replace_live=replace_live,
-            confirm=confirm,
+    payload: dict[str, Any] = {}
+    core_requested = target_file is not None or target_database is not None
+    if core_requested:
+        if target.engine == "sqlite":
+            payload = _restore_sqlite(
+                context,
+                artifact,
+                target_file=target_file,
+                target_database=target_database,
+                replace_live=replace_live,
+                confirm=confirm,
+            )
+        else:
+            payload = _restore_external(
+                context,
+                artifact,
+                target,
+                target_file=target_file,
+                target_database=target_database,
+                replace_live=replace_live,
+                confirm=confirm,
+            )
+    if target_extensions is not None:
+        destination = Path(target_extensions).expanduser()
+        if not destination.is_absolute():
+            destination = Path.cwd() / destination
+        replace = _extension_target(
+            destination, artifact, replace_live=replace_live, confirm=confirm
         )
-    else:
-        payload = _restore_external(
-            context,
-            artifact,
-            target,
-            target_file=target_file,
-            target_database=target_database,
-            replace_live=replace_live,
-            confirm=confirm,
+        payload["extensions"] = extensions.restore(
+            artifact.directory,
+            artifact.manifest.extensions,
+            destination=destination,
+            replace=replace,
         )
+        payload.setdefault("status", "ok")
+        payload.setdefault("backupId", artifact.manifest.id)
+        payload.setdefault("engine", target.engine)
+    elif not core_requested:
+        if target.engine == "sqlite":
+            raise UsageError("sqlite restores require --target-file")
+        raise UsageError(f"{target.engine} restores require --target-database")
     return _attach_credential_report(context, artifact, payload)
 
 
@@ -770,6 +777,7 @@ def status(context: OpsContext) -> dict[str, Any]:
         "database": None if target is None else target.describe(),
         "backupRoot": str(root),
         "backupCount": len(artifacts),
+        "extensions": extensions.footprint(context.settings.extension_data_path),
         "lastBackup": _last_backup_payload(artifacts),
         "failures": stored.get("failures", []),
         "lastUpgrade": stored.get("lastUpgrade"),

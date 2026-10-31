@@ -7,8 +7,10 @@ database locator is always redacted.
 
 Operator settings for this tool (documented in ``docs/ops-backup-restore.md``):
 ``ITSM_OPS_BACKUP_ROOT``, ``ITSM_OPS_RETENTION_KEEP`` and
-``ITSM_OPS_RETENTION_MAX_AGE_DAYS``. The database URL itself comes from the
-application settings authority, ``ITSM_DATABASE_URL``.
+``ITSM_OPS_RETENTION_MAX_AGE_DAYS``. The database URL and the extension data
+root come from the application settings authority, ``ITSM_DATABASE_URL`` and
+``ITSM_EXTENSION_DATA_PATH``; extension data files are archived and restored as
+part of the same artifact.
 """
 
 from __future__ import annotations
@@ -57,6 +59,11 @@ def build_parser() -> argparse.ArgumentParser:
     restore.add_argument("backup_id")
     restore.add_argument("--target-file", default=None, help="new SQLite file to create")
     restore.add_argument("--target-database", default=None, help="new database to restore into")
+    restore.add_argument(
+        "--target-extensions",
+        default=None,
+        help="extension data directory to write the archived module files into",
+    )
     restore.add_argument(
         "--replace-live",
         action="store_true",
@@ -119,6 +126,7 @@ def _dispatch(args: argparse.Namespace, context: OpsContext) -> tuple[dict[str, 
             args.backup_id,
             target_file=args.target_file,
             target_database=args.target_database,
+            target_extensions=args.target_extensions,
             replace_live=args.replace_live,
             confirm=args.confirm,
         )
