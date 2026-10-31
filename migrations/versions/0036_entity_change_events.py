@@ -8,15 +8,15 @@ key atomically on every supported engine. On SQLite the table is declared
 ``AUTOINCREMENT`` so a pruned sequence slot is never handed out again: a reused
 number would look already delivered to a consumer cursor.
 
-Revision ID: 0035_entity_change_events
-Revises: 0034_chat_attachments
+Revision ID: 0036_entity_change_events
+Revises: 0035_extension_isolation
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0035_entity_change_events"
-down_revision = "0034_chat_attachments"
+revision = "0036_entity_change_events"
+down_revision = "0035_extension_isolation"
 branch_labels = None
 depends_on = None
 
