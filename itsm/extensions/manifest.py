@@ -17,9 +17,10 @@ import json
 import stat
 import sys
 import zipfile
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from pathlib import PurePosixPath
-from typing import Any, Collection, Mapping
+from typing import Any
 
 from itsm.identity.permissions import PERMISSION_CODES
 
@@ -31,7 +32,26 @@ MAX_MEMBER_BYTES = 1024 * 1024
 MAX_SKILLS = 64
 MAX_TESTS = 64
 
-REQUIRED_ROOT_FILES = ("extension.json", "backend.py", "frontend.js")
+REQUIRED_ROOT_FILES = ("extension.json",)
+# Static authoring rules: the runner cannot provide these powers, so a package
+# that reaches for them is refused with the missing public capability named.
+_GAP_IMPORTS = {
+    "itsm": "host capabilities",
+    "sqlalchemy": "host capabilities",
+    "ctypes": "host capabilities",
+    "socket": "network",
+    "subprocess": "process execution",
+    "multiprocessing": "process execution",
+}
+_GAP_CALLS = {
+    "os.system": "process execution",
+    "os.popen": "process execution",
+    "os.exec": "process execution",
+    "os.spawn": "process execution",
+    "os.fork": "process execution",
+    "os.posix_spawn": "process execution",
+    "ctypes.CDLL": "host capabilities",
+}
 _ALLOWED_SUFFIXES = frozenset({".json", ".py", ".js", ".md", ".txt"})
 _ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 _FORBIDDEN_PARTS = frozenset(
@@ -148,7 +168,8 @@ def validate_manifest_dict(
 def validate_arguments(parameters: Mapping[str, Any], arguments: Mapping[str, Any]) -> None:
     """Validate invocation arguments with the same SDK contract as the package."""
     try:
-        from itsm.extensions.sdk.contract import ArgumentError, validate_arguments as check
+        from itsm.extensions.sdk.contract import ArgumentError
+        from itsm.extensions.sdk.contract import validate_arguments as check
     except ImportError as exc:  # pragma: no cover
         raise PackageError("the canonical extension contract is unavailable") from exc
     try:
@@ -250,6 +271,24 @@ def _decode(name: str, value: bytes) -> str:
         raise PackageError(f"package member is not UTF-8 text: {name}") from None
 
 
+def _gap(name: str, capability: str) -> PackageError:
+    return PackageError(
+        "contract_gap_required: backend.py uses "
+        f"{name}, which needs the {capability} capability. The SDK v2 runner "
+        "does not grant it; declare the capability if it is public, or record a "
+        "contract gap instead of bypassing isolation."
+    )
+
+
+def _call_name(node: ast.AST) -> str | None:
+    if isinstance(node, ast.Name):
+        return node.id
+    if isinstance(node, ast.Attribute):
+        prefix = _call_name(node.value)
+        return f"{prefix}.{node.attr}" if prefix else node.attr
+    return None
+
+
 def _check_backend_imports(source: str) -> None:
     try:
         tree = ast.parse(source, filename="backend.py")
@@ -260,14 +299,28 @@ def _check_backend_imports(source: str) -> None:
         if isinstance(node, ast.Import):
             for alias in node.names:
                 root = alias.name.split(".", 1)[0]
+                if root in _GAP_IMPORTS:
+                    raise _gap(root, _GAP_IMPORTS[root])
                 if root not in stdlib:
                     raise PackageError(f"backend.py may import only the standard library: {root}")
         elif isinstance(node, ast.ImportFrom):
             if node.level:
                 raise PackageError("backend.py may not use relative imports")
             root = (node.module or "").split(".", 1)[0]
+            if root in _GAP_IMPORTS:
+                raise _gap(root, _GAP_IMPORTS[root])
             if root not in stdlib:
                 raise PackageError(f"backend.py may import only the standard library: {root}")
+        elif isinstance(node, ast.Call):
+            name = _call_name(node.func)
+            if name in _GAP_CALLS:
+                raise _gap(name, _GAP_CALLS[name])
+            if (
+                name is not None
+                and name.rsplit(".", 1)[-1] in ("system", "popen")
+                and (name.startswith("os.") or name.startswith("asyncio."))
+            ):
+                raise _gap(name, "process execution")
 
 
 def _declared_skills(manifest: Mapping[str, Any]) -> dict[str, str]:
@@ -340,9 +393,7 @@ def inspect_package(
         raw_manifest = json.loads(manifest_source)
     except json.JSONDecodeError as exc:
         raise PackageError(f"extension.json is not valid JSON: {exc.msg}") from None
-    manifest = validate_manifest_dict(
-        raw_manifest, known_core_permissions=known_core_permissions
-    )
+    manifest = validate_manifest_dict(raw_manifest, known_core_permissions=known_core_permissions)
 
     skill_paths = _declared_skills(manifest)
     for path in skill_paths:
@@ -351,18 +402,35 @@ def inspect_package(
         if not _decode(path, members[path]).strip():
             raise PackageError(f"declared skill is empty: {path}")
 
-    frontend_bytes = members["frontend.js"]
-    if not frontend_bytes.strip():
-        raise PackageError("frontend.js is empty")
-    frontend_source = _decode("frontend.js", frontend_bytes)
-    backend_source = _decode("backend.py", members["backend.py"])
-    if not backend_source.strip():
-        raise PackageError("backend.py is empty")
-    _check_backend_imports(backend_source)
+    runtime = manifest["runtime"]
+    if runtime == "sandboxed":
+        if "backend.py" not in members:
+            raise PackageError(
+                "package is missing required root file: backend.py (sandboxed runtime)"
+            )
+        backend_source = _decode("backend.py", members["backend.py"])
+        if not backend_source.strip():
+            raise PackageError("backend.py is empty")
+        _check_backend_imports(backend_source)
+    else:
+        if "backend.py" in members:
+            raise PackageError(
+                "declarative packages cannot ship backend.py; use the sandboxed runtime"
+            )
+        backend_source = ""
+    entry = manifest["frontend"].get("entry")
+    if entry is not None and entry != "frontend.js":
+        raise PackageError("frontend.entry must be frontend.js")
+    if entry is not None and "frontend.js" not in members:
+        raise PackageError("package is missing declared frontend entry: frontend.js")
+    frontend_bytes = members.get("frontend.js", b"")
+    frontend_source = ""
+    if frontend_bytes:
+        frontend_source = _decode("frontend.js", frontend_bytes)
+        if not frontend_source.strip():
+            raise PackageError("frontend.js is empty")
 
-    test_files = tuple(
-        name for name in names if name.startswith("tests/") and name.endswith(".py")
-    )
+    test_files = tuple(name for name in names if name.startswith("tests/") and name.endswith(".py"))
     if not test_files:
         raise PackageError("package must include at least one tests/*.py file")
     if len(test_files) > MAX_TESTS:

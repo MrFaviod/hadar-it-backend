@@ -19,17 +19,15 @@ import json
 import os
 import re
 import selectors
-import signal
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
 import time
-import traceback
-from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 try:
     from ..contract import ManifestError, validate_manifest
@@ -49,13 +47,11 @@ try:
     )
 except ImportError:  # pragma: no cover - only the fixed image layout
     from itsm.extensions.sdk.contract import (  # type: ignore[no-redef]
-        ManifestError,
         validate_manifest,
     )
     from itsm.extensions.sdk.package import (  # type: ignore[no-redef]
         DEFAULT_LIMITS,
         ArchiveLimits,
-        PackageError,
         load_manifest,
         read_zip,
         validate_layout,
@@ -112,14 +108,13 @@ class ValidationFailure(RuntimeError):
 def _detail(value: Any, limit: int = MAX_DETAIL) -> str:
     text = str(value)
     text = "".join(
-        character if character.isprintable() or character in "\n\t" else " "
-        for character in text
+        character if character.isprintable() or character in "\n\t" else " " for character in text
     )
     return text[:limit]
 
 
 def _now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+    return datetime.now(UTC).isoformat()
 
 
 def _python_version() -> str:
@@ -159,9 +154,7 @@ def _js_engine() -> tuple[str, str]:
         version = output.split()[-1] if output else "unknown"
         _JS_ENGINE = (name, version)
         return _JS_ENGINE
-    raise ValidationFailure(
-        "no JavaScript engine is available; frontend syntax cannot be claimed"
-    )
+    raise ValidationFailure("no JavaScript engine is available; frontend syntax cannot be claimed")
 
 
 def _container(engine: str) -> dict[str, Any]:
@@ -172,11 +165,7 @@ def _container(engine: str) -> dict[str, Any]:
         "readOnly": True,
         "nonRoot": True,
         "capabilities": "dropped",
-        "engine": (
-            f"python {_python_version()}; "
-            f"jsonschema {_jsonschema_version()}; "
-            f"js {engine}"
-        ),
+        "engine": (f"python {_python_version()}; jsonschema {_jsonschema_version()}; js {engine}"),
         "limits": (
             f"archive={DEFAULT_LIMITS.max_archive_bytes}; "
             f"expanded={DEFAULT_LIMITS.max_expanded_bytes}; "
@@ -203,9 +192,7 @@ class MemoryStore:
 
     def __init__(self, collections: set[str]):
         self._collections = collections
-        self._data: dict[str, dict[str, dict[str, Any]]] = {
-            name: {} for name in collections
-        }
+        self._data: dict[str, dict[str, dict[str, Any]]] = {name: {} for name in collections}
 
     def _collection(self, name: str) -> dict[str, dict[str, Any]]:
         if name not in self._collections:
@@ -228,8 +215,7 @@ class MemoryStore:
         rows = [
             {"id": name, **copy.deepcopy(value)}
             for name, value in self._collection(collection).items()
-            if not filters
-            or all(value["data"].get(key) == item for key, item in filters.items())
+            if not filters or all(value["data"].get(key) == item for key, item in filters.items())
         ]
         rows.sort(key=lambda row: row["id"])
         return {"items": rows[offset : offset + limit], "total": len(rows)}
@@ -266,9 +252,7 @@ class MemoryStore:
         rows[record_id] = {"version": version, "data": copy.deepcopy(data)}
         return {"id": record_id, **copy.deepcopy(rows[record_id])}
 
-    def delete(
-        self, collection: str, record_id: str, expected_version: int | None = None
-    ) -> bool:
+    def delete(self, collection: str, record_id: str, expected_version: int | None = None) -> bool:
         if expected_version is not None and (
             type(expected_version) is not int or expected_version < 0
         ):
@@ -283,20 +267,21 @@ class MemoryStore:
         return rows.pop(record_id, None) is not None
 
 
-@dataclass(frozen=True)
-class Principal:
-    """Immutable caller fields, without importing the application's SQL stack."""
-
-    actor_id: str = "extension-validator"
-    kind: str = "human"
-    username: str = "extension-validator"
-    display_name: str = "Extension validator"
-    role_id: str = "superadmin"
-    delegated_by: str | None = None
-    scopes: frozenset[str] = frozenset()
-    execution_id: str | None = None
-    authorization_ref: str | None = None
-    session_id: str | None = None
+# The runner hands modules the invoking principal as a plain dict, so the
+# offline harness must use the same shape or a module would pass here and fail
+# in the sandbox.
+HARNESS_PRINCIPAL: dict[str, Any] = {
+    "actor_id": "extension-validator",
+    "kind": "human",
+    "username": "extension-validator",
+    "display_name": "Extension validator",
+    "role_id": "superadmin",
+    "delegated_by": None,
+    "scopes": [],
+    "execution_id": None,
+    "authorization_ref": None,
+    "session_id": None,
+}
 
 
 class NotFound(Exception):
@@ -312,12 +297,20 @@ class Assets:
         raise NotFound(f"asset {asset_id!r} not found")
 
     def search(
-        self, *, query: str | None = None, category: str | None = None,
-        site: str | None = None, status: str | None = None,
-        quick_code: str | None = None, asset_id: str | None = None,
-        site_id: str | None = None, location_id: str | None = None,
-        responsible_person_id: str | None = None, archived: bool = False,
-        limit: int = 50, offset: int = 0,
+        self,
+        *,
+        query: str | None = None,
+        category: str | None = None,
+        site: str | None = None,
+        status: str | None = None,
+        quick_code: str | None = None,
+        asset_id: str | None = None,
+        site_id: str | None = None,
+        location_id: str | None = None,
+        responsible_person_id: str | None = None,
+        archived: bool = False,
+        limit: int = 50,
+        offset: int = 0,
     ) -> dict[str, Any]:
         self._context.authorize("assets.view")
         if type(limit) is not int or not 1 <= limit <= 200:
@@ -334,10 +327,8 @@ class Context:
     policy or queue delivery. Those belong to the installed host integration.
     """
 
-    def __init__(
-        self, permissions: set[str], collections: set[str], extension_id: str
-    ):
-        self.principal = Principal()
+    def __init__(self, permissions: set[str], collections: set[str], extension_id: str):
+        self.principal = dict(HARNESS_PRINCIPAL)
         self._permissions = permissions
         self._extension_id = extension_id
         self.authorized: list[str] = []
@@ -351,10 +342,23 @@ class Context:
         self.authorized.append(permission)
 
     def notify(
-        self, *, recipient_ids: list[str] | tuple[str, ...], key: str,
-        title: str, body: str, permission: str, asset_id: str | None = None,
+        self,
+        *,
+        recipient_ids: list[str] | tuple[str, ...],
+        key: str,
+        title: str,
+        body: str,
+        permission: str,
+        asset_id: str | None = None,
         url: str | None = None,
+        idempotency_key: str | None = None,
     ) -> None:
+        # ``idempotency_key`` is a host requirement for mutating capabilities;
+        # the offline harness only records that the module supplied one.
+        if idempotency_key is not None and (
+            not isinstance(idempotency_key, str) or not 1 <= len(idempotency_key) <= 128
+        ):
+            raise ValueError("idempotency_key must be bounded text")
         if not isinstance(recipient_ids, (list, tuple)) or not 1 <= len(recipient_ids) <= 100:
             raise ValueError("recipient_ids must contain 1..100 actors")
         if any(not isinstance(item, str) or not 1 <= len(item) <= 64 for item in recipient_ids):
@@ -375,17 +379,24 @@ class Context:
                 raise ValueError("notice asset id is invalid")
             self.assets.get(asset_id)
         if url is not None and (
-            not isinstance(url, str) or len(url) > 500
+            not isinstance(url, str)
+            or len(url) > 500
             or not url.startswith(f"#/extensiones/{self._extension_id}/")
         ):
             raise ValueError("notice URL must belong to this extension")
         recipients = list(dict.fromkeys(recipient_ids))
-        if self.principal.actor_id in recipients:
-            self.notices.append({
-                "recipient_ids": [self.principal.actor_id], "key": key,
-                "title": title, "body": body, "permission": permission,
-                "asset_id": asset_id, "url": url,
-            })
+        if self.principal["actor_id"] in recipients:
+            self.notices.append(
+                {
+                    "recipient_ids": [self.principal["actor_id"]],
+                    "key": key,
+                    "title": title,
+                    "body": body,
+                    "permission": permission,
+                    "asset_id": asset_id,
+                    "url": url,
+                }
+            )
 
     @contextlib.contextmanager
     def transaction(self):
@@ -467,9 +478,7 @@ def _json_bound(value: Any, label: str) -> None:
         raise ValidationFailure(f"{label} result exceeds {MAX_OPERATION_BYTES} bytes")
 
 
-def _frontend_checks(
-    frontend: Path, manifest: dict[str, Any]
-) -> tuple[str, str, str]:
+def _frontend_checks(frontend: Path, manifest: dict[str, Any]) -> tuple[str, str, str]:
     engine, version = _js_engine()
     engine_label = f"{engine} {version}"
     harness_dir = Path(__file__).resolve().parent / "js"
@@ -541,9 +550,7 @@ def _frontend_checks(
     bound = set(payload.get("components") or [])
     missing = [name for name in components if name not in bound]
     if missing:
-        raise ValidationFailure(
-            "frontend did not provide components: " + ", ".join(missing)
-        )
+        raise ValidationFailure("frontend did not provide components: " + ", ".join(missing))
     return (
         "syntax and registration passed with " + engine_label,
         "registered " + ", ".join(sorted(bound)) + f" with {engine_label}",
@@ -610,9 +617,7 @@ def _run_package_tests(root: Path) -> str:
     output = ((completed.stdout or "") + "\n" + (completed.stderr or "")).strip()
     output = output.replace(str(root), "<package>")
     if completed.returncode != 0:
-        raise ValidationFailure(
-            "package tests failed: " + _detail(output[-1500:], 1500)
-        )
+        raise ValidationFailure("package tests failed: " + _detail(output[-1500:], 1500))
     if "Ran 0 tests" in output:
         raise ValidationFailure(
             "package tests discovered no test functions; name files tests/test*.py"
@@ -636,7 +641,11 @@ def _backend_syntax(source: str) -> str:
     if forbidden:
         raise ValidationFailure("backend.py imports non-stdlib modules: " + ", ".join(forbidden))
     register = next(
-        (node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name == "register"),
+        (
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef) and node.name == "register"
+        ),
         None,
     )
     if register is None:
@@ -664,7 +673,9 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
 
     def registration_check() -> str:
         with _package_on_path(root):
-            spec = importlib.util.spec_from_file_location("itsm_extension_candidate", root / "backend.py")
+            spec = importlib.util.spec_from_file_location(
+                "itsm_extension_candidate", root / "backend.py"
+            )
             if spec is None or spec.loader is None:
                 raise ValidationFailure("backend.py could not be loaded")
             module = importlib.util.module_from_spec(spec)
@@ -679,7 +690,9 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
             ("schedules", binder.schedules, binder.bound_schedules),
         ):
             if set(bound) != set(expected):
-                raise ValidationFailure(label + " not registered: " + ", ".join(sorted(set(expected) - set(bound))))
+                raise ValidationFailure(
+                    label + " not registered: " + ", ".join(sorted(set(expected) - set(bound)))
+                )
         return (
             f"backend imported; {len(binder.operations)} operations; "
             f"{len(binder.migrations)} migrations; {len(binder.schedules)} schedules"
@@ -691,7 +704,9 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
     def context() -> Context:
         permissions = {item["code"] for item in manifest["permissions"]}
         permissions.update(manifest["corePermissions"])
-        return Context(permissions, {item["name"] for item in manifest["collections"]}, manifest["id"])
+        return Context(
+            permissions, {item["name"] for item in manifest["collections"]}, manifest["id"]
+        )
 
     def operations_check() -> str:
         names = []
@@ -700,7 +715,8 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
             _check_signature(handler, operation)
             names.append(operation["name"])
         return (
-            f"{len(names)} operations: " + ", ".join(names)
+            f"{len(names)} operations: "
+            + ", ".join(names)
             + "; signatures checked; domain execution belongs to package tests"
         )
 
@@ -714,16 +730,23 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
             signature = inspect.signature(handler)
             parameters = list(signature.parameters.values())
             if not parameters or parameters[0].kind not in (
-                inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
             ):
                 raise ValidationFailure(f"migration {migration['handler']} must accept context")
             if any(
-                item.default is inspect.Parameter.empty and item.kind in (
-                    inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD,
+                item.default is inspect.Parameter.empty
+                and item.kind
+                in (
+                    inspect.Parameter.POSITIONAL_ONLY,
+                    inspect.Parameter.POSITIONAL_OR_KEYWORD,
                     inspect.Parameter.KEYWORD_ONLY,
-                ) for item in parameters[1:]
+                )
+                for item in parameters[1:]
             ):
-                raise ValidationFailure(f"migration {migration['handler']} requires unexpected arguments")
+                raise ValidationFailure(
+                    f"migration {migration['handler']} requires unexpected arguments"
+                )
             _json_bound(handler(current), migration["handler"])
             names.append(f"{migration['from']}->{migration['to']}:{migration['handler']}")
         return "migrations executed: " + ", ".join(names) if names else "no migrations declared"
@@ -746,9 +769,13 @@ def _exercise_candidate(root: Path, manifest: dict[str, Any]) -> list[dict[str, 
 
 def execution_main(root: Path, result_fd: int) -> int:
     """Fixed child entry; stdout/stderr are candidate logs, not report framing."""
-    manifest = load_manifest({"extension.json": (root / "extension.json").read_text(encoding="utf-8")})
+    manifest = load_manifest(
+        {"extension.json": (root / "extension.json").read_text(encoding="utf-8")}
+    )
     checks = _exercise_candidate(root, manifest)
-    encoded = json.dumps({"completed": True, "checks": checks}, separators=(",", ":")).encode("utf-8")
+    encoded = json.dumps({"completed": True, "checks": checks}, separators=(",", ":")).encode(
+        "utf-8"
+    )
     with os.fdopen(result_fd, "wb") as output:
         output.write(encoded)
     return 0
@@ -758,18 +785,26 @@ def _execution_evidence(payload: bytes) -> list[dict[str, str]]:
     try:
         value = json.loads(payload.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise ValidationFailure("candidate subprocess did not complete its execution checks") from exc
-    if not isinstance(value, dict) or set(value) != {"completed", "checks"} or value["completed"] is not True:
+        raise ValidationFailure(
+            "candidate subprocess did not complete its execution checks"
+        ) from exc
+    if (
+        not isinstance(value, dict)
+        or set(value) != {"completed", "checks"}
+        or value["completed"] is not True
+    ):
         raise ValidationFailure("candidate subprocess returned invalid completion evidence")
     checks = value["checks"]
     if not isinstance(checks, list) or len(checks) not in (1, len(EXECUTION_CHECK_NAMES)):
         raise ValidationFailure("candidate subprocess returned incomplete execution checks")
     for index, check in enumerate(checks):
         if (
-            not isinstance(check, dict) or set(check) != {"name", "status", "detail"}
+            not isinstance(check, dict)
+            or set(check) != {"name", "status", "detail"}
             or check["name"] != EXECUTION_CHECK_NAMES[index]
             or check["status"] not in ("passed", "failed")
-            or not isinstance(check["detail"], str) or len(check["detail"]) > MAX_DETAIL
+            or not isinstance(check["detail"], str)
+            or len(check["detail"]) > MAX_DETAIL
         ):
             raise ValidationFailure("candidate subprocess returned invalid execution checks")
     if len(checks) == 1 and checks[0]["status"] != "failed":
@@ -784,22 +819,43 @@ def _run_execution(root: Path, max_output: int) -> list[dict[str, str]]:
     evidence = bytearray()
     received = 0
     environment = {
-        "PATH": os.environ.get("PATH", ""), "HOME": "/tmp", "TMPDIR": "/tmp",
-        "PYTHONDONTWRITEBYTECODE": "1", "PYTHONUNBUFFERED": "1", "NO_COLOR": "1",
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "PYTHONDONTWRITEBYTECODE": "1",
+        "PYTHONUNBUFFERED": "1",
+        "NO_COLOR": "1",
     }
     try:
         process = subprocess.Popen(
-            [sys.executable, "-I", "-B", str(Path(__file__).with_name("run.py")),
-             "--exercise", str(root), str(write_fd)],
-            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-            cwd=root, env=environment, close_fds=True, pass_fds=(write_fd,), start_new_session=True,
+            [
+                sys.executable,
+                "-I",
+                "-B",
+                str(Path(__file__).with_name("run.py")),
+                "--exercise",
+                str(root),
+                str(write_fd),
+            ],
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            cwd=root,
+            env=environment,
+            close_fds=True,
+            pass_fds=(write_fd,),
+            start_new_session=True,
         )
         os.close(write_fd)
         write_fd = -1
         assert process.stdout is not None and process.stderr is not None
         deadline = time.monotonic() + EXECUTION_TIMEOUT
         with selectors.DefaultSelector() as selector:
-            for stream, kind in ((read_fd, "evidence"), (process.stdout, "log"), (process.stderr, "log")):
+            for stream, kind in (
+                (read_fd, "evidence"),
+                (process.stdout, "log"),
+                (process.stderr, "log"),
+            ):
                 os.set_blocking(stream if isinstance(stream, int) else stream.fileno(), False)
                 selector.register(stream, selectors.EVENT_READ, kind)
             while selector.get_map():
@@ -819,7 +875,9 @@ def _run_execution(root: Path, max_output: int) -> list[dict[str, str]]:
             try:
                 process.wait(timeout=max(0.01, deadline - time.monotonic()))
             except subprocess.TimeoutExpired as exc:
-                raise ValidationFailure("validator candidate execution exceeded its time limit") from exc
+                raise ValidationFailure(
+                    "validator candidate execution exceeded its time limit"
+                ) from exc
         if process.returncode != 0:
             raise ValidationFailure(f"candidate subprocess exited with {process.returncode}")
         return _execution_evidence(bytes(evidence))
@@ -836,6 +894,161 @@ def _run_execution(root: Path, max_output: int) -> list[dict[str, str]]:
         os.close(read_fd)
         if write_fd != -1:
             os.close(write_fd)
+
+
+def _declarative_evidence(root: Path, manifest: dict[str, Any]) -> list[dict[str, str]]:
+    """Checks for a module that ships no executable code at all."""
+    checks: list[dict[str, str]] = []
+    kinds = ", ".join(f"{item['name']}:{contract_kind(item)}" for item in manifest["operations"])
+    checks.append(
+        {
+            "name": "registration",
+            "status": "passed",
+            "detail": "declarative runtime: no handlers to register",
+        }
+    )
+    checks.append(
+        {
+            "name": "operations",
+            "status": "passed",
+            "detail": f"{len(manifest['operations'])} declarative operations executed by the host: {kinds}",
+        }
+    )
+    checks.append(
+        {
+            "name": "migrations",
+            "status": "passed",
+            "detail": "no migrations declared",
+        }
+    )
+    checks.append({"name": "schedules", "status": "passed", "detail": "no schedules declared"})
+    try:
+        checks.append({"name": "tests", "status": "passed", "detail": _run_package_tests(root)})
+    except Exception as exc:
+        checks.append(
+            {
+                "name": "tests",
+                "status": "failed",
+                "detail": _detail(f"{type(exc).__name__}: {exc}").replace(str(root), "<package>"),
+            }
+        )
+    return checks
+
+
+def contract_kind(operation: dict[str, Any]) -> str:
+    return str(operation.get("kind") or "handler")
+
+
+def _declarative_view_detail(manifest: dict[str, Any]) -> str:
+    frontend = manifest["frontend"]
+    declared = {item["name"] for item in manifest["operations"]}
+    problems: list[str] = []
+    views = 0
+    for section in ("pages", "assetPanels", "widgets"):
+        for item in frontend.get(section) or []:
+            view = item.get("view") or {}
+            views += 1
+            for kind in ("table", "form"):
+                body = view.get(kind)
+                if not body:
+                    continue
+                operation = body.get("operation")
+                if operation not in declared:
+                    problems.append(
+                        f"{section} {item['id']} references unknown operation {operation!r}"
+                    )
+    if problems:
+        raise ValidationFailure("; ".join(problems))
+    return f"{views} declarative view(s) rendered by the host; no module JavaScript"
+
+
+def _isolated_frontend_check(
+    frontend: Path, manifest: dict[str, Any], engine: str, version: str
+) -> tuple[str, str, str]:
+    """Syntax plus registration check for isolated (iframe) module code only."""
+    engine_label = f"{engine} {version}"
+    harness_dir = Path(__file__).resolve().parent / "js"
+    parse = harness_dir / "parse.js"
+    if not parse.is_file():
+        raise ValidationFailure("fixed JavaScript harness is missing from the image")
+    environment = {
+        "PATH": os.environ.get("PATH", ""),
+        "HOME": "/tmp",
+        "TMPDIR": "/tmp",
+        "NO_COLOR": "1",
+    }
+    try:
+        syntax = subprocess.run(
+            [engine, str(parse), str(frontend)],
+            capture_output=True,
+            text=True,
+            timeout=JS_TIMEOUT,
+            check=False,
+            env=environment,
+            cwd="/tmp",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationFailure(f"frontend syntax check failed to run: {exc}") from exc
+    if syntax.returncode != 0:
+        message = (syntax.stderr or syntax.stdout or "syntax error").strip()
+        raise ValidationFailure(f"frontend syntax is invalid: {message[:MAX_DETAIL]}")
+    source = frontend.read_text(encoding="utf-8", errors="replace")
+    if "ITSMExtension.register" not in source:
+        raise ValidationFailure(
+            "isolated frontend code must call window.ITSMExtension.register({components})"
+        )
+    components: list[str] = []
+    for section in ("pages", "assetPanels", "widgets"):
+        for item in manifest["frontend"].get(section) or []:
+            for component in (
+                item.get("component"),
+                (item.get("view") or {}).get("isolated", {}).get("component"),
+            ):
+                if component and component not in components:
+                    components.append(component)
+    for contribution in manifest["frontend"].get("contributions") or []:
+        component = contribution.get("component")
+        if component and component not in components:
+            components.append(component)
+    missing = [name for name in components if name not in source]
+    if missing:
+        raise ValidationFailure(
+            "isolated frontend does not define components: " + ", ".join(missing)
+        )
+    registration = harness_dir / "register.js"
+    if not registration.is_file():
+        raise ValidationFailure("fixed JavaScript harness is missing from the image")
+    try:
+        registered = subprocess.run(
+            [engine, str(registration), str(frontend), json.dumps(components)],
+            capture_output=True,
+            text=True,
+            timeout=JS_TIMEOUT,
+            check=False,
+            env=environment,
+            cwd="/tmp",
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise ValidationFailure(f"frontend registration failed to run: {exc}") from exc
+    if registered.returncode != 0:
+        message = (registered.stderr or registered.stdout or "registration error").strip()
+        raise ValidationFailure(
+            f"isolated frontend registration is invalid: {message[:MAX_DETAIL]}"
+        )
+    return (
+        "syntax passed and registration present with " + engine_label,
+        "isolated components: " + ", ".join(components),
+        engine_label,
+    )
+
+
+def _raiser(error: BaseException) -> Callable[[], str]:
+    """Turn an already captured failure back into a failing check."""
+
+    def raise_error() -> str:
+        raise error
+
+    return raise_error
 
 
 def validate_payload(payload: bytes) -> dict[str, Any]:
@@ -860,7 +1073,13 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
         elif name == "execution":
             text = "candidate subprocess completed; bounded diagnostic checks received"
         elif name == "frontend":
-            text = _detail(detail[0] + "; " + detail[1])
+            # Isolated code reports (summary, components); declarative views
+            # report a single summary string.
+            text = (
+                _detail(detail[0] + "; " + detail[1])
+                if isinstance(detail, tuple)
+                else _detail(detail)
+            )
         else:
             text = _detail(detail or "passed")
         checks.append({"name": name, "status": "passed", "detail": text})
@@ -875,10 +1094,18 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
         engine = f"{_js_engine()[0]} {_js_engine()[1]}"
     except ValidationFailure:
         pass
-    checks.append({"name": "protocol", "status": "passed", "detail": f"protocolVersion=1 bytes={len(frame.archive)}"})
+    checks.append(
+        {
+            "name": "protocol",
+            "status": "passed",
+            "detail": f"protocolVersion=1 bytes={len(frame.archive)}",
+        }
+    )
     limits = ArchiveLimits(
-        max_archive_bytes=frame.limits["archiveBytes"], max_expanded_bytes=frame.limits["expandedBytes"],
-        max_entries=frame.limits["entries"], max_file_bytes=frame.limits["fileBytes"],
+        max_archive_bytes=frame.limits["archiveBytes"],
+        max_expanded_bytes=frame.limits["expandedBytes"],
+        max_entries=frame.limits["entries"],
+        max_file_bytes=frame.limits["fileBytes"],
     )
     files = record("archive", lambda: read_zip(frame.archive, limits))
     if files is None:
@@ -886,7 +1113,11 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
     manifest: dict[str, Any] = {}
 
     def manifest_check() -> str:
-        manifest.update(validate_manifest(load_manifest(files), known_core_permissions=frame.known_core_permissions))
+        manifest.update(
+            validate_manifest(
+                load_manifest(files), known_core_permissions=frame.known_core_permissions
+            )
+        )
         return f"{manifest['id']} {manifest['version']} schema={manifest['schemaVersion']}"
 
     if record("manifest", manifest_check) is None:
@@ -896,21 +1127,55 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
         validate_layout(files, manifest)
         return f"{len(files)} files; {len(manifest['skills'])} skill(s); tests/ present"
 
-    if record("layout", layout_check) is None or record("backend", lambda: _backend_syntax(files["backend.py"])) is None:
+    if record("layout", layout_check) is None:
         return _finish(frame.digest, checks, errors, engine)
+    runtime = manifest["runtime"]
+    if runtime == "sandboxed":
+        if record("backend", lambda: _backend_syntax(files["backend.py"])) is None:
+            return _finish(frame.digest, checks, errors, engine)
+    else:
+        record(
+            "backend",
+            lambda: "declarative runtime ships no executable backend",
+        )
     with tempfile.TemporaryDirectory(prefix="itsm-sdk-package-") as directory:
         root = Path(directory)
         for relative, content in files.items():
             destination = root / relative
             destination.parent.mkdir(parents=True, exist_ok=True)
             destination.write_text(content, encoding="utf-8")
-        evidence = record("execution", lambda: _run_execution(root, frame.limits["outputBytes"]))
+        if runtime == "sandboxed":
+            evidence = record(
+                "execution", lambda: _run_execution(root, frame.limits["outputBytes"])
+            )
+        else:
+            # Declarative modules ship no code: the host-side evidence list is
+            # appended once by the shared block below.
+            evidence = _declarative_evidence(root, manifest)
         if evidence is not None:
             checks.extend(evidence)
-            errors.extend(f"{item['name']}: {item['detail']}" for item in evidence if item["status"] == "failed")
-        frontend = record("frontend", lambda: _frontend_checks(root / manifest["frontend"]["entry"], manifest))
-        if frontend is not None:
-            engine = frontend[2]
+            errors.extend(
+                f"{item['name']}: {item['detail']}"
+                for item in evidence
+                if item["status"] == "failed"
+            )
+        entry = (manifest["frontend"] or {}).get("entry")
+        if entry:
+            try:
+                engine_name, engine_version = _js_engine()
+            except ValidationFailure as failure:
+                record("frontend", _raiser(failure))
+            else:
+                frontend = record(
+                    "frontend",
+                    lambda: _isolated_frontend_check(
+                        root / entry, manifest, engine_name, engine_version
+                    ),
+                )
+                if frontend is not None:
+                    engine = frontend[2]
+        else:
+            record("frontend", lambda: _declarative_view_detail(manifest))
     return _finish(frame.digest, checks, errors, engine)
 
 
@@ -921,7 +1186,7 @@ def _finish(
     return {
         "status": "failed" if failed else "passed",
         "digest": digest,
-        "sdkVersion": 1,
+        "sdkVersion": 2,
         "checks": checks[:MAX_CHECKS],
         "errors": errors[:MAX_ERRORS],
         "container": _container(engine),

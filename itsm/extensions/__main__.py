@@ -1,4 +1,4 @@
-"""Offline extension SDK CLI: generate, pack, inspect and validate."""
+"""Offline extension SDK CLI: generate, pack, inspect, validate, relocate."""
 
 from __future__ import annotations
 
@@ -92,12 +92,38 @@ def _validate(args: argparse.Namespace) -> int:
 def _serve(args: argparse.Namespace) -> int:
     token = os.environ.get("ITSM_EXTENSION_VALIDATOR_BROKER_TOKEN", "")
     validator = ContainerValidator(
-        core_permissions=_known_core(), image=args.image,
+        core_permissions=_known_core(),
+        image=args.image,
         timeout=args.timeout,
     )
     serve_validator(
-        validator=validator, token=token, host=args.listen, port=args.port,
+        validator=validator,
+        token=token,
+        host=args.listen,
+        port=args.port,
     )
+    return 0
+
+
+def _relocate(args: argparse.Namespace) -> int:
+    """Copy SDK v1 collection rows into module SQLite files (dry run by default)."""
+    from itsm.config import Settings
+    from itsm.database import create_engine_from_settings, create_session_factory
+    from itsm.extensions.host import ExtensionHostService
+
+    settings = Settings(_env_file=None)
+    engine = create_engine_from_settings(settings)
+    try:
+        host = ExtensionHostService(settings, create_session_factory(engine))
+        report = host.relocate_legacy(apply=bool(args.apply))
+    finally:
+        engine.dispose()
+    _emit(report)
+    if not args.apply:
+        print(
+            "dry run: no module data was written; re-run with --apply",
+            file=sys.stderr,
+        )
     return 0
 
 
@@ -129,17 +155,28 @@ def build_parser() -> argparse.ArgumentParser:
     inspect.add_argument("archive")
     inspect.set_defaults(handler=_inspect)
 
-    validate = commands.add_parser(
-        "validate", help="run the fixed offline validator container"
-    )
+    validate = commands.add_parser("validate", help="run the fixed offline validator container")
     validate.add_argument("archive")
     validate.add_argument("--image", default="itsm-extension-validator:1")
     validate.set_defaults(handler=_validate)
 
+    relocate = commands.add_parser(
+        "relocate-legacy",
+        help="copy SDK v1 collection rows into per-module SQLite (dry run by default)",
+    )
+    relocate.add_argument(
+        "--apply",
+        action="store_true",
+        help="write the copies; legacy rows are always retained",
+    )
+    relocate.set_defaults(handler=_relocate)
+
     serve = commands.add_parser(
         "serve-validator", help="serve the fixed authenticated host validation broker"
     )
-    serve.add_argument("--listen", default="127.0.0.1", help="trusted bind address (default: loopback)")
+    serve.add_argument(
+        "--listen", default="127.0.0.1", help="trusted bind address (default: loopback)"
+    )
     serve.add_argument("--port", type=int, default=8766)
     serve.add_argument("--image", default="itsm-extension-validator:1")
     serve.add_argument("--timeout", type=float, default=60)

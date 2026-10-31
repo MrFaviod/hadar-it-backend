@@ -100,9 +100,7 @@ class ExtensionCandidate(ExtensionBase):
 class ExtensionCollectionRecord(ExtensionBase):
     __tablename__ = "extension_collection_records"
     __table_args__ = (
-        UniqueConstraint(
-            "extension_id", "collection", "record_id", name="uq_extension_record"
-        ),
+        UniqueConstraint("extension_id", "collection", "record_id", name="uq_extension_record"),
         Index("ix_extension_collection_lookup", "extension_id", "collection"),
     )
 
@@ -191,4 +189,29 @@ class ExtensionScheduleState(ExtensionBase):
     )
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
+
+
+class ExtensionCoreCall(ExtensionBase):
+    """Replay ledger for authorized core mutations performed by an extension.
+
+    The row is core-owned host metadata: it stores the caller-supplied
+    idempotency key, the capability that consumed it, a digest of the request
+    and the canonical service response.  Module business data never lands here.
+    """
+
+    __tablename__ = "extension_core_calls"
+    __table_args__ = (
+        UniqueConstraint("extension_id", "call_key", name="uq_extension_core_call"),
+        Index("ix_extension_core_calls_extension", "extension_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    extension_id: Mapped[str] = mapped_column(String(48), nullable=False)
+    call_key: Mapped[str] = mapped_column(String(128), nullable=False)
+    capability: Mapped[str] = mapped_column(String(64), nullable=False)
+    request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    response_json: Mapped[str] = mapped_column(Text, nullable=False, default="{}")
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow
     )

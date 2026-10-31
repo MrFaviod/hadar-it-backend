@@ -10,18 +10,16 @@ import hashlib
 import json
 import stat
 import zipfile
+from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from io import BytesIO
-from typing import Any, Callable, Iterator
+from typing import Any
 
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
-from sqlalchemy import text
-
-from conftest import ADMIN_PASSWORD, ADMIN_USERNAME, run_migrations
 from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.extensions.api import create_extension_router, install_extension_error_handlers
 from itsm.extensions.host import (
@@ -42,14 +40,17 @@ from itsm.identity.api import create_identity_router, install_error_handlers
 from itsm.identity.permissions import PERMISSION_CATALOG, is_known_permission
 from itsm.identity.service import IdentityService, PermissionDenied, Principal
 from itsm.inventory.service import InventoryService
+from sqlalchemy import text
 from tests.inventory_support import asset_values
+
+from conftest import ADMIN_PASSWORD, ADMIN_USERNAME, run_migrations
 
 MODULE_ID = "record-book"
 READ = "ext_record_book.read"
 WRITE = "ext_record_book.write"
 NOW = datetime(2026, 10, 28, 12, 0, tzinfo=UTC)
 
-BACKEND = '''
+BACKEND = """
 def read_records(context):
     context.authorize("ext_record_book.read")
     return context.store.list("records", limit=200)
@@ -72,8 +73,11 @@ def readonly_write(context):
 
 def notify_record(context, recipient_ids, url=None):
     context.store.put("records", "notice-write", {"label": "transactional"})
+    fingerprint = __import__("hashlib").sha256(
+        (str(recipient_ids) + str(url)).encode("utf-8")).hexdigest()[:32]
     context.notify(recipient_ids=recipient_ids, key="expiry:one", title="Vence pronto",
-                   body="Revisa tu registro", permission="ext_record_book.read", url=url)
+                   body="Revisa tu registro", permission="ext_record_book.read", url=url,
+                   idempotency_key="notice:" + fingerprint)
     return {"notified": True}
 
 def canonical_asset(context, asset_id):
@@ -118,7 +122,7 @@ def register(sdk):
     sdk.operation("write_then_asset", write_then_asset)
     __MIGRATION_BINDING__
     __SCHEDULE_BINDING__
-'''
+"""
 
 
 def parameters(properties: dict[str, str], required: list[str]) -> dict[str, Any]:
@@ -141,26 +145,42 @@ def manifest(
         ("read_records", READ, False, {}, []),
         ("get_record", READ, False, {"record_id": "string"}, ["record_id"]),
         (
-            "put_record", WRITE, True,
+            "put_record",
+            WRITE,
+            True,
             {"record_id": "string", "label": "string", "expected_version": "integer"},
             ["record_id", "label"],
         ),
         (
-            "delete_record", WRITE, True,
-            {"record_id": "string", "expected_version": "integer"}, ["record_id"],
+            "delete_record",
+            WRITE,
+            True,
+            {"record_id": "string", "expected_version": "integer"},
+            ["record_id"],
         ),
         ("fail_write", WRITE, True, {}, []),
         ("readonly_write", READ, False, {}, []),
-        ("notify_record", WRITE, True, {"recipient_ids": "array", "url": "string"}, ["recipient_ids"]),
+        (
+            "notify_record",
+            WRITE,
+            True,
+            {"recipient_ids": "array", "url": "string"},
+            ["recipient_ids"],
+        ),
         ("canonical_asset", READ, False, {"asset_id": "string"}, ["asset_id"]),
         ("write_then_authorize", WRITE, True, {"permission": "string"}, ["permission"]),
         (
-            "write_then_asset", WRITE, True,
-            {"mode": "string", "asset_id": "string"}, ["mode", "asset_id"],
+            "write_then_asset",
+            WRITE,
+            True,
+            {"mode": "string", "asset_id": "string"},
+            ["mode", "asset_id"],
         ),
     ]
     return {
-        "sdkVersion": 1,
+        "sdkVersion": 2,
+        "runtime": "sandboxed",
+        "capabilities": ["assets.read", "assets.write", "notify"],
         "id": MODULE_ID,
         "name": "Registro nativo",
         "description": "Registros persistidos con autorización nativa",
@@ -175,6 +195,7 @@ def manifest(
                 "name": name,
                 "description": "Operación de prueba con efecto observable",
                 "permission": permission,
+                "kind": "handler",
                 "mutation": mutation,
                 "parameters": parameters(properties, required),
             }
@@ -183,19 +204,43 @@ def manifest(
         "collections": [{"name": "records", "description": "Registros del módulo"}],
         "schemaVersion": schema,
         "compatibleSchemaVersions": compatible or ([1, 2] if schema == 2 else [1]),
-        "migrations": (
-            [{"from": 1, "to": 2, "handler": "migrate_records"}] if schema == 2 else []
-        ),
+        "migrations": ([{"from": 1, "to": 2, "handler": "migrate_records"}] if schema == 2 else []),
         "frontend": {
             "entry": "frontend.js",
-            "pages": [{"id": "records", "label": "Registros", "component": "Records", "permission": READ}],
+            "pages": [
+                {
+                    "id": "records",
+                    "label": "Registros",
+                    "permission": READ,
+                    "view": {
+                        "table": {
+                            "operation": "read_records",
+                            "columns": [{"field": "label", "label": "Etiqueta"}],
+                        }
+                    },
+                }
+            ],
             "assetPanels": [],
         },
         "schedules": (
-            [{"name": "expiry", "handler": "run_expiry", "intervalSeconds": 60, "permission": WRITE}]
-            if schedules else []
+            [
+                {
+                    "name": "expiry",
+                    "handler": "run_expiry",
+                    "intervalSeconds": 60,
+                    "permission": WRITE,
+                }
+            ]
+            if schedules
+            else []
         ),
-        "skills": [{"name": "record-guide", "description": "Uso autorizado", "path": "skills/record-guide/SKILL.md"}],
+        "skills": [
+            {
+                "name": "record-guide",
+                "description": "Uso autorizado",
+                "path": "skills/record-guide/SKILL.md",
+            }
+        ],
     }
 
 
@@ -208,15 +253,25 @@ def package(
     extra: dict[str, bytes] | None = None,
 ) -> bytes:
     declaration = declaration or manifest()
-    source = BACKEND.replace(
-        "__MIGRATION_FAILURE__", "raise ValueError('migration secret')" if fail_migration else "pass"
-    ).replace(
-        "__SCHEDULE_FAILURE__", "raise ValueError('schedule secret')" if fail_schedule else "pass"
-    ).replace(
-        "__MIGRATION_BINDING__",
-        'sdk.migration("migrate_records", migrate_records)' if declaration["migrations"] else "pass",
-    ).replace(
-        "__SCHEDULE_BINDING__", 'sdk.schedule("expiry", tick)' if declaration["schedules"] else "pass"
+    source = (
+        BACKEND.replace(
+            "__MIGRATION_FAILURE__",
+            "raise ValueError('migration secret')" if fail_migration else "pass",
+        )
+        .replace(
+            "__SCHEDULE_FAILURE__",
+            "raise ValueError('schedule secret')" if fail_schedule else "pass",
+        )
+        .replace(
+            "__MIGRATION_BINDING__",
+            'sdk.migration("migrate_records", migrate_records)'
+            if declaration["migrations"]
+            else "pass",
+        )
+        .replace(
+            "__SCHEDULE_BINDING__",
+            'sdk.schedule("run_expiry", tick)' if declaration["schedules"] else "pass",
+        )
     )
     members: dict[str, bytes] = {
         "extension.json": json.dumps(declaration).encode(),
@@ -238,8 +293,14 @@ def trusted_unit_report(digest: str, *, status: str = "passed") -> dict[str, Any
     return {
         "status": status,
         "digest": digest,
-        "sdkVersion": 1,
-        "checks": [{"name": "unit-boundary-fixture", "status": status, "detail": "No validator/container execution claimed"}],
+        "sdkVersion": 2,
+        "checks": [
+            {
+                "name": "unit-boundary-fixture",
+                "status": status,
+                "detail": "No validator/container execution claimed",
+            }
+        ],
         "errors": [] if status == "passed" else ["unit validation failure"],
         "container": {"source": "trusted-internal-unit-fixture", "notExecutionEvidence": True},
         "completedAt": NOW.isoformat(),
@@ -260,16 +321,26 @@ class Environment:
     def validated(self, data: bytes | None = None) -> dict[str, Any]:
         candidate = self.candidate(data)
         return self.host.record_validation_report(
-            candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=candidate["revision"]
+            candidate["id"],
+            trusted_unit_report(candidate["digest"]),
+            expected_version=candidate["revision"],
         )
 
     def install(self, data: bytes | None = None) -> dict[str, Any]:
         candidate = self.validated(data)
         return self.host.approve_candidate(
-            self.owner, candidate["id"], digest=candidate["digest"], expected_version=candidate["currentRevision"]
+            self.owner,
+            candidate["id"],
+            digest=candidate["digest"],
+            expected_version=candidate["currentRevision"],
         )
 
-    def invoke(self, operation: str, arguments: dict[str, Any] | None = None, actor: Principal | None = None) -> Any:
+    def invoke(
+        self,
+        operation: str,
+        arguments: dict[str, Any] | None = None,
+        actor: Principal | None = None,
+    ) -> Any:
         return self.host.invoke(actor or self.owner, MODULE_ID, operation, arguments or {})
 
     def records(self) -> list[dict[str, Any]]:
@@ -280,14 +351,18 @@ class Environment:
             identity = IdentityService(session, self.settings)
             role = identity.create_role(self.owner, name="role " + name, permissions=permissions)
             user = identity.create_user(
-                self.owner, username=name, name=name.title(), role_id=role.id, password=ADMIN_PASSWORD
+                self.owner,
+                username=name,
+                name=name.title(),
+                role_id=role.id,
+                password=ADMIN_PASSWORD,
             )
             return identity.resolve_actor(user.id), role.id
 
 
 @pytest.fixture
-def env(settings_factory: Callable[..., Any]) -> Iterator[Environment]:
-    settings = settings_factory()
+def env(settings_factory: Callable[..., Any], tmp_path: Path) -> Iterator[Environment]:
+    settings = settings_factory(extension_data_path=tmp_path / "extensions-data")
     migration = run_migrations(settings)
     assert migration.returncode == 0, migration.stdout + migration.stderr
     engine = create_engine_from_settings(settings)
@@ -297,19 +372,31 @@ def env(settings_factory: Callable[..., Any]) -> Iterator[Environment]:
         user = identity.bootstrap_superadmin(ADMIN_USERNAME, "Ana Admin", ADMIN_PASSWORD)
         owner = identity.resolve_actor(user.id)
     now = [NOW]
-    yield Environment(settings, factory, ExtensionHostService(settings, factory, now=lambda: now[0]), owner, now)
+    yield Environment(
+        settings, factory, ExtensionHostService(settings, factory, now=lambda: now[0]), owner, now
+    )
     engine.dispose()
 
 
 def test_inspection_has_no_candidate_import_and_rejects_unsafe_members(tmp_path):
     marker = tmp_path / "candidate-imported"
-    payload = package(backend_prefix=f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n")
+    payload = package(
+        backend_prefix=f"from pathlib import Path\nPath({str(marker)!r}).write_text('imported')\n"
+    )
     inspected = inspect_package(payload)
     assert inspected.digest == hashlib.sha256(payload).hexdigest()
     assert not marker.exists()
     with pytest.raises(PackageError, match="digest"):
         inspect_package(payload, expected_digest="0" * 64)
-    for unsafe in ("../escape.py", "/absolute.py", "tests/../escape.py", "backend\\evil.py", "requirements.txt", "node_modules/code.js", "library.so"):
+    for unsafe in (
+        "../escape.py",
+        "/absolute.py",
+        "tests/../escape.py",
+        "backend\\evil.py",
+        "requirements.txt",
+        "node_modules/code.js",
+        "library.so",
+    ):
         with pytest.raises(PackageError):
             inspect_package(package(extra={unsafe: b"bad"}))
     with pytest.raises(PackageError, match="large|limit|size"):
@@ -341,27 +428,39 @@ def test_candidate_review_digest_and_validation_are_immutable(env):
     assert candidate["validation"] is None
     assert candidate["manifest"] == manifest()
     assert candidate["manifest"]["corePermissions"] == ["assets.view"]
-    assert candidate["trust"]["sandboxed"] is False
+    # SDK v2: executable code never runs in the API/worker process.
+    assert candidate["trust"]["sandboxed"] is True
+    assert candidate["trust"]["runtime"] == "sandboxed"
     assert candidate["permissionDelta"]["added"][0]["code"] == READ
     assert env.host.discovery(env.owner)["items"] == []
     with pytest.raises(ExtensionValidationFailed, match="trusted validation"):
-        env.host.approve_candidate(env.owner, candidate["id"], digest=candidate["digest"], expected_version=None)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest=candidate["digest"], expected_version=None
+        )
     with pytest.raises(ExtensionValidationFailed):
         env.host.record_validation_report(candidate["id"], {"passed": True}, expected_version=1)
     with pytest.raises(ExtensionDigestMismatch):
-        env.host.record_validation_report(candidate["id"], trusted_unit_report("0" * 64), expected_version=1)
+        env.host.record_validation_report(
+            candidate["id"], trusted_unit_report("0" * 64), expected_version=1
+        )
     assert env.host.candidate_detail(env.owner, candidate["id"])["revision"] == 1
-    validated = env.host.record_validation_report(candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1)
+    validated = env.host.record_validation_report(
+        candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1
+    )
     assert validated["revision"] == 2
     with pytest.raises(ExtensionDigestMismatch):
-        env.host.approve_candidate(env.owner, candidate["id"], digest="0" * 64, expected_version=None)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest="0" * 64, expected_version=None
+        )
     assert env.host.discovery(env.owner)["items"] == []
     replacement = env.candidate(package(backend_prefix="# edited bytes invalidate review\n"))
     assert replacement["digest"] != candidate["digest"]
     old = env.host.candidate_detail(env.owner, candidate["id"])
     assert old["state"] == "superseded"
     with pytest.raises(ExtensionConflict):
-        env.host.approve_candidate(env.owner, candidate["id"], digest=candidate["digest"], expected_version=None)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest=candidate["digest"], expected_version=None
+        )
     assert env.host.discovery(env.owner)["items"] == []
 
 
@@ -370,12 +469,16 @@ def test_install_store_optimistic_versions_restart_and_disable(env):
     assert installed["state"] == "installed"
     item = env.host.discovery(env.owner)["items"][0]
     assert item["revision"] == 1 and item["version"] == "1.0.0" and item["enabled"]
-    record = env.invoke("put_record", {"record_id": "old", "label": "Before", "expected_version": 0})
+    record = env.invoke(
+        "put_record", {"record_id": "old", "label": "Before", "expected_version": 0}
+    )
     assert record == {"id": "old", "version": 1, "data": {"label": "Before"}}
     with pytest.raises(ExtensionStoreConflict):
         env.invoke("put_record", {"record_id": "old", "label": "Wrong", "expected_version": 0})
     assert env.records() == [record]
-    updated = env.invoke("put_record", {"record_id": "old", "label": "After", "expected_version": 1})
+    updated = env.invoke(
+        "put_record", {"record_id": "old", "label": "After", "expected_version": 1}
+    )
     assert updated["version"] == 2
     with pytest.raises(ExtensionStoreConflict):
         env.invoke("delete_record", {"record_id": "old", "expected_version": 1})
@@ -392,7 +495,9 @@ def test_install_store_optimistic_versions_restart_and_disable(env):
         env.host.set_enabled(env.owner, MODULE_ID, enabled=True, expected_version=1)
     env.host.set_enabled(env.owner, MODULE_ID, enabled=True, expected_version=2)
     assert env.records() == [updated]
-    assert env.invoke("delete_record", {"record_id": "old", "expected_version": 2}) == {"deleted": True}
+    assert env.invoke("delete_record", {"record_id": "old", "expected_version": 2}) == {
+        "deleted": True
+    }
     assert env.records() == []
 
 
@@ -428,9 +533,13 @@ def test_write_then_denial_rolls_back_without_secondary_writer(env, boundary):
     elif boundary == "notify":
         operation, arguments = "notify_record", {"recipient_ids": [env.owner.actor_id]}
     else:
-        operation, arguments = "write_then_asset", {
-            "mode": "get" if boundary == "asset_get" else "search", "asset_id": asset.id,
-        }
+        operation, arguments = (
+            "write_then_asset",
+            {
+                "mode": "get" if boundary == "asset_get" else "search",
+                "asset_id": asset.id,
+            },
+        )
     with pytest.raises(PermissionDenied, match="^permission denied$"):
         env.invoke(operation, arguments, actor=actor)
     assert env.records() == before
@@ -443,12 +552,17 @@ def test_write_then_sensitive_machine_authority_keeps_reference_and_scope_ceilin
     with env.factory() as session:
         identity = IdentityService(session, env.settings)
         role = identity.create_role(
-            env.owner, name="Extension remote operator",
+            env.owner,
+            name="Extension remote operator",
             permissions=[WRITE, READ, "assets.view", "assets.remote"],
         )
         machine = identity.create_user(
-            env.owner, username="remote.extension.agent", name="Remote Extension Agent",
-            role_id=role.id, actor_kind="internal_agent", delegated_by_id=env.owner.actor_id,
+            env.owner,
+            username="remote.extension.agent",
+            name="Remote Extension Agent",
+            role_id=role.id,
+            actor_kind="internal_agent",
+            delegated_by_id=env.owner.actor_id,
         )
         actor = identity.resolve_actor(machine.id)
     before = env.records()
@@ -458,7 +572,9 @@ def test_write_then_sensitive_machine_authority_keeps_reference_and_scope_ceilin
     assert env.records() == before
     approved = replace(actor, authorization_ref="human-approved-remote-operation")
     assert env.invoke("write_then_authorize", arguments, actor=approved) == {
-        "id": "pending-authority", "version": 1, "data": {"label": "transactional"},
+        "id": "pending-authority",
+        "version": 1,
+        "data": {"label": "transactional"},
     }
     before = env.records()
     scoped = replace(approved, scopes=frozenset({WRITE}))
@@ -476,7 +592,9 @@ def test_live_permissions_catalog_ceiling_no_global_leak_and_forged_claims(env, 
     forged = replace(actor, kind="human", role_id="superadmin", username=ADMIN_USERNAME)
     candidate = env.validated(package(manifest("1.1.0")))
     with pytest.raises(PermissionDenied):
-        env.host.approve_candidate(forged, candidate["id"], digest=candidate["digest"], expected_version=1)
+        env.host.approve_candidate(
+            forged, candidate["id"], digest=candidate["digest"], expected_version=1
+        )
     with env.factory() as session:
         identity = IdentityService(session, env.settings)
         assert READ in identity.catalog(env.owner).permissions
@@ -507,17 +625,27 @@ def test_machine_delegated_developer_cannot_approve_install(env):
     env.install()
     with env.factory() as session:
         identity = IdentityService(session, env.settings)
-        role = identity.create_role(env.owner, name="Extension developer", permissions=["system.modules"])
+        role = identity.create_role(
+            env.owner, name="Extension developer", permissions=["system.modules"]
+        )
         machine = identity.create_user(
-            env.owner, username="extension.agent", name="Extension Agent", role_id=role.id,
-            actor_kind="internal_agent", delegated_by_id=env.owner.actor_id,
+            env.owner,
+            username="extension.agent",
+            name="Extension Agent",
+            role_id=role.id,
+            actor_kind="internal_agent",
+            delegated_by_id=env.owner.actor_id,
         )
         actor = identity.resolve_actor(machine.id)
     candidate = env.host.submit_candidate(actor, package(manifest("1.1.0")))
-    env.host.record_validation_report(candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1)
+    env.host.record_validation_report(
+        candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1
+    )
     before = env.host.discovery(env.owner)["items"][0]
     with pytest.raises(PermissionDenied, match="human Superadmin"):
-        env.host.approve_candidate(actor, candidate["id"], digest=candidate["digest"], expected_version=1)
+        env.host.approve_candidate(
+            actor, candidate["id"], digest=candidate["digest"], expected_version=1
+        )
     with pytest.raises(PermissionDenied, match="human Superadmin"):
         env.host.set_enabled(actor, MODULE_ID, enabled=False, expected_version=1)
     assert env.host.discovery(env.owner)["items"][0] == before
@@ -531,9 +659,13 @@ def test_revision_cas_rejects_candidate_after_toggle_aba(env):
     env.host.set_enabled(env.owner, MODULE_ID, enabled=False, expected_version=1)
     env.host.set_enabled(env.owner, MODULE_ID, enabled=True, expected_version=2)
     with pytest.raises(ExtensionStale, match="revision"):
-        env.host.approve_candidate(env.owner, candidate["id"], digest=candidate["digest"], expected_version=1)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest=candidate["digest"], expected_version=1
+        )
     with pytest.raises(ExtensionStale, match="baseline"):
-        env.host.approve_candidate(env.owner, candidate["id"], digest=candidate["digest"], expected_version=3)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest=candidate["digest"], expected_version=3
+        )
     assert env.host.discovery(env.owner)["items"][0]["version"] == "1.0.0"
     assert env.records()[0]["data"] == {"label": "Before"}
 
@@ -544,7 +676,9 @@ def test_failed_migration_keeps_old_active_data_candidate_and_permissions(env):
     before = env.records()
     candidate = env.validated(package(manifest("2.0.0", schema=2), fail_migration=True))
     with pytest.raises(ExtensionMigrationFailed):
-        env.host.approve_candidate(env.owner, candidate["id"], digest=candidate["digest"], expected_version=1)
+        env.host.approve_candidate(
+            env.owner, candidate["id"], digest=candidate["digest"], expected_version=1
+        )
     assert env.records() == before
     assert env.host.discovery(env.owner)["items"][0]["version"] == "1.0.0"
     detail = env.host.candidate_detail(env.owner, candidate["id"])
@@ -559,15 +693,23 @@ def test_upgrade_and_compatible_rollback_preserve_before_and_after_records(env):
     assert upgraded["currentVersion"] == "2.0.0"
     env.invoke("put_record", {"record_id": "after", "label": "New"})
     before_rollback = env.records()
-    assert next(item for item in before_rollback if item["id"] == "before")["data"]["status"] == "active"
-    rolled = env.host.rollback(env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=2)
+    assert (
+        next(item for item in before_rollback if item["id"] == "before")["data"]["status"]
+        == "active"
+    )
+    rolled = env.host.rollback(
+        env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=2
+    )
     assert rolled["version"] == "1.0.0" and rolled["schemaVersion"] == 2 and rolled["revision"] == 3
     assert env.records() == before_rollback
     restarted = ExtensionHostService(env.settings, env.factory)
     assert restarted.discovery(env.owner)["items"][0]["version"] == "1.0.0"
     assert restarted.invoke(env.owner, MODULE_ID, "read_records", {})["items"] == before_rollback
     history = env.host.history(env.owner, MODULE_ID)["items"]
-    assert any(item["action"] == "extension.rolled_back" and item["detail"]["digest"] == first["digest"] for item in history)
+    assert any(
+        item["action"] == "extension.rolled_back" and item["detail"]["digest"] == first["digest"]
+        for item in history
+    )
 
 
 def test_incompatible_rollback_and_stale_digest_leave_business_state_unchanged(env):
@@ -576,11 +718,17 @@ def test_incompatible_rollback_and_stale_digest_leave_business_state_unchanged(e
     env.install(package(manifest("2.0.0", schema=2)))
     before = env.records()
     with pytest.raises(ExtensionRollbackIncompatible):
-        env.host.rollback(env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=2)
+        env.host.rollback(
+            env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=2
+        )
     with pytest.raises(ExtensionDigestMismatch):
-        env.host.rollback(env.owner, MODULE_ID, version="1.0.0", digest="0" * 64, expected_version=2)
+        env.host.rollback(
+            env.owner, MODULE_ID, version="1.0.0", digest="0" * 64, expected_version=2
+        )
     with pytest.raises(ExtensionStale):
-        env.host.rollback(env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=1)
+        env.host.rollback(
+            env.owner, MODULE_ID, version="1.0.0", digest=first["digest"], expected_version=1
+        )
     assert env.records() == before
     assert env.host.discovery(env.owner)["items"][0]["revision"] == 2
 
@@ -589,18 +737,25 @@ def test_notification_callback_failure_rolls_back_notice_and_business_data(env):
     env.install()
     env.invoke("put_record", {"record_id": "kept", "label": "Keep"})
     before = env.records()
+
     # Callback writes an independently observable SQL effect in the caller's
     # transaction, then fails.  This proves no callback-owned commit boundary.
     def failing_notify(*, session, **values):
-        session.execute(text("UPDATE identity_identities SET name=:name WHERE id=:id"), {"name": "must rollback", "id": env.owner.actor_id})
+        session.execute(
+            text("UPDATE identity_identities SET name=:name WHERE id=:id"),
+            {"name": "must rollback", "id": env.owner.actor_id},
+        )
         raise RuntimeError("native inbox unavailable")
+
     host = ExtensionHostService(env.settings, env.factory, notify=failing_notify)
     with pytest.raises(ExtensionHandlerFailed):
         host.invoke(env.owner, MODULE_ID, "notify_record", {"recipient_ids": [env.owner.actor_id]})
     assert env.records() == before
     with env.factory() as session:
-        assert IdentityService(session, env.settings).resolve_actor(env.owner.actor_id).display_name == "Ana Admin"
-
+        assert (
+            IdentityService(session, env.settings).resolve_actor(env.owner.actor_id).display_name
+            == "Ana Admin"
+        )
 
 
 def test_notification_native_hash_route_and_recipient_authority(env):
@@ -609,19 +764,32 @@ def test_notification_native_hash_route_and_recipient_authority(env):
     without_core, _ = env.human("notice.no.core", [READ])
     without_module, _ = env.human("notice.no.module", ["assets.view"])
     notices = []
-    host = ExtensionHostService(env.settings, env.factory, notify=lambda **values: notices.append(values))
+    host = ExtensionHostService(
+        env.settings, env.factory, notify=lambda **values: notices.append(values)
+    )
     route = "#/extensiones/record-book/records"
     recipients = [reader.actor_id, without_core.actor_id, without_module.actor_id, "absent"]
-    assert host.invoke(env.owner, MODULE_ID, "notify_record", {"recipient_ids": recipients, "url": route}) == {"notified": True}
+    assert host.invoke(
+        env.owner, MODULE_ID, "notify_record", {"recipient_ids": recipients, "url": route}
+    ) == {"notified": True}
     assert len(notices) == 1
     assert notices[0]["recipient_ids"] == (reader.actor_id,)
     assert notices[0]["url"] == route
     before = env.records()
-    for invalid in ("https://example.com/", "/arbitrary", "#/extensiones/other/records", "#/extensiones/record-book-evil/records", route + "x" * 500):
+    for invalid in (
+        "https://example.com/",
+        "/arbitrary",
+        "#/extensiones/other/records",
+        "#/extensiones/record-book-evil/records",
+        route + "x" * 500,
+    ):
         with pytest.raises(ExtensionValidationFailed, match="native extension page"):
-            host.invoke(env.owner, MODULE_ID, "notify_record", {"recipient_ids": recipients, "url": invalid})
+            host.invoke(
+                env.owner, MODULE_ID, "notify_record", {"recipient_ids": recipients, "url": invalid}
+            )
         assert env.records() == before
     assert len(notices) == 1
+
 
 def test_schedules_persist_owner_due_claim_disable_revoke_and_failure_atomicity(env):
     env.install(package(manifest(schedules=True)))
@@ -641,7 +809,11 @@ def test_schedules_persist_owner_due_claim_disable_revoke_and_failure_atomicity(
     env.host.set_enabled(env.owner, MODULE_ID, enabled=True, expected_version=2)
     # Live owner revocation prevents execution although the persisted schedule remains.
     with env.factory() as session:
-        session.execute(text("DELETE FROM identity_role_policies WHERE role_id='superadmin' AND resource='ext_record_book' AND operation='write'"))
+        session.execute(
+            text(
+                "DELETE FROM identity_role_policies WHERE role_id='superadmin' AND resource='ext_record_book' AND operation='write'"
+            )
+        )
         session.commit()
     assert env.host.run_due_schedules(due + timedelta(minutes=2))["succeeded"] == 0
     assert env.invoke("get_record", {"record_id": "ticks"})["data"] == {"count": 1}
@@ -669,13 +841,27 @@ def test_http_auth_csrf_review_install_history_frontend_skill_and_invoke(env):
     prefix = env.settings.api_prefix + "/extensions"
     with TestClient(app) as client:
         assert client.get(prefix).status_code == 401
-        login = client.post(env.settings.api_prefix + "/auth/login", json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD}, headers={"Origin": env.settings.auth_origin})
+        login = client.post(
+            env.settings.api_prefix + "/auth/login",
+            json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
+            headers={"Origin": env.settings.auth_origin},
+        )
         assert login.status_code == 200, login.text
         headers = {"Origin": env.settings.auth_origin, "X-CSRF-Token": login.json()["csrfToken"]}
-        rejected = client.post(prefix + "/candidates", content=iter([b"x" * MAX_MEMBER_BYTES] * 5), headers={**headers, "Content-Type": "application/zip"})
-        assert rejected.status_code == 413 and rejected.json()["error"]["code"] == "package_too_large"
+        rejected = client.post(
+            prefix + "/candidates",
+            content=iter([b"x" * MAX_MEMBER_BYTES] * 5),
+            headers={**headers, "Content-Type": "application/zip"},
+        )
+        assert (
+            rejected.status_code == 413 and rejected.json()["error"]["code"] == "package_too_large"
+        )
         assert env.host.list_candidates(env.owner)["items"] == []
-        upload = client.post(prefix + "/candidates", content=package(), headers={**headers, "Content-Type": "application/zip"})
+        upload = client.post(
+            prefix + "/candidates",
+            content=package(),
+            headers={**headers, "Content-Type": "application/zip"},
+        )
         assert upload.status_code == 201, upload.text
         candidate = upload.json()
         assert candidate["manifest"] == manifest()
@@ -683,10 +869,19 @@ def test_http_auth_csrf_review_install_history_frontend_skill_and_invoke(env):
         assert detail.status_code == 200
         assert detail.json()["manifest"] == manifest()
         assert detail.json()["manifest"]["corePermissions"] == ["assets.view"]
-        env.host.record_validation_report(candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1)
+        env.host.record_validation_report(
+            candidate["id"], trusted_unit_report(candidate["digest"]), expected_version=1
+        )
         approval = {"digest": candidate["digest"], "expectedVersion": None}
-        assert client.post(prefix + "/candidates/" + candidate["id"] + "/approve", json=approval).status_code == 403
-        approved = client.post(prefix + "/candidates/" + candidate["id"] + "/approve", json=approval, headers=headers)
+        assert (
+            client.post(
+                prefix + "/candidates/" + candidate["id"] + "/approve", json=approval
+            ).status_code
+            == 403
+        )
+        approved = client.post(
+            prefix + "/candidates/" + candidate["id"] + "/approve", json=approval, headers=headers
+        )
         assert approved.status_code == 200, approved.text
         assert approved.json()["manifest"]["id"] == MODULE_ID
         discovery = client.get(prefix).json()["items"][0]
@@ -695,14 +890,27 @@ def test_http_auth_csrf_review_install_history_frontend_skill_and_invoke(env):
         assert frontend.status_code == 200 and "ITSMExtensions.register" in frontend.text
         assert frontend.headers["cache-control"] == "no-store"
         assert frontend.headers["x-content-type-options"] == "nosniff"
-        assert client.get(prefix + "/" + MODULE_ID + "/frontend.js?digest=" + "0" * 64).json()["error"]["code"] == "digest_mismatch"
+        assert (
+            client.get(prefix + "/" + MODULE_ID + "/frontend.js?digest=" + "0" * 64).json()[
+                "error"
+            ]["code"]
+            == "digest_mismatch"
+        )
         skill = client.get(prefix + "/" + MODULE_ID + "/skills/record-guide")
         assert skill.status_code == 200 and skill.json()["content"].startswith("# Record guide")
         assert client.get(prefix + "/" + MODULE_ID + "/history").json()["items"]
-        invoke = client.post(prefix + "/" + MODULE_ID + "/invoke/put_record", json={"record_id": "http", "label": "Native"}, headers=headers)
+        invoke = client.post(
+            prefix + "/" + MODULE_ID + "/invoke/put_record",
+            json={"record_id": "http", "label": "Native"},
+            headers=headers,
+        )
         assert invoke.status_code == 200, invoke.text
         assert invoke.json()["data"] == {"label": "Native"}
-        stale = client.post(prefix + "/" + MODULE_ID + "/enabled", json={"enabled": False, "expectedVersion": 0}, headers=headers)
+        stale = client.post(
+            prefix + "/" + MODULE_ID + "/enabled",
+            json={"enabled": False, "expectedVersion": 0},
+            headers=headers,
+        )
         assert stale.status_code == 409 and stale.json()["error"]["code"] == "stale"
         assert env.records()[0]["id"] == "http"
 
@@ -737,10 +945,12 @@ def test_schedule_rechecks_persisted_permission_after_module_load(env, monkeypat
 
     def revoke_then_load(version):
         with env.factory() as session:
-            session.execute(text(
-                "DELETE FROM identity_role_policies WHERE role_id='superadmin' "
-                "AND resource='ext_record_book' AND operation='write'"
-            ))
+            session.execute(
+                text(
+                    "DELETE FROM identity_role_policies WHERE role_id='superadmin' "
+                    "AND resource='ext_record_book' AND operation='write'"
+                )
+            )
             session.commit()
         return original(version)
 

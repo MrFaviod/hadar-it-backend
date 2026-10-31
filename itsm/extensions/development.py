@@ -16,11 +16,11 @@ import tempfile
 import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from itsm.extensions.sdk.contract import ManifestError
+from itsm.extensions.sdk.contract import SDK_VERSION, ManifestError
 from itsm.extensions.sdk.generator import generate_package, write_package
 from itsm.extensions.sdk.package import (
     DEFAULT_LIMITS,
@@ -44,7 +44,11 @@ REFERENCE_INDEX: tuple[tuple[str, str, str], ...] = (
     ("lifecycle", "Lifecycle", "Workspace, candidate, approval, install and rollback."),
     ("manifest", "Manifest", "Exact extension.json fields and constraints."),
     ("backend", "Backend", "register(sdk), handler context and store contract."),
-    ("frontend", "Frontend", "Native Vue registration and host components."),
+    (
+        "frontend",
+        "Frontend",
+        "Declarative host-rendered views; isolated iframe components only.",
+    ),
     ("collections", "Collections", "Namespaced durable data and optimistic versions."),
     ("migrations", "Migrations", "Ordered explicit data migrations and rollback."),
     ("security", "Security", "Trusted native code, permissions and package safety."),
@@ -138,9 +142,7 @@ def _atomic_text(path: Path, content: str, mode: int = 0o600) -> None:
     """Write a server-owned metadata/source file without following links."""
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    descriptor, temporary = tempfile.mkstemp(
-        prefix=".itsm-sdk-", dir=path.parent, text=False
-    )
+    descriptor, temporary = tempfile.mkstemp(prefix=".itsm-sdk-", dir=path.parent, text=False)
     try:
         os.fchmod(descriptor, mode)
         with os.fdopen(descriptor, "wb") as handle:
@@ -157,7 +159,7 @@ def _failure(digest: str, error: str) -> dict[str, Any]:
     return {
         "status": "failed",
         "digest": digest if re.fullmatch(r"[0-9a-f]{64}", digest or "") else "",
-        "sdkVersion": 1,
+        "sdkVersion": SDK_VERSION,
         "checks": [{"name": "development", "status": "failed", "detail": error[:1000]}],
         "errors": [error[:1000]],
         "container": {
@@ -175,7 +177,7 @@ def _failure(digest: str, error: str) -> dict[str, Any]:
                 f"file={DEFAULT_LIMITS.max_file_bytes}"
             ),
         },
-        "completedAt": datetime.now(timezone.utc).isoformat(),
+        "completedAt": datetime.now(UTC).isoformat(),
     }
 
 
@@ -184,7 +186,7 @@ def _report_is_passed(report: Any, digest: str) -> bool:
         isinstance(report, dict)
         and report.get("status") == "passed"
         and report.get("digest") == digest
-        and report.get("sdkVersion") == 1
+        and report.get("sdkVersion") == SDK_VERSION
         and isinstance(report.get("checks"), list)
         and isinstance(report.get("errors"), list)
         and not report["errors"]
@@ -242,9 +244,7 @@ class DevelopmentService:
 
     # ------------------------------------------------------------------ public
 
-    def dispatch(
-        self, method: str, arguments: Any, principal: Any
-    ) -> dict[str, Any]:
+    def dispatch(self, method: str, arguments: Any, principal: Any) -> dict[str, Any]:
         """Authorize the trusted principal, then execute one bounded method."""
         if not isinstance(method, str) or method not in _METHODS:
             raise InvalidArguments("unknown extension development method")
@@ -267,7 +267,7 @@ class DevelopmentService:
     def _sdk_index(self, arguments: Any, principal: Any) -> dict[str, Any]:
         _arguments(arguments, set(), set())
         return {
-            "sdkVersion": 1,
+            "sdkVersion": SDK_VERSION,
             "schema": SCHEMA_RESOURCE,
             "trust": "trusted-native",
             "notice": (
@@ -306,7 +306,7 @@ class DevelopmentService:
         if len(content.encode("utf-8")) > MAX_REFERENCE_BYTES:
             raise DevelopmentUnavailable("SDK reference exceeds the bounded size")
         return {
-            "sdkVersion": 1,
+            "sdkVersion": SDK_VERSION,
             "name": entry[0],
             "title": entry[1],
             "summary": entry[2],
@@ -316,16 +316,18 @@ class DevelopmentService:
     # ------------------------------------------------------------ workspaces
 
     def _workspace_create(self, arguments: Any, principal: Any) -> dict[str, Any]:
-        data = _arguments(
-            arguments, {"id", "name", "description"}, {"id", "name"}
-        )
+        data = _arguments(arguments, {"id", "name", "description"}, {"id", "name"})
         workspace_id = data["id"]
         if not isinstance(workspace_id, str) or not WORKSPACE_ID.fullmatch(workspace_id):
             raise InvalidArguments("workspace id is invalid")
         if len(workspace_id) < 2 or len(workspace_id) > 48:
             raise InvalidArguments("workspace id must be between 2 and 48 characters")
         name = _text(data["name"], "name", 120)
-        description = _text(data.get("description", "Registros internos de ejemplo."), "description", MAX_DESCRIPTION)
+        description = _text(
+            data.get("description", "Registros internos de ejemplo."),
+            "description",
+            MAX_DESCRIPTION,
+        )
         actor_root = self._actor_root(principal, create=True)
         workspaces = actor_root / "workspaces"
         self._assert_directory_safe(actor_root)
@@ -431,9 +433,7 @@ class DevelopmentService:
             report = _failure(built.digest, f"validator failed: {type(exc).__name__}")
 
         if not isinstance(report, dict) or report.get("digest") != built.digest:
-            report = _failure(
-                built.digest, "validation digest does not match the package bytes"
-            )
+            report = _failure(built.digest, "validation digest does not match the package bytes")
         elif report.get("status") not in ("passed", "failed"):
             report = _failure(built.digest, "validation status is invalid")
         elif report.get("status") == "failed" and not report.get("errors"):
@@ -474,17 +474,13 @@ class DevelopmentService:
                     raise DevelopmentUnavailable("extension host returned no candidate id")
                 record = getattr(self._host, "record_validation_report", None)
                 if record is None:
-                    raise DevelopmentUnavailable(
-                        "extension host cannot record validation evidence"
-                    )
+                    raise DevelopmentUnavailable("extension host cannot record validation evidence")
                 record(candidate_id, report, expected_version=revision)
             else:
                 submit = getattr(self._host, "submit_candidate", None)
                 if submit is None:
                     raise DevelopmentUnavailable("extension host cannot accept candidates")
-                detail = submit(
-                    principal, built.data, expected_digest=built.digest
-                )
+                detail = submit(principal, built.data, expected_digest=built.digest)
                 if not isinstance(detail, Mapping):
                     raise DevelopmentUnavailable("extension host returned no candidate")
                 candidate_id = detail.get("id")
@@ -493,9 +489,7 @@ class DevelopmentService:
                     raise DevelopmentUnavailable("extension host returned no candidate id")
                 record = getattr(self._host, "record_validation_report", None)
                 if record is None:
-                    raise DevelopmentUnavailable(
-                        "extension host cannot record validation evidence"
-                    )
+                    raise DevelopmentUnavailable("extension host cannot record validation evidence")
                 record(candidate_id, report, expected_version=revision)
         except DevelopmentError:
             raise
@@ -512,9 +506,7 @@ class DevelopmentService:
             raise PermissionDenied("permission denied")
         with self._session_factory() as session:
             identity = self._identity_factory(session)
-            identity.authorize(
-                principal, self._permission, resource="extensions:development"
-            )
+            identity.authorize(principal, self._permission, resource="extensions:development")
 
     def _actor_root(self, principal: Any, *, create: bool = False) -> Path:
         actor = getattr(principal, "actor_id", None)
@@ -553,7 +545,7 @@ class DevelopmentService:
         path = actor_root / "meta" / f"{workspace_id}.json"
         try:
             content = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        except OSError, json.JSONDecodeError, UnicodeDecodeError:
             return {"id": workspace_id}
         return content if isinstance(content, dict) else {"id": workspace_id}
 
@@ -561,11 +553,7 @@ class DevelopmentService:
         directory = actor_root / "workspaces"
         if not directory.is_dir() or directory.is_symlink():
             return 0
-        return sum(
-            1
-            for item in directory.iterdir()
-            if item.is_dir() and not item.is_symlink()
-        )
+        return sum(1 for item in directory.iterdir() if item.is_dir() and not item.is_symlink())
 
     def _list_workspaces(self, actor_root: Path) -> list[dict[str, Any]]:
         directory = actor_root / "workspaces"
@@ -672,7 +660,7 @@ class DevelopmentService:
         path = self._validation_path(actor_root, workspace_id)
         try:
             stored = json.loads(path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        except OSError, json.JSONDecodeError, UnicodeDecodeError:
             return None
         if not isinstance(stored, dict):
             return None

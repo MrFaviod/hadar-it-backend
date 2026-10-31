@@ -18,15 +18,15 @@ import re
 import secrets
 import selectors
 import subprocess
-import socket
 import threading
-from collections.abc import Collection
 import time
+from collections.abc import Collection
 from datetime import datetime
-from typing import Any
 from http.server import BaseHTTPRequestHandler, HTTPServer
+from typing import Any
 from urllib.parse import urlsplit
 
+from .sdk.contract import SDK_VERSION
 from .sdk.validator.protocol import (
     DEFAULT_LIMITS,
     MAX_OUTPUT_BYTES,
@@ -107,7 +107,7 @@ class ContainerValidator:
                 timeout=10,
                 check=False,
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             return False
         return completed.returncode == 0
 
@@ -189,7 +189,7 @@ class ContainerValidator:
             return self._failed(expected, f"validator container exited with {returncode}")
         try:
             report = json.loads(output.decode("utf-8"))
-        except (UnicodeDecodeError, json.JSONDecodeError):
+        except UnicodeDecodeError, json.JSONDecodeError:
             return self._failed(expected, "validator did not return a JSON report")
         return self._checked(report, expected)
 
@@ -197,15 +197,20 @@ class ContainerValidator:
         """Drain both pipes while bounding total bytes and wall-clock duration."""
         environment = {"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/nonexistent"}
         process = subprocess.Popen(
-            command, stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE, env=environment,
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environment,
         )
         output = bytearray()
         received = 0
         offset = 0
         failure = None
         deadline = time.monotonic() + self._timeout
-        assert process.stdin is not None and process.stdout is not None and process.stderr is not None
+        assert (
+            process.stdin is not None and process.stdout is not None and process.stderr is not None
+        )
         with selectors.DefaultSelector() as selector:
             for stream, event, kind in (
                 (process.stdin, selectors.EVENT_WRITE, "input"),
@@ -224,7 +229,7 @@ class ContainerValidator:
                         stream = key.fileobj
                         if key.data == "input":
                             try:
-                                offset += os.write(stream.fileno(), frame[offset:offset + 16384])
+                                offset += os.write(stream.fileno(), frame[offset : offset + 16384])
                             except BrokenPipeError:
                                 offset = len(frame)
                             if offset == len(frame):
@@ -264,25 +269,31 @@ class ContainerValidator:
         try:
             subprocess.run(
                 [self._docker, "rm", "--force", name],
-                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
-                timeout=10, check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                timeout=10,
+                check=False,
                 env={"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/nonexistent"},
             )
-        except (OSError, subprocess.TimeoutExpired):
+        except OSError, subprocess.TimeoutExpired:
             pass
 
     def _checked(self, report: Any, expected: str) -> dict[str, Any]:
         error = _report_error(report, expected)
         if error:
             return self._failed(expected, error)
-        report["container"] = {**report["container"], "image": self._image, "wrapper": "fixed-docker"}
+        report["container"] = {
+            **report["container"],
+            "image": self._image,
+            "wrapper": "fixed-docker",
+        }
         return report
 
     def _failed(self, digest: str, error: str) -> dict[str, Any]:
         return {
             "status": "failed",
             "digest": digest if DIGEST_PATTERN.fullmatch(digest or "") else "",
-            "sdkVersion": 1,
+            "sdkVersion": SDK_VERSION,
             "checks": [{"name": "validator", "status": "failed", "detail": error}],
             "errors": [error],
             "container": {
@@ -311,11 +322,13 @@ def _report_error(report: Any, expected: str) -> str | None:
         return "validator report status is invalid"
     if report["digest"] != expected or not DIGEST_PATTERN.fullmatch(expected):
         return "validator report digest does not match the package"
-    if type(report["sdkVersion"]) is not int or report["sdkVersion"] != 1:
+    if type(report["sdkVersion"]) is not int or report["sdkVersion"] != SDK_VERSION:
         return "validator report sdkVersion is invalid"
     errors = report["errors"]
-    if not isinstance(errors, list) or len(errors) > 40 or any(
-        not isinstance(item, str) or len(item) > 1200 for item in errors
+    if (
+        not isinstance(errors, list)
+        or len(errors) > 40
+        or any(not isinstance(item, str) or len(item) > 1200 for item in errors)
     ):
         return "validator errors are malformed"
     checks = report["checks"]
@@ -327,7 +340,11 @@ def _report_error(report: Any, expected: str) -> str | None:
             return "validator check has an unexpected shape"
         if check["status"] not in ("passed", "failed"):
             return "validator check status is invalid"
-        if not isinstance(check["name"], str) or not 1 <= len(check["name"]) <= 128 or check["name"] in names:
+        if (
+            not isinstance(check["name"], str)
+            or not 1 <= len(check["name"]) <= 128
+            or check["name"] in names
+        ):
             return "validator check name is invalid"
         names.add(check["name"])
         if not isinstance(check["detail"], str) or len(check["detail"]) > 1200:
@@ -336,11 +353,13 @@ def _report_error(report: Any, expected: str) -> str | None:
         return "validator container metadata is invalid"
     try:
         completed = datetime.fromisoformat(report["completedAt"].replace("Z", "+00:00"))
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return "validator completion time is invalid"
     if completed.tzinfo is None:
         return "validator completion time lacks a timezone"
-    if report["status"] == "passed" and (errors or any(item["status"] != "passed" for item in checks)):
+    if report["status"] == "passed" and (
+        errors or any(item["status"] != "passed" for item in checks)
+    ):
         return "validator reported failed checks or errors as passed"
     if report["status"] == "failed" and not errors:
         return "validator reported failure without errors"
@@ -348,8 +367,10 @@ def _report_error(report: Any, expected: str) -> str | None:
 
 
 def _broker_token(token: str) -> str:
-    if not isinstance(token, str) or not 32 <= len(token) <= 512 or any(
-        ord(character) < 33 or ord(character) > 126 for character in token
+    if (
+        not isinstance(token, str)
+        or not 32 <= len(token) <= 512
+        or any(ord(character) < 33 or ord(character) > 126 for character in token)
     ):
         raise ValueError("validator broker token must contain 32..512 printable ASCII characters")
     return token
@@ -358,20 +379,33 @@ def _broker_token(token: str) -> str:
 class RemoteContainerValidator:
     """Call only the operator-configured broker; never use ambient HTTP proxies."""
 
-    def __init__(self, url: str, *, token: str, timeout: float = 75, max_output: int = MAX_OUTPUT_BYTES) -> None:
+    def __init__(
+        self, url: str, *, token: str, timeout: float = 75, max_output: int = MAX_OUTPUT_BYTES
+    ) -> None:
         parts = urlsplit(url)
         try:
             port = parts.port
         except ValueError as exc:
             raise ValueError("validator broker URL port is invalid") from exc
         if (
-            parts.scheme not in ("http", "https") or not parts.hostname
-            or parts.username is not None or parts.password is not None
-            or parts.path not in ("", "/") or parts.query or parts.fragment
-            or port == 0 or any(character.isspace() for character in url)
+            parts.scheme not in ("http", "https")
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.path not in ("", "/")
+            or parts.query
+            or parts.fragment
+            or port == 0
+            or any(character.isspace() for character in url)
         ):
-            raise ValueError("validator broker URL must be an HTTP(S) server base URL without credentials, path, query or fragment")
-        if not isinstance(timeout, (int, float)) or isinstance(timeout, bool) or not 5 <= timeout <= 315:
+            raise ValueError(
+                "validator broker URL must be an HTTP(S) server base URL without credentials, path, query or fragment"
+            )
+        if (
+            not isinstance(timeout, (int, float))
+            or isinstance(timeout, bool)
+            or not 5 <= timeout <= 315
+        ):
             raise ValueError("validator broker timeout must be between 5 and 315 seconds")
         if type(max_output) is not int or not 1024 <= max_output <= MAX_OUTPUT_BYTES:
             raise ValueError("validator broker output limit must be between 1 KiB and 256 KiB")
@@ -380,18 +414,29 @@ class RemoteContainerValidator:
         self._timeout, self._max_output = float(timeout), max_output
 
     def validate(self, package_bytes: bytes, *, digest: str | None = None) -> dict[str, Any]:
-        if not isinstance(package_bytes, bytes) or not 1 <= len(package_bytes) <= DEFAULT_LIMITS["archiveBytes"]:
+        if (
+            not isinstance(package_bytes, bytes)
+            or not 1 <= len(package_bytes) <= DEFAULT_LIMITS["archiveBytes"]
+        ):
             raise ValueError("validator package must contain 1..4194304 bytes")
         actual = hashlib.sha256(package_bytes).hexdigest()
         if digest is not None and digest != actual:
             raise ValueError("validator package digest does not match its bytes")
-        connection_type = http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
+        connection_type = (
+            http.client.HTTPSConnection if self._scheme == "https" else http.client.HTTPConnection
+        )
         connection = connection_type(self._hostname, self._port, timeout=self._timeout)
         try:
-            connection.request("POST", "/validate", body=package_bytes, headers={
-                "Authorization": "Bearer " + self._token,
-                "Content-Type": "application/zip", "X-ITSM-Extension-Digest": actual,
-            })
+            connection.request(
+                "POST",
+                "/validate",
+                body=package_bytes,
+                headers={
+                    "Authorization": "Bearer " + self._token,
+                    "Content-Type": "application/zip",
+                    "X-ITSM-Extension-Digest": actual,
+                },
+            )
             response = connection.getresponse()
             if response.status == 401:
                 raise ValidatorUnavailable("validator broker authorization failed")
@@ -415,8 +460,12 @@ class RemoteContainerValidator:
 
 
 def create_validator_server(
-    *, validator: ContainerValidator, token: str, host: str = "127.0.0.1",
-    port: int = 8766, read_timeout: float = 10,
+    *,
+    validator: ContainerValidator,
+    token: str,
+    host: str = "127.0.0.1",
+    port: int = 8766,
+    read_timeout: float = 10,
 ) -> HTTPServer:
     """Build a one-request-at-a-time broker. The caller owns its lifecycle."""
     expected_auth = "Bearer " + _broker_token(token)
@@ -482,7 +531,7 @@ def create_validator_server(
                     self._reply(502, {"error": "validator returned an invalid report"})
                     return
                 self._reply(200, report)
-            except (OSError, socket.timeout, ValidatorUnavailable):
+            except TimeoutError, OSError, ValidatorUnavailable:
                 self._reply(503, {"error": "validator runtime is unavailable"})
 
     server = HTTPServer((host, port), Handler)

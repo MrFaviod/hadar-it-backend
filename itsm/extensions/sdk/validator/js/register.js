@@ -5,7 +5,18 @@
 const path = require("path");
 
 let registration = null;
+// SDK v2 bridge: isolated iframe code registers components without an id.
+// The legacy v1 signature stays accepted so older bundles fail on content,
+// not on the bridge shape.
 globalThis.window = {
+  ITSMExtension: {
+    register(value) {
+      if (registration !== null) {
+        throw new Error("register called more than once");
+      }
+      registration = { id: "isolated", value };
+    },
+  },
   ITSMExtensions: {
     register(id, value) {
       if (registration !== null) {

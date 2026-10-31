@@ -1,0 +1,157 @@
+{
+  "sdkVersion": 2,
+  "runtime": "declarative",
+  "id": "{{EXT_ID}}",
+  "name": "{{EXT_NAME}}",
+  "description": "{{EXT_DESCRIPTION}}",
+  "version": "{{EXT_VERSION}}",
+  "storage": {"engine": "sqlite"},
+  "capabilities": [],
+  "permissions": [
+    {
+      "code": "{{PERMISSION_PREFIX}}notes_read",
+      "label": "Consultar notas",
+      "description": "Listar y consultar las notas del módulo."
+    },
+    {
+      "code": "{{PERMISSION_PREFIX}}notes_write",
+      "label": "Gestionar notas",
+      "description": "Crear, actualizar y eliminar notas del módulo."
+    }
+  ],
+  "corePermissions": [],
+  "operations": [
+    {
+      "name": "list_notes",
+      "kind": "list",
+      "collection": "notes",
+      "description": "Lista las notas con filtros de igualdad sobre campos declarados.",
+      "permission": "{{PERMISSION_PREFIX}}notes_read",
+      "mutation": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer"},
+          "offset": {"type": "integer"},
+          "filters": {"type": "object"}
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "get_note",
+      "kind": "get",
+      "collection": "notes",
+      "description": "Obtiene una nota por su identificador.",
+      "permission": "{{PERMISSION_PREFIX}}notes_read",
+      "mutation": false,
+      "parameters": {
+        "type": "object",
+        "properties": {"record_id": {"type": "string"}},
+        "required": ["record_id"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "put_note",
+      "kind": "put",
+      "collection": "notes",
+      "description": "Crea o actualiza una nota validando el esquema de la colección.",
+      "permission": "{{PERMISSION_PREFIX}}notes_write",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "record_id": {"type": "string"},
+          "data": {"type": "object"},
+          "expected_version": {"type": "integer"}
+        },
+        "required": ["data"],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "delete_note",
+      "kind": "delete",
+      "collection": "notes",
+      "description": "Elimina una nota con control de versión.",
+      "permission": "{{PERMISSION_PREFIX}}notes_write",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "record_id": {"type": "string"},
+          "expected_version": {"type": "integer"}
+        },
+        "required": ["record_id"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "collections": [
+    {
+      "name": "notes",
+      "description": "Notas del módulo, ejecutadas por el host sobre su archivo SQLite.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string", "maxLength": 200},
+          "body": {"type": "string", "maxLength": 4000},
+          "status": {"type": "string", "enum": ["open", "closed"]},
+          "assetId": {"type": "string", "maxLength": 64}
+        },
+        "required": ["title"],
+        "additionalProperties": false
+      },
+      "references": [
+        {"field": "assetId", "entity": "asset", "onArchive": "keep", "onDelete": "flag"}
+      ]
+    }
+  ],
+  "schemaVersion": 1,
+  "compatibleSchemaVersions": [1],
+  "migrations": [],
+  "frontend": {
+    "pages": [
+      {
+        "id": "notes",
+        "label": "Notas",
+        "icon": "list",
+        "permission": "{{PERMISSION_PREFIX}}notes_read",
+        "view": {
+          "table": {
+            "operation": "list_notes",
+            "columns": [
+              {"field": "title", "label": "Título"},
+              {"field": "status", "label": "Estado"}
+            ]
+          }
+        }
+      }
+    ],
+    "assetPanels": [
+      {
+        "id": "note-panel",
+        "label": "Nota",
+        "permission": "{{PERMISSION_PREFIX}}notes_read",
+        "view": {
+          "table": {
+            "operation": "list_notes",
+            "columns": [{"field": "title", "label": "Título"}],
+            "filterAsset": true
+          }
+        }
+      }
+    ],
+    "contributions": []
+  },
+  "schedules": [],
+  "skills": [
+    {
+      "name": "{{EXT_ID}}",
+      "description": "Operar las notas declarativas del módulo.",
+      "path": "skills/{{EXT_ID}}/SKILL.md"
+    }
+  ]
+}

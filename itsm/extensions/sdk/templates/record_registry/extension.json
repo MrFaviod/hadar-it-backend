@@ -1,9 +1,12 @@
 {
-  "sdkVersion": 1,
+  "sdkVersion": 2,
+  "runtime": "sandboxed",
   "id": "{{EXT_ID}}",
   "name": "{{EXT_NAME}}",
   "description": "{{EXT_DESCRIPTION}}",
   "version": "{{EXT_VERSION}}",
+  "storage": {"engine": "sqlite"},
+  "capabilities": [],
   "permissions": [
     {
       "code": "{{PERMISSION_PREFIX}}records_read",
@@ -20,6 +23,7 @@
   "operations": [
     {
       "name": "list_records",
+      "kind": "handler",
       "description": "Lista los registros del módulo con un límite acotado.",
       "permission": "{{PERMISSION_PREFIX}}records_read",
       "mutation": false,
@@ -36,6 +40,7 @@
     },
     {
       "name": "create_record",
+      "kind": "handler",
       "description": "Crea un registro nuevo en el módulo.",
       "permission": "{{PERMISSION_PREFIX}}records_write",
       "mutation": true,
@@ -55,7 +60,21 @@
   "collections": [
     {
       "name": "records",
-      "description": "Registros propios del módulo, aislados por espacio de nombres."
+      "description": "Registros propios del módulo, aislados en su archivo SQLite.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string", "maxLength": 200},
+          "status": {"type": "string", "enum": ["open", "closed"]},
+          "notes": {"type": "string", "maxLength": 2000},
+          "assetId": {"type": "string", "maxLength": 64}
+        },
+        "required": ["title", "status"],
+        "additionalProperties": false
+      },
+      "references": [
+        {"field": "assetId", "entity": "asset", "onArchive": "keep", "onDelete": "flag"}
+      ]
     }
   ],
   "schemaVersion": 2,
@@ -68,22 +87,35 @@
     }
   ],
   "frontend": {
-    "entry": "frontend.js",
     "pages": [
       {
         "id": "records",
         "label": "Registros",
-        "component": "RecordList",
+        "icon": "list",
         "permission": "{{PERMISSION_PREFIX}}records_read",
-        "icon": "list"
+        "view": {
+          "table": {
+            "operation": "list_records",
+            "columns": [
+              {"field": "title", "label": "Título"},
+              {"field": "status", "label": "Estado"}
+            ]
+          }
+        }
       }
     ],
     "assetPanels": [
       {
         "id": "record-summary",
         "label": "Registro",
-        "component": "RecordSummary",
-        "permission": "{{PERMISSION_PREFIX}}records_read"
+        "permission": "{{PERMISSION_PREFIX}}records_read",
+        "view": {
+          "table": {
+            "operation": "list_records",
+            "columns": [{"field": "title", "label": "Título"}],
+            "filterAsset": true
+          }
+        }
       }
     ],
     "contributions": []

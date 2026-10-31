@@ -7,10 +7,10 @@ no core checkout is copied into it.
 
 from __future__ import annotations
 
-import copy
 import contextlib
-import http.client
+import copy
 import hashlib
+import http.client
 import io
 import json
 import os
@@ -18,14 +18,13 @@ import shutil
 import stat
 import subprocess
 import sys
-import time
 import threading
+import time
 import zipfile
 from pathlib import Path
 from typing import Any
 
 import pytest
-
 from itsm.extensions.development import (
     DevelopmentService,
     DevelopmentUnavailable,
@@ -43,7 +42,6 @@ from itsm.extensions.sdk.package import (
     PackageError,
     build_package,
     parse_package,
-    read_workspace,
 )
 from itsm.extensions.sdk.validator.protocol import build_frame
 from itsm.extensions.validator import ContainerValidator, ValidatorUnavailable
@@ -95,7 +93,7 @@ def _report_for(
     return {
         "status": status,
         "digest": actual,
-        "sdkVersion": 1,
+        "sdkVersion": 2,
         "checks": [
             {
                 "name": "archive",
@@ -242,13 +240,17 @@ def test_generate_writes_complete_working_record_registry(tmp_path: Path) -> Non
     assert set(generated.files) == {
         "extension.json",
         "backend.py",
-        "frontend.js",
         "skills/record-registry/SKILL.md",
         "tests/test_backend.py",
     }
     manifest = validate_manifest(generated.manifest, known_core_permissions=())
     assert manifest["id"] == "record-registry"
-    assert manifest["sdkVersion"] == 1
+    assert manifest["sdkVersion"] == 2
+    assert manifest["runtime"] == "sandboxed"
+    assert manifest["storage"] == {"engine": "sqlite"}
+    assert {item["kind"] for item in manifest["operations"]} == {"handler"}
+    assert manifest["frontend"]["pages"][0]["view"]["table"]["operation"] == "list_records"
+    assert "entry" not in manifest["frontend"]
     assert manifest["version"] == "1.0.0"
     assert manifest["schemaVersion"] == 2
     assert manifest["compatibleSchemaVersions"] == [1, 2]
@@ -271,6 +273,38 @@ def test_generate_writes_complete_working_record_registry(tmp_path: Path) -> Non
         assert (target / relative).read_text(encoding="utf-8") == content
     with pytest.raises(PackageError):
         write_package(target, generated)
+
+    declarative = generate_package(
+        extension_id="notes-board",
+        name="Tablero de notas",
+        description="Notas declarativas sin código de módulo.",
+        runtime="declarative",
+    )
+    assert set(declarative.files) == {
+        "extension.json",
+        "skills/notes-board/SKILL.md",
+        "tests/test_module.py",
+    }
+    declarative_manifest = validate_manifest(declarative.manifest, known_core_permissions=())
+    assert declarative_manifest["runtime"] == "declarative"
+    assert "backend.py" not in declarative.files
+    assert {item["kind"] for item in declarative_manifest["operations"]} == {
+        "list",
+        "get",
+        "put",
+        "delete",
+    }
+    assert declarative_manifest["migrations"] == []
+    assert (
+        declarative_manifest["frontend"]["pages"][0]["view"]["table"]["operation"] == "list_notes"
+    )
+    with pytest.raises(ValueError, match="runtime"):
+        generate_package(
+            extension_id="notes-board",
+            name="Tablero de notas",
+            description="Runtime desconocido.",
+            runtime="native",
+        )
 
 
 def test_package_bytes_are_deterministic_and_digest_is_actual_bytes() -> None:
@@ -308,17 +342,8 @@ def test_real_harness_validates_generated_package_operations_and_migrations(
         description="Registros internos de ejemplo para el SDK.",
     )
     built = build_package(generated.files, known_core_permissions=())
-    payload = build_frame(
-        built.data, digest=built.digest, known_core_permissions=()
-    )
-    run_py = (
-        BACKEND_ROOT
-        / "itsm"
-        / "extensions"
-        / "sdk"
-        / "validator"
-        / "run.py"
-    )
+    payload = build_frame(built.data, digest=built.digest, known_core_permissions=())
+    run_py = BACKEND_ROOT / "itsm" / "extensions" / "sdk" / "validator" / "run.py"
     completed = subprocess.run(
         [sys.executable, "-I", str(run_py)],
         input=payload,
@@ -338,9 +363,9 @@ def test_real_harness_validates_generated_package_operations_and_migrations(
     assert engine.startswith("python ")
     assert " js " in engine and engine.split(" js ", 1)[1].startswith(("node ", "bun "))
     checks = {item["name"]: item for item in report["checks"]}
-    assert REQUIRED_CHECKS <= set(checks)
+    assert set(checks) >= REQUIRED_CHECKS
     assert all(item["status"] == "passed" for item in checks.values())
-    assert checks["archive"]["detail"].startswith("5 files;")
+    assert checks["archive"]["detail"].startswith("4 files;")
     assert "expanded bytes" in checks["archive"]["detail"]
     assert "backend.py" in checks["archive"]["detail"]
     assert "def register" not in checks["archive"]["detail"]
@@ -349,36 +374,45 @@ def test_real_harness_validates_generated_package_operations_and_migrations(
     assert checks["operations"]["detail"].startswith("2 operations")
     assert "normalize_status" in checks["migrations"]["detail"]
     assert "1->2" in checks["migrations"]["detail"]
+    assert "declarative view" in checks["frontend"]["detail"]
 
 
 @pytest.mark.parametrize("failure", [None, "signature", "business"])
 def test_validator_uses_package_fixtures_for_domain_operations(
-    tmp_path: Path, failure: str | None,
+    tmp_path: Path,
+    failure: str | None,
 ) -> None:
     generated = generate_package(
-        extension_id="asset-records", name="Registros de equipos",
+        extension_id="asset-records",
+        name="Registros de equipos",
         description="Validación con activos y fechas reales de prueba.",
     )
     files = dict(generated.files)
     manifest = copy.deepcopy(generated.manifest)
     operation = manifest["operations"][1]
     manifest["corePermissions"] = ["assets.view"]
-    manifest["operations"] = [{
-        **operation, "name": "record_asset", "parameters": {
-            "type": "object", "additionalProperties": False,
-            "properties": {
-                "asset_id": {"type": "string"},
-                "expires_on": {"type": "string"},
-                "notes": {"type": "string"},
+    manifest["operations"] = [
+        {
+            **operation,
+            "name": "record_asset",
+            "parameters": {
+                "type": "object",
+                "additionalProperties": False,
+                "properties": {
+                    "asset_id": {"type": "string"},
+                    "expires_on": {"type": "string"},
+                    "notes": {"type": "string"},
+                },
+                "required": ["asset_id", "expires_on"],
             },
-            "required": ["asset_id", "expires_on"],
-        },
-    }]
+        }
+    ]
     manifest["schemaVersion"] = 1
     manifest["compatibleSchemaVersions"] = [1]
     manifest["migrations"] = []
+    manifest["frontend"] = {"pages": [], "assetPanels": [], "contributions": []}
     files["extension.json"] = json.dumps(manifest)
-    files["backend.py"] = '''
+    files["backend.py"] = """
 from datetime import date
 
 def record_asset(context, asset_id, expires_on, notes=""):
@@ -388,8 +422,8 @@ def record_asset(context, asset_id, expires_on, notes=""):
 
 def register(sdk):
     sdk.operation("record_asset", record_asset)
-'''
-    files["tests/test_backend.py"] = '''
+"""
+    files["tests/test_backend.py"] = """
 import unittest
 from types import SimpleNamespace
 from backend import record_asset
@@ -410,21 +444,25 @@ class DomainTests(unittest.TestCase):
             record_asset(context, "missing", "2030-01-02")
         with self.assertRaises(ValueError):
             record_asset(context, "test-computer", "not-a-date")
-'''
+"""
     if failure == "signature":
-        files["backend.py"] += '''
+        files["backend.py"] += """
 def register(sdk):
     sdk.operation("record_asset", lambda context, asset_id, expires_on: {})
-'''
+"""
     elif failure == "business":
         files["backend.py"] = files["backend.py"].replace(
-            'date.fromisoformat(expires_on).isoformat()', '"incorrect-expiration"',
+            "date.fromisoformat(expires_on).isoformat()",
+            '"incorrect-expiration"',
         )
     built = build_package(files, known_core_permissions=("assets.view",))
     completed = subprocess.run(
         [sys.executable, "-I", str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py")],
         input=build_frame(built.data, digest=built.digest, known_core_permissions=("assets.view",)),
-        capture_output=True, timeout=90, cwd=tmp_path, check=False,
+        capture_output=True,
+        timeout=90,
+        cwd=tmp_path,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
     report = json.loads(completed.stdout)
@@ -483,7 +521,7 @@ def test_manifest_contract_rejects_unknown_fields_and_unsafe_shapes() -> None:
     assert any("skill" in error for error in rejected(wrong_skill_path).errors)
     assert any("version" in error for error in rejected(bad_version).errors)
     schema = load_schema()
-    assert schema["properties"]["sdkVersion"]["const"] == 1
+    assert schema["properties"]["sdkVersion"]["const"] == 2
     assert schema["additionalProperties"] is False
 
 
@@ -504,14 +542,22 @@ def _composition_manifest(mode="replace", target="page.inventory"):
     if mode != "hide":
         item["component"] = "RecordList"
     manifest["frontend"]["contributions"] = [item]
+    # SDK v2 renders module components only inside the isolated iframe, so a
+    # component contribution requires the module's own entry bundle.
+    manifest["frontend"]["entry"] = "frontend.js"
     return manifest
+
+
+COMPOSITION_FRONTEND = """
+window.ITSMExtension.register({components: {RecordList: {template: "<div>records</div>"}}});
+"""
 
 
 @pytest.mark.parametrize("mode", ["add", "hide", "replace"])
 def test_business_ui_composition_roundtrips_package_and_keeps_old_pages(mode):
     manifest = _composition_manifest(mode)
     validated = validate_manifest(manifest, known_core_permissions=())
-    assert validated["sdkVersion"] == 1
+    assert validated["sdkVersion"] == 2
     assert validated["frontend"]["contributions"][0]["mode"] == mode
     generated = generate_package(
         extension_id="record-registry",
@@ -520,14 +566,12 @@ def test_business_ui_composition_roundtrips_package_and_keeps_old_pages(mode):
     )
     files = dict(generated.files)
     files["extension.json"] = json.dumps(manifest)
+    files["frontend.js"] = COMPOSITION_FRONTEND
     packed = build_package(files, known_core_permissions=())
     decoded = parse_package(packed.data, known_core_permissions=()).manifest
     assert decoded == manifest
     assert decoded["frontend"]["pages"] == generated.manifest["frontend"]["pages"]
-    assert (
-        decoded["frontend"]["assetPanels"]
-        == generated.manifest["frontend"]["assetPanels"]
-    )
+    assert decoded["frontend"]["assetPanels"] == generated.manifest["frontend"]["assetPanels"]
     legacy = copy.deepcopy(manifest)
     del legacy["frontend"]["contributions"]
     assert validate_manifest(legacy, known_core_permissions=()) == legacy
@@ -600,6 +644,7 @@ def test_real_harness_requires_new_composition_components(tmp_path, registered):
     manifest["frontend"]["contributions"][0]["component"] = component
     files = dict(generated.files)
     files["extension.json"] = json.dumps(manifest)
+    files["frontend.js"] = COMPOSITION_FRONTEND
     built = build_package(files, known_core_permissions=())
     completed = subprocess.run(
         [
@@ -697,7 +742,6 @@ def test_workspace_create_list_read_write_is_actor_owned(
     assert set(created["files"]) == {
         "extension.json",
         "backend.py",
-        "frontend.js",
         "skills/record-registry/SKILL.md",
         "tests/test_backend.py",
     }
@@ -812,9 +856,7 @@ def test_forbidden_paths_links_and_sizes_preserve_workspace_and_validation(
         {"workspace_id": "record-registry"},
         admin,
     )
-    assert {item["path"] for item in after["files"]} == {
-        item["path"] for item in before["files"]
-    }
+    assert {item["path"] for item in after["files"]} == {item["path"] for item in before["files"]}
     assert after["workspace"]["validation"]["status"] == "failed"
 
 
@@ -979,7 +1021,7 @@ def test_bad_manifest_in_workspace_fails_closed_before_the_container(
 def test_sdk_reference_is_bounded_and_searchable(tmp_path: Path, catalog, admin) -> None:
     service = _service(catalog, tmp_path / "references")
     index = service.dispatch("extension_sdk_index", {}, admin)
-    assert index["sdkVersion"] == 1
+    assert index["sdkVersion"] == 2
     assert index["schema"] == "schema/extension.schema.json"
     names = {item["name"] for item in index["references"]}
     assert {
@@ -995,10 +1037,8 @@ def test_sdk_reference_is_bounded_and_searchable(tmp_path: Path, catalog, admin)
         "workspace-tools",
     } <= names
     for item in index["references"]:
-        reference = service.dispatch(
-            "extension_sdk_reference", {"name": item["name"]}, admin
-        )
-        assert reference["sdkVersion"] == 1
+        reference = service.dispatch("extension_sdk_reference", {"name": item["name"]}, admin)
+        assert reference["sdkVersion"] == 2
         assert reference["content"]
         assert len(reference["content"]) <= 24_384
     with pytest.raises(InvalidArguments):
@@ -1028,11 +1068,7 @@ def test_container_command_is_fixed_isolated_and_uniquely_named() -> None:
 
 
 def test_cli_generate_pack_inspect_offline_roundtrip(tmp_path: Path) -> None:
-    environment = {
-        key: value
-        for key, value in os.environ.items()
-        if not key.startswith("ITSM_")
-    }
+    environment = {key: value for key, value in os.environ.items() if not key.startswith("ITSM_")}
     environment["PYTHONDONTWRITEBYTECODE"] = "1"
     target = tmp_path / "cli-package"
     generated = subprocess.run(
@@ -1135,9 +1171,7 @@ def test_container_validator_smoke_is_prerequisite_gated(tmp_path: Path) -> None
         image=os.environ.get("ITSM_TEST_EXTENSION_VALIDATOR_IMAGE", "itsm-extension-validator:1"),
     )
     if not validator.available():
-        pytest.skip(
-            "validator image is not built; parent runs the actual container smoke"
-        )
+        pytest.skip("validator image is not built; parent runs the actual container smoke")
     generated = generate_package(
         extension_id="record-registry",
         name="Registro de registros",
@@ -1191,7 +1225,10 @@ def _running_validator_broker():
         pytest.skip("fixed local validator image is not available")
     token = "fixed-broker-test-token-with-32-characters"
     server = create_validator_server(
-        validator=validator, token=token, host="127.0.0.1", port=0,
+        validator=validator,
+        token=token,
+        host="127.0.0.1",
+        port=0,
         read_timeout=2,
     )
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -1210,7 +1247,8 @@ def test_remote_validator_uses_authenticated_fixed_http_path_without_proxy(monke
     monkeypatch.setenv("HTTP_PROXY", "http://127.0.0.1:1")
     monkeypatch.setenv("HTTPS_PROXY", "http://127.0.0.1:1")
     generated = generate_package(
-        extension_id="remote-records", name="Registros remotos",
+        extension_id="remote-records",
+        name="Registros remotos",
         description="Prueba de protocolo fijo del validador.",
     )
     built = build_package(generated.files, known_core_permissions=())
@@ -1250,14 +1288,28 @@ def test_validator_broker_rejects_auth_paths_oversize_and_digest_before_executio
         assert request("/other", {**auth, "Content-Length": "0"})[0] == 404
         assert request("/validate?image=other", {**auth, "Content-Length": "0"})[0] == 404
         assert request("/validate", {**auth, "Content-Length": "4194305"})[0] == 413
-        assert request("/validate", {**auth, "Content-Length": "1", "X-ITSM-Extension-Digest": "0" * 64}, b"x")[0] == 422
+        assert (
+            request(
+                "/validate",
+                {**auth, "Content-Length": "1", "X-ITSM-Extension-Digest": "0" * 64},
+                b"x",
+            )[0]
+            == 422
+        )
         assert request("/validate", {**auth, "Transfer-Encoding": "chunked"})[0] == 411
 
 
-@pytest.mark.parametrize("url", [
-    "ftp://localhost", "http://user:password@localhost", "http://localhost/validate",
-    "http://localhost?image=other", "http://localhost#fragment", "http://localhost:0",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "ftp://localhost",
+        "http://user:password@localhost",
+        "http://localhost/validate",
+        "http://localhost?image=other",
+        "http://localhost#fragment",
+        "http://localhost:0",
+    ],
+)
 def test_remote_validator_rejects_non_fixed_server_urls(url) -> None:
     from itsm.extensions.validator import RemoteContainerValidator
 
@@ -1267,20 +1319,22 @@ def test_remote_validator_rejects_non_fixed_server_urls(url) -> None:
 
 def test_harness_context_matches_native_store_assets_and_notice_contract(tmp_path: Path) -> None:
     generated = generate_package(
-        extension_id="context-records", name="Contrato nativo",
+        extension_id="context-records",
+        name="Contrato nativo",
         description="Prueba del contexto publicado por el SDK.",
     )
     files = dict(generated.files)
     manifest = dict(generated.manifest)
     manifest["corePermissions"] = ["assets.view"]
     files["extension.json"] = json.dumps(manifest)
-    files["backend.py"] += '''
+    files["backend.py"] += """
 
 _create_record = create_record
 
 def create_record(context, title, status="open", notes="", asset_id=None):
-    assert context.principal.actor_id
-    assert context.principal.kind == "human"
+    # The sandboxed runner hands modules a plain dict projection, not a dataclass.
+    assert context.principal["actor_id"]
+    assert context.principal["kind"] == "human"
     page = context.assets.search(query="registry", limit=2, offset=0)
     assert page == {"items": [], "total": 0, "limit": 2, "offset": 0}
     try:
@@ -1307,7 +1361,7 @@ def create_record(context, title, status="open", notes="", asset_id=None):
         raise AssertionError("delete must reject a stale expected version")
     assert context.store.get("records", record["id"]) is not None
     context.notify(
-        recipient_ids=[context.principal.actor_id], key="record-created",
+        recipient_ids=[context.principal["actor_id"]], key="record-created",
         title="Registro creado", body="Se ha creado el registro.",
         permission=WRITE_PERMISSION, url="#/extensiones/context-records/records",
     )
@@ -1318,8 +1372,8 @@ _normalize_status = normalize_status
 def normalize_status(context):
     create_record(context, "Explicit context fixture")
     return _normalize_status(context)
-'''
-    files["tests/test_backend.py"] = '''
+"""
+    files["tests/test_backend.py"] = """
 import unittest
 import backend
 
@@ -1337,12 +1391,16 @@ class RegistrationTest(unittest.TestCase):
         backend.register(binder)
         self.assertEqual(set(binder.operations), {"list_records", "create_record"})
         self.assertEqual(set(binder.migrations), {"normalize_status"})
-'''
+"""
     built = build_package(files, known_core_permissions=("assets.view",))
     payload = build_frame(built.data, digest=built.digest, known_core_permissions=("assets.view",))
     completed = subprocess.run(
         [sys.executable, "-I", str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py")],
-        input=payload, capture_output=True, timeout=90, cwd=tmp_path, check=False,
+        input=payload,
+        capture_output=True,
+        timeout=90,
+        cwd=tmp_path,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
     report = json.loads(completed.stdout)
@@ -1379,11 +1437,15 @@ def _protocol_report_server(status: int, payload: dict[str, Any]):
         thread.join(timeout=5)
 
 
-@pytest.mark.parametrize("change", ["unknown", "digest", "sdk", "failed-check", "empty-checks", "redirect"])
+@pytest.mark.parametrize(
+    "change", ["unknown", "digest", "sdk", "failed-check", "empty-checks", "redirect"]
+)
 def test_remote_validator_rejects_malformed_success_and_redirects(change) -> None:
     from itsm.extensions.validator import RemoteContainerValidator
 
-    generated = generate_package(extension_id="report-records", name="Informe", description="Informe acotado.")
+    generated = generate_package(
+        extension_id="report-records", name="Informe", description="Informe acotado."
+    )
     built = build_package(generated.files, known_core_permissions=())
     report = _report_for(built.data)
     status = 200
@@ -1400,7 +1462,9 @@ def test_remote_validator_rejects_malformed_success_and_redirects(change) -> Non
     else:
         status = 302
     with _protocol_report_server(status, report) as url:
-        validator = RemoteContainerValidator(url, token="fixed-broker-test-token-with-32-characters")
+        validator = RemoteContainerValidator(
+            url, token="fixed-broker-test-token-with-32-characters"
+        )
         with pytest.raises(ValidatorUnavailable):
             validator.validate(built.data, digest=built.digest)
 
@@ -1410,18 +1474,21 @@ def test_harness_failure_report_uses_package_relative_paths(tmp_path: Path) -> N
         extension_id="failed-records", name="Fallo verificable", description="Informe portable."
     )
     files = dict(generated.files)
-    files["tests/test_backend.py"] = '''
+    files["tests/test_backend.py"] = """
 import unittest
 
 class FailureTest(unittest.TestCase):
     def test_failure(self):
         self.fail("expected package failure")
-'''
+"""
     built = build_package(files, known_core_permissions=())
     completed = subprocess.run(
         [sys.executable, "-I", str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py")],
         input=build_frame(built.data, digest=built.digest, known_core_permissions=()),
-        capture_output=True, timeout=90, cwd=tmp_path, check=False,
+        capture_output=True,
+        timeout=90,
+        cwd=tmp_path,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
     report = json.loads(completed.stdout)
@@ -1433,12 +1500,16 @@ class FailureTest(unittest.TestCase):
 
 
 @pytest.mark.parametrize("output", ["stdout", "fd"])
-def test_candidate_cannot_replace_validator_report_and_exit_early(tmp_path: Path, output: str) -> None:
+def test_candidate_cannot_replace_validator_report_and_exit_early(
+    tmp_path: Path, output: str
+) -> None:
     generated = generate_package(
-        extension_id="forged-records", name="Informe ajeno", description="No aceptar informes del paquete."
+        extension_id="forged-records",
+        name="Informe ajeno",
+        description="No aceptar informes del paquete.",
     )
     files = dict(generated.files)
-    files["backend.py"] = '''
+    files["backend.py"] = """
 import inspect
 import json
 import os
@@ -1453,14 +1524,15 @@ for caller in inspect.stack():
         digest = frame.digest
         break
 forged = {
-    "status": "passed", "digest": digest, "sdkVersion": 1,
+    "status": "passed", "digest": digest, "sdkVersion": 2,
     "checks": [{"name": "forged", "status": "passed", "detail": "candidate report"}],
     "errors": [], "container": {}, "completedAt": "2000-01-01T00:00:00+00:00",
 }
 encoded = json.dumps(forged)
-'''
+"""
     files["backend.py"] += (
-        'print(encoded, flush=True)\n' if output == "stdout"
+        "print(encoded, flush=True)\n"
+        if output == "stdout"
         else 'os.write(1, encoded.encode("utf-8"))\n'
     )
     files["backend.py"] += "os._exit(0)\n"
@@ -1468,7 +1540,10 @@ encoded = json.dumps(forged)
     completed = subprocess.run(
         [sys.executable, "-I", str(BACKEND_ROOT / "itsm/extensions/sdk/validator/run.py")],
         input=build_frame(built.data, digest=built.digest, known_core_permissions=()),
-        capture_output=True, timeout=90, cwd=tmp_path, check=False,
+        capture_output=True,
+        timeout=90,
+        cwd=tmp_path,
+        check=False,
     )
     assert completed.returncode == 0, completed.stderr.decode(errors="replace")
     report = json.loads(completed.stdout)
@@ -1478,82 +1553,48 @@ encoded = json.dumps(forged)
     assert report["completedAt"] != "2000-01-01T00:00:00+00:00"
     checks = {item["name"]: item for item in report["checks"]}
     assert "forged" not in checks
-    assert all(checks[name]["status"] == "passed" for name in ("archive", "manifest", "layout", "backend"))
+    assert all(
+        checks[name]["status"] == "passed" for name in ("archive", "manifest", "layout", "backend")
+    )
     assert report["errors"]
 
 
-def test_generated_asset_summary_reads_native_context_and_rejects_stale_results() -> None:
-    import shutil
+def test_generated_asset_panel_is_a_declarative_filtered_view() -> None:
+    """SDK v2 asset panels are host-rendered views, not same-origin module code.
 
-    engine = shutil.which("node") or shutil.which("bun")
-    if engine is None:
-        pytest.skip("no existing JavaScript engine is available")
+    The v1 generator shipped a Vue component that queried ``list_records`` itself.
+    v2 keeps module code out of the host document: the panel declares a table view
+    over a declared operation, and only an isolated iframe bundle may carry module
+    JavaScript.
+    """
     generated = generate_package(
         extension_id="panel-records", name="Panel nativo", description="Consulta por activo."
     )
-    script = r'''
-const assert = require("node:assert/strict");
-const fs = require("node:fs");
-const vm = require("node:vm");
-let components;
-vm.runInNewContext(fs.readFileSync(0, "utf8"), {
-  window: { ITSMExtensions: { register(id, entry) {
-    assert.equal(id, "panel-records"); components = entry.components;
-  } } }
-});
-(async () => {
-  const component = components.RecordSummary;
-  const requests = [];
-  const instance = Object.assign(component.data(), {
-    asset: Object.freeze({id: "asset-one", name: "Router"}),
-    sdk: { request: async (operation, args) => {
-      requests.push({operation, args});
-      return {items: [{id: "record-one", title: "Revisión", status: "closed"}], total: 1};
-    } }
-  });
-  for (const [name, method] of Object.entries(component.methods)) instance[name] = method.bind(instance);
-  for (const [name, getter] of Object.entries(component.computed)) {
-    Object.defineProperty(instance, name, {get: getter.bind(instance)});
-  }
-  await instance.load();
-  assert.equal(requests[0].operation, "list_records");
-  assert.equal(requests[0].args.asset_id, "asset-one");
-  assert.equal(requests[0].args.limit, 1);
-  assert.equal(instance.record.id, "record-one");
-  assert.equal(instance.statusText, "Cerrado");
-  assert.equal(instance.statusTone, "down");
-  assert.equal(instance.loading, false);
-  instance.sdk.request = async () => { throw new Error("Sin permiso"); };
-  await instance.load();
-  assert.equal(instance.error, "Sin permiso");
-  assert.equal(instance.loading, false);
-  const pending = [];
-  instance.sdk.request = (_operation, args) => new Promise(resolve => pending.push({args, resolve}));
-  instance.asset = {id: "asset-old"};
-  const stale = instance.load();
-  instance.asset = {id: "asset-new"};
-  const current = instance.load();
-  pending[1].resolve({items: [{id: "new", title: "Actual", status: "open"}], total: 1});
-  await current;
-  pending[0].resolve({items: [{id: "old", title: "Antiguo", status: "closed"}], total: 1});
-  await stale;
-  assert.equal(instance.record.id, "new");
-  const abandoned = instance.load();
-  component.beforeUnmount.call(instance);
-  pending[2].resolve({items: [{id: "unmounted", status: "closed"}], total: 1});
-  await abandoned;
-  assert.notEqual(instance.record?.id, "unmounted");
-  instance.asset = null;
-  const watcher = component.watch.asset.handler;
-  await (typeof watcher === "string" ? instance[watcher]() : watcher.call(instance));
-  assert.equal(instance.record, null);
-  assert.equal(instance.loading, false);
-  console.log("asset summary contract passed");
-})().catch(problem => { console.error(problem); process.exitCode = 1; });
-'''
-    completed = subprocess.run(
-        [engine, "-e", script], input=generated.files["frontend.js"], text=True,
-        capture_output=True, timeout=20, check=False,
+    manifest = validate_manifest(generated.manifest, known_core_permissions=())
+    assert "frontend.js" not in generated.files
+    assert "entry" not in manifest["frontend"]
+    panel = manifest["frontend"]["assetPanels"][0]
+    table = panel["view"]["table"]
+    assert table["filterAsset"] is True
+    assert table["operation"] == "list_records"
+    assert [column["field"] for column in table["columns"]] == ["title"]
+    operations = {item["name"]: item for item in manifest["operations"]}
+    assert operations[table["operation"]]["mutation"] is False
+    assert operations[table["operation"]]["permission"] == panel["permission"]
+
+    isolated = copy.deepcopy(manifest)
+    isolated["frontend"]["entry"] = "frontend.js"
+    isolated["frontend"]["assetPanels"][0]["view"] = {
+        "isolated": {"component": "RecordSummary", "height": 320}
+    }
+    files = dict(generated.files)
+    files["extension.json"] = json.dumps(isolated)
+    files["frontend.js"] = (
+        'window.ITSMExtension.register({components: {RecordSummary: {template: "<div/>"}}});'
     )
-    assert completed.returncode == 0, completed.stderr
-    assert completed.stdout == "asset summary contract passed\n"
+    packed = build_package(files, known_core_permissions=())
+    decoded = parse_package(packed.data, known_core_permissions=()).manifest
+    assert decoded["frontend"]["entry"] == "frontend.js"
+    assert decoded["frontend"]["assetPanels"][0]["view"]["isolated"]["component"] == (
+        "RecordSummary"
+    )
