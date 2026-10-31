@@ -8,6 +8,11 @@ Three independent mechanisms are stacked, each failing closed:
   TCP bind/connect and scopes abstract unix sockets and signals on ABI >= 6;
 * a seccomp-BPF filter that refuses a documented syscall deny-list with EPERM,
   allows ``clone`` only with ``CLONE_THREAD`` and answers ``clone3`` with ENOSYS.
+  The deny-list includes the inode metadata family (``chmod``/``utime``/xattr):
+  Landlock restricts file content, not ownership-based metadata changes, and a
+  module runs as the service user.  Without this entry a module could make the
+  core database unreadable (``chmod 000``) or tamper with a foreign module's
+  directories, so the runner refuses the whole family it never needs.
 
 Stdlib only: this file is imported by ``python -I -S -B runner.py``.
 """
@@ -69,6 +74,26 @@ DENY_SYSCALLS = {
         "io_uring_setup": 425,
         "io_uring_enter": 426,
         "io_uring_register": 427,
+        "chmod": 90,
+        "fchmod": 91,
+        "fchmodat": 268,
+        "fchmodat2": 452,
+        "utime": 132,
+        "utimes": 235,
+        "futimesat": 261,
+        "utimensat": 280,
+        "setxattr": 188,
+        "lsetxattr": 189,
+        "fsetxattr": 190,
+        "getxattr": 191,
+        "lgetxattr": 192,
+        "fgetxattr": 193,
+        "listxattr": 194,
+        "llistxattr": 195,
+        "flistxattr": 196,
+        "removexattr": 197,
+        "lremovexattr": 198,
+        "fremovexattr": 199,
     },
     "aarch64": {
         "socket": 198,
@@ -98,6 +123,24 @@ DENY_SYSCALLS = {
         "io_uring_setup": 425,
         "io_uring_enter": 426,
         "io_uring_register": 427,
+        # aarch64 has no chmod/utime/utimes: glibc routes them through the
+        # *at variants, which are denied here along with fchmodat2.
+        "fchmod": 52,
+        "fchmodat": 53,
+        "fchmodat2": 452,
+        "utimensat": 88,
+        "setxattr": 5,
+        "lsetxattr": 6,
+        "fsetxattr": 7,
+        "getxattr": 8,
+        "lgetxattr": 9,
+        "fgetxattr": 10,
+        "listxattr": 11,
+        "llistxattr": 12,
+        "flistxattr": 13,
+        "removexattr": 14,
+        "lremovexattr": 15,
+        "fremovexattr": 16,
     },
 }
 CLONE_NR = {"x86_64": 56, "aarch64": 220}
