@@ -28,14 +28,32 @@ def run_migrations_online() -> None:
     engine = create_engine_from_settings(settings)
     try:
         with engine.connect() as connection:
+            sqlite = connection.dialect.name == "sqlite"
+            if sqlite:
+                # The sqlite driver defers BEGIN until the first write statement and
+                # autocommits DDL, so a revision that fails halfway would leave every
+                # table it created committed and no way to retry ("table already
+                # exists"). Take the write lock up front and commit once at the end:
+                # all revisions and the version table then succeed or roll back
+                # together. Alembic must stay out of the transaction management
+                # here, because its SQLite dialect declares non-transactional DDL.
+                connection.exec_driver_sql("BEGIN IMMEDIATE")
             context.configure(
                 connection=connection,
                 target_metadata=target_metadata,
                 compare_type=True,
-                render_as_batch=connection.dialect.name == "sqlite",
+                transactional_ddl=False if sqlite else None,
+                render_as_batch=sqlite,
             )
-            with context.begin_transaction():
-                context.run_migrations()
+            try:
+                with context.begin_transaction():
+                    context.run_migrations()
+            except BaseException:
+                if sqlite:
+                    connection.rollback()
+                raise
+            if sqlite:
+                connection.commit()
     finally:
         engine.dispose()
 

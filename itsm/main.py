@@ -40,6 +40,7 @@ from itsm.database import (
     check_readiness,
     create_engine_from_settings,
     create_session_factory,
+    migration_state,
 )
 from itsm.demo.restrictions import (
     DemoRestrictionMiddleware,
@@ -67,6 +68,7 @@ from itsm.mcp.server import TOOL_NAMES, create_mcp_server
 from itsm.monitoring.api import create_monitoring_router
 from itsm.notifications.api import create_notification_router
 from itsm.notifications.service import record_alert_event
+from itsm.ops import quiesce
 from itsm.redundancy.api import create_redundancy_router
 from itsm.relationships.api import create_relationship_router
 from itsm.release_identity import DeploymentIdentityError, StartupMode, enforce_startup
@@ -149,6 +151,35 @@ def _extension_components(settings: Settings) -> tuple[Any, Any]:
     return catalog, registry
 
 
+IDENTITY_REVALIDATE_SECONDS = 2.0
+SCHEMA_REVALIDATE_SECONDS = 2.0
+_SCHEMA_EXEMPT_SUFFIXES = ("/health/live", "/health/ready")
+
+
+def _schema_allows(app: FastAPI, settings: Settings, path: str) -> bool:
+    """Refuse business routes while the schema is not at the code head.
+
+    The state is re-read on a short interval so an upgrade (or a restore that
+    brought an older schema back) takes effect without restarting the API.
+    """
+    if not path.startswith(settings.api_prefix):
+        return True
+    exempt = {settings.api_prefix + suffix for suffix in _SCHEMA_EXEMPT_SUFFIXES}
+    if path in exempt:
+        return True
+    checked = getattr(app.state, "schema_checked_at", None)
+    now = time.monotonic()
+    if checked is not None and now - checked < SCHEMA_REVALIDATE_SECONDS:
+        return bool(getattr(app.state, "schema_current", False))
+    try:
+        current = migration_state(app.state.engine, settings).is_current
+    except Exception:
+        current = False
+    app.state.schema_current = current
+    app.state.schema_checked_at = now
+    return current
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the API application for one settings snapshot."""
     settings = settings or get_settings()
@@ -205,6 +236,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         app.state.settings = settings
         app.state.engine = engine
         app.state.session_factory = factory
+        app.state.schema_current = False
+        app.state.schema_checked_at = None
+        app.state.identity_checked_at = None
+        app.state.runtime_marker = quiesce.register(settings, "api")
         install_search_sync(settings)
         app.state.task_queue = create_task_queue(settings)
         app.state.extensions, app.state.extension_development = create_extension_services(
@@ -263,6 +298,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                 cycle_task.cancel()
                 with suppress(asyncio.CancelledError):
                     await cycle_task
+            quiesce.release(getattr(app.state, "runtime_marker", None))
             if demo_controller is not None:
                 demo_controller.release()
             engine.dispose()
@@ -301,9 +337,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     async def log_requests(request: Request, call_next: Any) -> Any:
         started = time.perf_counter()
         status_code = 500
-        if not app.state.release_identity_verified and request.url.path != (
-            settings.api_prefix + "/health/live"
-        ):
+        identity_due = not app.state.release_identity_verified or (
+            app.state.identity_checked_at is None
+            or time.monotonic() - app.state.identity_checked_at >= IDENTITY_REVALIDATE_SECONDS
+        )
+        if identity_due and request.url.path != (settings.api_prefix + "/health/live"):
             try:
                 verified = enforce_startup(
                     settings,
@@ -312,6 +350,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     require_identity=True,
                 )
                 app.state.release_identity_verified = verified.identity_verified
+                app.state.identity_checked_at = time.monotonic()
             except DeploymentIdentityError:
                 if request.url.path == settings.api_prefix + "/health/ready":
                     payload = check_readiness(
@@ -332,6 +371,20 @@ def create_app(settings: Settings | None = None) -> FastAPI:
                     },
                     headers={"Cache-Control": "no-store"},
                 )
+        if not _schema_allows(app, settings, request.url.path):
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "error": {
+                        "code": "database_not_migrated",
+                        "message": (
+                            "the database schema is not at the migration head this release "
+                            "expects; run `python -m itsm.ops upgrade` and retry"
+                        ),
+                    }
+                },
+                headers={"Cache-Control": "no-store"},
+            )
         try:
             response = await call_next(request)
             status_code = response.status_code

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable
+from pathlib import Path
 
 from itsm.config import Settings
 from sqlalchemy import create_engine, inspect
@@ -59,3 +60,132 @@ def test_current_revision_matches_the_single_head(
     head_revision = heads.stdout.strip().split()[0]
     assert head_revision in current.stdout
     assert " (head)" in heads.stdout
+
+
+def probe_migrations_ini(tmp_path: Path) -> Path:
+    """Copy the migration tree and add one probe revision after the real head."""
+    import shutil
+
+    migrations = tmp_path / "probe-migrations"
+    shutil.copytree(BACKEND_ROOT / "migrations", migrations)
+    ini = tmp_path / "probe-alembic.ini"
+    ini.write_text(
+        "[alembic]\n"
+        f"script_location = {migrations}\n"
+        f"prepend_sys_path = {BACKEND_ROOT}\n"
+        "path_separator = os\n"
+    )
+    return ini
+
+
+def write_probe_revision(tmp_path: Path, name: str, body: str) -> None:
+    versions = tmp_path / "probe-migrations" / "versions"
+    (versions / f"0099_{name}.py").write_text(
+        '"""Probe revision (test only)."""\n\n'
+        "from alembic import op\n\n"
+        'revision = "0099_probe"\n'
+        'down_revision = "0036_entity_change_events"\n'
+        "branch_labels = None\n"
+        "depends_on = None\n\n\n"
+        f"def upgrade() -> None:\n{body}\n\n\n"
+        "def downgrade() -> None:\n"
+        "    pass\n"
+    )
+
+
+def sqlite_state(database_url: str) -> tuple[set[str], str]:
+    import sqlite3
+
+    path = database_url.removeprefix("sqlite:///")
+    connection = sqlite3.connect(path)
+    try:
+        tables = {
+            str(row[0])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")
+        }
+        row = connection.execute("SELECT version_num FROM alembic_version").fetchone()
+    finally:
+        connection.close()
+    assert row is not None
+    return tables, str(row[0])
+
+
+def test_a_failed_sqlite_revision_rolls_back_its_ddl(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = settings_factory()
+    applied = run_migrations(settings)
+    assert applied.returncode == 0, applied.stderr
+    ini = probe_migrations_ini(tmp_path)
+    write_probe_revision(
+        tmp_path,
+        "failing",
+        '    op.execute("CREATE TABLE probe_partial (id INTEGER PRIMARY KEY)")\n'
+        '    raise RuntimeError("injected DDL failure")',
+    )
+
+    result = run_cli(["-m", "alembic", "-c", str(ini), "upgrade", "head"], settings)
+
+    assert result.returncode != 0
+    assert "injected DDL failure" in result.stderr
+    tables, revision = sqlite_state(settings.database_url)
+    assert "probe_partial" not in tables
+    assert "itsm_infrastructure" in tables
+    assert revision == "0036_entity_change_events"
+
+
+def test_a_successful_sqlite_revision_commits_its_ddl(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    settings = settings_factory()
+    ini = probe_migrations_ini(tmp_path)
+    write_probe_revision(
+        tmp_path,
+        "succeeding",
+        '    op.execute("CREATE TABLE probe_complete (id INTEGER PRIMARY KEY)")',
+    )
+
+    result = run_cli(["-m", "alembic", "-c", str(ini), "upgrade", "head"], settings)
+
+    assert result.returncode == 0, result.stderr
+    tables, revision = sqlite_state(settings.database_url)
+    assert "probe_complete" in tables
+    assert revision == "0099_probe"
+
+
+def set_recorded_revision(database_url: str, revision: str) -> None:
+    import sqlite3
+
+    connection = sqlite3.connect(database_url.removeprefix("sqlite:///"))
+    try:
+        connection.execute("UPDATE alembic_version SET version_num = ?", (revision,))
+        connection.commit()
+    finally:
+        connection.close()
+
+
+def test_business_routes_are_refused_while_migrations_are_pending(
+    settings_factory: Callable[..., Settings],
+    client: Callable[..., object],
+    monkeypatch,
+) -> None:
+    monkeypatch.setattr("itsm.main.SCHEMA_REVALIDATE_SECONDS", 0.0)
+    settings = settings_factory()
+    applied = run_migrations(settings)
+    assert applied.returncode == 0, applied.stderr
+    set_recorded_revision(settings.database_url, "0035_extension_isolation")
+
+    test_client = client(settings)
+
+    refused = test_client.get("/api/v1/assets")
+    assert refused.status_code == 503
+    assert refused.json()["error"]["code"] == "database_not_migrated"
+    assert "python -m itsm.ops upgrade" in refused.json()["error"]["message"]
+    ready = test_client.get("/api/v1/health/ready")
+    assert ready.status_code == 503
+    assert ready.json()["checks"]["migrations"] == "pending"
+
+    set_recorded_revision(settings.database_url, "0036_entity_change_events")
+
+    served = test_client.get("/api/v1/assets")
+    assert served.status_code in {401, 403}

@@ -15,6 +15,7 @@ import shutil
 import sqlite3
 import subprocess
 import sys
+import time
 from collections.abc import Callable
 from pathlib import Path
 
@@ -452,3 +453,106 @@ def test_verify_rejects_an_unknown_backup_id(
     assert result.returncode == 1
     assert "not found" in payload(result)["error"]
     assert os.stat(backup_root).st_mode & 0o700 == 0o700
+
+
+def test_a_live_restore_is_refused_while_the_api_holds_the_database(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    """R4-F5: replacing a live file under a running API silently loses writes."""
+    from fastapi.testclient import TestClient
+    from itsm.main import create_app
+
+    settings = migrated(settings_factory)
+    backup_root = tmp_path / "backups"
+    backup = single_backup(settings, backup_root)
+    live = Path(settings.database_url.removeprefix("sqlite:///"))
+    arguments = [
+        "restore",
+        backup["id"],
+        "--target-file",
+        str(live),
+        "--replace-live",
+        "--confirm",
+        backup["id"],
+    ]
+
+    with TestClient(create_app(settings)) as api:
+        assert api.get("/api/v1/health/ready").status_code == 200
+        before = hashlib.sha256(live.read_bytes()).hexdigest()
+        refused = run_ops(arguments, settings, backup_root)
+
+    assert refused.returncode == 3
+    body = payload(refused)
+    assert body["status"] == "refused"
+    assert "stop the api and the worker" in body["error"].lower()
+    assert hashlib.sha256(live.read_bytes()).hexdigest() == before
+
+    allowed = run_ops(arguments, settings, backup_root)
+
+    assert allowed.returncode == 0, allowed.stdout + allowed.stderr
+    assert payload(allowed)["live"] is True
+
+
+def test_the_api_revalidates_deployment_identity_after_the_database_changes(
+    settings_factory: Callable[..., Settings], monkeypatch
+) -> None:
+    """R4-F5: identity used to be validated once for the process lifetime."""
+    from fastapi.testclient import TestClient
+    from itsm.main import create_app
+
+    monkeypatch.setattr("itsm.main.IDENTITY_REVALIDATE_SECONDS", 0.0)
+    settings = migrated(settings_factory)
+    live = Path(settings.database_url.removeprefix("sqlite:///"))
+
+    with TestClient(create_app(settings)) as api:
+        assert api.get("/api/v1/health/ready").status_code == 200
+        assert api.get("/api/v1/assets").status_code in {401, 403}
+
+        # A restore brought back a database owned by another release mode.
+        connection = sqlite3.connect(live)
+        try:
+            connection.execute("UPDATE deployment_identity SET release_mode = 'demo'")
+            connection.commit()
+        finally:
+            connection.close()
+
+        refused = api.get("/api/v1/assets")
+
+    assert refused.status_code == 503
+    assert refused.json()["error"]["code"] == "release_identity_unavailable"
+
+
+def test_interrupted_backups_are_reported_and_reclaimable(
+    settings_factory: Callable[..., Settings], tmp_path: Path
+) -> None:
+    """R4-F11: leftover .partial-* directories must be visible and reclaimable."""
+    settings = migrated(settings_factory)
+    backup_root = tmp_path / "backups"
+    backup = single_backup(settings, backup_root)
+    partial = backup_root / ".partial-sqlite-interrupted"
+    partial.mkdir()
+    (partial / "database.db").write_bytes(b"x" * 2048)
+    stale = time.time() - 5 * 86400
+    os.utime(partial, (stale, stale))
+
+    reported = payload(run_ops(["status"], settings, backup_root))
+
+    entry = next(item for item in reported["partials"] if item["name"] == partial.name)
+    assert entry["bytes"] == 2048
+    assert entry["ageDays"] > 4
+
+    dry = run_ops(
+        ["prune", "--keep", "1", "--partials-older-than", "1", "--dry-run"], settings, backup_root
+    )
+    assert dry.returncode == 0, dry.stderr
+    assert payload(dry)["reclaimedPartials"] == [partial.name]
+    assert partial.is_dir()
+
+    reclaimed = run_ops(
+        ["prune", "--keep", "1", "--partials-older-than", "1"], settings, backup_root
+    )
+
+    assert reclaimed.returncode == 0, reclaimed.stderr
+    assert payload(reclaimed)["reclaimedPartials"] == [partial.name]
+    assert not partial.exists()
+    assert (backup_root / backup["id"]).is_dir()

@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="extension data directory to write the archived module files into",
     )
     restore.add_argument(
+        "--target-attachments",
+        default=None,
+        help="attachment storage directory to write the archived blobs into",
+    )
+    restore.add_argument(
         "--replace-live",
         action="store_true",
         help="replace the live database; requires --confirm <backup id>",
@@ -77,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-age-days", type=int, default=None, help="delete backups older than this many days"
     )
     prune.add_argument("--dry-run", action="store_true", help="report without deleting")
+    prune.add_argument(
+        "--partials-older-than",
+        type=int,
+        default=None,
+        help="delete interrupted-backup .partial-* directories older than this many days",
+    )
 
     commands.add_parser("status", parents=[common], help="report backup and upgrade status")
     commands.add_parser("upgrade", parents=[common], help="guarded upgrade to the code head")
@@ -127,6 +138,7 @@ def _dispatch(args: argparse.Namespace, context: OpsContext) -> tuple[dict[str, 
             target_file=args.target_file,
             target_database=args.target_database,
             target_extensions=args.target_extensions,
+            target_attachments=args.target_attachments,
             replace_live=args.replace_live,
             confirm=args.confirm,
         )
@@ -138,7 +150,16 @@ def _dispatch(args: argparse.Namespace, context: OpsContext) -> tuple[dict[str, 
             if args.max_age_days is not None
             else _env_int(ENV_RETENTION_MAX_AGE_DAYS)
         )
-        return service.prune(context, keep=keep, max_age_days=max_age, dry_run=args.dry_run), 0
+        return (
+            service.prune(
+                context,
+                keep=keep,
+                max_age_days=max_age,
+                dry_run=args.dry_run,
+                partials_older_than=args.partials_older_than,
+            ),
+            0,
+        )
     if args.command == "status":
         return service.status(context), 0
     outcome = upgrade.run_upgrade(context)

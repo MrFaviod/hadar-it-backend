@@ -12,6 +12,7 @@ It does not import ``itsm.release_mode`` and does not open a connection.
 
 from __future__ import annotations
 
+import re
 import shlex
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -210,6 +211,82 @@ def postgres_restore_command(
 def postgres_list_command(dump_path: Path) -> ToolCommand:
     """Read the custom-format archive table of contents without a connection."""
     return ToolCommand(argv=("pg_restore", "--list", str(dump_path)))
+
+
+_VERSION_DIGITS = re.compile(r"(\d+)(?:\.\d+)?")
+
+
+def version_major(version_text: str | None) -> int | None:
+    """Extract the leading major number from a tool or server version string.
+
+    ``pg_dump (PostgreSQL) 18.6``, ``pg_restore (PostgreSQL) 16.13 (Ubuntu ...)``
+    and a bare ``16.13`` all yield their major. ``None``, empty text and
+    ``unavailable`` yield ``None`` instead of guessing one.
+    """
+    if not version_text:
+        return None
+    match = _VERSION_DIGITS.search(version_text)
+    return None if match is None else int(match.group(1))
+
+
+def postgres_major_mismatch(
+    client_major: int | None, server_major: int | None, *, tool: str = "pg_dump"
+) -> str | None:
+    """Return an actionable error when the client major cannot restore the archive.
+
+    A PostgreSQL custom-format archive is only reliably restorable by the same
+    client major that wrote it, and that major must also match the server's. The
+    message names the concrete remedy; it never suggests retrying blindly.
+    """
+    if client_major is None:
+        return (
+            "the backup does not record the PostgreSQL client major version, so its "
+            "restorability cannot be proven; take a new backup with this release"
+        )
+    if server_major is None:
+        return (
+            "the backup does not record the PostgreSQL server major version, so its "
+            "restorability cannot be proven; take a new backup with this release"
+        )
+    if client_major != server_major:
+        return (
+            f"{tool} client major {client_major} does not match PostgreSQL server major "
+            f"{server_major}: a custom-format archive written by a different client major is "
+            f"not restorable. Install the PostgreSQL {server_major} client tools on this host "
+            f"(or take the backup with them) and retry"
+        )
+    return None
+
+
+def postgres_restore_refusal(
+    client_major: int | None,
+    server_major: int | None,
+    installed_client_major: int | None,
+) -> str | None:
+    """Refuse a restore whose recorded or installed major cannot read the archive.
+
+    An artifact that predates version recording is not refused here: the caller
+    still runs the real tool, which fails loudly instead of being blocked on
+    metadata it never had.
+    """
+    if client_major is not None and server_major is not None and client_major != server_major:
+        return (
+            f"this artifact was written by pg_dump client major {client_major} against "
+            f"PostgreSQL server major {server_major}; a custom-format archive from another "
+            "client major is not restorable. Take the backup with client tools that match "
+            f"the server major ({server_major}) and restore that artifact"
+        )
+    if (
+        server_major is not None
+        and installed_client_major is not None
+        and installed_client_major != server_major
+    ):
+        return (
+            f"the installed pg_restore major {installed_client_major} cannot restore an "
+            f"archive from PostgreSQL server major {server_major}; install the PostgreSQL "
+            f"{server_major} client tools and retry"
+        )
+    return None
 
 
 def _escape_option_value(value: str) -> str:

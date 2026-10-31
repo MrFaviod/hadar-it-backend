@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import sqlite3
 from collections.abc import Callable
+from pathlib import Path
 
 import pytest
 from fastapi.testclient import TestClient
@@ -170,3 +172,40 @@ def test_machine_bearer_can_submit_tasks_without_origin_or_csrf(
         headers={"Authorization": f"Bearer {token}"},
     )
     assert response.status_code == 202, response.text
+
+
+def test_an_unusable_queue_reports_service_unavailable(
+    settings_factory: Callable[..., Settings],
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """R4-F6: a queue that cannot store state is 503, never an internal error."""
+    import itsm.tasks.adapter as adapter_module
+
+    settings = settings_factory()
+    test_client, auth = signed_in_client(settings)
+
+    def broken(*args: object, **kwargs: object) -> None:
+        raise sqlite3.DatabaseError("file is not a database")
+
+    monkeypatch.setattr(adapter_module, "write_task_state", broken)
+
+    response = test_client.post("/api/v1/tasks/demo", json={"message": "diagnostico"}, headers=auth)
+
+    assert response.status_code == 503
+    assert "task storage" in response.json()["error"]["message"].lower()
+
+
+def test_probe_rejects_a_corrupt_queue_file(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """R4-F6: readiness must not call a garbage queue healthy."""
+    from itsm.tasks.adapter import TaskStorageUnavailable, create_task_queue
+
+    settings = settings_factory()
+    path = Path(settings.task_sqlite_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_bytes(b"not a sqlite database" * 64)
+
+    with pytest.raises(TaskStorageUnavailable):
+        create_task_queue(settings).probe()

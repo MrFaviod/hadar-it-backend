@@ -14,7 +14,9 @@ Reads always peek, so ``GET`` never consumes a stored result.
 
 from __future__ import annotations
 
+import contextlib
 import os
+import sqlite3
 import uuid
 from dataclasses import dataclass
 from enum import StrEnum
@@ -86,9 +88,75 @@ class TaskQueue(Protocol):
         """Return the stored state without consuming it; ``None`` if unknown."""
 
 
+OWNER_PREFIX = "itsm:owner:"
+INTERRUPTED_ERROR = "worker_interrupted"
+
+
+def _process_alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def record_task_owner(huey: Any, task_id: str, pid: int | None = None) -> None:
+    """Remember which worker process is executing a task."""
+    owner = os.getpid() if pid is None else pid
+    with contextlib.suppress(Exception):
+        huey.storage.put_data(f"{OWNER_PREFIX}{task_id}", str(owner).encode())
+
+
+def _owner_pid(huey: Any, key: str) -> int | None:
+    try:
+        raw = huey.storage.peek_data(key)
+    except Exception:
+        return None
+    if not isinstance(raw, (bytes, bytearray)):
+        return None
+    try:
+        return int(bytes(raw).decode())
+    except ValueError:
+        return None
+
+
+def _owned_task_keys(storage: Any) -> list[str]:
+    """List owner markers on a SQLite-backed queue; other backends keep order."""
+    if not hasattr(storage, "filename") or not hasattr(storage, "sql"):
+        return []
+    try:
+        rows = storage.sql(
+            "select key from kv where key like ?",
+            (f"{OWNER_PREFIX}%",),
+            results=True,
+        )
+    except Exception:
+        return []
+    return [str(row[0]) for row in rows]
+
+
+def reconcile_interrupted_tasks(huey: Any) -> int:
+    """Fail tasks a dead worker left behind; returns how many were reconciled."""
+    reconciled = 0
+    for key in _owned_task_keys(huey.storage):
+        pid = _owner_pid(huey, key)
+        if pid is not None and _process_alive(pid):
+            continue
+        task_id = key[len(OWNER_PREFIX) :]
+        huey.put_result(task_id, {"state": TaskState.ERROR.value, "error": INTERRUPTED_ERROR})
+        with contextlib.suppress(Exception):
+            huey.storage.delete_data(key)
+        reconciled += 1
+    return reconciled
+
+
 def write_task_state(huey: Any, task_id: str, state: TaskState) -> None:
     """Persist an execution state marker in the queue's result storage."""
     huey.put_result(task_id, {"state": state.value})
+    if state is TaskState.RUNNING:
+        record_task_owner(huey, task_id)
 
 
 class HueyTaskQueue:
@@ -129,6 +197,17 @@ class HueyTaskQueue:
             raise TaskStorageUnavailable("task storage directory is not writable")
         if path.exists() and not os.access(path, os.W_OK):
             raise TaskStorageUnavailable("task storage file is not writable")
+        if path.exists():
+            try:
+                connection = sqlite3.connect(f"file:{path}?mode=rw", uri=True, timeout=2.0)
+                try:
+                    row = connection.execute("PRAGMA quick_check(1)").fetchone()
+                finally:
+                    connection.close()
+            except sqlite3.DatabaseError as exc:
+                raise TaskStorageUnavailable("task storage file is not a usable database") from exc
+            if not row or row[0] != "ok":
+                raise TaskStorageUnavailable("task storage file failed its integrity check")
 
     @staticmethod
     def _probe_redis(url: str) -> None:
@@ -155,48 +234,63 @@ class HueyTaskQueue:
     def submit_demo(self, message: str, delay_seconds: int = 0) -> TaskStatus:
         state = TaskState.SCHEDULED if delay_seconds > 0 else TaskState.PENDING
         task_id = uuid.uuid4().hex
-        task = self.runtime.demo.echo.s(
-            message,
-            delay=delay_seconds if delay_seconds > 0 else None,
-            id=task_id,
+        delay = delay_seconds if delay_seconds > 0 else None
+        return self._enqueue(
+            lambda runtime: runtime.demo.echo.s(message, delay=delay, id=task_id), task_id, state
         )
-        return self._enqueue(task, task_id, state)
 
     def submit_demo_failure(self, message: str) -> TaskStatus:
         task_id = uuid.uuid4().hex
-        task = self.runtime.demo.failure.s(message, id=task_id)
-        return self._enqueue(task, task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.demo.failure.s(message, id=task_id), task_id, TaskState.PENDING
+        )
 
     def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
-        task = self.runtime.operation.s(operation_id, id=task_id)
-        return self._enqueue(task, task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.operation.s(operation_id, id=task_id),
+            task_id,
+            TaskState.PENDING,
+        )
 
     def submit_monitoring(self) -> TaskStatus:
         task_id = uuid.uuid4().hex
-        return self._enqueue(self.runtime.monitoring.s(id=task_id), task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.monitoring.s(id=task_id), task_id, TaskState.PENDING
+        )
 
     def submit_notifications(self) -> TaskStatus:
         task_id = uuid.uuid4().hex
-        return self._enqueue(self.runtime.notifications.s(id=task_id), task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.notifications.s(id=task_id), task_id, TaskState.PENDING
+        )
 
     def submit_report(self, job_id: str, task_id: str) -> TaskStatus:
-        return self._enqueue(self.runtime.report.s(job_id, id=task_id), task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.report.s(job_id, id=task_id), task_id, TaskState.PENDING
+        )
 
     def submit_search_sync(self) -> TaskStatus:
         task_id = uuid.uuid4().hex
-        return self._enqueue(self.runtime.search_sync.s(id=task_id), task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.search_sync.s(id=task_id), task_id, TaskState.PENDING
+        )
 
     def submit_search_rebuild(self) -> TaskStatus:
         task_id = uuid.uuid4().hex
-        return self._enqueue(self.runtime.search_rebuild.s(id=task_id), task_id, TaskState.PENDING)
+        return self._enqueue(
+            lambda runtime: runtime.search_rebuild.s(id=task_id), task_id, TaskState.PENDING
+        )
 
-    def _enqueue(self, task: Any, task_id: str, state: TaskState) -> TaskStatus:
-        runtime = self.runtime
-        write_task_state(runtime.huey, task_id, state)
+    def _enqueue(self, build: Any, task_id: str, state: TaskState) -> TaskStatus:
+        """Build and enqueue inside the guard: an unusable queue must answer 503."""
         try:
+            runtime = self.runtime
+            task = build(runtime)
+            write_task_state(runtime.huey, task_id, state)
             runtime.huey.enqueue(task)
         except Exception as exc:
-            runtime.huey.delete(task_id)
+            with contextlib.suppress(Exception):
+                self.runtime.huey.delete(task_id)
             raise TaskStorageUnavailable("could not enqueue demo task") from exc
         return TaskStatus(task_id=task_id, state=state)
 
@@ -212,6 +306,15 @@ class HueyTaskQueue:
         if not isinstance(stored, dict):
             return None
         state = stored.get("state")
+        if state == TaskState.ERROR.value:
+            error = stored.get("error")
+            return TaskStatus(
+                task_id=task_id,
+                state=TaskState.ERROR,
+                result=None,
+                error=str(error) if error else None,
+                retries_remaining=0,
+            )
         if state == TaskState.COMPLETE.value:
             # Internal state markers never leak into the public result payload.
             result = {key: value for key, value in stored.items() if key != "state"}
