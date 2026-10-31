@@ -1,10 +1,18 @@
-# Business UI composition (SDK v1)
+# Business UI composition (SDK v2)
 
-The optional `frontend.contributions` array extends the existing frontend contract.
-Keep `entry`, `pages` and `assetPanels`; old packages without `contributions` remain
-valid. The generator emits an empty array. This is a manifest contract, not a DOM
-patch API or an authorization grant. Trusted Vue components still register through
-`ITSMExtensions.register`; raw HTML and CSS selectors are not targets.
+The optional `frontend.contributions` array extends the existing frontend
+contract. Keep `pages`, `assetPanels` and the declarative view contract; old
+packages without `contributions` remain valid. The generator emits an empty
+array. This is a manifest contract, not a DOM patch API or an authorization
+grant.
+
+SDK v2 has no same-origin module Vue. `add`/`replace` contributions point at an
+**isolated** iframe component, so they require `frontend.entry: "frontend.js"`;
+`hide` contributions are pure slot removals and need no bundle. Declarative
+pages, panels and widgets are rendered by the host with its own components and
+never inject markup or CSS.
+
+## Declaration
 
 ## Declaration
 

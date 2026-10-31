@@ -9,9 +9,11 @@ code and a workspace has no runtime authority.
 | candidate | Immutable package bytes with a SHA-256 digest, pending review | `submit_candidate` |
 | validated | A trusted validation report bound to that candidate digest | Host-internal recorder |
 | approved | Human Superadmin approved this exact digest and delta | Human Superadmin only |
-| installed | Active package bytes and schema revision recorded by the host | Approval/upgrade action |
-| disabled | Installed bytes retained, operations and UI unavailable | Human Superadmin |
-| rolled back | A compatible previously installed version is active | Human Superadmin only |
+| installed | Active package bytes, data file and schema revision recorded | Approval/upgrade action |
+| disabled | Installed bytes and data retained, operations and UI unavailable | Human Superadmin |
+| requires_upgrade | Installed by SDK v1; never executed again until rebuilt for v2 | Legacy detection |
+| rolled back | A compatible previous version is active, optionally with restored data | Human Superadmin only |
+| uninstalled | Host rows and grants removed; data directory kept | Human Superadmin |
 
 ## Rules
 
@@ -22,16 +24,44 @@ code and a workspace has no runtime authority.
   expected installed revision. A stale revision fails safely.
 - The expected revision is the installed monotonic integer revision, or null
   for the first install. It is not the semantic version.
+- Approval prepares storage (`<data-path>/<id>/data.sqlite3`) and extracts the
+  package into the read-only per-digest cache before any module code runs.
 - Agents and models can create, read, write, validate and submit. They cannot
-  approve, enable, disable, upgrade or roll back.
+  approve, enable, disable, upgrade, roll back or uninstall.
 - Disabling removes operations, tools, skills and native UI immediately while
   preserving module data and installed versions.
-- Uninstall removes installed frontend contributions and stops operations; it
-  does not silently delete durable collection data.
+- Uninstall is `POST /api/v1/extensions/{id}/uninstall {expectedVersion}`. It
+  removes installed versions, candidates, schedule state, migration rows,
+  registered extension permissions and the Superadmin role policies for those
+  codes, and records an audit event. It **keeps** the data directory and
+  returns `{uninstalled: true, dataRetained: true, dataPath: "..."}`. No
+  lifecycle action deletes module data.
+
+## Status
+
+`GET /api/v1/extensions/{id}/status` reports the operational state without
+touching module code: id, status (`ready`, `disabled`, `requires_upgrade`),
+enabled, version, digest, schema version, runtime, revision, storage path, data
+size, available snapshots, event cursor, stalled flag and sandbox availability
+(`available`, `landlockAbi`, `arch`, `detail`).
+
+## SDK v1 modules
+
+Installed SDK v1 modules stay visible with `status: "requires_upgrade"` and are
+never executed: invocation returns `409 extension_requires_upgrade` with a
+message pointing at `python -m itsm.extensions relocate-legacy`. Schedules are
+not dispatched for them. New v1 candidates are rejected at inspection with an
+actionable message naming `sdkVersion: 2` and the relocation command. Their
+legacy rows remain in `extension_collection_records` until an operator copies
+them into the module file with `relocate-legacy`; the command never deletes
+them.
 
 ## Rollback
 
 Rollback requires a previously installed version whose
-`compatibleSchemaVersions` includes the current schema revision. Incompatible
-rollback is rejected without changing the active version or data. A rollback
-never deletes records and never rewrites migrations backwards.
+`compatibleSchemaVersions` includes the current schema revision. Otherwise the
+request must carry `restoreData: true` and `confirm: "<extension id>"`; the host
+then restores `<data-path>/<id>/snapshots/<target-schema>.sqlite3` and moves the
+mirrored data revision back. Incompatible rollback without that confirmation is
+rejected without changing the active version or data. A rollback never rewrites
+migrations backwards.

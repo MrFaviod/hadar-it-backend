@@ -1,58 +1,111 @@
-# Native frontend reference
+# Frontend reference (SDK v2, declarative views)
 
-Trusted `frontend.js` runs in the authenticated same-origin host. Register Vue
-component definitions; do not create an app, iframe, router or second design
-system. The host supplies its full Vue runtime including template compilation.
+SDK v2 removes same-origin module JavaScript. Pages, asset panels, widgets and
+asset actions are **declarative**: the manifest describes a view, and the host
+renders it with its own Vue components and design system. A module bundle exists
+only for an explicitly isolated iframe component.
+
+## Declarative views
+
+```json
+"frontend": {
+  "pages": [{
+    "id": "records",
+    "label": "Registros",
+    "permission": "ext_record_registry.records_read",
+    "view": {
+      "table": {
+        "operation": "list_records",
+        "columns": [
+          {"field": "title", "label": "Título"},
+          {"field": "status", "label": "Estado"}
+        ]
+      }
+    }
+  }],
+  "assetPanels": [{
+    "id": "record-summary",
+    "label": "Registros",
+    "permission": "ext_record_registry.records_read",
+    "view": {
+      "table": {
+        "operation": "list_records",
+        "columns": [{"field": "title", "label": "Título"}],
+        "filterAsset": true
+      }
+    }
+  }],
+  "contributions": []
+}
+```
+
+Three view shapes are allowed:
+
+| Shape | Fields |
+| --- | --- |
+| `table` | `operation` (a declared operation), `columns` (`field`, `label`, optional `format`: `text`, `date`, `date-time`, `number`, `boolean`), optional `filterAsset`, optional `form` |
+| `form` | `operation`, `fields` (`field`, `label`, `input`: `text`, `textarea`, `number`, `date`, `select`, `checkbox`, optional `required`, `options`), optional `assetField` |
+| `isolated` | `component` and optional `height` (120–2000) |
+
+Every view declares `id`, `label`, a declared `permission` and optionally
+`icon`. `filterAsset: true` passes the selected asset's permanent id to the
+operation as `assetId`; the module decides what to store. The host renders
+labels, inputs, tables, empty states, errors and loading with its own components,
+so the module cannot inject markup, CSS or a second design system.
+
+`actions` add an entry to the asset action menu:
+
+```json
+"actions": [{
+  "id": "flag-record", "label": "Marcar registro",
+  "target": "asset.action",
+  "permission": "ext_record_registry.records_write",
+  "operation": "create_record",
+  "confirm": "¿Crear el registro para este activo?"
+}]
+```
+
+`contributions` keep the `add`/`hide` slot model: `hide` requires no
+component, `add`/`replace` require an isolated component and therefore
+`frontend.entry`.
+
+## Isolated components
+
+Only a `view.isolated` component (or a non-`hide` contribution) may ship a
+bundle, declared as `frontend.entry: "frontend.js"`. It is loaded into an iframe
+with `sandbox="allow-scripts"`: an opaque origin with no cookies, no host DOM
+and no storage access. The host inlines its own Vue runtime and component kit
+into the frame.
 
 ```js
-window.ITSMExtensions.register("record-registry", {
-  components: { RecordList, RecordSummary }
+window.ITSMExtension.register({
+  components: { RecordBoard }
 });
 ```
 
-Manifest page/panel component names resolve from this object. The registration
-ID must equal the manifest ID. Use the generator for working definitions; the
-fixed validator executes registration and checks every declared name.
+The frame talks to the host only through `postMessage`:
 
-## Host components: exact props
-
-| Component | Public props/events |
+| Direction | Messages |
 | --- | --- |
-| `ItsmTable` | `columns: [{field: 'title', label: 'Título'}]`, `rows`, `caption`, `empty`, `loading`, `rowKey` (template `row-key`). |
-| `ItsmField` | `v-model` (`modelValue` / `update:modelValue`), required `label`, `id`, `type`, `hint`, `error`, `placeholder`, `autocomplete`, `required`, `disabled`, `multiline`, `rows`; emits `blur`. |
-| `ItsmStatus` | `label`, `tone`: `ok`, `hold`, `warn` or `down`. |
-| `ItsmError` | `error` string, `title`, `retry`, `retryLabel`; emits `retry`. |
-| `ModalShell`, `AppIcon` | Native host dialog and icon components; retain host interaction and accessibility conventions. |
+| Module → host | `itsm:request` (own declared operation), `itsm:navigate` (own page), `itsm:resize`, `itsm:ready` |
+| Host → module | `itsm:init` (asset, theme, principal projection), `itsm:response`, `itsm:theme` |
 
-Use `field`, not `key`, for table columns; `label`, not `value`, for status;
-`error`, not `message`, for errors. These are not compatibility aliases.
+A request may name only the current extension's declared operations; the host
+re-checks authority on every call. `itsm:navigate` cannot open another module's
+private page. `itsm:resize` is bounded by the host. No message grants
+permissions, and nothing is read from the parent window.
 
-```html
-<ItsmError v-if="error" :error="error" :retry="true" @retry="load" />
-<ItsmTable v-else :columns="columns" :rows="records" :loading="loading"
-           caption="Registros del módulo" row-key="id" />
-```
+## Permissions and lifecycle
 
-## SDK capabilities
+`sdk.can(permission)` does not exist for declarative views: the host shows or
+hides a view using the same live authorization it uses for invocation, and the
+server rechecks every call. Disable and uninstall remove the module's pages,
+panels, widgets and actions immediately.
 
-Components receive `sdk` as a prop:
+## Validator evidence
 
-- `await sdk.request("list_records", {limit: 20})` returns the operation JSON.
-  It uses canonical same-origin POST, session and CSRF. It is not a general
-  HTTP client: no URL, actor, SQL or arbitrary host operation input.
-- `sdk.can(permission)` is a UI affordance for declared operation/contribution
-  permissions and the live server grant, never authorization proof. The server
-  rechecks every invocation.
-- `sdk.navigate('#/core/hash')` uses host navigation;
-  `sdk.navigate({page: 'records'})` opens an own manifest page. It cannot open
-  another extension's private page.
-
-An optional `asset` prop is a deeply frozen canonical asset copy. Never mutate
-it. Native asset panels do not themselves add an asset-write API.
-
-Preserve Spanish-tú copy, light/dark classes, responsive layout, keyboard and
-screen-reader semantics. Use escaped text, not `v-html` with stored data.
-Ignore stale async completions after reload/unmount; logout aborts host SDK
-requests. Disable/uninstall removes pages and panels immediately without
-breaking core routes. No bundled Vue, external component library or global
-style reset is needed.
+For declarative views the validator checks that every `view.table`/`view.form`
+names a declared operation and reports the count of host-rendered views. For an
+isolated bundle it parses the JavaScript, executes it in the sandboxed JS
+harness and requires `window.ITSMExtension.register({components})` plus every
+declared component name.
