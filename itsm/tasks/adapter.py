@@ -137,14 +137,37 @@ def _owned_task_keys(storage: Any) -> list[str]:
     return [str(row[0]) for row in rows]
 
 
+def _stored_state(huey: Any, task_id: str) -> str | None:
+    """Read the persisted state without consuming it, if the queue can answer."""
+    try:
+        stored = huey.result(task_id, preserve=True)
+    except Exception:
+        return None
+    if isinstance(stored, dict):
+        state = stored.get("state")
+        return str(state) if state is not None else None
+    return None
+
+
 def reconcile_interrupted_tasks(huey: Any) -> int:
-    """Fail tasks a dead worker left behind; returns how many were reconciled."""
+    """Fail tasks a dead worker left behind; returns how many were reconciled.
+
+    The owner marker is written before a task starts and may survive a kill that
+    happens after the result was stored, so the persisted state is authoritative:
+    a finished task keeps its result and its marker is simply dropped.
+    """
     reconciled = 0
     for key in _owned_task_keys(huey.storage):
         pid = _owner_pid(huey, key)
         if pid is not None and _process_alive(pid):
             continue
         task_id = key[len(OWNER_PREFIX) :]
+        state = _stored_state(huey, task_id)
+        terminal = {TaskState.COMPLETE.value, TaskState.ERROR.value}
+        if state in terminal or state is None:
+            with contextlib.suppress(Exception):
+                huey.storage.delete_data(key)
+            continue
         huey.put_result(task_id, {"state": TaskState.ERROR.value, "error": INTERRUPTED_ERROR})
         with contextlib.suppress(Exception):
             huey.storage.delete_data(key)

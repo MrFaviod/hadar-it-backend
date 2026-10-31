@@ -140,7 +140,7 @@ def test_a_failed_sqlite_revision_rolls_back_its_ddl(
     tables, revision = sqlite_state(settings.database_url)
     assert "probe_partial" not in tables
     assert "itsm_infrastructure" in tables
-    assert revision == "0037_extension_core_call_principal"
+    assert revision == "0037_ext_core_call_principal"
 
 
 def test_a_successful_sqlite_revision_commits_its_ddl(
@@ -194,7 +194,7 @@ def test_business_routes_are_refused_while_migrations_are_pending(
     assert ready.status_code == 503
     assert ready.json()["checks"]["migrations"] == "pending"
 
-    set_recorded_revision(settings.database_url, "0037_extension_core_call_principal")
+    set_recorded_revision(settings.database_url, "0037_ext_core_call_principal")
 
     served = test_client.get("/api/v1/assets")
     assert served.status_code in {401, 403}
@@ -210,3 +210,16 @@ def _head_revision(tmp_path: Path) -> str:
     heads = [head for head in versions.get_heads() if head != "0099_probe"]
     assert len(heads) == 1, heads
     return heads[0]
+
+
+def test_every_revision_id_fits_the_version_column() -> None:
+    """`alembic_version.version_num` is VARCHAR(32); a longer id breaks PostgreSQL."""
+
+    from alembic.config import Config
+    from alembic.script import ScriptDirectory
+
+    scripts = ScriptDirectory.from_config(
+        Config(str(BACKEND_ROOT / "alembic.ini"))
+    ).walk_revisions()
+    too_long = [script.revision for script in scripts if len(script.revision) > 32]
+    assert too_long == [], too_long

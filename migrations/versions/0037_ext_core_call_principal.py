@@ -12,14 +12,14 @@ backfilled with an empty principal id: such a row is never replayed again
 (nobody resolves to an empty actor id) and it never blocks a new reservation
 for a real principal.  Retiring the old response is the fail-closed choice.
 
-Revision ID: 0037_extension_core_call_principal
+Revision ID: 0037_ext_core_call_principal
 Revises: 0036_entity_change_events
 """
 
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0037_extension_core_call_principal"
+revision = "0037_ext_core_call_principal"
 down_revision = "0036_entity_change_events"
 branch_labels = None
 depends_on = None

@@ -186,3 +186,34 @@ def test_the_worker_reconciles_a_task_a_crashed_worker_left_running(
     assert reconciled["error"] == INTERRUPTED_ERROR
     assert reconciled["result"] is None
     assert reconciled["retries_remaining"] == 0
+
+
+def test_reconciliation_never_overwrites_a_finished_task(
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """A stale owner marker must not turn a completed task into an error."""
+
+    import subprocess
+    import sys
+    import uuid
+
+    from itsm.tasks.adapter import reconcile_interrupted_tasks
+    from itsm.tasks.runtime import build_runtime
+
+    settings = settings_factory()
+    runtime = build_runtime(settings)
+    finished = subprocess.Popen([sys.executable, "-c", "pass"])
+    finished.wait(timeout=30)
+
+    completed = uuid.uuid4().hex
+    runtime.huey.put_result(completed, {"state": "complete", "result": {"message": "x"}})
+    # The marker survives when a worker is killed between the result write and
+    # any cleanup, so reconciliation has to trust the stored state, not the key.
+    from itsm.tasks.adapter import record_task_owner
+
+    record_task_owner(runtime.huey, completed, pid=finished.pid)
+
+    assert reconcile_interrupted_tasks(runtime.huey) == 0
+    stored = runtime.huey.result(completed, preserve=True)
+    assert stored["state"] == "complete"
+    assert stored["result"] == {"message": "x"}
