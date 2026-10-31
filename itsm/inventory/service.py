@@ -314,6 +314,20 @@ def _entity_id(value: Any) -> str:
     return value.strip()
 
 
+def reference_ids(values: Any, limit: int = MAX_LIMIT) -> list[str]:
+    """Validate and de-duplicate permanent ids before a batched read."""
+    if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
+        raise ValidationFailed("ids must be a list of permanent identifiers")
+    if len(values) > limit:
+        raise ValidationFailed(f"at most {limit} ids may be resolved at once")
+    ordered: list[str] = []
+    for value in values:
+        identifier = _entity_id(value)
+        if identifier not in ordered:
+            ordered.append(identifier)
+    return ordered
+
+
 def _normalize(field: str, value: Any) -> Any:
     if field == "quick_code":
         return _quick_code(value)
@@ -1015,6 +1029,26 @@ class InventoryService:
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.view", resource=f"asset:{asset.id}")
         return self._view(asset)
+
+    def reference_states(self, principal: Principal, asset_ids: Sequence[str]) -> dict[str, str]:
+        """Resolve permanent asset ids to ``active``/``archived``/``missing``.
+
+        This is the read the entity event feed and its reconciliation path use.
+        It keeps the ordinary ``assets.view`` authority and never exposes a
+        field beyond the lifecycle state, so a consumer cannot read inventory
+        through this seam that it could not read through REST.
+        """
+        self._identity.authorize(principal, "assets.view", resource="inventory:assets")
+        ids = reference_ids(asset_ids)
+        if not ids:
+            return {}
+        rows = self._session.execute(
+            select(Asset.id, Asset.archived_at).where(Asset.id.in_(ids))
+        ).all()
+        states = dict.fromkeys(ids, "missing")
+        for asset_id, archived_at in rows:
+            states[asset_id] = "archived" if archived_at is not None else "active"
+        return states
 
     def search(
         self,
@@ -1837,6 +1871,7 @@ __all__ = [
     "PurgeResult",
     "ValidationFailed",
     "iter_statuses",
+    "reference_ids",
 ]
 
 
