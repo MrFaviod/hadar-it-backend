@@ -82,6 +82,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--max-age-days", type=int, default=None, help="delete backups older than this many days"
     )
     prune.add_argument("--dry-run", action="store_true", help="report without deleting")
+    prune.add_argument(
+        "--partials-older-than",
+        type=int,
+        default=None,
+        help="delete interrupted-backup .partial-* directories older than this many days",
+    )
 
     commands.add_parser("status", parents=[common], help="report backup and upgrade status")
     commands.add_parser("upgrade", parents=[common], help="guarded upgrade to the code head")
@@ -144,7 +150,16 @@ def _dispatch(args: argparse.Namespace, context: OpsContext) -> tuple[dict[str, 
             if args.max_age_days is not None
             else _env_int(ENV_RETENTION_MAX_AGE_DAYS)
         )
-        return service.prune(context, keep=keep, max_age_days=max_age, dry_run=args.dry_run), 0
+        return (
+            service.prune(
+                context,
+                keep=keep,
+                max_age_days=max_age,
+                dry_run=args.dry_run,
+                partials_older_than=args.partials_older_than,
+            ),
+            0,
+        )
     if args.command == "status":
         return service.status(context), 0
     outcome = upgrade.run_upgrade(context)

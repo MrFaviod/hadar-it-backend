@@ -40,7 +40,7 @@ from itsm.database import (
     current_revision,
     probe_database,
 )
-from itsm.ops import attachments, engines, extensions, store
+from itsm.ops import attachments, engines, extensions, quiesce, store
 from itsm.ops import sqlite as sqlite_ops
 from itsm.ops.engines import DatabaseTarget, OpsError, ToolCommand
 
@@ -550,13 +550,22 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
     if attachment_errors:
         combined = "; ".join(attachment_errors)
         error = combined if error is None else f"{error}; {combined}"
-    verified = (
+    integrity_verified = (
         checks["checksum"]
         and checks["size"]
         and checks["integrity"] == "ok"
         and extensions_ok
         and attachments_ok
     )
+    # A missing key ring does not damage the artifact, so recovery must stay
+    # possible: it is reported, and it fails verification so backup automation
+    # cannot publish or prune over an installation that cannot read its secrets.
+    key_report = _credential_key_report(context, artifact)
+    if key_report["missing"]:
+        checks["credentialKeys"] = "missing"
+        if error is None:
+            error = str(key_report["error"])
+    verified = integrity_verified and not key_report["missing"]
     store.update_verification(artifact, verified=verified)
     if not verified:
         _record_failure(
@@ -571,6 +580,7 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
         "checks": checks,
         "extensions": extension_reports,
         "attachments": attachment_report,
+        "integrityVerified": integrity_verified,
         "verified": verified,
         "error": None if verified else (error or "verification failed"),
     }
@@ -598,7 +608,32 @@ def _credential_key_report(context: OpsContext, artifact: store.BackupArtifact) 
             "provider credentials sealed with those keys stay unreadable until the key is "
             "restored"
         )
-    return {"recorded": recorded, "current": current, "missing": missing, "warning": warning}
+    if missing:
+        status = "missing"
+        error = (
+            f"the current AI credential key ring lacks {len(missing)} recorded "
+            f"fingerprint(s): {', '.join(missing)}; provider credentials sealed with those "
+            "keys stay unreadable until ITSM_AI_CREDENTIAL_KEYS contains the recorded key"
+        )
+    elif recorded:
+        status = "ok"
+        error = None
+    else:
+        status = "unrecorded"
+        error = None
+        warning = (
+            "the backup records no AI credential key fingerprint; provider credentials "
+            "cannot be proven readable after a restore. Configure ITSM_AI_CREDENTIAL_KEYS "
+            "and take a new backup so the ring is recorded"
+        )
+    return {
+        "status": status,
+        "recorded": recorded,
+        "current": current,
+        "missing": missing,
+        "warning": warning,
+        "error": error,
+    }
 
 
 def _attach_credential_report(
@@ -665,6 +700,9 @@ def _restore_sqlite(
             raise RestoreRefused(
                 "--confirm must repeat the backup id to overwrite the live database"
             )
+        in_use = quiesce.refusal(context.settings)
+        if in_use is not None:
+            raise RestoreRefused(f"restore refused: {in_use}")
     else:
         if replace_live:
             raise RestoreRefused("--replace-live only applies to the live database path")
@@ -854,7 +892,9 @@ def restore(
         if refusal is not None:
             raise RestoreRefused(f"backup {identifier} cannot be restored: {refusal}")
     verification = _verify_artifact(context, artifact)
-    if not verification["verified"]:
+    # Artifact integrity gates recovery; a missing key ring is reported by the
+    # restore payload instead of blocking a disaster recovery.
+    if not verification["integrityVerified"]:
         raise OpsError(f"backup {identifier} failed verification: {verification['error']}")
     payload: dict[str, Any] = {}
     core_requested = target_file is not None or target_database is not None
@@ -940,23 +980,39 @@ def prune(
     keep: int | None = None,
     max_age_days: int | None = None,
     dry_run: bool = False,
+    partials_older_than: int | None = None,
 ) -> dict[str, Any]:
     """Delete artifacts outside the retention policy, never the newest verified one."""
-    if keep is None and max_age_days is None:
-        raise UsageError("a retention rule is required: pass --keep and/or --max-age-days")
+    if keep is None and max_age_days is None and partials_older_than is None:
+        raise UsageError(
+            "a retention rule is required: pass --keep, --max-age-days and/or --partials-older-than"
+        )
     if keep is not None and keep < 1:
         raise UsageError("--keep must be at least 1")
     if max_age_days is not None and max_age_days < 0:
         raise UsageError("--max-age-days must not be negative")
+    if partials_older_than is not None and partials_older_than < 0:
+        raise UsageError("--partials-older-than must not be negative")
     root = context.backup_root
     store.prepare_root(root)
     artifacts = store.list_artifacts(root)
+    reclaimed: list[str] = []
+    if partials_older_than is not None:
+        for item in store.partial_artifacts(root):
+            age = item["ageDays"]
+            if age is None or age <= partials_older_than:
+                continue
+            if not dry_run:
+                shutil.rmtree(root / item["name"], ignore_errors=True)
+            reclaimed.append(item["name"])
     if not artifacts:
         return {
             "status": "ok",
             "kept": [],
             "deleted": [],
             "protected": [],
+            "reclaimedPartials": reclaimed,
+            "partials": store.partial_artifacts(root),
             "dryRun": dry_run,
         }
     newest = artifacts[0]
@@ -986,6 +1042,8 @@ def prune(
         "kept": kept,
         "deleted": deleted,
         "protected": protected,
+        "reclaimedPartials": reclaimed,
+        "partials": store.partial_artifacts(root),
         "dryRun": dry_run,
     }
 
@@ -1037,6 +1095,8 @@ def status(context: OpsContext) -> dict[str, Any]:
         "lastBackup": _last_backup_payload(artifacts),
         "failures": stored.get("failures", []),
         "lastUpgrade": stored.get("lastUpgrade"),
+        "credentialKeys": _credential_key_report(context, artifacts[0]) if artifacts else None,
+        "partials": store.partial_artifacts(root),
         "upgradeAttempt": _upgrade_attempt_payload(root),
         "updatedAt": stored.get("updatedAt"),
     }

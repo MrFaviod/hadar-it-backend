@@ -488,6 +488,28 @@ def create_artifact(
         raise
 
 
+def partial_artifacts(root: Path) -> list[dict[str, Any]]:
+    """Report leftovers of interrupted backups so they are visible and reclaimable."""
+    if not root.is_dir():
+        return []
+    now = utc_now()
+    found: list[dict[str, Any]] = []
+    for entry in root.iterdir():
+        if not entry.is_dir() or not entry.name.startswith(_PARTIAL_PREFIX):
+            continue
+        total = 0
+        with contextlib.suppress(OSError):
+            for path in entry.rglob("*"):
+                if path.is_file() and not path.is_symlink():
+                    total += path.stat().st_size
+        age: float | None = None
+        with contextlib.suppress(OSError):
+            modified = datetime.fromtimestamp(entry.stat().st_mtime, tz=UTC)
+            age = round((now - modified).total_seconds() / 86400.0, 3)
+        found.append({"name": entry.name, "bytes": total, "ageDays": age})
+    return sorted(found, key=lambda item: item["name"])
+
+
 def load_artifact(root: Path, identifier: str) -> BackupArtifact:
     """Load one artifact by id, rejecting traversal and unknown ids."""
     if not _IDENTIFIER.match(identifier or ""):
@@ -587,7 +609,14 @@ PUBLISHED_SUMMARY_KEYS = (
 #: Fields the private ops record gains from publication. ``failures`` and
 #: ``lastUpgrade`` already live there as raw history and are never replaced by
 #: the sanitized browser copy.
-PUBLISHED_RECORD_KEYS = ("status", "engine", "backupCount", "lastBackup", "updatedAt")
+PUBLISHED_RECORD_KEYS = (
+    "status",
+    "engine",
+    "backupCount",
+    "lastBackup",
+    "credentialKeys",
+    "updatedAt",
+)
 PUBLISHED_LAST_BACKUP_KEYS = (
     "id",
     "createdAt",
@@ -689,6 +718,21 @@ def _published_last_upgrade(value: object, secrets: tuple[str, ...]) -> dict[str
     return None if all(item is None for item in summary.values()) else summary
 
 
+def _published_credential_keys(value: object) -> dict[str, Any] | None:
+    """Publish only the key-ring state and the missing fingerprints (never key material)."""
+    if not isinstance(value, Mapping):
+        return None
+    missing = [
+        item
+        for item in value.get("missing") or []
+        if isinstance(item, str) and _FINGERPRINT.match(item)
+    ]
+    status = value.get("status")
+    if not isinstance(status, str) or not status:
+        status = "unknown"
+    return {"status": status[:40], "missing": missing}
+
+
 def public_summary(payload: Mapping[str, Any], secrets: tuple[str, ...] = ()) -> dict[str, Any]:
     """Return the allow-listed, source-sanitized operational summary."""
     return {
@@ -698,6 +742,7 @@ def public_summary(payload: Mapping[str, Any], secrets: tuple[str, ...] = ()) ->
         "lastBackup": _published_last_backup(payload.get("lastBackup"), secrets),
         "failures": _published_failures(payload.get("failures"), secrets),
         "lastUpgrade": _published_last_upgrade(payload.get("lastUpgrade"), secrets),
+        "credentialKeys": _published_credential_keys(payload.get("credentialKeys")),
         "updatedAt": isoformat(utc_now()),
     }
 
@@ -731,7 +776,9 @@ def publish_summary(
     """Publish the summary, keeping failure/upgrade history and the private record."""
     summary = public_summary(payload, secrets=secrets)
     stored = read_status(root)
-    stored.update({key: summary[key] for key in PUBLISHED_RECORD_KEYS})
+    stored.update(
+        {key: summary[key] for key in PUBLISHED_RECORD_KEYS if summary.get(key) is not None}
+    )
     write_status(root, stored)
     if external_path is not None:
         write_published_copy(external_path, summary)

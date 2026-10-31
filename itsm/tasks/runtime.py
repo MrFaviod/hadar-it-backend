@@ -19,6 +19,7 @@ from huey.signals import SIGNAL_ERROR, SIGNAL_RETRYING
 from itsm.config import Settings, get_settings
 from itsm.database import check_readiness, create_engine_from_settings
 from itsm.logging import configure_logging, log_event
+from itsm.ops import quiesce
 from itsm.release_identity import enforce_startup
 from itsm.release_mode import ReleaseModeError
 from itsm.tasks.adapter import (
@@ -34,6 +35,9 @@ TASK_NAME_ECHO = "demo_echo"
 TASK_NAME_FAILURE = "demo_failure"
 TASK_NAME_PERIODIC = "demo_periodic"
 TASK_QUEUE_NAME = "itsm"
+
+# Worker-process runtime marker, released on shutdown.
+_RUNTIME_MARKERS: dict[str, Path] = {}
 
 #: Process exit code when the release mode or the database owner is refused.
 WORKER_REFUSED_EXIT_CODE = 2
@@ -154,6 +158,9 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
                 readiness = check_readiness(engine, settings, task_storage_ok=True)
             finally:
                 engine.dispose()
+            marker = quiesce.register(settings, "worker")
+            if marker is not None:
+                _RUNTIME_MARKERS["worker"] = marker
             reconciled = reconcile_interrupted_tasks(huey)
             if reconciled:
                 log_event(logger, "worker.reconciled", count=reconciled)
@@ -183,6 +190,7 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
 
     @huey.on_shutdown()
     def on_worker_shutdown() -> None:
+        quiesce.release(_RUNTIME_MARKERS.pop("worker", None))
         log_event(logger, "worker.stopped", app=settings.app_name)
 
     periodic = None
