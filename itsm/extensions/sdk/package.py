@@ -26,13 +26,13 @@ MAX_EXPANDED_BYTES = 8 * 1024 * 1024
 MAX_ENTRIES = 200
 MAX_FILE_BYTES = 1024 * 1024
 
-EXACT_FILES = frozenset({"extension.json", "backend.py", "frontend.js"})
+ROOT_FILES = frozenset({"extension.json", "backend.py", "frontend.js"})
 SKILL_PATTERN = re.compile(r"^skills/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)/SKILL\.md$")
 TEST_PATTERN = re.compile(r"^tests/[A-Za-z_][A-Za-z0-9_]*\.py$")
 
 
 class PackageError(ValueError):
-    """The package violates the bounded v1 file or archive contract."""
+    """The package violates the bounded SDK v2 file or archive contract."""
 
 
 @dataclass(frozen=True)
@@ -60,7 +60,7 @@ def digest_bytes(data: bytes) -> str:
 
 def allowed_path(path: str) -> bool:
     return (
-        path in EXACT_FILES
+        path in ROOT_FILES
         or SKILL_PATTERN.fullmatch(path) is not None
         or TEST_PATTERN.fullmatch(path) is not None
     )
@@ -169,15 +169,31 @@ def load_manifest(files: Mapping[str, str]) -> dict[str, Any]:
 
 
 def validate_layout(files: Mapping[str, str], manifest: Mapping[str, Any]) -> None:
-    """Require exactly the declared package files and at least one Python test."""
-    missing = sorted(EXACT_FILES - set(files))
+    """Require exactly the files the manifest's runtime and views declare."""
+    required = {"extension.json"}
+    runtime = manifest.get("runtime")
+    if runtime == "sandboxed":
+        required.add("backend.py")
+    elif runtime == "declarative":
+        if "backend.py" in files:
+            raise PackageError(
+                "declarative packages cannot ship backend.py; use the sandboxed runtime"
+            )
+    else:
+        raise PackageError(f"unknown runtime: {runtime!r}")
+    entry = (manifest.get("frontend") or {}).get("entry")
+    if entry:
+        required.add(str(entry))
+    elif "frontend.js" in files:
+        raise PackageError("frontend.js is only allowed when frontend.entry declares it")
+    missing = sorted(required - set(files))
     if missing:
         raise PackageError(f"missing required package files: {', '.join(missing)}")
     declared_skills = {str(item["path"]) for item in manifest.get("skills", [])}
     for path in declared_skills:
         if path not in files:
             raise PackageError(f"declared skill file is missing: {path}")
-    extra = sorted(set(files) - EXACT_FILES - declared_skills)
+    extra = sorted(set(files) - ROOT_FILES - declared_skills)
     for path in extra:
         if SKILL_PATTERN.fullmatch(path):
             raise PackageError(f"skill file is not declared in the manifest: {path}")
@@ -208,17 +224,13 @@ def build_package(
         normalized[name] = content
     manifest = load_manifest(normalized)
     try:
-        manifest = validate_manifest(
-            manifest, known_core_permissions=known_core_permissions
-        )
+        manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
     except ManifestError as exc:
         raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
     validate_layout(normalized, manifest)
 
     buffer = io.BytesIO()
-    with zipfile.ZipFile(
-        buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9
-    ) as archive:
+    with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED, compresslevel=9) as archive:
         for name in sorted(normalized):
             info = zipfile.ZipInfo(filename=name, date_time=(1980, 1, 1, 0, 0, 0))
             info.compress_type = zipfile.ZIP_DEFLATED
@@ -245,9 +257,7 @@ def parse_package(
     files = read_zip(data, limits)
     manifest = load_manifest(files)
     try:
-        manifest = validate_manifest(
-            manifest, known_core_permissions=known_core_permissions
-        )
+        manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
     except ManifestError as exc:
         raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
     validate_layout(files, manifest)
@@ -300,9 +310,7 @@ def read_workspace(
                 raise PackageError(f"file exceeds {limits.max_file_bytes} bytes: {relative}")
             expanded += size
             if expanded > limits.max_expanded_bytes:
-                raise PackageError(
-                    f"workspace exceeds {limits.max_expanded_bytes} bytes"
-                )
+                raise PackageError(f"workspace exceeds {limits.max_expanded_bytes} bytes")
             try:
                 data = candidate.read_bytes()
             except OSError as exc:

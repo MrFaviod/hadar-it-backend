@@ -3,21 +3,20 @@
 from __future__ import annotations
 
 import pytest
-from sqlalchemy import delete, select
-from sqlalchemy.orm import Session
-
 from itsm.database import create_engine_from_settings
 from itsm.extensions.notifications import enqueue_extension_notice
 from itsm.identity.models import Identity, IdentityRolePolicy
 from itsm.identity.service import IdentityService, NotFound, Principal, ValidationFailed
 from itsm.notifications.models import NotificationEvent, NotificationInbox
 from itsm.notifications.service import NotificationService
+from sqlalchemy import delete, select
+from sqlalchemy.orm import Session
 from tests.conftest import ADMIN_USERNAME, bootstrap_superadmin, run_migrations
 
 
 @pytest.fixture
-def notice_context(settings_factory):
-    settings = settings_factory()
+def notice_context(settings_factory, tmp_path):
+    settings = settings_factory(extension_data_path=tmp_path / "extensions-data")
     migrated = run_migrations(settings)
     assert migrated.returncode == 0, migrated.stderr
     bootstrap_superadmin(settings)
@@ -153,37 +152,48 @@ def test_periodic_worker_delivers_once_and_disable_preserves_data(notice_context
         pytest.skip("fixed extension validator image unavailable")
     factory = create_session_factory(session.get_bind())
     host = ExtensionHostService(
-        settings, factory, notify=partial(enqueue_extension_notice, settings=settings),
+        settings,
+        factory,
+        notify=partial(enqueue_extension_notice, settings=settings),
     )
     generated = generate_package(
-        extension_id="scheduled-records", name="Registros periódicos",
+        extension_id="scheduled-records",
+        name="Registros periódicos",
         description="Avisos nativos periódicos con estado persistido.",
         known_core_permissions=PERMISSION_CODES,
     )
     files = dict(generated.files)
     manifest = dict(generated.manifest)
     permission = manifest["permissions"][1]["code"]
-    manifest["schedules"] = [{
-        "name": "record_notice", "handler": "record_notice", "intervalSeconds": 60,
-        "permission": permission,
-    }]
+    manifest["schedules"] = [
+        {
+            "name": "record_notice",
+            "handler": "record_notice",
+            "intervalSeconds": 60,
+            "permission": permission,
+        }
+    ]
+    # SDK v2 capabilities are an explicit manifest allowlist; the handler calls
+    # context.notify, so the module must declare it.
+    manifest["capabilities"] = ["notify"]
     files["extension.json"] = json.dumps(manifest)
-    files["backend.py"] += '''
+    files["backend.py"] += """
 
 def record_notice(context):
     old = context.store.get("records", "scheduled")
     context.store.put("records", "scheduled", {"title": "Periodic record", "status": "active"},
                       0 if old is None else old["version"])
-    context.notify(recipient_ids=[context.principal.actor_id, "READER_ID"],
+    context.notify(recipient_ids=[context.principal["actor_id"], "READER_ID"],
                    key="record:expiry:2026-10-28", title="Registro próximo a vencer",
                    body="Revisa el registro antes de su vencimiento.",
-                   permission="NOTICE_PERMISSION", url="#/extensiones/scheduled-records/records")
+                   permission="NOTICE_PERMISSION", url="#/extensiones/scheduled-records/records",
+                   idempotency_key="notice:record:expiry:2026-10-28")
 
 _register_records = register
 def register(sdk):
     _register_records(sdk)
     sdk.schedule("record_notice", record_notice)
-'''.replace("READER_ID", reader_id).replace("NOTICE_PERMISSION", permission)
+""".replace("READER_ID", reader_id).replace("NOTICE_PERMISSION", permission)
     files["tests/test_backend.py"] = files["tests/test_backend.py"].replace(
         'raise AssertionError("this example declares no schedules")',
         'assert name == "record_notice" and callable(handler)',
@@ -201,10 +211,19 @@ def register(sdk):
     assert process_extension_schedules(settings, second_due)["succeeded"] == 1
     session.expire_all()
     notices = session.scalars(select(NotificationInbox)).all()
-    assert [(row.recipient_id, row.required_permission) for row in notices] == [(principal.actor_id, permission)]
+    assert [(row.recipient_id, row.required_permission) for row in notices] == [
+        (principal.actor_id, permission)
+    ]
     assert host.invoke(principal, "scheduled-records", "list_records", {})["total"] == 1
     installed = host.discovery(principal)["items"][0]
-    host.set_enabled(principal, "scheduled-records", enabled=False, expected_version=installed["revision"])
+    host.set_enabled(
+        principal, "scheduled-records", enabled=False, expected_version=installed["revision"]
+    )
     assert process_extension_schedules(settings, second_due + timedelta(minutes=2))["claimed"] == 0
-    host.set_enabled(principal, "scheduled-records", enabled=True, expected_version=installed["revision"] + 1)
-    assert host.invoke(principal, "scheduled-records", "list_records", {})["items"][0]["title"] == "Periodic record"
+    host.set_enabled(
+        principal, "scheduled-records", enabled=True, expected_version=installed["revision"] + 1
+    )
+    assert (
+        host.invoke(principal, "scheduled-records", "list_records", {})["items"][0]["title"]
+        == "Periodic record"
+    )

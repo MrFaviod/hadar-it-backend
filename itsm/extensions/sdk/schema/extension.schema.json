@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://itsm.local/sdk/extension.schema.json",
-  "title": "ITSM native extension manifest",
-  "description": "Version 1 manifest contract for trusted native extensions. The host owns installation; this schema defines the package declaration only.",
+  "$id": "https://itsm.local/schema/extension.schema.json",
+  "title": "ITSM native extension manifest (SDK v2)",
+  "description": "Declarative shape only; cross-field rules live in sdk/contract.py and are reported with the same bounded error list.",
   "type": "object",
   "additionalProperties": false,
   "required": [
@@ -11,24 +11,23 @@
     "name",
     "description",
     "version",
+    "runtime",
     "permissions",
-    "corePermissions",
     "operations",
     "collections",
     "schemaVersion",
     "compatibleSchemaVersions",
     "migrations",
-    "frontend",
-    "schedules",
-    "skills"
+    "frontend"
   ],
   "properties": {
     "sdkVersion": {
-      "const": 1
+      "const": 2,
+      "description": "SDK v2 is the only admitted authoring contract."
     },
     "id": {
       "type": "string",
-      "minLength": 2,
+      "minLength": 3,
       "maxLength": 48,
       "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
     },
@@ -44,192 +43,657 @@
     },
     "version": {
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$",
-      "maxLength": 32
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$"
+    },
+    "runtime": {
+      "enum": [
+        "declarative",
+        "sandboxed"
+      ],
+      "description": "declarative runs host-side over collections; sandboxed runs backend.py in the runner."
+    },
+    "storage": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "engine": {
+          "const": "sqlite"
+        }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "uniqueItems": true,
+      "items": {
+        "enum": [
+          "assets.read",
+          "assets.write",
+          "incidents.read",
+          "incidents.write",
+          "notify"
+        ]
+      }
     },
     "permissions": {
       "type": "array",
       "maxItems": 64,
       "items": {
-        "$ref": "#/$defs/permission"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "code",
+          "label",
+          "description"
+        ],
+        "properties": {
+          "code": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 120
+          },
+          "label": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 120
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          }
+        }
       }
     },
     "corePermissions": {
       "type": "array",
-      "maxItems": 64,
       "uniqueItems": true,
       "items": {
         "type": "string",
-        "pattern": "^[a-z][a-z0-9_]*(?:\\.[a-z][a-z0-9_]*)+$",
-        "maxLength": 96
+        "minLength": 3,
+        "maxLength": 120
       }
     },
     "operations": {
       "type": "array",
       "maxItems": 64,
       "items": {
-        "$ref": "#/$defs/operation"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "permission",
+          "parameters"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "permission": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 120
+          },
+          "mutation": {
+            "type": "boolean"
+          },
+          "kind": {
+            "enum": [
+              "handler",
+              "list",
+              "get",
+              "put",
+              "delete"
+            ]
+          },
+          "collection": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "parameters": {
+            "$ref": "#/$defs/parameters"
+          }
+        }
       }
     },
     "collections": {
       "type": "array",
       "maxItems": 64,
       "items": {
-        "$ref": "#/$defs/collection"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 512
+          },
+          "schema": {
+            "type": "object"
+          },
+          "references": {
+            "type": "array",
+            "maxItems": 32,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "field",
+                "entity",
+                "onArchive",
+                "onDelete"
+              ],
+              "properties": {
+                "field": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                },
+                "entity": {
+                  "enum": [
+                    "asset",
+                    "incident"
+                  ]
+                },
+                "onArchive": {
+                  "enum": [
+                    "keep",
+                    "flag"
+                  ]
+                },
+                "onDelete": {
+                  "enum": [
+                    "flag",
+                    "delete"
+                  ]
+                }
+              }
+            }
+          }
+        }
       }
     },
     "schemaVersion": {
       "type": "integer",
       "minimum": 1,
-      "maximum": 1000000
+      "maximum": 100000
     },
     "compatibleSchemaVersions": {
       "type": "array",
       "minItems": 1,
       "maxItems": 64,
-      "uniqueItems": true,
       "items": {
         "type": "integer",
         "minimum": 1,
-        "maximum": 1000000
+        "maximum": 100000
       }
     },
     "migrations": {
       "type": "array",
       "maxItems": 64,
       "items": {
-        "$ref": "#/$defs/migration"
-      }
-    },
-    "frontend": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["entry", "pages", "assetPanels"],
-      "properties": {
-        "entry": {
-          "const": "frontend.js"
-        },
-        "pages": {
-          "type": "array",
-          "maxItems": 64,
-          "items": {
-            "$ref": "#/$defs/contribution"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "from",
+          "to",
+          "handler"
+        ],
+        "properties": {
+          "from": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "to": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "handler": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
           }
-        },
-        "assetPanels": {
-          "type": "array",
-          "maxItems": 64,
-          "items": {
-            "$ref": "#/$defs/contribution"
-          }
-        },
-        "contributions": {
-          "type": "array",
-          "maxItems": 64,
-          "items": {"$ref": "#/$defs/uiContribution"}
         }
       }
     },
     "schedules": {
       "type": "array",
-      "maxItems": 64,
+      "maxItems": 32,
       "items": {
-        "$ref": "#/$defs/schedule"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "handler",
+          "intervalSeconds",
+          "permission"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "handler": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          },
+          "intervalSeconds": {
+            "type": "integer",
+            "minimum": 60,
+            "maximum": 2592000
+          },
+          "permission": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 120
+          }
+        }
+      }
+    },
+    "subscriptions": {
+      "type": "array",
+      "maxItems": 32,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "event",
+          "handler"
+        ],
+        "properties": {
+          "event": {
+            "enum": [
+              "asset.created",
+              "asset.updated",
+              "asset.archived",
+              "asset.restored",
+              "asset.deleted",
+              "incident.created",
+              "incident.updated"
+            ]
+          },
+          "handler": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9_]{1,63}$"
+          }
+        }
+      }
+    },
+    "reconcile": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "handler",
+        "intervalSeconds"
+      ],
+      "properties": {
+        "handler": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9_]{1,63}$"
+        },
+        "intervalSeconds": {
+          "type": "integer",
+          "minimum": 300,
+          "maximum": 2592000
+        }
+      }
+    },
+    "frontend": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "pages",
+        "assetPanels"
+      ],
+      "properties": {
+        "entry": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "pages": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/view"
+          }
+        },
+        "assetPanels": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/view"
+          }
+        },
+        "widgets": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "$ref": "#/$defs/view"
+          }
+        },
+        "actions": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "id",
+              "label",
+              "target",
+              "permission",
+              "operation"
+            ],
+            "properties": {
+              "id": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+              },
+              "label": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 120
+              },
+              "target": {
+                "const": "asset.action"
+              },
+              "permission": {
+                "type": "string",
+                "minLength": 3,
+                "maxLength": 120
+              },
+              "operation": {
+                "type": "string",
+                "pattern": "^[a-z][a-z0-9_]{1,63}$"
+              },
+              "confirm": {
+                "type": "string",
+                "minLength": 1,
+                "maxLength": 200
+              }
+            }
+          }
+        },
+        "contributions": {
+          "type": "array",
+          "maxItems": 64,
+          "items": {
+            "$ref": "#/$defs/uiContribution"
+          }
+        }
       }
     },
     "skills": {
       "type": "array",
       "maxItems": 64,
       "items": {
-        "$ref": "#/$defs/skill"
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "name",
+          "description",
+          "path"
+        ],
+        "properties": {
+          "name": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+          },
+          "description": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 1024
+          },
+          "path": {
+            "type": "string",
+            "minLength": 3,
+            "maxLength": 200
+          }
+        }
       }
     }
   },
   "$defs": {
-    "uiTarget": {
-      "type": "string",
-      "enum": [
-        "nav.panel",
-        "nav.inventory",
-        "nav.conversation",
-        "nav.maintenance",
-        "nav.monitoring",
-        "nav.infrastructure",
-        "nav.datos",
-        "nav.reports",
-        "nav.warranties",
-        "nav.labels",
-        "nav.people",
-        "nav.help",
-        "nav.extensions",
-        "page.panel",
-        "page.inventory",
-        "page.conversation",
-        "page.maintenance",
-        "page.monitoring",
-        "page.map",
-        "page.graph",
-        "page.datos",
-        "page.reports",
-        "page.warranties",
-        "page.labels",
-        "page.people",
-        "page.person",
-        "page.detail",
-        "page.incident",
-        "page.reportAsset",
-        "page.monitorDevice",
-        "page.monitorAlert",
-        "page.notifications",
-        "page.help",
-        "widget.availability",
-        "widget.alerts",
-        "widget.distribution",
-        "widget.infrastructure",
-        "widget.activity",
-        "widget.maintenance",
-        "widget.warranties",
-        "widget.inventory",
-        "widget.latency",
-        "widget.incidents",
-        "asset.panel.warranty",
-        "asset.panel.attachments",
-        "asset.panel.qr",
-        "asset.panel.relations",
-        "asset.panel.maintenance",
-        "asset.panel.monitoring",
-        "asset.panel.history",
-        "asset.action.edit",
-        "asset.action.assign",
-        "asset.action.return",
-        "asset.action.transfer",
-        "asset.action.ask",
-        "asset.action.duplicate",
-        "asset.action.change-status",
-        "asset.action.restore",
-        "asset.action.archive",
-        "asset.action.retire",
-        "asset.action.purge",
-        "asset.action.delete",
-        "config.apariencia",
-        "config.general",
-        "config.categorias",
-        "config.activos",
-        "config.sedes",
-        "config.personas",
-        "config.integraciones",
-        "config.relaciones",
-        "config.mantenimiento",
-        "config.supervision",
-        "config.alertas",
-        "config.notificaciones",
-        "config.mapas",
-        "config.datos",
-        "config.reportes",
-        "config.garantias",
-        "config.qr",
-        "config.etiquetas"
-      ]
+    "parameters": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "type",
+        "properties",
+        "additionalProperties"
+      ],
+      "properties": {
+        "type": {
+          "const": "object"
+        },
+        "properties": {
+          "type": "object",
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": [
+              "type"
+            ],
+            "properties": {
+              "type": {
+                "enum": [
+                  "string",
+                  "number",
+                  "integer",
+                  "boolean",
+                  "array",
+                  "object"
+                ]
+              },
+              "items": {
+                "type": "object"
+              }
+            }
+          }
+        },
+        "required": {
+          "type": "array",
+          "maxItems": 32,
+          "items": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 64
+          }
+        },
+        "additionalProperties": {
+          "type": "boolean"
+        }
+      }
+    },
+    "view": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "label",
+        "permission"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$"
+        },
+        "label": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 120
+        },
+        "icon": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 64
+        },
+        "permission": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 120
+        },
+        "component": {
+          "type": "string",
+          "pattern": "^[A-Z][A-Za-z0-9]{1,63}$",
+          "description": "Legacy custom component name; requires frontend.entry and an isolated view."
+        },
+        "view": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 1,
+          "additionalProperties": false,
+          "properties": {
+            "table": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operation",
+                "columns"
+              ],
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{1,63}$"
+                },
+                "columns": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "field",
+                      "label"
+                    ],
+                    "properties": {
+                      "field": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                      },
+                      "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120
+                      },
+                      "format": {
+                        "enum": [
+                          "text",
+                          "date",
+                          "date-time",
+                          "number",
+                          "boolean"
+                        ]
+                      }
+                    }
+                  }
+                },
+                "filterAsset": {
+                  "type": "boolean"
+                }
+              }
+            },
+            "form": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "operation",
+                "fields"
+              ],
+              "properties": {
+                "operation": {
+                  "type": "string",
+                  "pattern": "^[a-z][a-z0-9_]{1,63}$"
+                },
+                "assetField": {
+                  "type": "string",
+                  "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                },
+                "fields": {
+                  "type": "array",
+                  "minItems": 1,
+                  "maxItems": 32,
+                  "items": {
+                    "type": "object",
+                    "additionalProperties": false,
+                    "required": [
+                      "field",
+                      "label",
+                      "input"
+                    ],
+                    "properties": {
+                      "field": {
+                        "type": "string",
+                        "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
+                      },
+                      "label": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": 120
+                      },
+                      "input": {
+                        "enum": [
+                          "text",
+                          "textarea",
+                          "number",
+                          "date",
+                          "select",
+                          "checkbox"
+                        ]
+                      },
+                      "required": {
+                        "type": "boolean"
+                      },
+                      "options": {
+                        "type": "array",
+                        "maxItems": 64,
+                        "items": {
+                          "type": "string",
+                          "minLength": 1,
+                          "maxLength": 120
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            },
+            "isolated": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": [
+                "component"
+              ],
+              "properties": {
+                "component": {
+                  "type": "string",
+                  "pattern": "^[A-Z][A-Za-z0-9]{1,63}$"
+                },
+                "height": {
+                  "type": "integer",
+                  "minimum": 120,
+                  "maximum": 2000
+                }
+              }
+            }
+          }
+        }
+      }
     },
     "uiContribution": {
       "type": "object",
@@ -322,210 +786,90 @@
         }
       ]
     },
-    "permission": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["code", "label", "description"],
-      "properties": {
-        "code": {
-          "type": "string",
-          "pattern": "^ext_[a-z0-9_]+\\.[a-z][a-z0-9_]{1,63}$",
-          "maxLength": 128
-        },
-        "label": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 120
-        },
-        "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 512
-        }
-      }
-    },
-    "operation": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "description", "permission", "mutation", "parameters"],
-      "properties": {
-        "name": {
-          "$ref": "#/$defs/handlerName"
-        },
-        "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024
-        },
-        "permission": {
-          "type": "string",
-          "pattern": "^ext_[a-z0-9_]+\\.[a-z][a-z0-9_]{1,63}$",
-          "maxLength": 128
-        },
-        "mutation": {
-          "type": "boolean"
-        },
-        "parameters": {
-          "$ref": "#/$defs/parameters"
-        }
-      }
-    },
-    "collection": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "description"],
-      "properties": {
-        "name": {
-          "$ref": "#/$defs/handlerName"
-        },
-        "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 512
-        }
-      }
-    },
-    "migration": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["from", "to", "handler"],
-      "properties": {
-        "from": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000000
-        },
-        "to": {
-          "type": "integer",
-          "minimum": 1,
-          "maximum": 1000000
-        },
-        "handler": {
-          "$ref": "#/$defs/handlerName"
-        }
-      }
-    },
-    "contribution": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["id", "label", "component", "permission"],
-      "properties": {
-        "id": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9-]{1,47}$"
-        },
-        "label": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 120
-        },
-        "component": {
-          "type": "string",
-          "pattern": "^[A-Z][A-Za-z0-9]{1,63}$"
-        },
-        "permission": {
-          "type": "string",
-          "pattern": "^ext_[a-z0-9_]+\\.[a-z][a-z0-9_]{1,63}$",
-          "maxLength": 128
-        },
-        "icon": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 64
-        }
-      }
-    },
-    "schedule": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "handler", "intervalSeconds", "permission"],
-      "properties": {
-        "name": {
-          "$ref": "#/$defs/handlerName"
-        },
-        "handler": {
-          "$ref": "#/$defs/handlerName"
-        },
-        "intervalSeconds": {
-          "type": "integer",
-          "minimum": 60,
-          "maximum": 2592000
-        },
-        "permission": {
-          "type": "string",
-          "pattern": "^ext_[a-z0-9_]+\\.[a-z][a-z0-9_]{1,63}$",
-          "maxLength": 128
-        }
-      }
-    },
-    "skill": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["name", "description", "path"],
-      "properties": {
-        "name": {
-          "type": "string",
-          "pattern": "^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$",
-          "minLength": 2,
-          "maxLength": 48
-        },
-        "description": {
-          "type": "string",
-          "minLength": 1,
-          "maxLength": 1024
-        },
-        "path": {
-          "type": "string",
-          "pattern": "^skills/[a-z][a-z0-9]*(?:-[a-z0-9]+)*/SKILL\\.md$",
-          "maxLength": 120
-        }
-      }
-    },
-    "handlerName": {
+    "uiTarget": {
       "type": "string",
-      "pattern": "^[a-z][a-z0-9_]{1,63}$"
-    },
-    "parameters": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type", "properties"],
-      "properties": {
-        "type": {
-          "const": "object"
-        },
-        "properties": {
-          "type": "object",
-          "maxProperties": 32,
-          "propertyNames": {
-            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
-          },
-          "additionalProperties": {
-            "$ref": "#/$defs/parameter"
-          }
-        },
-        "required": {
-          "type": "array",
-          "maxItems": 32,
-          "uniqueItems": true,
-          "items": {
-            "type": "string",
-            "pattern": "^[A-Za-z_][A-Za-z0-9_]{0,63}$"
-          }
-        },
-        "additionalProperties": {
-          "type": "boolean"
-        }
-      }
-    },
-    "parameter": {
-      "type": "object",
-      "additionalProperties": false,
-      "required": ["type"],
-      "properties": {
-        "type": {
-          "enum": ["array", "boolean", "integer", "number", "object", "string"]
-        }
-      }
+      "enum": [
+        "nav.panel",
+        "nav.inventory",
+        "nav.conversation",
+        "nav.maintenance",
+        "nav.monitoring",
+        "nav.infrastructure",
+        "nav.datos",
+        "nav.reports",
+        "nav.warranties",
+        "nav.labels",
+        "nav.people",
+        "nav.help",
+        "nav.extensions",
+        "page.panel",
+        "page.inventory",
+        "page.conversation",
+        "page.maintenance",
+        "page.monitoring",
+        "page.map",
+        "page.graph",
+        "page.datos",
+        "page.reports",
+        "page.warranties",
+        "page.labels",
+        "page.people",
+        "page.person",
+        "page.detail",
+        "page.incident",
+        "page.reportAsset",
+        "page.monitorDevice",
+        "page.monitorAlert",
+        "page.notifications",
+        "page.help",
+        "widget.availability",
+        "widget.alerts",
+        "widget.distribution",
+        "widget.infrastructure",
+        "widget.activity",
+        "widget.maintenance",
+        "widget.warranties",
+        "widget.inventory",
+        "widget.latency",
+        "widget.incidents",
+        "asset.panel.warranty",
+        "asset.panel.attachments",
+        "asset.panel.qr",
+        "asset.panel.relations",
+        "asset.panel.maintenance",
+        "asset.panel.monitoring",
+        "asset.panel.history",
+        "asset.action.edit",
+        "asset.action.assign",
+        "asset.action.return",
+        "asset.action.transfer",
+        "asset.action.ask",
+        "asset.action.duplicate",
+        "asset.action.change-status",
+        "asset.action.restore",
+        "asset.action.archive",
+        "asset.action.retire",
+        "asset.action.purge",
+        "asset.action.delete",
+        "config.apariencia",
+        "config.general",
+        "config.categorias",
+        "config.activos",
+        "config.sedes",
+        "config.personas",
+        "config.integraciones",
+        "config.relaciones",
+        "config.mantenimiento",
+        "config.supervision",
+        "config.alertas",
+        "config.notificaciones",
+        "config.mapas",
+        "config.datos",
+        "config.reportes",
+        "config.garantias",
+        "config.qr",
+        "config.etiquetas"
+      ]
     }
   }
 }

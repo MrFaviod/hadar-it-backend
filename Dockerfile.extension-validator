@@ -1,4 +1,9 @@
-# Fixed offline validator for trusted native ITMS extensions.
+# Fixed offline validator for SDK v2 ITMS extension packages.
+#
+# It validates sandboxed and declarative packages: static rules, layout, the
+# contract, JavaScript registration and the package's own tests. It never runs
+# candidate code in the backend process; candidate execution happens inside this
+# fixed container with no network, no host mounts and a non-root user.
 #
 # The base is a locally present application image because this workstation has
 # no authorized package download. Its content address is asserted through the
@@ -28,7 +33,7 @@ ARG VALIDATOR_BASE_ID=sha256:c3b29b814929ab5107c91ecf042d3830b25d0380b2d72d9c872
 ARG BUN_IMAGE
 
 LABEL org.opencontainers.image.title="ITMS extension validator"
-LABEL org.itsm.validator.protocol="1"
+LABEL org.itsm.validator.protocol="2"
 LABEL org.itsm.validator.base.id="${VALIDATOR_BASE_ID}"
 LABEL org.itsm.validator.js="bun 1.4.2 (oven/bun@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895)"
 LABEL org.itsm.validator.network="none"

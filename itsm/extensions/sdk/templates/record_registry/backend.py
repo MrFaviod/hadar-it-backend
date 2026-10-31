@@ -1,7 +1,10 @@
-"""Record registry example: native backend operations, collections and migration.
+"""Record registry example: sandboxed operations, collections and migration.
 
-The host imports this module and calls ``register(sdk)``. Approved native code
-runs inside the host process; this is a trusted-code extension, not a sandbox.
+The host never imports this module. Every invocation starts a fresh
+``python -E -s -S -B`` runner in the module data directory, restricted by
+rlimits, ``no_new_privs``, Landlock and a seccomp deny-list, and calls
+``register(sdk)`` there. Core data is reachable only through authorized host
+capabilities; persistence is this module's own SQLite file.
 """
 
 import uuid
@@ -23,12 +26,12 @@ def _row(row):
 
 def _text(value, field, maximum):
     if not isinstance(value, str):
-        raise ValueError("%s must be text" % field)
+        raise ValueError(f"{field} must be text")
     cleaned = value.strip()
     if not cleaned:
-        raise ValueError("%s is required" % field)
+        raise ValueError(f"{field} is required")
     if len(cleaned) > maximum:
-        raise ValueError("%s must be at most %d characters" % (field, maximum))
+        raise ValueError(f"{field} must be at most {maximum} characters")
     return cleaned
 
 
@@ -36,7 +39,7 @@ def list_records(context, limit=DEFAULT_LIST, status=None, asset_id=None):
     """Return the module-scoped records visible to the caller."""
     context.authorize(READ_PERMISSION)
     if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1 or limit > MAX_LIST:
-        raise ValueError("limit must be an integer between 1 and %d" % MAX_LIST)
+        raise ValueError(f"limit must be an integer between 1 and {MAX_LIST}")
     if status is not None and status not in ("open", "closed"):
         raise ValueError("status must be open or closed")
     filters = {}
@@ -79,9 +82,7 @@ def normalize_status(context):
                 continue
             updated = dict(data)
             updated["status"] = "open"
-            context.store.put(
-                COLLECTION, row["id"], updated, expected_version=row["version"]
-            )
+            context.store.put(COLLECTION, row["id"], updated, expected_version=row["version"])
             migrated += 1
         offset += len(page["items"])
         if offset >= page["total"]:

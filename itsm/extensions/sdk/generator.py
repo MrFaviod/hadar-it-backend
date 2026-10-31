@@ -1,8 +1,9 @@
-"""Generate the working record-registry extension package.
+"""Generate working SDK v2 extension packages.
 
-The template is a real package: operations, a collection, a schema migration,
-an unlocked frontend registration and Python tests. It carries no license or
-product-specific behavior.
+Two real templates are rendered: a sandboxed module with operations, a
+collection, a schema migration, declarative host-rendered views and Python
+tests, and a declarative module with no executable code at all. Neither carries
+license or product-specific behavior.
 """
 
 from __future__ import annotations
@@ -17,8 +18,12 @@ from typing import Any
 from .contract import ID_PATTERN, VERSION_PATTERN, validate_manifest
 from .package import PackageError, build_package
 
-TEMPLATE_ROOT = Path(__file__).resolve().parent / "templates" / "record_registry"
-TEMPLATE_SKILL_PREFIX = "skills/record-registry/"
+TEMPLATE_ROOT = Path(__file__).resolve().parent / "templates"
+TEMPLATES = {
+    "sandboxed": TEMPLATE_ROOT / "record_registry",
+    "declarative": TEMPLATE_ROOT / "notes_declarative",
+}
+RUNTIMES = tuple(TEMPLATES)
 
 
 @dataclass(frozen=True)
@@ -52,9 +57,13 @@ def generate_package(
     name: str,
     description: str,
     version: str = "1.0.0",
+    runtime: str = "sandboxed",
     known_core_permissions: Collection[str] = (),
 ) -> GeneratedPackage:
     """Render a complete package, validating it before returning any bytes."""
+    if runtime not in TEMPLATES:
+        raise ValueError(f"runtime must be one of {', '.join(RUNTIMES)}")
+    template = TEMPLATES[runtime]
     if not isinstance(extension_id, str) or not ID_PATTERN.fullmatch(extension_id):
         raise ValueError("extension id must be lowercase words joined by hyphens")
     if len(extension_id) < 2 or len(extension_id) > 48:
@@ -72,12 +81,13 @@ def generate_package(
         "{{PERMISSION_PREFIX}}": f"ext_{extension_id.replace('-', '_')}.",
     }
     files: dict[str, str] = {}
-    for source in sorted(TEMPLATE_ROOT.rglob("*")):
+    for source in sorted(template.rglob("*")):
         if not source.is_file():
             continue
-        relative = source.relative_to(TEMPLATE_ROOT).as_posix()
-        if relative.startswith(TEMPLATE_SKILL_PREFIX):
-            relative = f"skills/{extension_id}/" + relative[len(TEMPLATE_SKILL_PREFIX) :]
+        relative = source.relative_to(template).as_posix()
+        if relative.startswith("skills/"):
+            # Every template skill directory becomes the module's own skill.
+            relative = f"skills/{extension_id}/" + relative.rsplit("/", 1)[-1]
         content = source.read_text(encoding="utf-8")
         for token, value in substitutions.items():
             content = content.replace(token, value)

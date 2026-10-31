@@ -68,7 +68,7 @@ def build_frame(
     resolved = _limits(limits or DEFAULT_LIMITS)
     header = {
         "protocolVersion": PROTOCOL_VERSION,
-        "sdkVersion": 1,
+        "sdkVersion": 2,
         "digest": digest,
         "archiveBytes": len(archive),
         "knownCorePermissions": list(core),
@@ -107,7 +107,7 @@ def parse_frame(payload: bytes) -> Frame:
         raise ProtocolError("frame header must be a JSON object")
     if header.get("protocolVersion") != PROTOCOL_VERSION:
         raise ProtocolError("unsupported protocol version")
-    if header.get("sdkVersion") != 1:
+    if header.get("sdkVersion") != 2:
         raise ProtocolError("unsupported SDK version")
     digest = header.get("digest")
     if not isinstance(digest, str) or not _DIGEST.fullmatch(digest):
@@ -137,11 +137,7 @@ def _core_permissions(values: Any) -> tuple[str, ...]:
     seen: set[str] = set()
     result: list[str] = []
     for value in values:
-        if (
-            not isinstance(value, str)
-            or len(value) > 96
-            or not _CORE_CODE.fullmatch(value)
-        ):
+        if not isinstance(value, str) or len(value) > 96 or not _CORE_CODE.fullmatch(value):
             raise ProtocolError("known core permission is invalid")
         if value in seen:
             raise ProtocolError("known core permission is duplicated")

@@ -8,7 +8,8 @@ maps refusals to the application's stable error envelope.
 from __future__ import annotations
 
 import hmac
-from typing import Annotated, Any, Iterator
+from collections.abc import Iterator
+from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
@@ -21,10 +22,13 @@ from itsm.extensions.host import (
     ExtensionHandlerFailed,
     ExtensionHostError,
     ExtensionHostService,
+    ExtensionIdempotencyConflict,
     ExtensionImportFailed,
     ExtensionMigrationFailed,
     ExtensionNotFound,
+    ExtensionRequiresUpgrade,
     ExtensionRollbackIncompatible,
+    ExtensionSandboxUnavailable,
     ExtensionStale,
     ExtensionStoreConflict,
     ExtensionStoreValidation,
@@ -65,6 +69,14 @@ class RollbackBody(BaseModel):
     version: str
     digest: str
     expectedVersion: int
+    restoreData: bool = False
+    confirm: str | None = None
+
+
+class UninstallBody(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    expectedVersion: int
 
 
 def get_extension_host(request: Request) -> Iterator[ExtensionHostService]:
@@ -84,8 +96,14 @@ def _failure(exc: ExtensionHostError) -> tuple[int, str, str]:
         return 409, "extension_disabled", str(exc)
     if isinstance(exc, ExtensionDigestMismatch):
         return 409, "digest_mismatch", str(exc)
+    if isinstance(exc, ExtensionRequiresUpgrade):
+        return 409, "extension_requires_upgrade", str(exc)
     if isinstance(exc, ExtensionRollbackIncompatible):
         return 409, "rollback_incompatible", str(exc)
+    if isinstance(exc, ExtensionIdempotencyConflict):
+        return 409, "idempotency_conflict", str(exc)
+    if isinstance(exc, ExtensionSandboxUnavailable):
+        return 503, "sandbox_unavailable", str(exc)
     if isinstance(exc, ExtensionStoreConflict):
         return 409, "version_conflict", str(exc)
     if isinstance(exc, ExtensionImportFailed):
@@ -142,9 +160,7 @@ def create_extension_router() -> APIRouter:
     ) -> dict[str, Any]:
         content_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
         if content_type not in CANDIDATE_TYPES:
-            raise ExtensionValidationFailed(
-                "candidate upload must be an application/zip package"
-            )
+            raise ExtensionValidationFailed("candidate upload must be an application/zip package")
         declared_length = request.headers.get("content-length")
         if declared_length is not None:
             try:
@@ -160,8 +176,7 @@ def create_extension_router() -> APIRouter:
             body.extend(chunk)
         digest = request.headers.get("x-package-digest")
         if digest is not None and (
-            len(digest) != 64
-            or any(ch not in "0123456789abcdef" for ch in digest.lower())
+            len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest.lower())
         ):
             raise ExtensionDigestMismatch("package digest must be SHA-256 hex")
         return host.submit_candidate(
@@ -209,12 +224,27 @@ def create_extension_router() -> APIRouter:
             version=body.version,
             digest=body.digest,
             expected_version=body.expectedVersion,
+            restore_data=body.restoreData,
+            confirm=body.confirm,
         )
 
-    @router.get("/{extension_id}/history")
-    def history(
-        extension_id: str, context: AuthDependency, host: HostDependency
+    @router.post("/{extension_id}/uninstall")
+    def uninstall(
+        extension_id: str,
+        body: UninstallBody,
+        context: MutationDependency,
+        host: HostDependency,
     ) -> dict[str, Any]:
+        return host.uninstall(
+            context.principal, extension_id, expected_version=body.expectedVersion
+        )
+
+    @router.get("/{extension_id}/status")
+    def status(extension_id: str, context: AuthDependency, host: HostDependency) -> dict[str, Any]:
+        return host.status(context.principal, extension_id)
+
+    @router.get("/{extension_id}/history")
+    def history(extension_id: str, context: AuthDependency, host: HostDependency) -> dict[str, Any]:
         return host.history(context.principal, extension_id)
 
     @router.get("/{extension_id}/skills/{name}")

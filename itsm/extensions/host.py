@@ -1,27 +1,33 @@
 """Host-owned lifecycle, storage, migrations and dispatch for native extensions.
 
-Trust boundary: an installed extension is approved native Python running in the
-host process.  It is not sandboxed or allowlist-isolated at runtime; the only
-isolation claims here are the pre-install package admission checks and the
-separate fixed validation container owned by the developer toolchain.  Every
-installation is an explicit persisted-human-Superadmin action.
+Trust boundary (SDK v2): a sandboxed module never runs in this process.  Every
+invocation is a fresh ``python -E -s -S -B runner.py`` process restricted by
+rlimits, ``no_new_privs``, Landlock and a seccomp deny-list, speaking JSON-lines
+over its standard streams.  Declarative modules never carry executable code at
+all: the host runs their list/get/put/delete operations against the module's own
+SQLite collections.  Module business data lives in
+``<extension_data_path>/<id>/data.sqlite3``; the core database keeps only host
+metadata plus the ``extension_core_calls`` idempotency ledger for authorized
+capability mutations.  Every installation, upgrade and uninstall is an explicit
+persisted-human-Superadmin action.
 """
 
 from __future__ import annotations
 
-import hashlib
 import hmac
 import json
 import logging
+import sqlite3
 import threading
-import types
 import zipfile
+from collections.abc import Callable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 from io import BytesIO
-from typing import Any, Callable, Iterable, Mapping, Sequence
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 from uuid import uuid4
 
@@ -31,21 +37,78 @@ from sqlalchemy.orm import Session, sessionmaker
 
 from itsm.config import Settings
 from itsm.extensions import manifest as package_contract
-from itsm.extensions import storage
+from itsm.extensions import sandbox, storage
+from itsm.extensions.capabilities import CapabilityBroker
+from itsm.extensions.errors import (
+    ExtensionConflict as ExtensionConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionDigestMismatch as ExtensionDigestMismatch,
+)
+from itsm.extensions.errors import (
+    ExtensionDisabled as ExtensionDisabled,
+)
+from itsm.extensions.errors import (
+    ExtensionHandlerFailed as ExtensionHandlerFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionHostError as ExtensionHostError,
+)
+from itsm.extensions.errors import (
+    ExtensionIdempotencyConflict as ExtensionIdempotencyConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionImportFailed as ExtensionImportFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionMigrationFailed as ExtensionMigrationFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionNotFound as ExtensionNotFound,
+)
+from itsm.extensions.errors import (
+    ExtensionRequiresUpgrade as ExtensionRequiresUpgrade,
+)
+from itsm.extensions.errors import (
+    ExtensionRollbackIncompatible as ExtensionRollbackIncompatible,
+)
+from itsm.extensions.errors import (
+    ExtensionSandboxUnavailable as ExtensionSandboxUnavailable,
+)
+from itsm.extensions.errors import (
+    ExtensionStale as ExtensionStale,
+)
+from itsm.extensions.errors import (
+    ExtensionStoreConflict as ExtensionStoreConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionStoreValidation as ExtensionStoreValidation,
+)
+from itsm.extensions.errors import (
+    ExtensionTooLarge as ExtensionTooLarge,
+)
+from itsm.extensions.errors import (
+    ExtensionUnavailable as ExtensionUnavailable,
+)
+from itsm.extensions.errors import (
+    ExtensionValidationFailed as ExtensionValidationFailed,
+)
 from itsm.extensions.models import (
     ExtensionCandidate,
     ExtensionCollectionRecord,
     ExtensionEvent,
     ExtensionMigration,
     ExtensionModule,
+    ExtensionPermission,
     ExtensionScheduleState,
     ExtensionVersion,
 )
+from itsm.extensions.runtime import sqlite_store
+from itsm.extensions.sdk import contract as sdk_contract
 from itsm.identity.clock import as_utc, utcnow
-from itsm.identity.models import Identity
+from itsm.identity.models import Identity, IdentityRolePolicy
 from itsm.identity.permissions import (
     HUMAN_ACTOR_KIND,
-    MACHINE_ACTOR_KINDS,
     PERMISSION_CODES,
     ROLE_SUPERADMIN,
 )
@@ -53,7 +116,7 @@ from itsm.identity.service import IdentityService, PermissionDenied, Principal
 
 logger = logging.getLogger(__name__)
 
-SDK_VERSION = 1
+SDK_VERSION = 2
 CANDIDATE_LIMIT = 200
 EVENT_LIMIT = 100
 MAX_COLLECTION_DATA_BYTES = 256 * 1024
@@ -62,68 +125,6 @@ MAX_REPORT_BYTES = 32 * 1024
 _CANDIDATE_STATES = frozenset({"pending", "installing", "installed", "superseded"})
 
 NotifyCallback = Callable[..., None]
-
-
-class ExtensionHostError(Exception):
-    """Base class for host refusals; the API maps these to JSON errors."""
-
-
-class ExtensionUnavailable(ExtensionHostError):
-    pass
-
-
-class ExtensionValidationFailed(ExtensionHostError):
-    def __init__(self, message: str, errors: Iterable[str] = ()) -> None:
-        self.errors = tuple(dict.fromkeys(str(error) for error in errors))[:40]
-        super().__init__(message)
-
-
-class ExtensionTooLarge(ExtensionHostError):
-    pass
-
-
-class ExtensionNotFound(ExtensionHostError):
-    pass
-
-
-class ExtensionConflict(ExtensionHostError):
-    pass
-
-
-class ExtensionStale(ExtensionConflict):
-    pass
-
-
-class ExtensionDisabled(ExtensionConflict):
-    pass
-
-
-class ExtensionDigestMismatch(ExtensionConflict):
-    pass
-
-
-class ExtensionRollbackIncompatible(ExtensionConflict):
-    pass
-
-
-class ExtensionImportFailed(ExtensionValidationFailed):
-    pass
-
-
-class ExtensionHandlerFailed(ExtensionHostError):
-    pass
-
-
-class ExtensionStoreConflict(ExtensionConflict):
-    pass
-
-
-class ExtensionStoreValidation(ExtensionValidationFailed):
-    pass
-
-
-class ExtensionMigrationFailed(ExtensionHostError):
-    pass
 
 
 @dataclass(frozen=True)
@@ -143,58 +144,22 @@ class ScheduleView:
 
 @dataclass(frozen=True)
 class _LoadedModule:
+    """Admitted module metadata; never executable code in this process."""
+
     extension_id: str
     version: str
     digest: str
     manifest: Mapping[str, Any]
-    backend_source: str
+    runtime: str
+    package_bytes: bytes
     frontend_bytes: bytes
-    operations: Mapping[str, Callable[..., Any]]
-    migrations: Mapping[str, Callable[..., Any]]
-    schedules: Mapping[str, Callable[..., Any]]
+    operations: Mapping[str, Mapping[str, Any]]
+    migrations: Mapping[str, Mapping[str, Any]]
+    schedules: Mapping[str, Mapping[str, Any]]
 
-
-class _SDKBinder:
-    """Collect exactly the handlers the manifest declares."""
-
-    def __init__(self, manifest: Mapping[str, Any]) -> None:
-        self._declared = {
-            "operation": {item["name"] for item in manifest["operations"]},
-            "migration": {item["handler"] for item in manifest["migrations"]},
-            "schedule": {item["name"] for item in manifest["schedules"]},
-        }
-        self._bound: dict[str, dict[str, Callable[..., Any]]] = {
-            "operation": {},
-            "migration": {},
-            "schedule": {},
-        }
-
-    def _bind(self, kind: str, name: Any, handler: Any) -> None:
-        if not isinstance(name, str) or name not in self._declared[kind]:
-            raise ExtensionImportFailed(f"backend.py bound an undeclared {kind}: {name!r}")
-        if not callable(handler):
-            raise ExtensionImportFailed(f"{kind} {name} is not callable")
-        if name in self._bound[kind]:
-            raise ExtensionImportFailed(f"{kind} {name} was bound twice")
-        self._bound[kind][name] = handler
-
-    def operation(self, name: Any, handler: Any) -> None:
-        self._bind("operation", name, handler)
-
-    def migration(self, name: Any, handler: Any) -> None:
-        self._bind("migration", name, handler)
-
-    def schedule(self, name: Any, handler: Any) -> None:
-        self._bind("schedule", name, handler)
-
-    def finish(self) -> dict[str, dict[str, Callable[..., Any]]]:
-        missing: list[str] = []
-        for kind, declared in self._declared.items():
-            for name in sorted(declared - set(self._bound[kind])):
-                missing.append(f"{kind}:{name}")
-        if missing:
-            raise ExtensionImportFailed("backend.py did not bind: " + ", ".join(missing))
-        return self._bound
+    @property
+    def collections(self) -> frozenset[str]:
+        return frozenset(item["name"] for item in self.manifest["collections"])
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -261,188 +226,168 @@ def _is_human_superadmin(identity: Identity | None) -> bool:
     )
 
 
+def _legacy_equal(current: Any, stored_json: str) -> bool:
+    """Compare a module row's data with the legacy JSON without reordering."""
+    try:
+        return _jsonable(current) == _jsonable(json.loads(stored_json))
+    except TypeError, ValueError:
+        return False
+
+
+def sandbox_availability() -> dict[str, Any]:
+    """Report whether this host kernel can execute sandboxed modules at all.
+
+    Declarative modules never need it; a sandboxed module on an unsupported
+    kernel fails closed instead of running unsupervised in the host process.
+    """
+    return sandbox.sandbox_availability()
+
+
+def _module_status(module: ExtensionModule, manifest: Mapping[str, Any]) -> str:
+    """The single status vocabulary shared by discovery and ``GET /status``."""
+    if manifest.get("sdkVersion") != SDK_VERSION:
+        return "requires_upgrade"
+    return "ready" if module.enabled else "disabled"
+
+
+def _collection_schema(manifest: Mapping[str, Any], collection: str) -> Mapping[str, Any] | None:
+    for item in manifest["collections"]:
+        if item["name"] == collection:
+            return item.get("schema")
+    raise ExtensionValidationFailed(f"collection {collection!r} is not declared")
+
+
+def _declarative_filters(schema: Mapping[str, Any] | None, filters: Any) -> dict[str, Any] | None:
+    if filters is None:
+        return None
+    if not isinstance(filters, Mapping):
+        raise ExtensionStoreValidation("filters must be an object")
+    declared = set((schema or {}).get("properties") or {})
+    if declared:
+        unknown = sorted(set(filters) - declared)
+        if unknown:
+            raise ExtensionStoreValidation("filter on undeclared field: " + ", ".join(unknown[:8]))
+    return dict(filters)
+
+
+def _validate_record(
+    collection: str, schema: Mapping[str, Any] | None, data: Any
+) -> dict[str, Any]:
+    if not isinstance(data, Mapping):
+        raise ExtensionStoreValidation("data must be an object")
+    try:
+        return sdk_contract.validate_collection_value(collection, schema, dict(data))
+    except sdk_contract.CollectionError as exc:
+        raise ExtensionStoreValidation(str(exc) or "invalid record") from None
+
+
+@contextmanager
+def _store_errors() -> Iterator[None]:
+    """Translate stdlib store refusals into the host's public error types."""
+    try:
+        yield
+    except sqlite_store.StoreConflict as exc:
+        raise ExtensionStoreConflict(str(exc) or "record version conflict") from None
+    except (sqlite_store.StoreValidation, sqlite_store.ModuleError) as exc:
+        raise ExtensionStoreValidation(str(exc) or "invalid store request") from None
+
+
 class _ModuleStore:
-    """Module-scoped durable collections backed by the host SQL session."""
+    """The module's own collections inside ``<root>/<id>/data.sqlite3``.
+
+    Semantics match the v1 in-core store exactly (get/list/put/delete, CAS via
+    ``expected_version``, bounded page and filter shapes) so an upgraded module
+    keeps the same programming contract; only the location changed.
+    """
 
     def __init__(
         self,
-        session: Session,
+        connection: sqlite3.Connection,
         extension_id: str,
         collections: frozenset[str],
         *,
         allow_write: bool,
     ) -> None:
-        self._session = session
+        self._connection = connection
         self._extension_id = extension_id
         self._collections = collections
         self._allow_write = allow_write
 
+    @property
+    def connection(self) -> sqlite3.Connection:
+        return self._connection
+
     def _require_write(self) -> None:
         if not self._allow_write:
-            raise ExtensionStoreValidation("a read-only operation cannot write collections")
+            raise ExtensionStoreValidation("store is read-only for this invocation")
 
     def _collection(self, name: Any) -> str:
-        if not isinstance(name, str) or name not in self._collections:
-            raise ExtensionStoreValidation(f"unknown collection: {name!r}")
+        if not isinstance(name, str) or not name:
+            raise ExtensionStoreValidation("collection name must be text")
+        if self._collections and name not in self._collections:
+            raise ExtensionStoreValidation(f"collection {name!r} is not declared by the manifest")
         return name
 
-    @staticmethod
-    def _record_id(record_id: Any) -> str:
-        if not isinstance(record_id, str) or not record_id or len(record_id) > 64:
-            raise ExtensionStoreValidation("record id must be 1-64 characters")
-        if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for ch in record_id):
-            raise ExtensionStoreValidation("record id contains unsupported characters")
-        return record_id
+    def _begin(self) -> None:
+        if not self._connection.in_transaction:
+            self._connection.execute("BEGIN IMMEDIATE")
 
-    def _row(self, collection: str, record_id: str) -> ExtensionCollectionRecord | None:
-        return self._session.execute(
-            select(ExtensionCollectionRecord).where(
-                ExtensionCollectionRecord.extension_id == self._extension_id,
-                ExtensionCollectionRecord.collection == collection,
-                ExtensionCollectionRecord.record_id == record_id,
-            )
-        ).scalar_one_or_none()
-
-    @staticmethod
-    def _payload(row: ExtensionCollectionRecord) -> dict[str, Any]:
-        return {
-            "id": row.record_id,
-            "version": row.version,
-            "data": json.loads(row.data_json),
-        }
-
-    def get(self, collection: str, record_id: str) -> dict[str, Any] | None:
-        name = self._collection(collection)
-        row = self._row(name, self._record_id(record_id))
-        return None if row is None else self._payload(row)
+    def get(self, collection: Any, record_id: Any) -> dict[str, Any] | None:
+        with _store_errors():
+            return sqlite_store.get(self._connection, self._collection(collection), record_id)
 
     def list(
         self,
-        collection: str,
-        limit: int = 20,
-        offset: int = 0,
-        filters: Mapping[str, Any] | None = None,
+        collection: Any,
+        limit: Any = 50,
+        offset: Any = 0,
+        filters: Any = None,
     ) -> dict[str, Any]:
-        name = self._collection(collection)
-        if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 200:
-            raise ExtensionStoreValidation("limit must be 1-200")
-        if isinstance(offset, bool) or not isinstance(offset, int) or not 0 <= offset <= 1_000_000:
-            raise ExtensionStoreValidation("offset must be 0-1000000")
-        if filters is None:
-            clean_filters: dict[str, Any] = {}
-        elif isinstance(filters, Mapping) and len(filters) <= 20:
-            clean_filters = {}
-            for key, value in filters.items():
-                if not isinstance(key, str) or not key or len(key) > 64:
-                    raise ExtensionStoreValidation("filter keys must be 1-64 characters")
-                if isinstance(value, (Mapping, list, tuple, set, bytes)):
-                    raise ExtensionStoreValidation("filter values must be JSON scalars")
-                if value is not None and not isinstance(value, (str, int, float, bool)):
-                    raise ExtensionStoreValidation("filter values must be JSON scalars")
-                clean_filters[key] = value
-        else:
-            raise ExtensionStoreValidation("filters must be an object with at most 20 keys")
-        rows = self._session.execute(
-            select(ExtensionCollectionRecord)
-            .where(
-                ExtensionCollectionRecord.extension_id == self._extension_id,
-                ExtensionCollectionRecord.collection == name,
+        with _store_errors():
+            return sqlite_store.list_records(
+                self._connection,
+                self._collection(collection),
+                limit=limit,
+                offset=offset,
+                filters=filters,
             )
-            .order_by(ExtensionCollectionRecord.record_id)
-        ).scalars()
-        matched: list[dict[str, Any]] = []
-        for row in rows:
-            data = json.loads(row.data_json)
-            if all(data.get(key) == value for key, value in clean_filters.items()):
-                matched.append(self._payload(row))
-        return {
-            "items": matched[offset : offset + limit],
-            "total": len(matched),
-        }
 
     def put(
         self,
-        collection: str,
-        record_id: str,
-        data: Mapping[str, Any],
-        expected_version: int | None = None,
+        collection: Any,
+        record_id: Any,
+        data: Any,
+        expected_version: Any = None,
     ) -> dict[str, Any]:
         self._require_write()
-        name = self._collection(collection)
-        identifier = self._record_id(record_id)
-        if not isinstance(data, Mapping):
-            raise ExtensionStoreValidation("collection data must be an object")
-        encoded = _json_dumps(data, sort_keys=True)
-        if len(encoded.encode("utf-8")) > MAX_COLLECTION_DATA_BYTES:
-            raise ExtensionStoreValidation("collection data is too large")
-        if expected_version is not None and (
-            isinstance(expected_version, bool)
-            or not isinstance(expected_version, int)
-            or expected_version < 0
-        ):
-            raise ExtensionStoreValidation("expected_version must be a non-negative integer")
-        row = self._row(name, identifier)
-        if row is None:
-            if expected_version not in (None, 0):
-                raise ExtensionStoreConflict("record version does not match")
-            row = ExtensionCollectionRecord(
-                extension_id=self._extension_id,
-                collection=name,
-                record_id=identifier,
-                version=1,
-                data_json=encoded,
-            )
-            self._session.add(row)
-            self._session.flush()
-            return self._payload(row)
-        if expected_version is not None and expected_version != row.version:
-            raise ExtensionStoreConflict("record version does not match")
-        next_version = row.version + 1
-        changed = self._session.execute(
-            update(ExtensionCollectionRecord)
-            .where(
-                ExtensionCollectionRecord.id == row.id,
-                ExtensionCollectionRecord.version == row.version,
-            )
-            .values(data_json=encoded, version=next_version, updated_at=utcnow())
-            .execution_options(synchronize_session="fetch")
-        )
-        if changed.rowcount != 1:
-            raise ExtensionStoreConflict("record version does not match")
-        return {"id": identifier, "version": next_version, "data": json.loads(encoded)}
+        with _store_errors():
+            name = self._collection(collection)
+            self._begin()
+            return sqlite_store.put(self._connection, name, record_id, data, expected_version)
 
     def delete(
         self,
-        collection: str,
-        record_id: str,
-        expected_version: int | None = None,
+        collection: Any,
+        record_id: Any,
+        expected_version: Any = None,
     ) -> bool:
         self._require_write()
-        name = self._collection(collection)
-        if expected_version is not None and (
-            isinstance(expected_version, bool)
-            or not isinstance(expected_version, int)
-            or expected_version < 0
-        ):
-            raise ExtensionStoreValidation("expected_version must be a non-negative integer")
-        row = self._row(name, self._record_id(record_id))
-        if row is None:
-            if expected_version not in (None, 0):
-                raise ExtensionStoreConflict("record version does not match")
-            return False
-        if expected_version is not None and expected_version != row.version:
-            raise ExtensionStoreConflict("record version does not match")
-        changed = self._session.execute(
-            delete(ExtensionCollectionRecord)
-            .where(
-                ExtensionCollectionRecord.id == row.id,
-                ExtensionCollectionRecord.version == row.version,
-            )
-            .execution_options(synchronize_session=False)
-        )
-        if changed.rowcount != 1:
-            raise ExtensionStoreConflict("record version does not match")
-        return True
+        with _store_errors():
+            name = self._collection(collection)
+            self._begin()
+            return sqlite_store.delete(self._connection, name, record_id, expected_version)
+
+    def commit(self) -> None:
+        if self._connection.in_transaction:
+            self._connection.commit()
+
+    def rollback(self) -> None:
+        if self._connection.in_transaction:
+            self._connection.rollback()
+
+    def close(self) -> None:
+        self.rollback()
+        self._connection.close()
 
 
 class _AssetReadIdentityService(IdentityService):
@@ -456,17 +401,13 @@ class _AssetReadIdentityService(IdentityService):
         resource: str | None = None,
         commit_denial: bool = False,
     ) -> None:
-        super().authorize(
-            principal, permission, resource=resource, commit_denial=commit_denial
-        )
+        super().authorize(principal, permission, resource=resource, commit_denial=commit_denial)
 
 
 class _AssetAccess:
     """Read-only canonical inventory views, never direct asset SQL."""
 
-    def __init__(
-        self, host: ExtensionHostService, principal: Principal, session: Session
-    ) -> None:
+    def __init__(self, host: ExtensionHostService, principal: Principal, session: Session) -> None:
         self._host = host
         self._principal = principal
         self._session = session
@@ -501,97 +442,6 @@ class _AssetAccess:
         return _jsonable(page.as_payload())
 
 
-class _HostContext:
-    """The public SDK context passed to installed handlers."""
-
-    sdk_version = SDK_VERSION
-
-    def __init__(
-        self,
-        *,
-        host: ExtensionHostService,
-        principal: Principal,
-        session: Session,
-        loaded: _LoadedModule,
-        operation: str | None,
-        schedule: str | None = None,
-        collections: frozenset[str] | None = None,
-        write_allowed: bool = True,
-    ) -> None:
-        self.principal = principal
-        self.operation = operation
-        self.schedule = schedule
-        self.extension_id = loaded.extension_id
-        self.version = loaded.version
-        self.digest = loaded.digest
-        self.manifest = loaded.manifest
-        self._host = host
-        self._session = session
-        self._loaded = loaded
-        self._write_allowed = write_allowed
-        declared = (
-            frozenset(item["name"] for item in loaded.manifest["collections"])
-            if collections is None
-            else collections
-        )
-        self.store = _ModuleStore(
-            session,
-            loaded.extension_id,
-            declared,
-            allow_write=write_allowed,
-        )
-        self.assets = _AssetAccess(host, principal, session)
-
-    def authorize(self, permission: str) -> None:
-        if not isinstance(permission, str) or not permission:
-            raise ExtensionValidationFailed("permission must be non-empty text")
-        IdentityService(self._session, self._host._settings).authorize(
-            self.principal,
-            permission,
-            resource=f"extension:{self.extension_id}",
-            commit_denial=False,
-        )
-
-    def notify(
-        self,
-        *,
-        recipient_ids: Sequence[str],
-        key: str,
-        title: str,
-        body: str,
-        permission: str,
-        asset_id: str | None = None,
-        url: str | None = None,
-    ) -> None:
-        if not self._write_allowed:
-            raise ExtensionValidationFailed("a read-only operation cannot notify")
-        self._host.notify_from_module(
-            session=self._session,
-            principal=self.principal,
-            loaded=self._loaded,
-            recipient_ids=recipient_ids,
-            key=key,
-            title=title,
-            body=body,
-            permission=permission,
-            asset_id=asset_id,
-            url=url,
-        )
-
-    @contextmanager
-    def transaction(self):
-        """Explicit nested savepoint; the host owns the outer commit."""
-        if not self._session.in_transaction():
-            self._session.execute(select(1))
-        nested = self._session.begin_nested()
-        try:
-            yield self
-        except BaseException:
-            nested.rollback()
-            raise
-        nested.commit()
-
-
 class ExtensionHostService:
     """One host-owned service for installed state, candidates and dispatch."""
 
@@ -603,15 +453,15 @@ class ExtensionHostService:
         notify: NotifyCallback | None = None,
         now: Callable[[], datetime] = utcnow,
         api_prefix: str | None = None,
+        sandbox_limits: sandbox.SandboxLimits | None = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._notify = notify
         self._now = now
+        self._sandbox_limits = sandbox_limits or sandbox.SandboxLimits()
         self._api_prefix = (
-            api_prefix
-            if api_prefix is not None
-            else getattr(settings, "api_prefix", "/api/v1")
+            api_prefix if api_prefix is not None else getattr(settings, "api_prefix", "/api/v1")
         ).rstrip("/")
         self._cache: dict[tuple[str, str, str], _LoadedModule] = {}
         self._cache_lock = threading.Lock()
@@ -626,74 +476,59 @@ class ExtensionHostService:
             yield
 
     # ------------------------------------------------------------ authorization
-    def authorize_fresh(
-        self, principal: Principal, permission: str, *, resource: str
-    ) -> None:
+    def authorize_fresh(self, principal: Principal, permission: str, *, resource: str) -> None:
         """Authorize in a dedicated session; denial audit commits there only."""
         with self._session_factory() as session:
             IdentityService(session, self._settings).authorize(
                 principal, permission, resource=resource
             )
 
-    def _effective_permissions(
-        self, session: Session, principal: Principal
-    ) -> frozenset[str]:
+    def _effective_permissions(self, session: Session, principal: Principal) -> frozenset[str]:
         return IdentityService(session, self._settings).effective_permissions(principal)
 
     def _require_human_superadmin(self, session: Session, principal: Principal) -> Identity:
         identity = session.get(Identity, principal.actor_id)
         if not _is_human_superadmin(identity) or identity.id != principal.actor_id:
-            raise PermissionDenied(
-                "extension installation requires a persisted human Superadmin"
-            )
+            raise PermissionDenied("extension installation requires a persisted human Superadmin")
         return identity
 
     # ---------------------------------------------------------------- loading
     def _load_module(self, version_row: ExtensionVersion) -> _LoadedModule:
+        """Admit one installed version; module code is never imported here."""
         key = (version_row.extension_id, version_row.version, version_row.digest)
         with self._cache_lock:
             cached = self._cache.get(key)
         if cached is not None:
             return cached
         manifest = json.loads(version_row.manifest_json)
-        backend_source = self._member_source(version_row.package_bytes, "backend.py")
-        module = types.ModuleType(
-            f"itsm_extension_{version_row.extension_id}_{version_row.digest[:12]}"
-        )
-        module.__file__ = f"<extension:{version_row.extension_id}:{version_row.version}>"
-        try:
-            code = compile(
-                backend_source,
-                f"<extension:{version_row.extension_id}:{version_row.version}>",
-                "exec",
+        sdk_version = manifest.get("sdkVersion")
+        if sdk_version != SDK_VERSION:
+            raise ExtensionRequiresUpgrade(
+                f"extension {version_row.extension_id}@{version_row.version} is an SDK "
+                f"{sdk_version} package; the SDK v2 runtime never executes it. Rebuild the "
+                "module against SDK v2, then copy its legacy collection rows with "
+                "`python -m itsm.extensions relocate-legacy --apply`."
             )
-            exec(code, module.__dict__)
-            register = module.__dict__.get("register")
-            if not callable(register):
-                raise ExtensionImportFailed("backend.py does not export register(sdk)")
-            binder = _SDKBinder(manifest)
-            register(binder)
-            bound = binder.finish()
-        except ExtensionHostError:
-            raise
-        except Exception as exc:
-            logger.warning(
-                "extension backend registration failed for %s@%s",
-                version_row.extension_id,
-                version_row.version,
-                exc_info=True,
-            )
-            raise ExtensionImportFailed("extension backend could not be registered") from exc
+        runtime = manifest["runtime"]
+        if runtime == "sandboxed":
+            backend_source = self._member_source(version_row.package_bytes, "backend.py")
+            if not backend_source.strip():  # pragma: no cover - admission already checks
+                raise ExtensionImportFailed("backend.py is empty")
         loaded = _LoadedModule(
             extension_id=version_row.extension_id,
             version=version_row.version,
             digest=version_row.digest,
             manifest=manifest,
-            backend_source=backend_source,
-            frontend_bytes=self._member_bytes(version_row.package_bytes, "frontend.js"),
-            operations=bound["operation"],
-            migrations=bound["migration"],
-            schedules=bound["schedule"],
+            runtime=runtime,
+            package_bytes=version_row.package_bytes,
+            frontend_bytes=(
+                self._member_bytes(version_row.package_bytes, "frontend.js")
+                if manifest["frontend"].get("entry")
+                else b""
+            ),
+            operations={item["name"]: item for item in manifest["operations"]},
+            migrations={item["handler"]: item for item in manifest["migrations"]},
+            schedules={item["name"]: item for item in manifest["schedules"]},
         )
         with self._cache_lock:
             self._cache[key] = loaded
@@ -704,7 +539,7 @@ class ExtensionHostService:
         try:
             with zipfile.ZipFile(BytesIO(package_bytes)) as archive:
                 return archive.read(name)
-        except (KeyError, zipfile.BadZipFile):
+        except KeyError, zipfile.BadZipFile:
             raise ExtensionImportFailed(f"installed package is missing {name}") from None
 
     @staticmethod
@@ -734,6 +569,7 @@ class ExtensionHostService:
         if version_row is None:
             raise ExtensionNotFound("extension has no installed version")
         manifest = json.loads(version_row.manifest_json)
+        runtime = manifest.get("runtime", "sandboxed")
         return {
             "id": module.id,
             "manifest": manifest,
@@ -742,8 +578,13 @@ class ExtensionHostService:
             "version": version_row.version,
             "schemaVersion": module.data_schema_version,
             "revision": module.revision,
+            "runtime": runtime,
+            "status": _module_status(module, manifest),
+            "sandboxed": runtime == "sandboxed",
             "frontendUrl": (
-                self._frontend_url(module.id, version_row.digest) if module.enabled else None
+                self._frontend_url(module.id, version_row.digest)
+                if module.enabled and manifest["frontend"].get("entry")
+                else None
             ),
             "operations": manifest["operations"],
         }
@@ -758,7 +599,6 @@ class ExtensionHostService:
         }
 
     def _history(self, session: Session, extension_id: str) -> list[dict[str, Any]]:
-        from itsm.extensions.models import ExtensionEvent
 
         rows = session.execute(
             select(ExtensionEvent)
@@ -800,9 +640,7 @@ class ExtensionHostService:
         ]
         removed = sorted(current_codes - candidate_codes)
         from_schema = module.data_schema_version if module is not None else 0
-        plan = package_contract.migration_plan(
-            manifest, from_schema, manifest["schemaVersion"]
-        )
+        plan = package_contract.migration_plan(manifest, from_schema, manifest["schemaVersion"])
         report = (
             json.loads(candidate.validation_report_json)
             if candidate.validation_report_json
@@ -811,8 +649,7 @@ class ExtensionHostService:
         rollback_compatible = True
         if current_manifest is not None:
             rollback_compatible = (
-                manifest["schemaVersion"]
-                in current_manifest["compatibleSchemaVersions"]
+                manifest["schemaVersion"] in current_manifest["compatibleSchemaVersions"]
             )
         return {
             "id": candidate.id,
@@ -850,11 +687,18 @@ class ExtensionHostService:
                 "steps": [] if plan is None else list(plan),
             },
             "trust": {
-                "model": "trusted-native",
-                "sandboxed": False,
+                "model": (
+                    "sandboxed-isolation"
+                    if manifest.get("runtime") == "sandboxed"
+                    else "declarative-host-executed"
+                ),
+                "sandboxed": manifest.get("runtime") == "sandboxed",
+                "runtime": manifest.get("runtime"),
                 "statement": (
-                    "Approved native code runs in the host process. Validation happens in "
-                    "an isolated container before review; installation is a human decision."
+                    "Sandboxed code never runs in the API or worker process: each call is a "
+                    "separate process restricted by rlimits, no_new_privs, Landlock and a "
+                    "seccomp deny-list, and every core effect goes through an authorized "
+                    "host capability. Declarative modules carry no executable code at all."
                 ),
             },
             "rollbackCompatible": rollback_compatible,
@@ -879,9 +723,7 @@ class ExtensionHostService:
                     continue
                 manifest = json.loads(version_row.manifest_json)
                 operations = [
-                    item
-                    for item in manifest["operations"]
-                    if item["permission"] in permissions
+                    item for item in manifest["operations"] if item["permission"] in permissions
                 ]
                 if not superadmin and (not module.enabled or not operations):
                     continue
@@ -905,9 +747,7 @@ class ExtensionHostService:
                 raise ExtensionNotFound("extension has no installed version")
             manifest = json.loads(version_row.manifest_json)
             permissions = self._effective_permissions(session, principal)
-            return [
-                item for item in manifest["operations"] if item["permission"] in permissions
-            ]
+            return [item for item in manifest["operations"] if item["permission"] in permissions]
 
     def frontend_script(self, principal: Principal, extension_id: str, *, digest: str) -> bytes:
         with self._session_factory() as session:
@@ -930,9 +770,7 @@ class ExtensionHostService:
                 raise PermissionDenied()
             return self._member_bytes(version_row.package_bytes, "frontend.js")
 
-    def skill(
-        self, principal: Principal, extension_id: str, name: str
-    ) -> dict[str, Any]:
+    def skill(self, principal: Principal, extension_id: str, name: str) -> dict[str, Any]:
         """Return one installed skill's bounded text; never auto-inject it."""
         with self._session_factory() as session:
             module = storage.get_module(session, extension_id)
@@ -956,9 +794,9 @@ class ExtensionHostService:
                 item["permission"] in permissions for item in manifest["operations"]
             ):
                 raise PermissionDenied()
-            content = self._member_bytes(
-                version_row.package_bytes, declaration["path"]
-            ).decode("utf-8")
+            content = self._member_bytes(version_row.package_bytes, declaration["path"]).decode(
+                "utf-8"
+            )
             return {
                 "name": declaration["name"],
                 "description": declaration["description"],
@@ -1014,6 +852,7 @@ class ExtensionHostService:
             if declaration is None:
                 raise ExtensionNotFound("operation not found")
             permission = declaration["permission"]
+        loaded = self._load_module(version_row)
         self.authorize_fresh(
             principal, permission, resource=f"extension:{extension_id}:{operation}"
         )
@@ -1021,57 +860,207 @@ class ExtensionHostService:
             package_contract.validate_arguments(declaration["parameters"], arguments)
         except package_contract.PackageError as exc:
             raise ExtensionValidationFailed(str(exc)) from None
-        loaded = self._load_module(version_row)
-        handler = loaded.operations[operation]
-        session = self._session_factory()
-        try:
+        with self._module_lock(extension_id):
+            self._recheck_installed(
+                principal,
+                extension_id,
+                version_row,
+                permission,
+                f"extension:{extension_id}:{operation}",
+            )
+            if loaded.runtime == "declarative":
+                result = self._invoke_declarative(
+                    loaded, loaded.operations[operation], dict(arguments)
+                )
+            else:
+                result = self._invoke_sandboxed(
+                    principal,
+                    loaded,
+                    kind="operation",
+                    name=operation,
+                    arguments=dict(arguments),
+                    allow_write=bool(declaration["mutation"]),
+                )
+        self._record_invocation(
+            principal, action="extensions.invoke", resource=f"extension:{extension_id}:{operation}"
+        )
+        return _jsonable(result)
+
+    def _recheck_installed(
+        self,
+        principal: Principal,
+        extension_id: str,
+        version_row: ExtensionVersion,
+        permission: str,
+        resource: str,
+    ) -> None:
+        """Second check after loading: the installed digest and grant still hold."""
+        with self._session_factory() as session:
             module = storage.get_module(session, extension_id)
             if module is None:
                 raise ExtensionNotFound("extension not found")
             if not module.enabled:
                 raise ExtensionDisabled("extension is disabled")
             live = storage.get_active_version(session, module)
-            if live is None or live.version != version_row.version or live.digest != version_row.digest:
+            if (
+                live is None
+                or live.version != version_row.version
+                or live.digest != version_row.digest
+            ):
                 raise ExtensionStale("extension changed during invocation")
             IdentityService(session, self._settings).authorize(
-                principal,
-                permission,
-                resource=f"extension:{extension_id}:{operation}",
-                commit_denial=False,
+                principal, permission, resource=resource, commit_denial=False
             )
-            context = _HostContext(
-                host=self,
-                principal=principal,
-                session=session,
-                loaded=loaded,
-                operation=operation,
-                write_allowed=bool(declaration["mutation"]),
+
+    def _record_invocation(self, principal: Principal, *, action: str, resource: str) -> None:
+        with self._session_factory() as session:
+            IdentityService(session, self._settings).record_operation(
+                principal, action=action, resource=resource
             )
-            result = handler(context, **dict(arguments))
-            payload = _jsonable(result)
-            identity_service = IdentityService(session, self._settings)
-            identity_service.record_operation(
-                principal,
-                action="extensions.invoke",
-                resource=f"extension:{extension_id}:{operation}",
-                commit=False,
-            )
-            session.commit()
-            return payload
-        except PermissionDenied:
-            session.rollback()
+
+    # ------------------------------------------------------------------ storage
+    def storage_root(self) -> Path:
+        return Path(self._settings.extension_data_path)
+
+    def module_dir(self, extension_id: str) -> Path:
+        return sqlite_store.data_dir(self.storage_root(), extension_id)
+
+    def _prepare_storage(self, extension_id: str) -> Path:
+        return sqlite_store.prepare(self.storage_root(), extension_id)
+
+    def _connect(self, extension_id: str) -> sqlite3.Connection:
+        return sqlite_store.connect(self.storage_root(), extension_id)
+
+    def _store(
+        self,
+        connection: sqlite3.Connection,
+        loaded: _LoadedModule,
+        *,
+        allow_write: bool,
+    ) -> _ModuleStore:
+        return _ModuleStore(
+            connection, loaded.extension_id, loaded.collections, allow_write=allow_write
+        )
+
+    # -------------------------------------------------------- declarative runtime
+    def _invoke_declarative(
+        self,
+        loaded: _LoadedModule,
+        declaration: Mapping[str, Any],
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        kind = declaration["kind"]
+        collection = declaration["collection"]
+        schema = _collection_schema(loaded.manifest, collection)
+        allowed = sdk_contract.DECLARATIVE_ARGUMENTS[kind][0]
+        extra = sorted(set(arguments) - allowed)
+        if extra:
+            raise ExtensionValidationFailed("unsupported argument: " + ", ".join(extra[:8]))
+        connection = self._connect(loaded.extension_id)
+        store = self._store(connection, loaded, allow_write=True)
+        try:
+            result = self._declarative_result(store, kind, collection, schema, arguments)
+        except BaseException:
+            store.rollback()
             raise
-        except ExtensionHostError:
-            session.rollback()
-            raise
-        except Exception as exc:
-            session.rollback()
-            logger.warning(
-                "extension operation failed for %s:%s", extension_id, operation, exc_info=True
-            )
-            raise ExtensionHandlerFailed("extension operation failed") from exc
+        else:
+            store.commit()
+            return result
         finally:
-            session.close()
+            store.close()
+
+    def _declarative_result(
+        self,
+        store: _ModuleStore,
+        kind: str,
+        collection: str,
+        schema: Mapping[str, Any] | None,
+        arguments: Mapping[str, Any],
+    ) -> Any:
+        if kind == "list":
+            return store.list(
+                collection,
+                limit=arguments.get("limit", 50),
+                offset=arguments.get("offset", 0),
+                filters=_declarative_filters(schema, arguments.get("filters")),
+            )
+        if kind == "get":
+            return store.get(collection, arguments.get("record_id"))
+        if kind == "put":
+            data = _validate_record(collection, schema, arguments.get("data"))
+            record_id = arguments.get("record_id") or str(uuid4())
+            return store.put(collection, record_id, data, arguments.get("expected_version"))
+        if kind == "delete":
+            deleted = store.delete(
+                collection, arguments.get("record_id"), arguments.get("expected_version")
+            )
+            return {"deleted": deleted}
+        raise ExtensionValidationFailed(f"unsupported declarative kind {kind}")
+
+    # ----------------------------------------------------------- sandboxed runtime
+    def _invoke_sandboxed(
+        self,
+        principal: Principal,
+        loaded: _LoadedModule,
+        *,
+        kind: str,
+        name: str,
+        arguments: Mapping[str, Any],
+        allow_write: bool,
+        event: Mapping[str, Any] | None = None,
+    ) -> Any:
+        availability = sandbox_availability()
+        if not availability.get("available"):
+            raise ExtensionSandboxUnavailable(
+                str(availability.get("detail") or "sandbox unavailable")
+            )
+        self._prepare_storage(loaded.extension_id)
+        sandbox.prepare_package(self._settings, loaded.digest, loaded.package_bytes)
+        connection = self._connect(loaded.extension_id)
+        store = self._store(connection, loaded, allow_write=allow_write)
+        broker = CapabilityBroker(
+            host=self,
+            principal=principal,
+            loaded=loaded,
+            store=store,
+            allow_write=allow_write,
+        )
+        request = {
+            "kind": kind,
+            "name": name,
+            "arguments": dict(arguments),
+            "context": {
+                "principal": _jsonable(principal),
+                "extensionId": loaded.extension_id,
+                "version": loaded.version,
+                "operation": name if kind == "operation" else None,
+                "schedule": name if kind == "schedule" else None,
+                "event": None if event is None else _jsonable(event),
+            },
+        }
+        try:
+            result = sandbox.run_module(
+                settings=self._settings,
+                limits=self._sandbox_limits,
+                digest=loaded.digest,
+                package_bytes=loaded.package_bytes,
+                data_dir=str(self.module_dir(loaded.extension_id)),
+                request=request,
+                declared={
+                    "operations": sorted(loaded.operations),
+                    "migrations": sorted(loaded.migrations),
+                    "schedules": sorted(item["handler"] for item in loaded.schedules.values()),
+                },
+                handle_call=broker.handle,
+            )
+        except BaseException:
+            store.rollback()
+            raise
+        else:
+            store.commit()
+            return result
+        finally:
+            store.close()
 
     def list_schedules(self) -> tuple[ScheduleView, ...]:
         with self._session_factory() as session:
@@ -1121,9 +1110,7 @@ class ExtensionHostService:
                     )
             return tuple(items)
 
-    def invoke_schedule(
-        self, principal: Principal, extension_id: str, schedule_name: str
-    ) -> Any:
+    def invoke_schedule(self, principal: Principal, extension_id: str, schedule_name: str) -> Any:
         """Explicit authorized smoke/force dispatch; does not move due state."""
         with self._module_lock(extension_id):
             return self._invoke_schedule_locked(principal, extension_id, schedule_name)
@@ -1148,54 +1135,41 @@ class ExtensionHostService:
             if declaration is None:
                 raise ExtensionNotFound("schedule not found")
             permission = declaration["permission"]
+        loaded = self._load_module(version_row)
         self.authorize_fresh(
             principal, permission, resource=f"extension:{extension_id}:schedule:{schedule_name}"
         )
-        loaded = self._load_module(version_row)
-        handler = loaded.schedules[schedule_name]
-        session = self._session_factory()
         try:
-            live_module = storage.get_module(session, extension_id)
-            if live_module is None or not live_module.enabled:
-                raise ExtensionDisabled("extension is disabled")
-            live = storage.get_active_version(session, live_module)
-            if live is None or live.digest != version_row.digest:
-                raise ExtensionStale("extension changed during schedule dispatch")
-            IdentityService(session, self._settings).authorize(
+            self._recheck_installed(
                 principal,
+                extension_id,
+                version_row,
                 permission,
-                resource=f"extension:{extension_id}:schedule:{schedule_name}",
-                commit_denial=False,
+                f"extension:{extension_id}:schedule:{schedule_name}",
             )
-            context = _HostContext(
-                host=self,
-                principal=principal,
-                session=session,
-                loaded=loaded,
-                operation=None,
-                schedule=schedule_name,
-            )
-            result = handler(context)
-            payload = _jsonable(result)
-            IdentityService(session, self._settings).record_operation(
+            if loaded.runtime == "declarative":
+                raise ExtensionValidationFailed("declarative modules cannot declare schedules")
+            result = self._invoke_sandboxed(
                 principal,
-                action="extensions.schedule",
-                resource=f"extension:{extension_id}:schedule:{schedule_name}",
-                commit=False,
+                loaded,
+                kind="schedule",
+                name=declaration["handler"],
+                arguments={},
+                allow_write=True,
             )
-            session.commit()
-            return payload
-        except (PermissionDenied, ExtensionHostError):
-            session.rollback()
+        except PermissionDenied, ExtensionHostError:
             raise
         except Exception as exc:
-            session.rollback()
             logger.warning(
                 "extension schedule failed for %s:%s", extension_id, schedule_name, exc_info=True
             )
             raise ExtensionHandlerFailed("extension schedule failed") from exc
-        finally:
-            session.close()
+        self._record_invocation(
+            principal,
+            action="extensions.schedule",
+            resource=f"extension:{extension_id}:schedule:{schedule_name}",
+        )
+        return _jsonable(result)
 
     @staticmethod
     def _sync_schedule_states(
@@ -1219,8 +1193,7 @@ class ExtensionHostService:
                         extension_id=extension_id,
                         name=schedule["name"],
                         owner_id=owner_id,
-                        next_due_at=now
-                        + timedelta(seconds=int(schedule["intervalSeconds"])),
+                        next_due_at=now + timedelta(seconds=int(schedule["intervalSeconds"])),
                         created_at=now,
                         updated_at=now,
                     )
@@ -1229,9 +1202,7 @@ class ExtensionHostService:
                 row.owner_id = owner_id
                 row.updated_at = now
                 if row.next_due_at is None:
-                    row.next_due_at = now + timedelta(
-                        seconds=int(schedule["intervalSeconds"])
-                    )
+                    row.next_due_at = now + timedelta(seconds=int(schedule["intervalSeconds"]))
         session.flush()
 
     def _mark_schedule_error(
@@ -1368,7 +1339,6 @@ class ExtensionHostService:
     def notify_from_module(
         self,
         *,
-        session: Session,
         principal: Principal,
         loaded: _LoadedModule,
         recipient_ids: Sequence[str],
@@ -1401,7 +1371,10 @@ class ExtensionHostService:
             clean_ids.append(value)
         if not isinstance(key, str) or not key or len(key) > 64:
             raise ExtensionValidationFailed("notification key must be 1-64 characters")
-        if any(ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-" for ch in key):
+        if any(
+            ch not in "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
+            for ch in key
+        ):
             raise ExtensionValidationFailed("notification key contains unsupported characters")
         if not isinstance(title, str) or not 1 <= len(title) <= 200:
             raise ExtensionValidationFailed("notification title must be 1-200 characters")
@@ -1414,43 +1387,53 @@ class ExtensionHostService:
             or not url.startswith(f"#/extensiones/{loaded.extension_id}/")
             or len(url) > 500
         ):
-            raise ExtensionValidationFailed("notification url must point to its native extension page")
-        IdentityService(session, self._settings).authorize(
-            principal,
-            permission,
-            resource=f"extension:{loaded.extension_id}:notify",
-            commit_denial=False,
-        )
-        if asset_id is not None:
-            _AssetAccess(self, principal, session).get(asset_id)
-        service = IdentityService(session, self._settings)
-        authorized: list[str] = []
-        for recipient_id in clean_ids:
-            identity = session.get(Identity, recipient_id)
-            if identity is None or not identity.active or identity.actor_kind != HUMAN_ACTOR_KIND:
-                continue
-            try:
-                recipient = service.resolve_actor(recipient_id)
-                effective = service.effective_permissions(recipient)
-            except PermissionDenied:
-                continue
-            if "assets.view" in effective and permission in effective:
-                authorized.append(recipient_id)
-        if not authorized:
-            return
-        self._notify(
-            session=session,
-            principal=principal,
-            module_id=loaded.extension_id,
-            module_permissions=tuple(sorted(declared)),
-            recipient_ids=tuple(authorized),
-            key=key,
-            title=title,
-            body=body,
-            permission=permission,
-            asset_id=asset_id,
-            url=url,
-        )
+            raise ExtensionValidationFailed(
+                "notification url must point to its native extension page"
+            )
+        with self._session_factory() as session:
+            IdentityService(session, self._settings).authorize(
+                principal,
+                permission,
+                resource=f"extension:{loaded.extension_id}:notify",
+                commit_denial=False,
+            )
+            if asset_id is not None:
+                _AssetAccess(self, principal, session).get(asset_id)
+            service = IdentityService(session, self._settings)
+            authorized: list[str] = []
+            for recipient_id in clean_ids:
+                identity = session.get(Identity, recipient_id)
+                if (
+                    identity is None
+                    or not identity.active
+                    or identity.actor_kind != HUMAN_ACTOR_KIND
+                ):
+                    continue
+                try:
+                    recipient = service.resolve_actor(recipient_id)
+                    effective = service.effective_permissions(recipient)
+                except PermissionDenied:
+                    continue
+                if "assets.view" in effective and permission in effective:
+                    authorized.append(recipient_id)
+            if not authorized:
+                return
+            self._notify(
+                session=session,
+                principal=principal,
+                module_id=loaded.extension_id,
+                module_permissions=tuple(sorted(declared)),
+                recipient_ids=tuple(authorized),
+                key=key,
+                title=title,
+                body=body,
+                permission=permission,
+                asset_id=asset_id,
+                url=url,
+            )
+            # The notice session belongs to the host, so the terminal effect is
+            # committed here; the enqueue helper deliberately never commits.
+            session.commit()
 
     # --------------------------------------------------------------- candidates
     def submit_candidate(
@@ -1460,9 +1443,7 @@ class ExtensionHostService:
         *,
         expected_digest: str | None = None,
     ) -> dict[str, Any]:
-        self.authorize_fresh(
-            principal, "system.modules", resource="extensions:candidates"
-        )
+        self.authorize_fresh(principal, "system.modules", resource="extensions:candidates")
         try:
             package = package_contract.inspect_package(
                 package_bytes, expected_digest=expected_digest
@@ -1617,8 +1598,7 @@ class ExtensionHostService:
         }
         if not isinstance(report, Mapping) or set(report) != allowed:
             raise ExtensionValidationFailed(
-                "validation report must contain exactly: "
-                + ", ".join(sorted(allowed))
+                "validation report must contain exactly: " + ", ".join(sorted(allowed))
             )
         status = report["status"]
         if status not in ("passed", "failed"):
@@ -1631,7 +1611,7 @@ class ExtensionHostService:
         ):
             raise ExtensionValidationFailed("validation digest must be SHA-256 hex")
         if report["sdkVersion"] != SDK_VERSION:
-            raise ExtensionValidationFailed("validation sdkVersion must be 1")
+            raise ExtensionValidationFailed(f"validation sdkVersion must be {SDK_VERSION}")
         checks = report["checks"]
         if not isinstance(checks, list) or len(checks) > 200:
             raise ExtensionValidationFailed("validation checks must be a bounded list")
@@ -1686,18 +1666,14 @@ class ExtensionHostService:
         with self._session_factory() as session:
             rows = session.execute(
                 select(ExtensionCandidate)
-                .order_by(
-                    ExtensionCandidate.submitted_at.desc(), ExtensionCandidate.id.desc()
-                )
+                .order_by(ExtensionCandidate.submitted_at.desc(), ExtensionCandidate.id.desc())
                 .limit(CANDIDATE_LIMIT)
             ).scalars()
             items: list[dict[str, Any]] = []
             for row in rows:
                 module = storage.get_module(session, row.extension_id)
                 report = (
-                    json.loads(row.validation_report_json)
-                    if row.validation_report_json
-                    else None
+                    json.loads(row.validation_report_json) if row.validation_report_json else None
                 )
                 items.append(
                     {
@@ -1776,12 +1752,13 @@ class ExtensionHostService:
                 json.loads(candidate.manifest_json),
                 known_core_permissions=PERMISSION_CODES,
             )
-            if module is not None and module.active_version is not None:
-                if (
-                    package_contract.version_key(candidate.version)
-                    <= package_contract.version_key(module.active_version)
-                ):
-                    raise ExtensionConflict("candidate version is not newer than installed")
+            if (
+                module is not None
+                and module.active_version is not None
+                and package_contract.version_key(candidate.version)
+                <= package_contract.version_key(module.active_version)
+            ):
+                raise ExtensionConflict("candidate version is not newer than installed")
             from_schema = module.data_schema_version if module is not None else 0
             to_schema = manifest["schemaVersion"]
             plan = package_contract.migration_plan(manifest, from_schema, to_schema)
@@ -1791,6 +1768,7 @@ class ExtensionHostService:
                 raise ExtensionConflict("candidate has no compatible migration path")
             now = self._now()
             previous_digest = self._current_digest(session, candidate.extension_id)
+            is_upgrade = current_version is not None
             candidate_revision = candidate.revision
             claimed = session.execute(
                 update(ExtensionCandidate)
@@ -1853,40 +1831,55 @@ class ExtensionHostService:
             )
             self._require_human_superadmin(session, principal)
             loaded = self._load_module_from_candidate(candidate)
-            context = _HostContext(
-                host=self,
-                principal=principal,
-                session=session,
-                loaded=loaded,
-                operation=None,
-                collections=frozenset(
-                    {
-                        *[
-                            item["name"]
-                            for item in manifest["collections"]
-                        ],
-                        *self._current_collection_names(session, candidate.extension_id),
-                    }
-                ),
-            )
-            for step in plan:
-                handler = loaded.migrations[step["handler"]]
-                try:
-                    handler(context)
-                except Exception as exc:
-                    raise ExtensionMigrationFailed(
-                        f"migration {step['handler']} failed; previous version retained"
-                    ) from exc
-                session.add(
-                    ExtensionMigration(
-                        extension_id=candidate.extension_id,
-                        package_version=candidate.version,
-                        from_schema=step["from"],
-                        to_schema=step["to"],
-                        applied_at=now,
-                        applied_by=principal.actor_id,
+            self._prepare_storage(candidate.extension_id)
+            # D4: extract the reviewed package once, read-only, per digest.
+            try:
+                sandbox.prepare_package(self._settings, candidate.digest, candidate.package_bytes)
+            except (ExtensionValidationFailed, OSError) as exc:
+                raise ExtensionImportFailed("extension package could not be materialized") from exc
+            if is_upgrade:
+                # D3: snapshot through the SQLite backup API before touching data.
+                sqlite_store.snapshot(self.storage_root(), candidate.extension_id, from_schema)
+            handler_name = plan[-1]["handler"] if plan else ""
+            try:
+                for step in plan:
+                    handler_name = step["handler"]
+                    self._invoke_sandboxed(
+                        principal,
+                        loaded,
+                        kind="migration",
+                        name=step["handler"],
+                        arguments={},
+                        allow_write=True,
+                        event={"from": step["from"], "to": step["to"]},
                     )
+                    session.add(
+                        ExtensionMigration(
+                            extension_id=candidate.extension_id,
+                            package_version=candidate.version,
+                            from_schema=step["from"],
+                            to_schema=step["to"],
+                            applied_at=now,
+                            applied_by=principal.actor_id,
+                        )
+                    )
+            except BaseException as exc:
+                if is_upgrade:
+                    sqlite_store.restore(self.storage_root(), candidate.extension_id, from_schema)
+                logger.warning(
+                    "extension migration failed for %s:%s",
+                    candidate.extension_id,
+                    handler_name,
+                    exc_info=True,
                 )
+                raise ExtensionMigrationFailed(
+                    f"migration {handler_name or 'chain'} failed; previous version retained"
+                ) from exc
+            connection = self._connect(candidate.extension_id)
+            try:
+                sqlite_store.set_schema_version(connection, to_schema)
+            finally:
+                connection.close()
             version_row = ExtensionVersion(
                 extension_id=candidate.extension_id,
                 version=candidate.version,
@@ -1966,7 +1959,7 @@ class ExtensionHostService:
             session.expire_all()
             refreshed = session.get(ExtensionCandidate, candidate.id)
             return self._candidate_detail(session, refreshed) if refreshed else {}
-        except (PermissionDenied, ExtensionHostError):
+        except PermissionDenied, ExtensionHostError:
             session.rollback()
             raise
         except IntegrityError:
@@ -2064,7 +2057,7 @@ class ExtensionHostService:
             session.expire_all()
             refreshed = session.get(ExtensionModule, extension_id)
             return self._module_payload(refreshed, version_row) if refreshed else {}
-        except (PermissionDenied, ExtensionHostError):
+        except PermissionDenied, ExtensionHostError:
             session.rollback()
             raise
         except SQLAlchemyError:
@@ -2081,10 +2074,14 @@ class ExtensionHostService:
         version: str,
         digest: str,
         expected_version: int,
+        restore_data: bool = False,
+        confirm: str | None = None,
     ) -> dict[str, Any]:
         self.authorize_fresh(
             principal, "system.modules", resource=f"extension:{extension_id}:rollback"
         )
+        if not isinstance(restore_data, bool):
+            raise ExtensionValidationFailed("restoreData must be a boolean")
         if not isinstance(version, str) or not version:
             raise ExtensionValidationFailed("version is required")
         if (
@@ -2125,17 +2122,42 @@ class ExtensionHostService:
             data_schema = module.data_schema_version
             if data_schema is None:
                 raise ExtensionConflict("extension has no data schema version")
+            restore_snapshot = False
             if data_schema not in target_manifest["compatibleSchemaVersions"]:
-                raise ExtensionRollbackIncompatible(
-                    "active data schema is not compatible with the rollback target"
-                )
+                if not restore_data:
+                    raise ExtensionRollbackIncompatible(
+                        "active data schema is not compatible with the rollback target; "
+                        'rollback requires restoreData: true and confirm: "<extension id>"'
+                    )
+                if confirm != extension_id:
+                    raise ExtensionValidationFailed(
+                        "restoring data on rollback requires confirm equal to the extension id"
+                    )
+                target_schema = int(target_manifest["schemaVersion"])
+                if target_schema not in {
+                    version
+                    for version, _ in sqlite_store.snapshot_versions(
+                        self.storage_root(), extension_id
+                    )
+                }:
+                    raise ExtensionConflict(
+                        "no data snapshot exists for the rollback target schema"
+                    )
+                restore_snapshot = True
             updated = session.execute(
                 update(ExtensionModule)
                 .where(
                     ExtensionModule.id == module.id,
                     ExtensionModule.revision == module.revision,
                 )
-                .values(active_version=target.version, revision=module.revision + 1, updated_at=self._now())
+                .values(
+                    active_version=target.version,
+                    revision=module.revision + 1,
+                    data_schema_version=int(target_manifest["schemaVersion"])
+                    if restore_snapshot
+                    else module.data_schema_version,
+                    updated_at=self._now(),
+                )
             )
             if updated.rowcount != 1:
                 raise ExtensionStale("installed revision changed")
@@ -2159,9 +2181,7 @@ class ExtensionHostService:
                     "fromDigest": current.digest,
                     "targetSchemaVersion": target_manifest["schemaVersion"],
                     "dataSchemaVersion": data_schema,
-                    "compatibleSchemaVersions": list(
-                        target_manifest["compatibleSchemaVersions"]
-                    ),
+                    "compatibleSchemaVersions": list(target_manifest["compatibleSchemaVersions"]),
                 },
             )
             IdentityService(session, self._settings).record_operation(
@@ -2171,11 +2191,17 @@ class ExtensionHostService:
                 commit=False,
             )
             session.commit()
+            if restore_snapshot:
+                restored = sqlite_store.restore(
+                    self.storage_root(), extension_id, int(target_manifest["schemaVersion"])
+                )
+                if not restored:  # pragma: no cover - checked before the update
+                    raise ExtensionMigrationFailed("rollback data restore failed")
             self._drop_cache(extension_id)
             session.expire_all()
             refreshed = session.get(ExtensionModule, extension_id)
             return self._module_payload(refreshed, target) if refreshed else {}
-        except (PermissionDenied, ExtensionHostError):
+        except PermissionDenied, ExtensionHostError:
             session.rollback()
             raise
         except SQLAlchemyError:
@@ -2183,6 +2209,206 @@ class ExtensionHostService:
             raise
         finally:
             session.close()
+
+    # ------------------------------------------------------------- status
+    def status(self, principal: Principal, extension_id: str) -> dict[str, Any]:
+        """Administrator view of storage, schema, availability and cursors."""
+        self.authorize_fresh(
+            principal, "system.modules", resource=f"extension:{extension_id}:status"
+        )
+        with self._session_factory() as session:
+            module = storage.get_module(session, extension_id)
+            if module is None:
+                raise ExtensionNotFound("extension not found")
+            version_row = storage.get_active_version(session, module)
+            if version_row is None:
+                raise ExtensionNotFound("extension has no installed version")
+            manifest = json.loads(version_row.manifest_json)
+            status_code = _module_status(module, manifest)
+            payload = {
+                "id": module.id,
+                "status": status_code,
+                "enabled": module.enabled,
+                "version": version_row.version,
+                "digest": version_row.digest,
+                "schemaVersion": module.data_schema_version,
+                "runtime": manifest.get("runtime", "sandboxed"),
+                "revision": module.revision,
+                "storagePath": str(self.module_dir(extension_id)),
+                "dataSizeBytes": sqlite_store.size_bytes(self.storage_root(), extension_id),
+                "snapshots": [
+                    {"schemaVersion": version}
+                    for version, _ in sqlite_store.snapshot_versions(
+                        self.storage_root(), extension_id
+                    )
+                ],
+                "eventCursor": None,
+                "stalled": False,
+            }
+        payload["sandbox"] = sandbox.sandbox_availability()
+        return payload
+
+    # ----------------------------------------------------------- uninstall
+    def uninstall(
+        self, principal: Principal, extension_id: str, *, expected_version: int
+    ) -> dict[str, Any]:
+        """Remove host metadata and grants; module data is never deleted."""
+        self.authorize_fresh(
+            principal, "system.modules", resource=f"extension:{extension_id}:uninstall"
+        )
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            raise ExtensionValidationFailed("expectedVersion must be a non-negative integer")
+        session = self._session_factory()
+        try:
+            self._require_human_superadmin(session, principal)
+            module = storage.get_module(session, extension_id)
+            if module is None:
+                raise ExtensionNotFound("extension not found")
+            if module.revision != expected_version:
+                raise ExtensionStale("installed revision changed")
+            version_row = storage.get_active_version(session, module)
+            codes = list(
+                session.execute(
+                    select(ExtensionPermission.code).where(
+                        ExtensionPermission.extension_id == extension_id
+                    )
+                ).scalars()
+            )
+            session.execute(
+                delete(ExtensionScheduleState).where(
+                    ExtensionScheduleState.extension_id == extension_id
+                )
+            )
+            session.execute(
+                delete(ExtensionMigration).where(ExtensionMigration.extension_id == extension_id)
+            )
+            session.execute(
+                delete(ExtensionVersion).where(ExtensionVersion.extension_id == extension_id)
+            )
+            session.execute(
+                delete(ExtensionCandidate).where(ExtensionCandidate.extension_id == extension_id)
+            )
+            session.execute(
+                delete(ExtensionPermission).where(ExtensionPermission.extension_id == extension_id)
+            )
+            for code in codes:
+                resource, _, operation = code.rpartition(".")
+                session.execute(
+                    delete(IdentityRolePolicy).where(
+                        IdentityRolePolicy.resource == resource,
+                        IdentityRolePolicy.operation == operation,
+                    )
+                )
+            session.delete(module)
+            storage.record_event(
+                session,
+                extension_id=extension_id,
+                action="extension.uninstalled",
+                actor_id=principal.actor_id,
+                detail={
+                    "version": version_row.version if version_row is not None else None,
+                    "digest": version_row.digest if version_row is not None else None,
+                    "dataRetained": True,
+                    "dataPath": str(self.module_dir(extension_id)),
+                },
+            )
+            IdentityService(session, self._settings).record_operation(
+                principal,
+                action="extensions.uninstalled",
+                resource=f"extension:{extension_id}",
+                commit=False,
+            )
+            session.commit()
+            self._drop_cache(extension_id)
+            return {
+                "uninstalled": True,
+                "dataRetained": True,
+                "dataPath": str(self.module_dir(extension_id)),
+            }
+        except PermissionDenied, ExtensionHostError:
+            session.rollback()
+            raise
+        except SQLAlchemyError:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    # --------------------------------------------------- legacy relocation
+    def relocate_legacy(self, *, apply: bool = False) -> dict[str, Any]:
+        """Copy v1 ``extension_collection_records`` into module SQLite files.
+
+        Idempotent by construction: an existing module row always wins, legacy
+        rows are only read and never deleted, and no module code is executed.
+        """
+        with self._session_factory() as session:
+            rows = list(
+                session.execute(
+                    select(ExtensionCollectionRecord).order_by(
+                        ExtensionCollectionRecord.extension_id,
+                        ExtensionCollectionRecord.collection,
+                        ExtensionCollectionRecord.record_id,
+                    )
+                ).scalars()
+            )
+            data = [
+                (
+                    row.extension_id,
+                    row.collection,
+                    row.record_id,
+                    int(row.version),
+                    row.data_json,
+                )
+                for row in rows
+            ]
+        plan: dict[str, dict[str, int]] = {}
+        for extension_id, *_ in data:
+            plan.setdefault(extension_id, {"copied": 0, "unchanged": 0, "conflicts": 0})
+        for extension_id, collection, record_id, version, data_json in data:
+            if not apply:
+                plan[extension_id]["copied"] += 1
+                continue
+            connection = self._connect(extension_id)
+            try:
+                existing = sqlite_store.get(connection, collection, record_id)
+                if existing is None:
+                    self._insert_legacy_row(connection, collection, record_id, version, data_json)
+                    plan[extension_id]["copied"] += 1
+                elif _legacy_equal(existing["data"], data_json):
+                    plan[extension_id]["unchanged"] += 1
+                else:
+                    plan[extension_id]["conflicts"] += 1
+            finally:
+                connection.close()
+        return {
+            "apply": apply,
+            "extensions": [
+                {"extensionId": extension_id, **counts}
+                for extension_id, counts in sorted(plan.items())
+            ],
+            "legacyRowsRetained": len(data),
+        }
+
+    @staticmethod
+    def _insert_legacy_row(
+        connection: sqlite3.Connection,
+        collection: str,
+        record_id: str,
+        version: int,
+        data_json: str,
+    ) -> None:
+        now = datetime.now(UTC).isoformat()
+        connection.execute(
+            f"INSERT INTO {sqlite_store.RECORDS_TABLE} "
+            "(collection, record_id, version, data, created_at, updated_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (collection, record_id, version, data_json, now, now),
+        )
+        connection.commit()
 
 
 def submit_workspace_candidate(

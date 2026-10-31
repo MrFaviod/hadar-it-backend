@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import json
+
 import pydantic_ai.models
 import pytest
 from pydantic_ai.messages import TextPart, ToolCallPart
@@ -34,7 +36,9 @@ def test_chat_discovers_sdk_and_creates_owned_independent_workspace(
             )
         ),
     )
-    response = chat(client, headers, message="Descubre el SDK y prepara una extensión de registros.")
+    response = chat(
+        client, headers, message="Descubre el SDK y prepara una extensión de registros."
+    )
     assert response.status_code == 200, response.text
     reply = response.json()
     assert [(action["tool"], action["status"]) for action in reply["actions"]] == [
@@ -45,7 +49,13 @@ def test_chat_discovers_sdk_and_creates_owned_independent_workspace(
     files = list((tmp_path / "sdk-workspaces").rglob("extension.json"))
     assert len(files) == 1
     assert list((tmp_path / "sdk-workspaces").rglob("backend.py"))
-    assert list((tmp_path / "sdk-workspaces").rglob("frontend.js"))
+    # SDK v2 renders declarative views on the host: the workspace carries no
+    # same-origin frontend bundle unless an isolated iframe view is declared.
+    assert not list((tmp_path / "sdk-workspaces").rglob("frontend.js"))
+    manifest = json.loads(files[0].read_text(encoding="utf-8"))
+    assert manifest["sdkVersion"] == 2
+    assert manifest["runtime"] == "sandboxed"
+    assert manifest["frontend"]["pages"][0]["view"]["table"]["operation"] == ("list_records")
     assert client.get("/api/v1/extensions").json()["items"] == []
 
 
@@ -56,9 +66,8 @@ def test_chat_validation_submission_requires_exact_human_review(
     """Known core permissions reach real validation; unknown codes fail closed."""
     import json
 
-    from pydantic_ai.messages import ModelResponse
-
     from itsm.extensions.validator import ContainerValidator
+    from pydantic_ai.messages import ModelResponse
     from tests.test_agent_chat import tool_returns
 
     validator = ContainerValidator()
@@ -71,29 +80,62 @@ def test_chat_validation_submission_requires_exact_human_review(
     def develop(messages, info):
         returns = tool_returns(messages)
         if not returns:
-            return ModelResponse(parts=[ToolCallPart("extension_workspace_create", {
-                "id": "chat-reviewed", "name": "Registros revisados",
-                "description": "Paquete independiente con revisión humana.",
-            })])
-        results = [json.loads(row.content) if isinstance(row.content, str) else row.content
-                   for row in returns]
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "extension_workspace_create",
+                        {
+                            "id": "chat-reviewed",
+                            "name": "Registros revisados",
+                            "description": "Paquete independiente con revisión humana.",
+                        },
+                    )
+                ]
+            )
+        results = [
+            json.loads(row.content) if isinstance(row.content, str) else row.content
+            for row in returns
+        ]
         assert results[0]["ok"] is True, results[0]
         workspace_id = results[0]["id"]
         if len(results) == 1:
-            return ModelResponse(parts=[ToolCallPart("extension_workspace_read", {
-                "workspace_id": workspace_id, "path": "extension.json",
-            })])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "extension_workspace_read",
+                        {
+                            "workspace_id": workspace_id,
+                            "path": "extension.json",
+                        },
+                    )
+                ]
+            )
         if len(results) == 2:
             manifest = json.loads(results[1]["content"])
             manifest["corePermissions"] = [core_permission]
-            return ModelResponse(parts=[ToolCallPart("extension_workspace_write", {
-                "workspace_id": workspace_id, "path": "extension.json",
-                "content": json.dumps(manifest),
-            })])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "extension_workspace_write",
+                        {
+                            "workspace_id": workspace_id,
+                            "path": "extension.json",
+                            "content": json.dumps(manifest),
+                        },
+                    )
+                ]
+            )
         if len(results) == 3:
-            return ModelResponse(parts=[ToolCallPart("extension_workspace_validate", {
-                "workspace_id": workspace_id,
-            })])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "extension_workspace_validate",
+                        {
+                            "workspace_id": workspace_id,
+                        },
+                    )
+                ]
+            )
         report = results[3]
         if core_permission != "assets.view":
             assert report["status"] == "failed", report
@@ -102,17 +144,30 @@ def test_chat_validation_submission_requires_exact_human_review(
             return ModelResponse(parts=[TextPart("El permiso desconocido impide la revisión.")])
         assert report["status"] == "passed", report
         if len(results) == 4:
-            return ModelResponse(parts=[ToolCallPart("extension_workspace_submit", {
-                "workspace_id": workspace_id,
-            })])
-        return ModelResponse(parts=[TextPart("El paquete está validado y pendiente de tu revisión.")])
+            return ModelResponse(
+                parts=[
+                    ToolCallPart(
+                        "extension_workspace_submit",
+                        {
+                            "workspace_id": workspace_id,
+                        },
+                    )
+                ]
+            )
+        return ModelResponse(
+            parts=[TextPart("El paquete está validado y pendiente de tu revisión.")]
+        )
 
     use_model(client, FunctionModel(develop))
-    response = chat(client, headers, message="Prepara registros y solicita mi revisión, sin instalar.")
+    response = chat(
+        client, headers, message="Prepara registros y solicita mi revisión, sin instalar."
+    )
     assert response.status_code == 200, response.text
     reply = response.json()
     assert [row["tool"] for row in reply["actions"]] == [
-        "extension_workspace_create", "extension_workspace_read", "extension_workspace_write",
+        "extension_workspace_create",
+        "extension_workspace_read",
+        "extension_workspace_write",
         "extension_workspace_validate",
     ] + (["extension_workspace_submit"] if core_permission == "assets.view" else [])
     if core_permission == "assets.view":
@@ -145,43 +200,78 @@ def test_mcp_development_rechecks_live_machine_authority(settings_factory, tmp_p
     try:
         with catalog.session() as session:
             identity = catalog.service(session)
-            role = identity.create_role(catalog.admin(), name="SDK developer", permissions=["system.modules"])
+            role = identity.create_role(
+                catalog.admin(), name="SDK developer", permissions=["system.modules"]
+            )
             machine = identity.create_user(
-                catalog.admin(), username="sdk.mcp", name="SDK MCP", role_id=role.id,
-                actor_kind="internal_agent", delegated_by_id=catalog.admin().actor_id,
+                catalog.admin(),
+                username="sdk.mcp",
+                name="SDK MCP",
+                role_id=role.id,
+                actor_kind="internal_agent",
+                delegated_by_id=catalog.admin().actor_id,
             )
             credential = identity.issue_machine_credential(machine.username)
         with serve(catalog.settings, free_tcp_port) as base:
+
             async def exercise():
                 transport = StreamableHttpTransport(
                     base + "/api/v1/mcp", headers={"Authorization": "Bearer " + credential.token}
                 )
                 async with Client(transport) as client:
                     with pytest.raises(ToolError):
-                        await client.call_tool("extension_workspace_write", {
-                            "workspace_id": "missing", "path": "../../core.py", "content": "not allowed",
-                        })
-                    created = await client.call_tool("extension_workspace_create", {
-                        "id": "mcp-records", "name": "Registros MCP", "description": "Desarrollo delegado real.",
-                    })
+                        await client.call_tool(
+                            "extension_workspace_write",
+                            {
+                                "workspace_id": "missing",
+                                "path": "../../core.py",
+                                "content": "not allowed",
+                            },
+                        )
+                    created = await client.call_tool(
+                        "extension_workspace_create",
+                        {
+                            "id": "mcp-records",
+                            "name": "Registros MCP",
+                            "description": "Desarrollo delegado real.",
+                        },
+                    )
                     assert created.data["id"] == "mcp-records"
-                    manifest = await client.call_tool("extension_workspace_read", {
-                        "workspace_id": "mcp-records", "path": "extension.json",
-                    })
+                    manifest = await client.call_tool(
+                        "extension_workspace_read",
+                        {
+                            "workspace_id": "mcp-records",
+                            "path": "extension.json",
+                        },
+                    )
                     import json
+
                     assert json.loads(manifest.data["content"])["id"] == "mcp-records"
                     with pytest.raises(ToolError):
-                        await client.call_tool("extension_workspace_write", {
-                            "workspace_id": "mcp-records", "path": "../backend.py", "content": "not allowed",
-                        })
+                        await client.call_tool(
+                            "extension_workspace_write",
+                            {
+                                "workspace_id": "mcp-records",
+                                "path": "../backend.py",
+                                "content": "not allowed",
+                            },
+                        )
                     with catalog.session() as session:
                         catalog.service(session).update_role(
-                            catalog.admin(), role.id, name="Revoked SDK developer", permissions=["assets.view"]
+                            catalog.admin(),
+                            role.id,
+                            name="Revoked SDK developer",
+                            permissions=["assets.view"],
                         )
                     with pytest.raises(ToolError, match="permission denied"):
-                        await client.call_tool("extension_workspace_read", {
-                            "workspace_id": "mcp-records", "path": "backend.py",
-                        })
+                        await client.call_tool(
+                            "extension_workspace_read",
+                            {
+                                "workspace_id": "mcp-records",
+                                "path": "backend.py",
+                            },
+                        )
+
             asyncio.run(exercise())
         assert catalog.asset_count() == 0
     finally:
