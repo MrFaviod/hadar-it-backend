@@ -43,7 +43,7 @@ from itsm.interventions.models import (
 )
 from itsm.inventory.codes import serialized
 from itsm.inventory.models import Asset, AssetHistory
-from itsm.inventory.service import InventoryService
+from itsm.inventory.service import InventoryService, reference_ids
 
 INTERVENTION_TYPES: tuple[str, ...] = (
     "preventive",
@@ -1305,6 +1305,24 @@ class InterventionService:
         self._identity.authorize(principal, "assets.view", resource="maintenance:incidents")
         return self._incident_detail(self._incident(incident_id))
 
+    def incident_reference_states(
+        self, principal: Principal, incident_ids: Sequence[str]
+    ) -> dict[str, str]:
+        """Resolve permanent incident ids to ``active`` or ``missing``.
+
+        The core incident lifecycle has no archive flag, so ``archived`` is
+        never reported. Authorization is the same ``assets.view`` check the
+        other incident reads use; the resolver adds no new permission.
+        """
+        self._identity.authorize(principal, "assets.view", resource="maintenance:incidents")
+        ids = reference_ids(incident_ids)
+        if not ids:
+            return {}
+        found = set(
+            self._session.execute(select(Incident.id).where(Incident.id.in_(ids))).scalars()
+        )
+        return {identifier: "active" if identifier in found else "missing" for identifier in ids}
+
     def list_incidents(
         self,
         principal: Principal,
@@ -1901,4 +1919,5 @@ __all__ = [
     "InterventionView",
     "ResolutionSuggestion",
     "TechnicalHistoryPage",
+    "reference_ids",
 ]

@@ -14,8 +14,14 @@ from sqlalchemy.engine import make_url
 from sqlalchemy.orm import Session, sessionmaker
 
 from itsm.config import Settings
+from itsm.events.outbox import install_event_listeners
 
 MIGRATION_TABLE = "alembic_version"
+
+# The transactional outbox writes through a session-level flush hook. Installing
+# it here means every entry point that owns a database (API, worker, CLI, tests)
+# gets it from the single engine/session seam, not from a module import order.
+install_event_listeners()
 
 
 class DatabaseUnavailable(RuntimeError):
