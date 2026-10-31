@@ -38,7 +38,7 @@ from itsm.database import (
     current_revision,
     probe_database,
 )
-from itsm.ops import engines, extensions, store
+from itsm.ops import attachments, engines, extensions, store
 from itsm.ops import sqlite as sqlite_ops
 from itsm.ops.engines import DatabaseTarget, OpsError, ToolCommand
 
@@ -301,6 +301,9 @@ def backup(context: OpsContext) -> store.BackupArtifact:
             write_extensions=lambda directory: extensions.archive(
                 context.settings.extension_data_path, directory / extensions.DATA_ROOT_DIR
             ),
+            write_attachments=lambda directory: attachments.archive(
+                context.settings.attachment_storage_path, directory / attachments.DATA_ROOT_DIR
+            ),
             credential_key_fingerprints=credential_key_fingerprints(context.settings),
         )
     except OpsError as exc:
@@ -363,8 +366,18 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
     if extension_errors:
         combined = "; ".join(extension_errors)
         error = combined if error is None else f"{error}; {combined}"
+    attachments_ok, attachment_report, attachment_errors = attachments.verify(
+        artifact.directory, artifact.manifest.attachments
+    )
+    if attachment_errors:
+        combined = "; ".join(attachment_errors)
+        error = combined if error is None else f"{error}; {combined}"
     verified = (
-        checks["checksum"] and checks["size"] and checks["integrity"] == "ok" and extensions_ok
+        checks["checksum"]
+        and checks["size"]
+        and checks["integrity"] == "ok"
+        and extensions_ok
+        and attachments_ok
     )
     store.update_verification(artifact, verified=verified)
     if not verified:
@@ -379,6 +392,7 @@ def _verify_artifact(context: OpsContext, artifact: store.BackupArtifact) -> dic
         "backupId": artifact.manifest.id,
         "checks": checks,
         "extensions": extension_reports,
+        "attachments": attachment_report,
         "verified": verified,
         "error": None if verified else (error or "verification failed"),
     }
@@ -572,6 +586,36 @@ def _external_payload(
     }
 
 
+def _attachment_target(
+    destination: Path, artifact: store.BackupArtifact, *, replace_live: bool, confirm: str | None
+) -> bool:
+    """Decide whether the attachment storage target may be written.
+
+    A missing directory is created. An existing *empty* directory is the normal
+    fresh-install case and needs no consent; an existing populated directory may
+    hold blobs that are not in the artifact, so it follows the same explicit
+    consent rule as the live database.
+    """
+    if not destination.exists():
+        if replace_live:
+            raise RestoreRefused("--replace-live only applies to an existing attachment target")
+        return False
+    if destination.is_symlink() or not destination.is_dir():
+        raise RestoreRefused(f"attachment restore target is not a directory: {destination}")
+    if not any(destination.iterdir()):
+        return False
+    if not replace_live:
+        raise RestoreRefused(
+            "attachment restore target already contains files; pass --replace-live and "
+            "--confirm <backup id> to write the archived blobs into it"
+        )
+    if confirm != artifact.manifest.id:
+        raise RestoreRefused(
+            "--confirm must repeat the backup id to write into the attachment storage target"
+        )
+    return True
+
+
 def _extension_target(
     destination: Path, artifact: store.BackupArtifact, *, replace_live: bool, confirm: str | None
 ) -> bool:
@@ -606,14 +650,16 @@ def restore(
     target_file: str | None = None,
     target_database: str | None = None,
     target_extensions: str | None = None,
+    target_attachments: str | None = None,
     replace_live: bool = False,
     confirm: str | None = None,
 ) -> dict[str, Any]:
     """Restore one verified backup into a new target, or the live one with consent.
 
-    The core database and the extension data files are restored independently:
-    ``--target-file``/``--target-database`` select the database target, and
-    ``--target-extensions`` selects the extension data path.
+    The core database, the extension data files and the attachment blobs are
+    restored independently: ``--target-file``/``--target-database`` select the
+    database target, ``--target-extensions`` the extension data path and
+    ``--target-attachments`` the attachment storage root.
     """
     store.prepare_root(context.backup_root)
     artifact = store.load_artifact(context.backup_root, identifier)
@@ -643,6 +689,22 @@ def restore(
                 replace_live=replace_live,
                 confirm=confirm,
             )
+    if target_attachments is not None:
+        destination = Path(target_attachments).expanduser()
+        if not destination.is_absolute():
+            destination = Path.cwd() / destination
+        replace = _attachment_target(
+            destination, artifact, replace_live=replace_live, confirm=confirm
+        )
+        payload["attachments"] = attachments.restore(
+            artifact.directory,
+            artifact.manifest.attachments,
+            destination=destination,
+            replace=replace,
+        )
+        payload.setdefault("status", "ok")
+        payload.setdefault("backupId", artifact.manifest.id)
+        payload.setdefault("engine", target.engine)
     if target_extensions is not None:
         destination = Path(target_extensions).expanduser()
         if not destination.is_absolute():
@@ -659,7 +721,7 @@ def restore(
         payload.setdefault("status", "ok")
         payload.setdefault("backupId", artifact.manifest.id)
         payload.setdefault("engine", target.engine)
-    elif not core_requested:
+    elif not core_requested and target_attachments is None:
         if target.engine == "sqlite":
             raise UsageError("sqlite restores require --target-file")
         raise UsageError(f"{target.engine} restores require --target-database")
@@ -778,6 +840,7 @@ def status(context: OpsContext) -> dict[str, Any]:
         "backupRoot": str(root),
         "backupCount": len(artifacts),
         "extensions": extensions.footprint(context.settings.extension_data_path),
+        "attachments": attachments.footprint(context.settings.attachment_storage_path),
         "lastBackup": _last_backup_payload(artifacts),
         "failures": stored.get("failures", []),
         "lastUpgrade": stored.get("lastUpgrade"),

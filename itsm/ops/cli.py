@@ -65,6 +65,11 @@ def build_parser() -> argparse.ArgumentParser:
         help="extension data directory to write the archived module files into",
     )
     restore.add_argument(
+        "--target-attachments",
+        default=None,
+        help="attachment storage directory to write the archived blobs into",
+    )
+    restore.add_argument(
         "--replace-live",
         action="store_true",
         help="replace the live database; requires --confirm <backup id>",
@@ -127,6 +132,7 @@ def _dispatch(args: argparse.Namespace, context: OpsContext) -> tuple[dict[str, 
             target_file=args.target_file,
             target_database=args.target_database,
             target_extensions=args.target_extensions,
+            target_attachments=args.target_attachments,
             replace_live=args.replace_live,
             confirm=args.confirm,
         )
