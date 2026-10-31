@@ -176,9 +176,7 @@ def apply_limits(
 def no_new_privs() -> None:
     library = _libc()
     if library.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
-        raise SandboxUnavailable(
-            f"PR_SET_NO_NEW_PRIVS failed: {os.strerror(ctypes.get_errno())}"
-        )
+        raise SandboxUnavailable(f"PR_SET_NO_NEW_PRIVS failed: {os.strerror(ctypes.get_errno())}")
 
 
 def _fs_access(abi: int) -> int:
@@ -238,9 +236,14 @@ def apply_landlock(
             _add_path_rule(library, int(ruleset_fd), path, read_access)
         for path in write_paths:
             _add_path_rule(library, int(ruleset_fd), path, handled_fs)
-        if library.syscall(
-            ctypes.c_long(SYS_LANDLOCK_RESTRICT_SELF), ctypes.c_int(ruleset_fd), ctypes.c_uint32(0)
-        ) != 0:
+        if (
+            library.syscall(
+                ctypes.c_long(SYS_LANDLOCK_RESTRICT_SELF),
+                ctypes.c_int(ruleset_fd),
+                ctypes.c_uint32(0),
+            )
+            != 0
+        ):
             raise SandboxUnavailable(
                 f"landlock_restrict_self failed: {os.strerror(ctypes.get_errno())}"
             )
@@ -248,9 +251,7 @@ def apply_landlock(
         os.close(int(ruleset_fd))
 
 
-def _add_path_rule(
-    library: ctypes.CDLL, ruleset_fd: int, path: str, access: int
-) -> None:
+def _add_path_rule(library: ctypes.CDLL, ruleset_fd: int, path: str, access: int) -> None:
     try:
         descriptor = os.open(path, os.O_PATH | os.O_CLOEXEC)
         is_directory = stat.S_ISDIR(os.fstat(descriptor).st_mode)
@@ -263,13 +264,16 @@ def _add_path_rule(
         rule = _PathBeneathAttr()
         rule.allowed_access = access
         rule.parent_fd = descriptor
-        if library.syscall(
-            ctypes.c_long(SYS_LANDLOCK_ADD_RULE),
-            ctypes.c_int(ruleset_fd),
-            ctypes.c_int(LANDLOCK_RULE_PATH_BENEATH),
-            ctypes.byref(rule),
-            ctypes.c_uint32(0),
-        ) != 0:
+        if (
+            library.syscall(
+                ctypes.c_long(SYS_LANDLOCK_ADD_RULE),
+                ctypes.c_int(ruleset_fd),
+                ctypes.c_int(LANDLOCK_RULE_PATH_BENEATH),
+                ctypes.byref(rule),
+                ctypes.c_uint32(0),
+            )
+            != 0
+        ):
             raise SandboxUnavailable(
                 f"landlock_add_rule({path}) failed: {os.strerror(ctypes.get_errno())}"
             )
@@ -351,7 +355,7 @@ def default_read_paths(package_dir: str, runner_dir: str) -> list[str]:
             import sysconfig
 
             value = sysconfig.get_paths().get(key)
-        except (ImportError, KeyError, AttributeError):  # pragma: no cover
+        except ImportError, KeyError, AttributeError:  # pragma: no cover
             value = None
         if value:
             candidates.append(value)

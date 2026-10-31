@@ -27,10 +27,10 @@ from sqlalchemy import text
 from tests.conftest import BACKEND_ROOT
 from tests.inventory_support import asset_values
 from tests.test_extension_runtime_support import (  # noqa: F401 - fixtures
-    env,
     MODULE_ID,
     build_package,
     core_fingerprint,
+    env,
     probe_manifest,
     sqlite_master_fingerprint,
 )

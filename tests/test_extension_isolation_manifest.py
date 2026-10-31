@@ -16,10 +16,10 @@ from itsm.extensions.sdk.contract import (
     validate_manifest,
 )
 from tests.test_extension_runtime_support import (  # noqa: F401 - fixtures
-    env,
     PROBE_BACKEND,
     build_package,
     declarative_manifest,
+    env,
     probe_manifest,
 )
 
@@ -67,7 +67,7 @@ def test_declarative_modules_cannot_ship_executable_or_migration_code() -> None:
 
 
 def test_sandboxed_modules_require_a_backend_and_handler_kinds() -> None:
-    with pytest.raises(PackageError, match="backend.py"):
+    with pytest.raises(PackageError, match=r"backend\.py"):
         inspect_package(build_package(probe_manifest(), backend=None))
     declaration = probe_manifest()
     declaration["operations"][1]["kind"] = "list"
@@ -166,7 +166,7 @@ def test_argument_validation_still_rejects_unknown_keys() -> None:
         )
 
 
-def test_candidate_detail_reports_v2_trust_and_runtime(env) -> None:
+def test_candidate_detail_reports_v2_trust_and_runtime(env) -> None:  # noqa: F811
     candidate = env.candidate(build_package(probe_manifest()))
     assert candidate["manifest"]["sdkVersion"] == 2
     assert candidate["trust"]["sandboxed"] is True

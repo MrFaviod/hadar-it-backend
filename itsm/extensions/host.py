@@ -74,24 +74,58 @@ NotifyCallback = Callable[..., None]
 
 
 from itsm.extensions.errors import (  # noqa: E402 - re-exported host contract
-    ExtensionConflict,
-    ExtensionDigestMismatch,
-    ExtensionDisabled,
-    ExtensionHandlerFailed,
-    ExtensionHostError,
-    ExtensionIdempotencyConflict,
-    ExtensionImportFailed,
-    ExtensionMigrationFailed,
-    ExtensionNotFound,
-    ExtensionRequiresUpgrade,
-    ExtensionRollbackIncompatible,
-    ExtensionSandboxUnavailable,
-    ExtensionStale,
-    ExtensionStoreConflict,
-    ExtensionStoreValidation,
-    ExtensionTooLarge,
-    ExtensionUnavailable,
-    ExtensionValidationFailed,
+    ExtensionConflict as ExtensionConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionDigestMismatch as ExtensionDigestMismatch,
+)
+from itsm.extensions.errors import (
+    ExtensionDisabled as ExtensionDisabled,
+)
+from itsm.extensions.errors import (
+    ExtensionHandlerFailed as ExtensionHandlerFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionHostError as ExtensionHostError,
+)
+from itsm.extensions.errors import (
+    ExtensionIdempotencyConflict as ExtensionIdempotencyConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionImportFailed as ExtensionImportFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionMigrationFailed as ExtensionMigrationFailed,
+)
+from itsm.extensions.errors import (
+    ExtensionNotFound as ExtensionNotFound,
+)
+from itsm.extensions.errors import (
+    ExtensionRequiresUpgrade as ExtensionRequiresUpgrade,
+)
+from itsm.extensions.errors import (
+    ExtensionRollbackIncompatible as ExtensionRollbackIncompatible,
+)
+from itsm.extensions.errors import (
+    ExtensionSandboxUnavailable as ExtensionSandboxUnavailable,
+)
+from itsm.extensions.errors import (
+    ExtensionStale as ExtensionStale,
+)
+from itsm.extensions.errors import (
+    ExtensionStoreConflict as ExtensionStoreConflict,
+)
+from itsm.extensions.errors import (
+    ExtensionStoreValidation as ExtensionStoreValidation,
+)
+from itsm.extensions.errors import (
+    ExtensionTooLarge as ExtensionTooLarge,
+)
+from itsm.extensions.errors import (
+    ExtensionUnavailable as ExtensionUnavailable,
+)
+from itsm.extensions.errors import (
+    ExtensionValidationFailed as ExtensionValidationFailed,
 )
 
 _SNAPSHOT_REVISION_LABEL = "data schema version"

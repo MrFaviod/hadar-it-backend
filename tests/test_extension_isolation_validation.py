@@ -81,8 +81,9 @@ def test_missing_javascript_engine_reports_a_failed_frontend_check(monkeypatch) 
         lambda: (_ for _ in ()).throw(ValidationFailure("no javascript engine available")),
     )
     report = validate_payload(
-        build_frame(built, digest=__import__("hashlib").sha256(built).hexdigest(),
-                    known_core_permissions=())
+        build_frame(
+            built, digest=__import__("hashlib").sha256(built).hexdigest(), known_core_permissions=()
+        )
     )
     assert report["status"] == "failed"
     detail = {check["name"]: check["detail"] for check in report["checks"]}["frontend"]

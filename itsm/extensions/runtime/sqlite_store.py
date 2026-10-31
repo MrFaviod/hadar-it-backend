@@ -9,11 +9,13 @@ file.  This module is stdlib-only so the runner can import it under ``-I -S``.
 
 from __future__ import annotations
 
+import contextlib
 import json
 import os
 import sqlite3
+from collections.abc import Mapping
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any
 
 try:  # script mode (runner) and package mode (host) both resolve
     from protocol import ModuleError, StoreConflict, StoreValidation
@@ -31,12 +33,8 @@ MAX_RECORD_BYTES = 256 * 1024
 MAX_PAGE = 200
 MAX_OFFSET = 1_000_000
 MAX_FILTERS = 20
-ID_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-"
-)
-FILTER_CHARS = frozenset(
-    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-"
-)
+ID_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789._:-")
+FILTER_CHARS = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
 
 _SCHEMA = f"""
 CREATE TABLE IF NOT EXISTS {RECORDS_TABLE} (
@@ -64,10 +62,8 @@ def snapshots_dir(root: Path, extension_id: str) -> Path:
 
 
 def _secure(path: Path, mode: int) -> None:
-    try:
+    with contextlib.suppress(OSError):
         os.chmod(path, mode)
-    except OSError:
-        pass
 
 
 def prepare(root: Path, extension_id: str) -> Path:
@@ -219,9 +215,7 @@ def put(
     if existing is None:
         if expected_version not in (None, 0):
             raise StoreConflict("record version does not match")
-        connection.execute(
-            insert, (name, key, int(data_version), encoded, now, now)
-        )
+        connection.execute(insert, (name, key, int(data_version), encoded, now, now))
         version = int(data_version)
     else:
         current = int(existing[0])
@@ -255,8 +249,7 @@ def delete(
         if not isinstance(expected_version, int) or isinstance(expected_version, bool):
             raise StoreValidation("expected_version must be an integer")
         cursor = connection.execute(
-            f"DELETE FROM {RECORDS_TABLE} "
-            "WHERE collection = ? AND record_id = ? AND version = ?",
+            f"DELETE FROM {RECORDS_TABLE} WHERE collection = ? AND record_id = ? AND version = ?",
             (name, key, int(expected_version)),
         )
     if cursor.rowcount != 1:
@@ -343,17 +336,15 @@ def size_bytes(root: Path, extension_id: str) -> int:
 
 def discard(connection: sqlite3.Connection) -> None:
     """Roll back any open transaction on failure paths."""
-    try:
+    with contextlib.suppress(sqlite3.Error):
         connection.rollback()
-    except sqlite3.Error:
-        pass
 
 
 __all__ = [
     "DB_FILENAME",
     "MAX_RECORD_BYTES",
-    "ModuleError",
     "RECORDS_TABLE",
+    "ModuleError",
     "connect",
     "data_dir",
     "database_path",

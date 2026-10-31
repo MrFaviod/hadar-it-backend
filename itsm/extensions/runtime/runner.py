@@ -1,4 +1,4 @@
-"""Sandboxed entry point: ``python -I -S -B runner.py``.
+"""Sandboxed entry point: ``python -E -s -S -B runner.py``.
 
 The host writes one JSON ``run`` frame on stdin, this process applies every
 isolation primitive *before* importing the module backend, and then serves the
@@ -9,7 +9,7 @@ are pointed at ``/dev/null`` so a stray ``print`` cannot forge a result.
 
 from __future__ import annotations
 
-import json
+import contextlib
 import os
 import sys
 import traceback
@@ -21,10 +21,8 @@ from protocol import ModuleError
 
 
 def _fail(channel: sdk._Channel, code: str, message: str) -> int:
-    try:
+    with contextlib.suppress(OSError):
         channel.send({"type": "error", "code": code, "message": message[:400]})
-    except OSError:
-        pass
     return 1
 
 
@@ -32,7 +30,7 @@ def _load_module(package_dir: str, backend: str) -> sdk.ModuleSDK:
     path = Path(package_dir) / backend
     source = path.read_text(encoding="utf-8")
     namespace: dict[str, object] = {"__name__": "itsm_extension_backend", "__file__": str(path)}
-    exec(compile(source, str(path), "exec"), namespace)  # noqa: S102 - reviewed package
+    exec(compile(source, str(path), "exec"), namespace)
     register = namespace.get("register")
     if not callable(register):
         raise ModuleError("backend.py does not expose register(sdk)")
@@ -88,7 +86,7 @@ def main() -> int:
     channel = sdk._Channel(reader_fd, writer_fd)
     try:
         init = channel.receive()
-    except (OSError, ModuleError):
+    except OSError, ModuleError:
         return 1
     if init.get("type") != "run":
         return _fail(channel, "protocol_error", "first frame must be a run request")
@@ -104,7 +102,9 @@ def main() -> int:
     except sandbox.SandboxUnavailable as exc:
         return _fail(channel, "sandbox_unavailable", str(exc))
     try:
-        module_sdk = _load_module(str(init.get("packageDir")), str(init.get("backend", "backend.py")))
+        module_sdk = _load_module(
+            str(init.get("packageDir")), str(init.get("backend", "backend.py"))
+        )
         _check_declared(module_sdk, init.get("declared", {}))
         request = init.get("request", {})
         kind = str(request.get("kind"))
@@ -129,7 +129,7 @@ def main() -> int:
         return _fail(channel, exc.code, str(exc) or "module refused the request")
     except MemoryError:
         return _fail(channel, "resource_limit", "module exceeded its memory limit")
-    except BaseException:  # noqa: BLE001 - private detail stays inside the sandbox
+    except BaseException:
         detail = traceback.format_exc(limit=2)
         sys.stderr.write(detail[-2000:])
         return _fail(channel, "handler_failed", "extension handler failed")

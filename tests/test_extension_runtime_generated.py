@@ -31,7 +31,7 @@ def _offline_report(data: bytes, digest: str) -> dict[str, Any]:
     return report
 
 
-def _install(env, package_id: str, *, runtime: str) -> dict[str, Any]:
+def _install(environment, package_id: str, *, runtime: str) -> dict[str, Any]:
     generated = generate_package(
         extension_id=package_id,
         name=package_id.title(),
@@ -39,14 +39,14 @@ def _install(env, package_id: str, *, runtime: str) -> dict[str, Any]:
         runtime=runtime,
     )
     built = build_package(generated.files, known_core_permissions=())
-    candidate = env.candidate(built.data)
-    validated = env.host.record_validation_report(
+    candidate = environment.candidate(built.data)
+    validated = environment.host.record_validation_report(
         candidate["id"],
         _offline_report(built.data, built.digest),
         expected_version=candidate["revision"],
     )
-    env.host.approve_candidate(
-        env.owner,
+    environment.host.approve_candidate(
+        environment.owner,
         validated["id"],
         digest=built.digest,
         expected_version=validated["currentRevision"],

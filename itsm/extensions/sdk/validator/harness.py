@@ -25,9 +25,10 @@ import subprocess
 import sys
 import tempfile
 import time
+from collections.abc import Callable
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 try:
     from ..contract import ManifestError, validate_manifest
@@ -245,9 +246,10 @@ class MemoryStore:
         current = rows.get(record_id)
         if expected_version == 0 and current is not None:
             raise RuntimeError("record already exists")
-        if expected_version not in (None, 0):
-            if current is None or current["version"] != expected_version:
-                raise RuntimeError("record version conflict")
+        if expected_version not in (None, 0) and (
+            current is None or current["version"] != expected_version
+        ):
+            raise RuntimeError("record version conflict")
         version = (current["version"] + 1) if current else 1
         rows[record_id] = {"version": version, "data": copy.deepcopy(data)}
         return {"id": record_id, **copy.deepcopy(rows[record_id])}

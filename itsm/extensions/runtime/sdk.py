@@ -12,7 +12,8 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
-from typing import Any, Callable, Mapping
+from collections.abc import Callable, Mapping
+from typing import Any
 
 try:  # script mode (runner) and package mode (host) both resolve
     from protocol import ModuleError
@@ -35,8 +36,7 @@ class _Channel:
 
     def send(self, message: Mapping[str, Any]) -> None:
         payload = (
-            json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
-            + b"\n"
+            json.dumps(message, ensure_ascii=False, separators=(",", ":")).encode("utf-8") + b"\n"
         )
         written = 0
         while written < len(payload):
@@ -119,9 +119,7 @@ class Store:
             },
         )
 
-    def delete(
-        self, collection: str, record_id: str, expected_version: int | None = None
-    ) -> bool:
+    def delete(self, collection: str, record_id: str, expected_version: int | None = None) -> bool:
         return self._channel.call(
             "store.delete",
             {

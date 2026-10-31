@@ -172,7 +172,7 @@ def collection_schema_errors(name: str, schema: Any) -> list[str]:
         errors.append(f"{label}: additionalProperties must be false")
     properties = schema.get("properties", {})
     if not isinstance(properties, Mapping):
-        return errors + [f"{label}: properties must be an object"]
+        return [*errors, f"{label}: properties must be an object"]
     for field, declaration in properties.items():
         field_label = f"{label} field {field}"
         if not FIELD_PATTERN.fullmatch(str(field)):
@@ -204,7 +204,11 @@ def collection_schema_errors(name: str, schema: Any) -> list[str]:
                         errors.append(f"{field_label}: enum value {value!r} must be {kind}")
         if "maxLength" in declaration and kind != "string":
             errors.append(f"{field_label}: maxLength applies to strings")
-        if kind == "string" and isinstance(declaration.get("maxLength"), int) and not 1 <= declaration["maxLength"] <= 4000:
+        if (
+            kind == "string"
+            and isinstance(declaration.get("maxLength"), int)
+            and not 1 <= declaration["maxLength"] <= 4000
+        ):
             errors.append(f"{field_label}: maxLength must be between 1 and 4000")
         for bound in ("minimum", "maximum"):
             if bound in declaration and kind not in ("number", "integer"):

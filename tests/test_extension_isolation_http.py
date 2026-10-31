@@ -21,32 +21,32 @@ from tests.test_extension_storage_lifecycle import seed_installed_v1_module
 from tests.test_native_extensions import env  # noqa: F401  (shared host fixture)
 
 
-def _client(env) -> TestClient:
+def _client(environment) -> TestClient:
     app = FastAPI()
-    app.state.settings = env.settings
-    app.state.session_factory = env.factory
-    app.state.extensions = env.host
-    app.include_router(create_identity_router(), prefix=env.settings.api_prefix)
-    app.include_router(create_extension_router(), prefix=env.settings.api_prefix)
+    app.state.settings = environment.settings
+    app.state.session_factory = environment.factory
+    app.state.extensions = environment.host
+    app.include_router(create_identity_router(), prefix=environment.settings.api_prefix)
+    app.include_router(create_extension_router(), prefix=environment.settings.api_prefix)
     install_error_handlers(app)
     install_extension_error_handlers(app)
     return TestClient(app)
 
 
-def _headers(env, client: TestClient) -> dict[str, str]:
+def _headers(environment, client: TestClient) -> dict[str, str]:
     login = client.post(
-        env.settings.api_prefix + "/auth/login",
+        environment.settings.api_prefix + "/auth/login",
         json={"username": ADMIN_USERNAME, "password": ADMIN_PASSWORD},
-        headers={"Origin": env.settings.auth_origin},
+        headers={"Origin": environment.settings.auth_origin},
     )
     assert login.status_code == 200, login.text
     return {
-        "Origin": env.settings.auth_origin,
+        "Origin": environment.settings.auth_origin,
         "X-CSRF-Token": login.json()["csrfToken"],
     }
 
 
-def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:
+def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:  # noqa: F811
     prefix = env.settings.api_prefix + "/extensions"
     with _client(env) as client:
         assert client.get(prefix + "/" + MODULE_ID + "/status").status_code == 401
@@ -82,7 +82,7 @@ def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:
         assert client.get(prefix + "/" + MODULE_ID + "/status").status_code == 404
 
 
-def test_v1_module_is_never_executed_over_http(env, tmp_path) -> None:
+def test_v1_module_is_never_executed_over_http(env, tmp_path) -> None:  # noqa: F811
     marker = tmp_path / "v1-executed.txt"
     seed_installed_v1_module(env, marker)
     prefix = env.settings.api_prefix + "/extensions"
