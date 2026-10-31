@@ -183,6 +183,12 @@ def test_both_architecture_tables_deny_the_metadata_family() -> None:
             "removexattr",
             "lremovexattr",
             "fremovexattr",
+            "setxattrat",
+            "getxattrat",
+            "listxattrat",
+            "removexattrat",
+            "file_getattr",
+            "file_setattr",
         },
         "aarch64": {
             "fchmod",
@@ -201,6 +207,12 @@ def test_both_architecture_tables_deny_the_metadata_family() -> None:
             "removexattr",
             "lremovexattr",
             "fremovexattr",
+            "setxattrat",
+            "getxattrat",
+            "listxattrat",
+            "removexattrat",
+            "file_getattr",
+            "file_setattr",
         },
     }
     for arch, names in expected.items():

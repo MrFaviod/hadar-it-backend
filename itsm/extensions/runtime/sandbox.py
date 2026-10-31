@@ -74,6 +74,14 @@ DENY_SYSCALLS = {
         "io_uring_setup": 425,
         "io_uring_enter": 426,
         "io_uring_register": 427,
+        # 6.13+ metadata syscalls: the older *xattr/chmod family below is not
+        # enough on a current kernel.
+        "setxattrat": 463,
+        "getxattrat": 464,
+        "listxattrat": 465,
+        "removexattrat": 466,
+        "file_getattr": 468,
+        "file_setattr": 469,
         "chmod": 90,
         "fchmod": 91,
         "fchmodat": 268,
@@ -123,6 +131,13 @@ DENY_SYSCALLS = {
         "io_uring_setup": 425,
         "io_uring_enter": 426,
         "io_uring_register": 427,
+        # 6.13+ metadata syscalls, same numbers on every architecture.
+        "setxattrat": 463,
+        "getxattrat": 464,
+        "listxattrat": 465,
+        "removexattrat": 466,
+        "file_getattr": 468,
+        "file_setattr": 469,
         # aarch64 has no chmod/utime/utimes: glibc routes them through the
         # *at variants, which are denied here along with fchmodat2.
         "fchmod": 52,

@@ -100,8 +100,11 @@ def main() -> int:
         return 1
     if init.get("type") != "run":
         return _fail(channel, "protocol_error", "first frame must be a run request")
-    # The host only accepts terminal frames that quote this per-run token; the
-    # module never sees it, so it cannot author a result or an error.
+    # The host only accepts terminal frames that quote this per-run token. The
+    # module shares this process and UID, so the token raises the cost of a
+    # forged frame but is not a boundary: runtime code and module code cannot be
+    # separated without a second process. Host-side effects still need a real
+    # account and its Casbin permissions.
     token = str(init.get("token") or "")
     try:
         sandbox.enforce(
