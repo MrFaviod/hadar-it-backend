@@ -56,6 +56,22 @@ _MUTATING = frozenset(
 _STORE_CALLS = frozenset({"store.get", "store.list", "store.put", "store.delete"})
 _STORE_MUTATIONS = frozenset({"store.put", "store.delete"})
 
+# Capability → the canonical core permission its execution required.  A replay
+# returns the stored canonical response, so it must not be handed to a caller
+# that no longer holds that permission.  ``notify`` stores only a constant
+# acknowledgement, so it carries no core data and needs no extra check.
+REPLAY_PERMISSIONS = {
+    "assets.get": "assets.view",
+    "assets.search": "assets.view",
+    "assets.resolve": "assets.view",
+    "assets.create": "assets.edit",
+    "assets.update": "assets.edit",
+    "assets.archive": "assets.edit",
+    "incidents.get": "assets.view",
+    "incidents.list": "assets.view",
+    "incidents.create": "assets.edit",
+}
+
 _ASSET_SEARCH_FIELDS = frozenset(
     {
         "query",
@@ -195,18 +211,17 @@ class CapabilityBroker:
             )
         digest = request_digest(capability, request)
         extension_id = self._loaded.extension_id
+        principal_id = self._principal.actor_id
         with self._host._session_factory() as session:
             existing = session.execute(
-                select(ExtensionCoreCall).where(
-                    ExtensionCoreCall.extension_id == extension_id,
-                    ExtensionCoreCall.call_key == key,
-                )
+                self._reservation(extension_id, principal_id, key)
             ).scalar_one_or_none()
             if existing is not None:
-                return self._replay(existing, digest)
+                return self._replay(existing, digest, capability)
             session.add(
                 ExtensionCoreCall(
                     extension_id=extension_id,
+                    principal_id=principal_id,
                     call_key=key,
                     capability=capability,
                     request_hash=digest,
@@ -218,25 +233,23 @@ class CapabilityBroker:
             except IntegrityError:
                 session.rollback()
                 concurrent = session.execute(
-                    select(ExtensionCoreCall).where(
-                        ExtensionCoreCall.extension_id == extension_id,
-                        ExtensionCoreCall.call_key == key,
-                    )
+                    self._reservation(extension_id, principal_id, key)
                 ).scalar_one_or_none()
                 if concurrent is None:  # pragma: no cover - defensive
                     raise ExtensionIdempotencyConflict(
                         "idempotency key could not be reserved"
                     ) from None
-                return self._replay(concurrent, digest)
+                return self._replay(concurrent, digest, capability)
         try:
             result = self._call(capability, request)
         except BaseException:
-            self._release(extension_id, key)
+            self._release(extension_id, principal_id, key)
             raise
         with self._host._session_factory() as session:
             session.execute(
                 delete(ExtensionCoreCall).where(
                     ExtensionCoreCall.extension_id == extension_id,
+                    ExtensionCoreCall.principal_id == principal_id,
                     ExtensionCoreCall.call_key == key,
                     ExtensionCoreCall.response_json == "",
                 )
@@ -247,6 +260,7 @@ class CapabilityBroker:
             session.add(
                 ExtensionCoreCall(
                     extension_id=extension_id,
+                    principal_id=principal_id,
                     call_key=key,
                     capability=capability,
                     request_hash=digest,
@@ -257,20 +271,45 @@ class CapabilityBroker:
         return result
 
     @staticmethod
-    def _replay(row: ExtensionCoreCall, digest: str) -> Any:
+    def _reservation(extension_id: str, principal_id: str, key: str) -> Any:
+        """The one ledger row a principal may reserve or replay for this module."""
+        return select(ExtensionCoreCall).where(
+            ExtensionCoreCall.extension_id == extension_id,
+            ExtensionCoreCall.principal_id == principal_id,
+            ExtensionCoreCall.call_key == key,
+        )
+
+    def _replay(self, row: ExtensionCoreCall, digest: str, capability: str) -> Any:
         if row.request_hash != digest:
             raise ExtensionIdempotencyConflict(
                 "idempotency key was already used with a different request"
             )
         if not row.response_json:
             raise ExtensionIdempotencyConflict("idempotency key is still in progress")
+        # A replay hands back a canonical core response: re-check that the
+        # caller still holds the permission the original execution required.
+        self._authorize_replay(capability)
         return json.loads(row.response_json)
 
-    def _release(self, extension_id: str, key: str) -> None:
+    def _authorize_replay(self, capability: str) -> None:
+        permission = REPLAY_PERMISSIONS.get(capability)
+        if permission is None:
+            return
+        from itsm.identity.service import IdentityService
+
+        with self._host._session_factory() as session:
+            IdentityService(session, self._host._settings).authorize(
+                self._principal,
+                permission,
+                resource=f"extension:{self._loaded.extension_id}:{capability}",
+            )
+
+    def _release(self, extension_id: str, principal_id: str, key: str) -> None:
         with self._host._session_factory() as session:
             session.execute(
                 delete(ExtensionCoreCall).where(
                     ExtensionCoreCall.extension_id == extension_id,
+                    ExtensionCoreCall.principal_id == principal_id,
                     ExtensionCoreCall.call_key == key,
                     ExtensionCoreCall.response_json == "",
                 )
@@ -403,6 +442,7 @@ def as_store_error(exc: BaseException) -> BaseException:
 __all__ = [
     "KNOWN_CAPABILITIES",
     "READ_CAPABILITIES",
+    "REPLAY_PERMISSIONS",
     "WRITE_CAPABILITIES",
     "CapabilityBroker",
     "as_store_error",

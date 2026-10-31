@@ -195,19 +195,22 @@ class ExtensionScheduleState(ExtensionBase):
 class ExtensionCoreCall(ExtensionBase):
     """Replay ledger for authorized core mutations performed by an extension.
 
-    The row is core-owned host metadata: it stores the caller-supplied
-    idempotency key, the capability that consumed it, a digest of the request
-    and the canonical service response.  Module business data never lands here.
+    The row is core-owned host metadata: it stores the invoking principal, the
+    caller-supplied idempotency key, the capability that consumed it, a digest
+    of the request and the canonical service response.  Module business data
+    never lands here, and the key is scoped by principal so one caller can
+    never replay another caller's stored response.
     """
 
     __tablename__ = "extension_core_calls"
     __table_args__ = (
-        UniqueConstraint("extension_id", "call_key", name="uq_extension_core_call"),
+        UniqueConstraint("extension_id", "principal_id", "call_key", name="uq_extension_core_call"),
         Index("ix_extension_core_calls_extension", "extension_id"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     extension_id: Mapped[str] = mapped_column(String(48), nullable=False)
+    principal_id: Mapped[str] = mapped_column(String(64), nullable=False)
     call_key: Mapped[str] = mapped_column(String(128), nullable=False)
     capability: Mapped[str] = mapped_column(String(64), nullable=False)
     request_hash: Mapped[str] = mapped_column(String(64), nullable=False)
