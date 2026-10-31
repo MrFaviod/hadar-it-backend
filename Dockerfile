@@ -6,10 +6,13 @@ RUN apt-get update \
        libpango-1.0-0 libpangoft2-1.0-0 libharfbuzz-subset0 fonts-dejavu-core \
     && rm -rf /var/lib/apt/lists/*
 COPY requirements.txt ./
+# /data/demo is deliberately absent: `python -m itsm.demo init` refuses an
+# existing directory, so a pre-created one makes the documented demo bootstrap
+# impossible inside the image.
 RUN pip install --no-cache-dir -r requirements.txt \
     && groupadd --gid 10001 itsm \
     && useradd --uid 10001 --gid itsm --no-create-home itsm \
-    && mkdir -p /data/app /data/tasks /data/attachments /data/dev /data/demo /data/backups /data/backup-status \
+    && mkdir -p /data/app /data/tasks /data/attachments /data/dev /data/backups /data/backup-status \
     && chmod 0700 /data/backup-status \
     && chown -R itsm:itsm /data
 COPY pyproject.toml alembic.ini ./
