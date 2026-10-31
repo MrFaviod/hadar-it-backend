@@ -22,6 +22,7 @@ DEVELOPMENT_TOOL_NAMES = (
     "extension_workspace_write",
     "extension_workspace_validate",
     "extension_workspace_submit",
+    "extension_contract_gap",
 )
 EXTENSION_TOOL_NAMES = (
     *DEVELOPMENT_TOOL_NAMES,
@@ -118,6 +119,24 @@ def register_agent_extension_tools(
         return execute(ctx.deps, "extension_workspace_submit", {"workspace_id": workspace_id})
 
     @toolset.tool
+    def extension_contract_gap(
+        ctx: RunContext[Any],
+        capability: str,
+        reason: str,
+        example: str,
+        extensionId: str | None = None,  # noqa: N803 - public tool argument name
+    ) -> dict[str, Any]:
+        """Record a missing public SDK contract; never alter core or private structures."""
+        arguments: dict[str, Any] = {
+            "capability": capability,
+            "reason": reason,
+            "example": example,
+        }
+        if extensionId is not None:
+            arguments["extensionId"] = extensionId
+        return execute(ctx.deps, "extension_contract_gap", arguments)
+
+    @toolset.tool
     def extension_list(ctx: RunContext[Any]) -> dict[str, Any]:
         """Discover installed native modules visible to your current permissions."""
         return execute(ctx.deps, "extension_list", {})
@@ -183,6 +202,23 @@ def register_mcp_extension_tools(
     def extension_workspace_submit(workspace_id: str) -> dict[str, Any]:
         """Submit exact validated bytes for human approval; never installs automatically."""
         return execute("extension_workspace_submit", {"workspace_id": workspace_id})
+
+    @server.tool
+    def extension_contract_gap(
+        capability: str,
+        reason: str,
+        example: str,
+        extensionId: str | None = None,
+    ) -> dict[str, Any]:
+        """Record a missing public SDK contract instead of bypassing isolation."""
+        arguments: dict[str, Any] = {
+            "capability": capability,
+            "reason": reason,
+            "example": example,
+        }
+        if extensionId is not None:
+            arguments["extensionId"] = extensionId
+        return execute("extension_contract_gap", arguments)
 
     @server.tool
     def extension_list() -> dict[str, Any]:

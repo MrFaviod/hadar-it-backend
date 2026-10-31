@@ -298,17 +298,22 @@ class CapabilityBroker:
                 filters = _filters(request, _ASSET_SEARCH_FIELDS)
                 return service.search(self._principal, **filters).as_payload()
             if rest == "resolve":
+                from itsm.events.references import resolve_entities
+
                 entity = request.get("entity")
-                if entity != "asset":
-                    raise ExtensionValidationFailed("resolve supports entity asset only")
+                if entity not in ("asset", "incident"):
+                    raise ExtensionValidationFailed("resolve supports asset or incident")
                 ids = request.get("ids")
-                if not isinstance(ids, list) or len(ids) > 50:
-                    raise ExtensionValidationFailed("resolve ids must be a list of at most 50")
-                items = [
-                    service.get(self._principal, _text(item, "asset id")).as_payload()
-                    for item in ids
-                ]
-                return {"items": items}
+                if not isinstance(ids, list) or len(ids) > 200:
+                    raise ExtensionValidationFailed("resolve ids must be a list of at most 200")
+                states = resolve_entities(
+                    self._principal,
+                    entity,
+                    [_text(item, "entity id") for item in ids],
+                    session=session,
+                    settings=self._host._settings,
+                )
+                return {"entity": entity, "states": states}
             if rest == "create":
                 values = request.get("values")
                 if not isinstance(values, Mapping):

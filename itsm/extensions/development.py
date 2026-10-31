@@ -20,6 +20,7 @@ from datetime import UTC, datetime
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from itsm.extensions import storage
 from itsm.extensions.sdk.contract import SDK_VERSION, ManifestError
 from itsm.extensions.sdk.generator import generate_package, write_package
 from itsm.extensions.sdk.package import (
@@ -696,12 +697,46 @@ class DevelopmentService:
         except OSError as exc:
             raise WorkspaceConflict("validation state could not be invalidated") from exc
 
+    def _contract_gap(self, arguments: Mapping[str, Any], principal: Any) -> dict[str, Any]:
+        """Record a missing public contract instead of editing private structures."""
+        self._authorize(principal)
+        extension_id = arguments.get("extensionId") or "sdk"
+        if not isinstance(extension_id, str) or not WORKSPACE_ID.fullmatch(extension_id):
+            raise InvalidArguments("extensionId must be a valid extension id")
+        capability = _gap_text(arguments.get("capability"), "capability", 200)
+        reason = _gap_text(arguments.get("reason"), "reason", 1024)
+        example = _gap_text(arguments.get("example"), "example", 1024)
+        with self._session_factory() as session:
+            storage.record_event(
+                session,
+                extension_id=extension_id,
+                action="extension.contract_gap",
+                actor_id=principal.actor_id,
+                detail={"capability": capability, "reason": reason, "example": example},
+            )
+            session.commit()
+        return {
+            "recorded": True,
+            "extensionId": extension_id,
+            "capability": capability,
+        }
+
     @staticmethod
     def _now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
 
 
+def _gap_text(value: Any, label: str, limit: int) -> str:
+    if not isinstance(value, str):
+        raise InvalidArguments(f"{label} must be a string")
+    text = value.strip()
+    if not text or len(text) > limit:
+        raise InvalidArguments(f"{label} must be 1-{limit} characters")
+    return text
+
+
 _METHODS: dict[str, Callable[[DevelopmentService, Any, Any], dict[str, Any]]] = {
+    "extension_contract_gap": DevelopmentService._contract_gap,
     "extension_sdk_index": DevelopmentService._sdk_index,
     "extension_sdk_reference": DevelopmentService._sdk_reference,
     "extension_workspace_create": DevelopmentService._workspace_create,

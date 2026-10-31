@@ -297,6 +297,29 @@ def register_extension_task(huey: Huey, settings: Settings):
     return extension_schedules
 
 
+def register_extension_events_task(huey: Huey, settings: Settings):
+    """Deliver core entity events and run due reconciliations every minute."""
+
+    @huey.periodic_task(
+        crontab(minute="*"),
+        name="extension_events",
+        retries=settings.task_retries,
+        retry_delay=settings.task_retry_delay_seconds,
+        context=True,
+    )
+    def extension_events(task: Any = None) -> dict[str, Any]:
+        from itsm.extensions.events import process_extension_events
+
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        result = process_extension_events(settings)
+        log_event(logger, "extensions.events.processed", **result)
+        payload = {"state": TaskState.COMPLETE.value, "summary": result}
+        huey.put_result(task.id, payload)
+        return payload
+
+    return extension_events
+
+
 def register_report_task(huey: Huey, settings: Settings):
     """Render durable document jobs using only a server-side SQL locator."""
 
@@ -381,6 +404,7 @@ def build_runtime(settings: Settings) -> TaskRuntime:
     huey = build_huey(settings)
     register_maintenance_task(huey, settings)
     register_extension_task(huey, settings)
+    register_extension_events_task(huey, settings)
     search_sync, search_rebuild = register_search_tasks(huey, settings)
     return TaskRuntime(
         huey=huey,
@@ -407,6 +431,7 @@ def _consumer_huey() -> Huey:
     register_monitoring_task(huey_instance, settings)
     register_notification_task(huey_instance, settings)
     register_extension_task(huey_instance, settings)
+    register_extension_events_task(huey_instance, settings)
     register_report_task(huey_instance, settings)
     register_search_tasks(huey_instance, settings)
     return huey_instance

@@ -49,7 +49,9 @@ def _resolve(module_sdk: sdk.ModuleSDK, kind: str, name: str) -> sdk.Handler:
     elif kind == "subscription":
         handler = module_sdk.subscriptions.get(name)
     elif kind == "reconcile":
-        handler = module_sdk.reconcile[1] if module_sdk.reconcile else None
+        handler = (
+            module_sdk.reconcile_handler[1] if module_sdk.reconcile_handler else None
+        )
     else:
         handler = None
     if handler is None:
@@ -73,6 +75,17 @@ def _check_declared(module_sdk: sdk.ModuleSDK, declared: dict[str, list[str]]) -
         for name in declared.get("schedules", [])
         if name not in module_sdk.schedules
     ]
+    missing += [
+        f"subscription {name}"
+        for name in declared.get("subscriptions", [])
+        if name not in module_sdk.subscriptions
+    ]
+    reconcile = declared.get("reconcile") or []
+    if reconcile and (
+        not module_sdk.reconcile_handler
+        or module_sdk.reconcile_handler[0] != reconcile[0]
+    ):
+        missing.append(f"reconcile {reconcile[0]}")
     if missing:
         raise ModuleError("unbound handlers: " + ", ".join(missing[:8]))
 

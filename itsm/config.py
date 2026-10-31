@@ -383,6 +383,18 @@ class Settings(BaseSettings):
             raise ValueError("database_url must include a database name")
         return value
 
+    @field_validator("extension_workspace_path", "extension_data_path")
+    @classmethod
+    def _validate_extension_storage_path(cls, value: Path) -> Path:
+        resolved = Path(value).expanduser().resolve()
+        backend = BACKEND_ROOT.resolve()
+        if resolved == backend or backend in resolved.parents:
+            raise ValueError(
+                "extension storage must not live inside the backend source tree; "
+                "the build environment cannot write the core repository"
+            )
+        return value
+
     @field_validator("task_redis_url")
     @classmethod
     def _validate_task_redis_url(cls, value: str) -> str:
@@ -610,6 +622,7 @@ class Settings(BaseSettings):
             raise ValueError("task_storage=postgres requires task_postgres_dsn")
         if self.task_storage == "sqlite":
             self._reject_shared_sqlite_file()
+        self._reject_extension_core_overlap()
         if self.auth_password_max_length <= self.auth_password_min_length:
             raise ValueError("auth_password_max_length must exceed auth_password_min_length")
         if (self.ai_broker_url is None) != (self.ai_broker_token is None):
@@ -623,6 +636,23 @@ class Settings(BaseSettings):
                 "extension_validator_url and extension_validator_token must be configured together"
             )
         return self
+
+    def _reject_extension_core_overlap(self) -> None:
+        """Keep extension storage and workspace strictly outside the core DB file."""
+        url = make_url(self.database_url)
+        if not url.drivername.startswith("sqlite") or not url.database:
+            return
+        core_path = Path(url.database).resolve()
+        for label, raw in (
+            ("extension_data_path", self.extension_data_path),
+            ("extension_workspace_path", self.extension_workspace_path),
+        ):
+            path = Path(raw).expanduser().resolve()
+            if path == core_path or path in core_path.parents or core_path in path.parents:
+                raise ValueError(
+                    f"{label} must not equal, contain or live inside the core SQLite "
+                    "database file"
+                )
 
     def _reject_shared_sqlite_file(self) -> None:
         url = make_url(self.database_url)

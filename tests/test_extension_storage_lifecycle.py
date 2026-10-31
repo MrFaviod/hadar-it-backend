@@ -541,7 +541,8 @@ def test_status_reports_storage_and_restarts_see_the_same_data(env) -> None:
     status = restarted.status(env.owner, MODULE_ID)
     assert status["storagePath"] == str(env.storage())
     assert status["dataSizeBytes"] > 0
-    assert status["eventCursor"] is None
+    assert status["eventCursor"] == 0
+    assert status["events"]["cursor"] == 0 and status["events"]["stalled"] is False
     assert status["stalled"] is False
 
 

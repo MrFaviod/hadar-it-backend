@@ -36,7 +36,10 @@ from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
 from itsm.config import Settings
+from itsm.events.feed import EntityEventFeed, UnknownConsumer
+from itsm.events.references import resolve_entities
 from itsm.extensions import manifest as package_contract
+from itsm.extensions import references as reference_policy
 from itsm.extensions import sandbox, storage
 from itsm.extensions.capabilities import CapabilityBroker
 from itsm.extensions.errors import (
@@ -118,6 +121,9 @@ logger = logging.getLogger(__name__)
 
 SDK_VERSION = 2
 CANDIDATE_LIMIT = 200
+EVENT_BATCH = 50
+EVENT_MAX_ATTEMPTS = 5
+RECONCILE_SCHEDULE = "__reconcile__"
 EVENT_LIMIT = 100
 MAX_COLLECTION_DATA_BYTES = 256 * 1024
 MAX_RECIPIENTS = 100
@@ -1050,6 +1056,14 @@ class ExtensionHostService:
                     "operations": sorted(loaded.operations),
                     "migrations": sorted(loaded.migrations),
                     "schedules": sorted(item["handler"] for item in loaded.schedules.values()),
+                    "subscriptions": sorted(
+                        item["event"] for item in loaded.manifest.get("subscriptions") or []
+                    ),
+                    "reconcile": (
+                        [loaded.manifest["reconcile"]["handler"]]
+                        if loaded.manifest.get("reconcile")
+                        else []
+                    ),
                 },
                 handle_call=broker.handle,
             )
@@ -1203,6 +1217,31 @@ class ExtensionHostService:
                 row.updated_at = now
                 if row.next_due_at is None:
                     row.next_due_at = now + timedelta(seconds=int(schedule["intervalSeconds"]))
+        reconcile = manifest.get("reconcile")
+        if reconcile:
+            row = session.execute(
+                select(ExtensionScheduleState).where(
+                    ExtensionScheduleState.extension_id == extension_id,
+                    ExtensionScheduleState.name == RECONCILE_SCHEDULE,
+                )
+            ).scalar_one_or_none()
+            interval = int(reconcile["intervalSeconds"])
+            if row is None:
+                session.add(
+                    ExtensionScheduleState(
+                        extension_id=extension_id,
+                        name=RECONCILE_SCHEDULE,
+                        owner_id=owner_id,
+                        next_due_at=now + timedelta(seconds=interval),
+                        created_at=now,
+                        updated_at=now,
+                    )
+                )
+            else:
+                row.owner_id = owner_id
+                row.updated_at = now
+                if row.next_due_at is None:
+                    row.next_due_at = now + timedelta(seconds=interval)
         session.flush()
 
     def _mark_schedule_error(
@@ -2244,9 +2283,392 @@ class ExtensionHostService:
                 ],
                 "eventCursor": None,
                 "stalled": False,
+                "events": {},
             }
+        events = self.event_status(extension_id)
+        payload["eventCursor"] = events["cursor"]
+        payload["stalled"] = events["stalled"]
+        payload["events"] = events
         payload["sandbox"] = sandbox.sandbox_availability()
         return payload
+
+    # -------------------------------------------------- events & reconcile
+    def _event_principal(self, session: Session, version_row: ExtensionVersion) -> Principal:
+        owner = (
+            session.get(Identity, version_row.installed_by)
+            if version_row.installed_by
+            else None
+        )
+        if not _is_human_superadmin(owner):
+            raise PermissionDenied(
+                "event dispatch requires the persisted human Superadmin that installed the module"
+            )
+        return IdentityService(session, self._settings).resolve_actor(owner.id)
+
+    def event_status(self, extension_id: str) -> dict[str, Any]:
+        """Public, non-sensitive consumer state for status and reset responses."""
+        feed = EntityEventFeed(self._session_factory)
+        try:
+            status = feed.status(event_consumer_id(extension_id))
+        except UnknownConsumer:
+            return {
+                "consumer": event_consumer_id(extension_id),
+                "cursor": 0,
+                "stalled": False,
+                "lastError": None,
+                "attempts": 0,
+                "retryAfter": None,
+                "state": "active",
+            }
+        payload = status.as_payload()
+        return {
+            "consumer": payload["consumer"],
+            "cursor": payload["lastSequence"],
+            "stalled": payload["state"] == "stalled",
+            "lastError": payload["lastError"],
+            "attempts": payload["attempts"],
+            "retryAfter": payload["retryAfter"],
+            "state": payload["state"],
+        }
+
+    def dispatch_entity_events(
+        self,
+        *,
+        now: datetime | None = None,
+        lag: int = 2,
+        grace_seconds: float = 2.0,
+    ) -> dict[str, int]:
+        """Deliver ordered core events to enabled modules, then acknowledge.
+
+        Sandboxed subscriptions run one handler per matching event with the
+        event id exposed to the module; declarative reference policies are
+        applied by the host.  A failure stops that module's batch, records a
+        closed failure code and resumes after backoff or an explicit reset.
+        """
+        current = as_utc(now) if now is not None else as_utc(self._now())
+        feed = EntityEventFeed(
+            self._session_factory, lag=lag, grace_seconds=grace_seconds
+        )
+        counts = {"modules": 0, "delivered": 0, "failed": 0, "skipped": 0}
+        with self._session_factory() as session:
+            modules = list(
+                session.execute(
+                    select(ExtensionModule)
+                    .where(ExtensionModule.enabled.is_(True))
+                    .order_by(ExtensionModule.id)
+                ).scalars()
+            )
+            for module in modules:
+                version_row = storage.get_active_version(session, module)
+                if version_row is None:
+                    continue
+                manifest = json.loads(version_row.manifest_json)
+                if manifest.get("sdkVersion") != SDK_VERSION:
+                    continue
+                subscriptions = manifest.get("subscriptions") or []
+                has_references = bool(reference_policy.references_for(manifest))
+                if not subscriptions and not has_references:
+                    continue
+                counts["modules"] += 1
+                consumer = event_consumer_id(module.id)
+                status = self.event_status(module.id)
+                if status["stalled"]:
+                    counts["skipped"] += 1
+                    continue
+                retry_after = status["retryAfter"]
+                if retry_after is not None:
+                    parsed = _parse_timestamp(retry_after, "retryAfter")
+                    if parsed > current:
+                        counts["skipped"] += 1
+                        continue
+                principal = self._event_principal(session, version_row)
+                loaded = self._load_module(version_row) if subscriptions else None
+                connection = self._connect(module.id) if has_references else None
+                try:
+                    for event in feed.poll(consumer, EVENT_BATCH):
+                        try:
+                            payload = {
+                                "id": event.id,
+                                "sequence": event.sequence,
+                                "type": event.event_type,
+                                "entityType": event.entity_type,
+                                "entityId": event.entity_id,
+                                "occurredAt": _iso(event.occurred_at),
+                                "changed": list(event.changed_fields or []),
+                            }
+                            for subscription in subscriptions:
+                                if subscription["event"] != event.event_type:
+                                    continue
+                                self._invoke_sandboxed(
+                                    principal,
+                                    loaded,
+                                    kind="subscription",
+                                    name=subscription["event"],
+                                    arguments={},
+                                    allow_write=True,
+                                    event=payload,
+                                )
+                            if connection is not None:
+                                reference_policy.apply_event(
+                                    connection,
+                                    manifest,
+                                    entity_type=event.entity_type,
+                                    entity_id=event.entity_id,
+                                    event_type=event.event_type,
+                                )
+                            feed.ack(consumer, event.sequence)
+                            counts["delivered"] += 1
+                        except Exception as exc:  # closed failure code, recorded below
+                            feed.fail(
+                                consumer,
+                                event_failure_code(exc),
+                                max_attempts=EVENT_MAX_ATTEMPTS,
+                            )
+                            counts["failed"] += 1
+                            break
+                finally:
+                    if connection is not None:
+                        connection.close()
+        return counts
+
+    def reset_events(
+        self, principal: Principal, extension_id: str, *, expected_version: int
+    ) -> dict[str, Any]:
+        """Clear a stalled consumer's retry budget without moving its cursor."""
+        self.authorize_fresh(
+            principal, "system.modules", resource=f"extension:{extension_id}:events"
+        )
+        with self._session_factory() as session:
+            self._require_human_superadmin(session, principal)
+            module = storage.get_module(session, extension_id)
+            if module is None:
+                raise ExtensionNotFound("extension not found")
+            if module.revision != expected_version:
+                raise ExtensionStale("installed revision changed")
+            EntityEventFeed(self._session_factory).reset(event_consumer_id(extension_id))
+            now = as_utc(self._now())
+            module.revision += 1
+            module.updated_at = now
+            storage.record_event(
+                session,
+                extension_id=extension_id,
+                action="extension.events.reset",
+                actor_id=principal.actor_id,
+                detail={"expectedVersion": expected_version},
+            )
+            IdentityService(session, self._settings).record_operation(
+                principal,
+                action="extensions.events_reset",
+                resource=f"extension:{extension_id}",
+                commit=False,
+            )
+            session.commit()
+        return {"events": self.event_status(extension_id)}
+
+    def _reconcile_manifest(
+        self,
+        principal: Principal,
+        session: Session,
+        module: ExtensionModule,
+        version_row: ExtensionVersion,
+        manifest: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        if reference_policy.references_for(manifest):
+            connection = self._connect(module.id)
+            changed = 0
+            try:
+                for entity_type in ("asset", "incident"):
+                    ids = reference_policy.referenced_ids(connection, manifest, entity_type)
+                    if not ids:
+                        continue
+                    states = resolve_entities(
+                        principal,
+                        entity_type,
+                        ids[:200],
+                        session=session,
+                        settings=self._settings,
+                    )
+                    changed += reference_policy.apply_states(
+                        connection, manifest, entity_type=entity_type, states=states
+                    )
+                connection.commit()
+            finally:
+                connection.close()
+            return {"references": changed}
+        declaration = manifest.get("reconcile")
+        if not declaration:
+            return {"references": 0}
+        loaded = self._load_module(version_row)
+        result = self._invoke_sandboxed(
+            principal,
+            loaded,
+            kind="reconcile",
+            name=declaration["handler"],
+            arguments={},
+            allow_write=True,
+        )
+        return {"reconcile": result}
+
+    def reconcile(
+        self, principal: Principal, extension_id: str, *, expected_version: int
+    ) -> dict[str, Any]:
+        """Run the idempotent repair path for one module, on demand."""
+        self.authorize_fresh(
+            principal, "system.modules", resource=f"extension:{extension_id}:reconcile"
+        )
+        with self._session_factory() as session:
+            self._require_human_superadmin(session, principal)
+            module = storage.get_module(session, extension_id)
+            if module is None:
+                raise ExtensionNotFound("extension not found")
+            if module.revision != expected_version:
+                raise ExtensionStale("installed revision changed")
+            if not module.enabled:
+                raise ExtensionDisabled("extension is disabled")
+            version_row = storage.get_active_version(session, module)
+            if version_row is None:
+                raise ExtensionNotFound("extension has no installed version")
+            manifest = json.loads(version_row.manifest_json)
+            result = self._reconcile_manifest(principal, session, module, version_row, manifest)
+            now = as_utc(self._now())
+            state = session.execute(
+                select(ExtensionScheduleState).where(
+                    ExtensionScheduleState.extension_id == extension_id,
+                    ExtensionScheduleState.name == RECONCILE_SCHEDULE,
+                )
+            ).scalar_one_or_none()
+            interval = int((manifest.get("reconcile") or {}).get("intervalSeconds", 300))
+            if state is not None:
+                state.next_due_at = now + timedelta(seconds=interval)
+                state.last_run_at = now
+                state.last_error = None
+                state.updated_at = now
+            storage.record_event(
+                session,
+                extension_id=extension_id,
+                action="extension.reconciled",
+                actor_id=principal.actor_id,
+                detail={"summary": str(result)[:500]},
+            )
+            IdentityService(session, self._settings).record_operation(
+                principal,
+                action="extensions.reconciled",
+                resource=f"extension:{extension_id}",
+                commit=False,
+            )
+            session.commit()
+        return result
+
+    def run_due_reconciles(self, now: datetime | None = None) -> dict[str, int]:
+        """Periodic repair for modules that declared a reconcile interval."""
+        current = as_utc(now) if now is not None else as_utc(self._now())
+        with self._session_factory() as session:
+            due = list(
+                session.execute(
+                    select(
+                        ExtensionScheduleState.id,
+                        ExtensionScheduleState.extension_id,
+                        ExtensionScheduleState.owner_id,
+                        ExtensionScheduleState.next_due_at,
+                    )
+                    .join(
+                        ExtensionModule,
+                        ExtensionModule.id == ExtensionScheduleState.extension_id,
+                    )
+                    .where(
+                        ExtensionModule.enabled.is_(True),
+                        ExtensionScheduleState.name == RECONCILE_SCHEDULE,
+                        ExtensionScheduleState.next_due_at.is_not(None),
+                        ExtensionScheduleState.next_due_at <= current,
+                    )
+                    .order_by(ExtensionScheduleState.next_due_at)
+                    .limit(50)
+                ).all()
+            )
+        counts = {"claimed": 0, "succeeded": 0, "failed": 0, "skipped": 0}
+        for state_id, extension_id, owner_id, observed_due in due:
+            with self._module_lock(extension_id), self._session_factory() as session:
+                row = session.get(ExtensionScheduleState, state_id)
+                module = storage.get_module(session, extension_id)
+                if row is None or module is None or not module.enabled:
+                    counts["skipped"] += 1
+                    continue
+                if row.next_due_at != observed_due:
+                    counts["skipped"] += 1
+                    continue
+                version_row = storage.get_active_version(session, module)
+                owner = session.get(Identity, owner_id) if owner_id else None
+                if version_row is None or not _is_human_superadmin(owner):
+                    counts["skipped"] += 1
+                    continue
+                manifest = json.loads(version_row.manifest_json)
+                interval = int((manifest.get("reconcile") or {}).get("intervalSeconds", 300))
+                claimed = session.execute(
+                    update(ExtensionScheduleState)
+                    .where(
+                        ExtensionScheduleState.id == state_id,
+                        ExtensionScheduleState.next_due_at == observed_due,
+                    )
+                    .values(
+                        next_due_at=current + timedelta(seconds=interval),
+                        last_run_at=current,
+                        last_error=None,
+                        updated_at=current,
+                    )
+                )
+                if claimed.rowcount != 1:
+                    session.rollback()
+                    counts["skipped"] += 1
+                    continue
+                session.commit()
+                counts["claimed"] += 1
+                principal = IdentityService(session, self._settings).resolve_actor(owner.id)
+                try:
+                    self._reconcile_manifest(
+                        principal, session, module, version_row, manifest
+                    )
+                    session.commit()
+                    counts["succeeded"] += 1
+                except Exception as exc:  # recorded as a bounded reconcile error
+                    session.rollback()
+                    self._mark_schedule_error(
+                        state_id,
+                        now=current,
+                        interval_seconds=interval,
+                        message=f"reconcile failed: {type(exc).__name__}",
+                    )
+                    counts["failed"] += 1
+        return counts
+
+    def contract_gaps(self, principal: Principal) -> dict[str, Any]:
+        """Superadmin listing of typed contract gaps recorded by agents."""
+        with self._session_factory() as session:
+            self._require_human_superadmin(session, principal)
+            rows = list(
+                session.execute(
+                    select(ExtensionEvent)
+                    .where(ExtensionEvent.action == "extension.contract_gap")
+                    .order_by(ExtensionEvent.created_at.desc(), ExtensionEvent.id.desc())
+                    .limit(100)
+                ).scalars()
+            )
+            items = []
+            for row in rows:
+                try:
+                    detail = json.loads(row.detail_json)
+                except json.JSONDecodeError:  # pragma: no cover - written by the host
+                    detail = {}
+                items.append(
+                    {
+                        "extensionId": row.extension_id,
+                        "capability": detail.get("capability"),
+                        "reason": detail.get("reason"),
+                        "example": detail.get("example"),
+                        "actorId": row.actor_id,
+                        "createdAt": _iso(row.created_at),
+                    }
+                )
+        return {"items": items}
 
     # ----------------------------------------------------------- uninstall
     def uninstall(
@@ -2409,6 +2831,26 @@ class ExtensionHostService:
             (collection, record_id, version, data_json, now, now),
         )
         connection.commit()
+
+
+def event_consumer_id(extension_id: str) -> str:
+    """Stable outbox consumer identity for one module; bounded for the feed."""
+    return f"extension:{extension_id}"[:96]
+
+
+def event_failure_code(exc: BaseException) -> str:
+    """Map a host refusal to the feed's closed failure-code set."""
+    if isinstance(exc, PermissionDenied):
+        return "authorization_denied"
+    if isinstance(exc, ExtensionIdempotencyConflict):
+        return "idempotency_conflict"
+    if isinstance(exc, (ExtensionStoreValidation, ExtensionValidationFailed)):
+        return "invalid_payload"
+    if isinstance(exc, (ExtensionSandboxUnavailable, ExtensionUnavailable)):
+        return "storage_unavailable"
+    if isinstance(exc, ExtensionHandlerFailed) and "timeout" in str(exc).lower():
+        return "timeout"
+    return "handler_error"
 
 
 def submit_workspace_candidate(

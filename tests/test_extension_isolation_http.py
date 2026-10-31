@@ -62,7 +62,16 @@ def test_status_uninstall_and_upgrade_gate_over_http(env, tmp_path) -> None:
         assert body["status"] == "ready"
         assert body["sandbox"]["available"] is True
         assert body["storagePath"].endswith("/" + MODULE_ID)
-        assert body["eventCursor"] is None and body["stalled"] is False
+        assert body["eventCursor"] == 0 and body["stalled"] is False
+        assert body["events"] == {
+            "consumer": "extension:" + MODULE_ID,
+            "cursor": 0,
+            "stalled": False,
+            "lastError": None,
+            "attempts": 0,
+            "retryAfter": None,
+            "state": "active",
+        }
 
         # Uninstall is a CSRF-guarded mutation with an optimistic version check.
         denied = client.post(prefix + "/" + MODULE_ID + "/uninstall", json={"expectedVersion": 1})

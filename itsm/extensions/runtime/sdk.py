@@ -258,7 +258,7 @@ class ModuleSDK:
         self.migrations: dict[str, Handler] = {}
         self.schedules: dict[str, Handler] = {}
         self.subscriptions: dict[str, Handler] = {}
-        self.reconcile: tuple[str, Handler] | None = None
+        self.reconcile_handler: tuple[str, Handler] | None = None
 
     def _bind(self, target: dict[str, Handler], kind: str, name: Any, handler: Any) -> None:
         if not isinstance(name, str) or not name:
@@ -281,7 +281,12 @@ class ModuleSDK:
     def subscribe(self, name: str, handler: Handler) -> None:
         self._bind(self.subscriptions, "subscription", name, handler)
 
+    def reconcile(self, name: str, handler: Handler) -> None:
+        """Declare the single periodic repair handler; called with only context."""
+        self.set_reconcile(name, handler)
+
     def set_reconcile(self, name: str, handler: Handler) -> None:
+        """Backward-compatible alias for :meth:`reconcile`."""
         if not callable(handler):
             raise ExtensionError("reconcile handler must be callable")
-        self.reconcile = (name, handler)
+        self.reconcile_handler = (name, handler)

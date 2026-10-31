@@ -14,6 +14,7 @@ import hashlib
 import hmac
 import io
 import json
+import re
 import stat
 import sys
 import zipfile
@@ -52,6 +53,45 @@ _GAP_CALLS = {
     "os.posix_spawn": "process execution",
     "ctypes.CDLL": "host capabilities",
 }
+# The core schema is never an extension surface. A module that names one of
+# these tables (or attaches another database) is asking for a contract the SDK
+# does not publish, so admission turns it into a typed contract gap.
+_CORE_TABLES = frozenset(
+    {
+        "assets",
+        "asset_history",
+        "asset_tombstones",
+        "entity_change_events",
+        "entity_event_consumers",
+        "extension_candidates",
+        "extension_collection_records",
+        "extension_core_calls",
+        "extension_events",
+        "extension_migrations",
+        "extension_modules",
+        "extension_permissions",
+        "extension_schedule_state",
+        "extension_versions",
+        "identity_audit_events",
+        "identity_credentials",
+        "identity_identities",
+        "identity_role_policies",
+        "identity_roles",
+        "identity_sessions",
+        "technical_incidents",
+        "technical_incident_events",
+    }
+)
+_SQL_KEYWORD = re.compile(
+    r"\b(?:SELECT|INSERT|UPDATE|DELETE|ATTACH|DETACH|CREATE|ALTER|DROP|REPLACE|PRAGMA)\b",
+    re.IGNORECASE,
+)
+_SQL_IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_FRONTEND_IMPORT = re.compile(
+    r"(?:\bimport\b[^\"']*?\bfrom\s+|\bimport\s*|\brequire\s*\(\s*)[\"']([^\"']+)[\"']"
+)
+_PRIVATE_SPECIFIERS = ("itsm", "@/", "../", "./")
+
 _ALLOWED_SUFFIXES = frozenset({".json", ".py", ".js", ".md", ".txt"})
 _ALLOWED_COMPRESSION = frozenset({zipfile.ZIP_STORED, zipfile.ZIP_DEFLATED})
 _FORBIDDEN_PARTS = frozenset(
@@ -271,13 +311,57 @@ def _decode(name: str, value: bytes) -> str:
         raise PackageError(f"package member is not UTF-8 text: {name}") from None
 
 
-def _gap(name: str, capability: str) -> PackageError:
+def _gap(name: str, capability: str, member: str = "backend.py") -> PackageError:
     return PackageError(
-        "contract_gap_required: backend.py uses "
+        f"contract_gap_required: {member} uses "
         f"{name}, which needs the {capability} capability. The SDK v2 runner "
         "does not grant it; declare the capability if it is public, or record a "
         "contract gap instead of bypassing isolation."
     )
+
+
+def _check_sql_literal(value: str) -> None:
+    """Refuse module SQL that reaches core tables or another database file."""
+    if not _SQL_KEYWORD.search(value):
+        return
+    if re.search(r"\b(?:ATTACH|DETACH)\s+DATABASE\b", value, re.IGNORECASE):
+        raise _gap("a second database attachment", "direct core database access")
+    identifiers = {item.lower() for item in _SQL_IDENTIFIER.findall(value)}
+    if "sqlite_master" in identifiers or "sqlite_schema" in identifiers:
+        raise _gap("sqlite_master", "core schema introspection")
+    forbidden = sorted(identifiers & _CORE_TABLES)
+    if forbidden:
+        raise _gap(", ".join(forbidden), "direct core table access")
+
+
+def _check_frontend_source(source: str, manifest: Mapping[str, Any]) -> None:
+    """Refuse imports of private host modules and unregistered components."""
+    for specifier in _FRONTEND_IMPORT.findall(source):
+        if specifier.startswith(_PRIVATE_SPECIFIERS) or "itsm" in specifier:
+            raise _gap(
+                f"frontend import {specifier!r}",
+                "private host module access",
+                member="frontend.js",
+            )
+    frontend = manifest.get("frontend") or {}
+    components = {
+        item["view"]["isolated"]["component"]
+        for item in (frontend.get("pages", []) + frontend.get("assetPanels", []))
+        if isinstance(item.get("view"), Mapping)
+        and isinstance(item["view"].get("isolated"), Mapping)
+    }
+    missing = sorted(
+        name
+        for name in components
+        if re.search(rf"\b{re.escape(name)}\s*:", source) is None
+    )
+    if missing:
+        raise _gap(
+            ", ".join(missing),
+            "an unregistered isolated component in frontend.js",
+            member="frontend.js",
+        )
+
 
 
 def _call_name(node: ast.AST) -> str | None:
@@ -321,6 +405,8 @@ def _check_backend_imports(source: str) -> None:
                 and (name.startswith("os.") or name.startswith("asyncio."))
             ):
                 raise _gap(name, "process execution")
+        elif isinstance(node, ast.Constant) and isinstance(node.value, str):
+            _check_sql_literal(node.value)
 
 
 def _declared_skills(manifest: Mapping[str, Any]) -> dict[str, str]:
@@ -429,6 +515,7 @@ def inspect_package(
         frontend_source = _decode("frontend.js", frontend_bytes)
         if not frontend_source.strip():
             raise PackageError("frontend.js is empty")
+        _check_frontend_source(frontend_source, manifest)
 
     test_files = tuple(name for name in names if name.startswith("tests/") and name.endswith(".py"))
     if not test_files:

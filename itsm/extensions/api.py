@@ -239,6 +239,34 @@ def create_extension_router() -> APIRouter:
             context.principal, extension_id, expected_version=body.expectedVersion
         )
 
+    @router.post("/{extension_id}/events/reset")
+    def reset_events(
+        extension_id: str,
+        body: UninstallBody,
+        context: MutationDependency,
+        host: HostDependency,
+    ) -> dict[str, Any]:
+        """Clear a stalled consumer's retry budget; the cursor is unchanged."""
+        return host.reset_events(
+            context.principal, extension_id, expected_version=body.expectedVersion
+        )
+
+    @router.post("/{extension_id}/reconcile")
+    def reconcile(
+        extension_id: str,
+        body: UninstallBody,
+        context: MutationDependency,
+        host: HostDependency,
+    ) -> dict[str, Any]:
+        """Run the idempotent repair path for one installed module."""
+        return host.reconcile(
+            context.principal, extension_id, expected_version=body.expectedVersion
+        )
+
+    @router.get("/contract-gaps")
+    def contract_gaps(context: AuthDependency, host: HostDependency) -> dict[str, Any]:
+        return host.contract_gaps(context.principal)
+
     @router.get("/{extension_id}/status")
     def status(extension_id: str, context: AuthDependency, host: HostDependency) -> dict[str, Any]:
         return host.status(context.principal, extension_id)
