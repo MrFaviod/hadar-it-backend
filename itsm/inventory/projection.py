@@ -51,11 +51,19 @@ def validate_fields(fields: list[str] | None) -> tuple[str, ...]:
     if fields is None:
         return COMPACT_FIELDS
     if not isinstance(fields, list) or not 1 <= len(fields) <= 24:
-        raise ValidationFailed("fields must contain between 1 and 24 public field names")
+        raise ValidationFailed(
+            "fields must contain between 1 and 24 public field names",
+            key="api.inventory.fields_range",
+            params={"maximum": 24},
+        )
     if any(not isinstance(name, str) or name not in PUBLIC_FIELDS for name in fields):
-        raise ValidationFailed("unknown public inventory field")
+        raise ValidationFailed(
+            "unknown public inventory field", key="api.inventory.unknown_public_field"
+        )
     if len(set(fields)) != len(fields):
-        raise ValidationFailed("fields must not contain duplicates")
+        raise ValidationFailed(
+            "fields must not contain duplicates", key="api.inventory.fields_duplicates"
+        )
     return tuple(fields)
 
 

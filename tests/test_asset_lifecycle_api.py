@@ -30,6 +30,7 @@ ASSET_KEYS = {
     "location",
     "responsible",
     "status",
+    "statusLabel",
     "description",
     "cost",
     "technical",

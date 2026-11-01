@@ -489,7 +489,10 @@ def create_inventory_router() -> APIRouter:
         context: MutationDependency,
     ) -> dict[str, Any]:
         if payload.personId is not None and payload.personId != person_id:
-            raise ValidationFailed("personId does not match the person in the path")
+            raise ValidationFailed(
+                "personId does not match the person in the path",
+                key="api.inventory.person_id_path_mismatch",
+            )
         assigned = service.assign_responsible(
             context.principal,
             asset_id,
@@ -603,7 +606,7 @@ def create_inventory_router() -> APIRouter:
         context: MutationDependency,
     ) -> dict[str, Any]:
         if payload.personId is None:
-            raise ValidationFailed("personId is required")
+            raise ValidationFailed("personId is required", key="api.inventory.person_id_required")
         assigned = service.assign_responsible(
             context.principal,
             asset_id,

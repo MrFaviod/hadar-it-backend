@@ -67,12 +67,20 @@ def reference(value: Any, field: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or not value.strip():
-        raise ValidationFailed(f"{field} must be a UUID")
+        raise ValidationFailed(
+            f"{field} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field},
+        )
     checked = value.strip()
     try:
         UUID(checked)
     except ValueError:
-        raise ValidationFailed(f"{field} must be a UUID") from None
+        raise ValidationFailed(
+            f"{field} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field},
+        ) from None
     return checked
 
 
@@ -81,17 +89,37 @@ def position(value: Any, field: str) -> str | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, str | int | float | Decimal):
-        raise ValidationFailed(f"{field} must be a number")
+        raise ValidationFailed(
+            f"{field} must be a number",
+            key="api.validation.field_number",
+            params={"field": field},
+        )
     try:
         parsed = Decimal(str(value).strip())
     except InvalidOperation:
-        raise ValidationFailed(f"{field} must be a number") from None
+        raise ValidationFailed(
+            f"{field} must be a number",
+            key="api.validation.field_number",
+            params={"field": field},
+        ) from None
     if not parsed.is_finite():
-        raise ValidationFailed(f"{field} must be a finite number")
+        raise ValidationFailed(
+            f"{field} must be a finite number",
+            key="api.inventory.position_finite",
+            params={"field": field},
+        )
     if parsed < 0 or parsed > 1:
-        raise ValidationFailed(f"{field} must be between 0 and 1")
+        raise ValidationFailed(
+            f"{field} must be between 0 and 1",
+            key="api.inventory.position_range",
+            params={"field": field},
+        )
     if -parsed.as_tuple().exponent > POSITION_DECIMALS:
-        raise ValidationFailed(f"{field} accepts at most {POSITION_DECIMALS} decimals")
+        raise ValidationFailed(
+            f"{field} accepts at most {POSITION_DECIMALS} decimals",
+            key="api.inventory.position_decimals",
+            params={"field": field, "limit": POSITION_DECIMALS},
+        )
     return format(parsed.normalize(), "f")
 
 
@@ -102,9 +130,15 @@ def moment(value: str | None) -> datetime | None:
     try:
         parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
     except ValueError:
-        raise ValidationFailed("effectiveAt must be an ISO 8601 timestamp") from None
+        raise ValidationFailed(
+            "effectiveAt must be an ISO 8601 timestamp",
+            key="api.inventory.effective_at_iso8601",
+        ) from None
     if parsed.tzinfo is None:
-        raise ValidationFailed("effectiveAt must include a timezone offset")
+        raise ValidationFailed(
+            "effectiveAt must include a timezone offset",
+            key="api.inventory.effective_at_timezone",
+        )
     return parsed
 
 
@@ -120,23 +154,30 @@ def check_position(values: Mapping[str, Any], *, location_id: str | None) -> Non
     if x is None and y is None:
         return
     if (x is None) != (y is None):
-        raise ValidationFailed("positionX and positionY must be provided together")
+        raise ValidationFailed(
+            "positionX and positionY must be provided together",
+            key="api.inventory.position_pair",
+        )
     if location_id is None:
-        raise ValidationFailed("a plan position requires a locationId")
+        raise ValidationFailed(
+            "a plan position requires a locationId", key="api.inventory.position_location"
+        )
 
 
 # ------------------------------------------------------------ directory reads
 def _active(directory: Any, principal: Principal, location_id: str) -> Any:
     view = directory.get_location(principal, location_id)
     if not view.active:
-        raise ValidationFailed("the referenced location is inactive")
+        raise ValidationFailed(
+            "the referenced location is inactive", key="api.inventory.location_inactive"
+        )
     return view
 
 
 def _site(directory: Any, principal: Principal, site_id: str) -> Any:
     view = _active(directory, principal, site_id)
     if view.level != "site":
-        raise ValidationFailed("siteId must reference a site")
+        raise ValidationFailed("siteId must reference a site", key="api.inventory.site_reference")
     return view
 
 
@@ -146,9 +187,14 @@ def _site_ancestor(directory: Any, principal: Principal, location: Any) -> Any:
         if current.level == "site":
             return current
         if current.parent_id is None:
-            raise ValidationFailed("locationId is not inside a site")
+            raise ValidationFailed(
+                "locationId is not inside a site", key="api.inventory.location_outside_site"
+            )
         current = _active(directory, principal, current.parent_id)
-    raise ValidationFailed("locationId hierarchy is deeper than the supported depth")
+    raise ValidationFailed(
+        "locationId hierarchy is deeper than the supported depth",
+        key="api.inventory.location_depth",
+    )
 
 
 def descendant_ids(session: Any, location_id: str) -> list[str]:
@@ -172,7 +218,9 @@ def descendant_ids(session: Any, location_id: str) -> list[str]:
         if len(found) > MAX_LOCATION_DESCENDANTS:
             raise ValidationFailed(
                 f"locationId matches more than {MAX_LOCATION_DESCENDANTS} locations; "
-                "narrow the filter"
+                "narrow the filter",
+                key="api.inventory.location_descendants_limit",
+                params={"limit": MAX_LOCATION_DESCENDANTS},
             )
         frontier = children
     return found
@@ -218,9 +266,14 @@ def _resolve_person(
         try:
             label = directory.person_label(principal, person_id, require_active=True)
         except Conflict as error:
-            raise ValidationFailed(str(error)) from None
+            raise ValidationFailed(
+                str(error), key="api.inventory.responsible_not_available"
+            ) from None
         if text is not None and text != label:
-            raise ValidationFailed("responsible and responsiblePersonId must agree")
+            raise ValidationFailed(
+                "responsible and responsiblePersonId must agree",
+                key="api.inventory.responsible_text_mismatch",
+            )
         return {"responsible_person_id": person_id, "responsible": label}
     # A cleared or text-only switch drops the stale reference and mirrors the text,
     # so an explicit ``None`` never leaves half of the pair behind.
@@ -249,19 +302,30 @@ def _resolve_place(
     location_text = values.get("location") if location_text_touched else None
     site = _site(directory, principal, site_id) if site_id is not None else None
     if site is not None and site_text is not None and site_text != site.name:
-        raise ValidationFailed("site and siteId must agree")
+        raise ValidationFailed("site and siteId must agree", key="api.inventory.site_text_mismatch")
 
     if location_id is not None:
         location = _active(directory, principal, location_id)
         if location.level not in _LOCATION_LEVELS:
-            raise ValidationFailed("locationId must reference a building, floor or room/zone")
+            raise ValidationFailed(
+                "locationId must reference a building, floor or room/zone",
+                key="api.inventory.location_level_allowed",
+            )
         if location_text is not None and location_text != location.name:
-            raise ValidationFailed("location and locationId must agree")
+            raise ValidationFailed(
+                "location and locationId must agree",
+                key="api.inventory.location_text_mismatch",
+            )
         ancestor = _site_ancestor(directory, principal, location)
         if site is not None and ancestor.id != site.id:
-            raise ValidationFailed("locationId must belong to the selected site")
+            raise ValidationFailed(
+                "locationId must belong to the selected site",
+                key="api.inventory.location_site_mismatch",
+            )
         if site_text is not None and site_text != ancestor.name:
-            raise ValidationFailed("site and siteId must agree")
+            raise ValidationFailed(
+                "site and siteId must agree", key="api.inventory.site_text_mismatch"
+            )
         # An explicit valid location is the replacement: nothing else becomes stale.
         return {
             "site_id": ancestor.id,
@@ -306,16 +370,24 @@ def validate_stored(stored: Mapping[str, Any], *, directory: Any, principal: Pri
     if location_id is not None:
         location = _active(directory, principal, location_id)
         if location.level not in _LOCATION_LEVELS:
-            raise ValidationFailed("locationId must reference a building, floor or room/zone")
+            raise ValidationFailed(
+                "locationId must reference a building, floor or room/zone",
+                key="api.inventory.location_level_allowed",
+            )
         ancestor = _site_ancestor(directory, principal, location)
         if site_id is not None and ancestor.id != site_id:
-            raise ValidationFailed("locationId must belong to the selected site")
+            raise ValidationFailed(
+                "locationId must belong to the selected site",
+                key="api.inventory.location_site_mismatch",
+            )
     person_id = stored.get("responsible_person_id")
     if person_id is not None:
         try:
             directory.person_label(principal, person_id, require_active=True)
         except Conflict as error:
-            raise ValidationFailed(str(error)) from None
+            raise ValidationFailed(
+                str(error), key="api.inventory.responsible_not_available"
+            ) from None
 
 
 @dataclass(frozen=True)

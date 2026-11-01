@@ -89,22 +89,38 @@ def _text(value: Any, field: str, *, max_length: int) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text",
+            key="api.validation.field_text",
+            params={"field": field},
+        )
     cleaned = value.strip()
     if not cleaned:
         return None
     if len(cleaned) > max_length:
-        raise ValidationFailed(f"{field} must be at most {max_length} characters")
+        raise ValidationFailed(
+            f"{field} must be at most {max_length} characters",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": max_length},
+        )
     return cleaned
 
 
 def _uuid(value: Any, field: str) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be a UUID")
+        raise ValidationFailed(
+            f"{field} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field},
+        )
     try:
         return str(UUID(value.strip()))
     except ValueError as exc:
-        raise ValidationFailed(f"{field} must be a UUID") from exc
+        raise ValidationFailed(
+            f"{field} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field},
+        ) from exc
 
 
 def _severity(value: str | None) -> str:
@@ -407,7 +423,11 @@ class DashboardService:
     ) -> dict[str, Any]:
         self._identity.authorize(principal, "assets.view", resource="dashboard")
         if period not in rules.PERIOD_PRESETS:
-            raise ValidationFailed("period must be one of 24h, 7d or 30d")
+            raise ValidationFailed(
+                "period must be one of 24h, 7d or 30d",
+                key="api.dashboard.period_allowed",
+                params={"allowed": ", ".join(rules.PERIOD_PRESETS)},
+            )
         checked_category = _text(category, "category", max_length=64)
         checked_site = _uuid(site_id, "siteId") if site_id is not None else None
         conditions = self._conditions(checked_category, checked_site)

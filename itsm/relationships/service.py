@@ -63,7 +63,10 @@ _UNSET = object()
 
 def _key(value: Any) -> str:
     if not isinstance(value, str) or not KEY_PATTERN.match(value):
-        raise ValidationFailed("type key must be 2-32 lowercase letters, digits or underscore")
+        raise ValidationFailed(
+            "type key must be 2-32 lowercase letters, digits or underscore",
+            key="api.relationships.type_key_format",
+        )
     return value
 
 
@@ -72,7 +75,9 @@ def _label(value: Any, mapping: Any, field: str) -> tuple[str, dict[str, str] | 
     try:
         return validate_label(value, mapping, field=field, limit=LABEL_MAX)
     except LabelError as exc:
-        raise ValidationFailed(str(exc)) from None
+        raise ValidationFailed(
+            str(exc), key="api.relationships.label_invalid", params={"field": field}
+        ) from None
 
 
 def _patched_label(
@@ -90,21 +95,35 @@ def _patched_label(
 
 def _direction(value: Any) -> str:
     if not isinstance(value, str) or value not in DIRECTIONS:
-        raise ValidationFailed("direction must be one of both, in, out")
+        raise ValidationFailed(
+            "direction must be one of both, in, out",
+            key="api.relationships.direction_allowed",
+            params={"allowed": "both, in, out"},
+        )
     return value
 
 
 def _bounded(limit: Any, offset: Any) -> tuple[int, int]:
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
-        raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {MAX_LIMIT}",
+            key="api.validation.limit_range",
+            params={"maximum": MAX_LIMIT},
+        )
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-        raise ValidationFailed("offset must be zero or greater")
+        raise ValidationFailed(
+            "offset must be zero or greater", key="api.validation.offset_non_negative"
+        )
     return limit, offset
 
 
 def _depth(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_GRAPH_DEPTH:
-        raise ValidationFailed(f"depth must be between 1 and {MAX_GRAPH_DEPTH}")
+        raise ValidationFailed(
+            f"depth must be between 1 and {MAX_GRAPH_DEPTH}",
+            key="api.relationships.depth_range",
+            params={"maximum": MAX_GRAPH_DEPTH},
+        )
     return value
 
 
@@ -113,15 +132,19 @@ def _asset_ids(value: Any) -> list[str]:
         return []
     entries = list(value)
     if len(entries) > BULK_LIMIT:
-        raise ValidationFailed(f"at most {BULK_LIMIT} asset ids are accepted")
+        raise ValidationFailed(
+            f"at most {BULK_LIMIT} asset ids are accepted",
+            key="api.relationships.ids_limit",
+            params={"limit": BULK_LIMIT},
+        )
     unique: list[str] = []
     for entry in entries:
         if not isinstance(entry, str):
-            raise ValidationFailed("asset ids must be text")
+            raise ValidationFailed("asset ids must be text", key="api.relationships.ids_text")
         try:
             UUID(entry)
         except ValueError:
-            raise NotFound("asset not found") from None
+            raise NotFound("asset not found", key="api.relationships.asset_not_found") from None
         if entry not in unique:
             unique.append(entry)
     return unique
@@ -405,7 +428,7 @@ class RelationshipService:
         for row in stored:
             type_row = types.get(row.type_key)
             if type_row is None:
-                raise Conflict("relationship type is missing")
+                raise Conflict("relationship type is missing", key="api.relationships.type_missing")
             if scope_ids is not None:
                 direction = "outgoing" if row.source_id in scope_ids else "incoming"
             else:
@@ -433,21 +456,26 @@ class RelationshipService:
         checked = _key(key)
         type_row = self._session.get(RelationshipType, checked)
         if type_row is None:
-            raise NotFound("relationship type not found")
+            raise NotFound("relationship type not found", key="api.relationships.type_not_found")
         if require_active and not type_row.active:
-            raise Conflict("relationship type is inactive")
+            raise Conflict("relationship type is inactive", key="api.relationships.type_inactive")
         return type_row
 
     def _relationship(self, relationship_id: Any) -> Relationship:
         if not isinstance(relationship_id, str):
-            raise ValidationFailed("relationship id is required")
+            raise ValidationFailed(
+                "relationship id is required",
+                key="api.relationships.relationship_id_required",
+            )
         try:
             UUID(relationship_id)
         except ValueError:
-            raise NotFound("relationship not found") from None
+            raise NotFound(
+                "relationship not found", key="api.relationships.relationship_not_found"
+            ) from None
         row = self._session.get(Relationship, relationship_id)
         if row is None:
-            raise NotFound("relationship not found")
+            raise NotFound("relationship not found", key="api.relationships.relationship_not_found")
         return row
 
     def _existing_assets(self, asset_ids: Sequence[str]) -> None:
@@ -461,7 +489,7 @@ class RelationshipService:
         }
         missing = [asset_id for asset_id in asset_ids if asset_id not in found]
         if missing:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.relationships.asset_not_found")
 
     def _assert_no_duplicate(
         self, source_id: str, target_id: str, type_key: str, *, exclude_id: str | None = None
@@ -474,7 +502,7 @@ class RelationshipService:
         if exclude_id is not None:
             statement = statement.where(Relationship.id != exclude_id)
         if self._session.execute(statement).first() is not None:
-            raise Conflict("relationship already exists")
+            raise Conflict("relationship already exists", key="api.relationships.already_exists")
 
     def _assert_single_host(self, child_id: str, *, exclude_id: str | None = None) -> None:
         statement = select(Relationship.id).where(
@@ -484,7 +512,10 @@ class RelationshipService:
         if exclude_id is not None:
             statement = statement.where(Relationship.id != exclude_id)
         if self._session.execute(statement).first() is not None:
-            raise Conflict("asset already has a hosting relation; use the host move operation")
+            raise Conflict(
+                "asset already has a hosting relation; use the host move operation",
+                key="api.relationships.hosting_exists",
+            )
 
     def _containment_keys(self) -> set[str]:
         return {
@@ -503,7 +534,9 @@ class RelationshipService:
     ) -> None:
         """Reject a containment edge that would close a cycle, mixing edge types."""
         if source_id == target_id:
-            raise ValidationFailed("an asset cannot relate to itself")
+            raise ValidationFailed(
+                "an asset cannot relate to itself", key="api.relationships.self_relation"
+            )
         containment = self._containment_keys()
         if not containment:
             return
@@ -518,7 +551,10 @@ class RelationshipService:
                 statement = statement.where(Relationship.id != exclude_edge_id)
             reached = set(self._session.execute(statement).scalars())
             if source_id in reached:
-                raise Conflict("containment relation would create a cycle")
+                raise Conflict(
+                    "containment relation would create a cycle",
+                    key="api.relationships.containment_cycle",
+                )
             frontier = reached - visited
             visited |= reached
 
@@ -551,7 +587,10 @@ class RelationshipService:
             return False
 
         if any(walk(node) for node in adjacency):
-            raise Conflict("containment relation would create a cycle")
+            raise Conflict(
+                "containment relation would create a cycle",
+                key="api.relationships.containment_cycle",
+            )
 
     # ------------------------------------------------------------ type config
     def list_types(
@@ -579,9 +618,11 @@ class RelationshipService:
         self._identity.authorize(principal, "config.general", resource="inventory:relationships")
         checked_key = _key(key)
         if not isinstance(containment, bool):
-            raise ValidationFailed("containment must be a boolean")
+            raise ValidationFailed(
+                "containment must be a boolean", key="api.relationships.containment_boolean"
+            )
         if self._session.get(RelationshipType, checked_key) is not None:
-            raise Conflict("relationship type already exists")
+            raise Conflict("relationship type already exists", key="api.relationships.type_exists")
         now = utcnow()
         forward_text, forward_map = _label(forward_label, forward_labels, "forwardLabel")
         inverse_text, inverse_map = _label(inverse_label, inverse_labels, "inverseLabel")
@@ -636,13 +677,17 @@ class RelationshipService:
             )
         if containment is not _UNSET:
             if not isinstance(containment, bool):
-                raise ValidationFailed("containment must be a boolean")
+                raise ValidationFailed(
+                    "containment must be a boolean", key="api.relationships.containment_boolean"
+                )
             if containment and not row.containment:
                 self._assert_type_change_safe(row.key)
             row.containment = containment
         if active is not _UNSET:
             if not isinstance(active, bool):
-                raise ValidationFailed("active must be a boolean")
+                raise ValidationFailed(
+                    "active must be a boolean", key="api.relationships.active_boolean"
+                )
             row.active = active
         row.updated_at = utcnow()
         self._flush_graph()
@@ -733,9 +778,14 @@ class RelationshipService:
         observations = _notes(notes)
         effective = _effective_at(effective_at)
         if source.id == target.id:
-            raise ValidationFailed("an asset cannot relate to itself")
+            raise ValidationFailed(
+                "an asset cannot relate to itself", key="api.relationships.self_relation"
+            )
         if source.archived_at is not None or target.archived_at is not None:
-            raise Conflict("archived assets cannot gain relationships")
+            raise Conflict(
+                "archived assets cannot gain relationships",
+                key="api.relationships.archived_cannot_relate",
+            )
         self._assert_no_duplicate(source.id, target.id, type_row.key)
         if type_row.containment:
             self._assert_containment_edge(source.id, target.id)
@@ -888,9 +938,14 @@ class RelationshipService:
         observations = _notes(notes)
         effective = _effective_at(effective_at)
         if child.id == new_host.id:
-            raise ValidationFailed("an asset cannot be hosted in itself")
+            raise ValidationFailed(
+                "an asset cannot be hosted in itself", key="api.relationships.self_hosting"
+            )
         if child.archived_at is not None or new_host.archived_at is not None:
-            raise Conflict("archived assets cannot move hosting relations")
+            raise Conflict(
+                "archived assets cannot move hosting relations",
+                key="api.relationships.archived_cannot_move_hosting",
+            )
         current = list(
             self._session.execute(
                 select(Relationship).where(
@@ -900,7 +955,10 @@ class RelationshipService:
             ).scalars()
         )
         if len(current) != 1:
-            raise Conflict("asset has no hosting relationship to move")
+            raise Conflict(
+                "asset has no hosting relationship to move",
+                key="api.relationships.hosting_missing",
+            )
         old = current[0]
         old_host = self._inventory._asset(old.target_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{old_host.id}")
@@ -1002,7 +1060,9 @@ class RelationshipService:
         checked_limit, checked_offset = _bounded(limit, offset)
         seeds = _asset_ids(asset_ids)
         if root_id is not None and seeds:
-            raise ValidationFailed("use either rootId or assetIds, not both")
+            raise ValidationFailed(
+                "use either rootId or assetIds, not both", key="api.relationships.root_or_ids"
+            )
         if root_id is not None:
             seeds = [self._inventory._asset(root_id).id]
         self._existing_assets(seeds)
@@ -1148,7 +1208,9 @@ class RelationshipService:
             self._session.flush()
         except IntegrityError:
             self._session.rollback()
-            raise Conflict("relationship already exists") from None
+            raise Conflict(
+                "relationship already exists", key="api.relationships.already_exists"
+            ) from None
 
     def _record_relation_history(
         self,

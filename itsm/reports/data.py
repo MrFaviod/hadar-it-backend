@@ -151,7 +151,7 @@ def group_table(
 ) -> ReportTable:
     """Sort rows stably by one asset group and add contiguous group labels."""
     if group not in GROUP_FIELDS:
-        raise ValidationFailed("unsupported group")
+        raise ValidationFailed("unsupported group", key="api.reports.unsupported_group")
     if group == "none":
         return table
     assets = {asset.quick_code: asset for asset in table.assets}
@@ -192,7 +192,7 @@ def _filters(filters: Any) -> dict[str, Any]:
     if filters is None:
         return {}
     if not isinstance(filters, Mapping):
-        raise ValidationFailed("filters must be an object")
+        raise ValidationFailed("filters must be an object", key="api.reports.filters_object")
     return dict(filters)
 
 
@@ -200,10 +200,18 @@ def _text(value: Any, field: str, limit: int = 120) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"filters.{field} must be text")
+        raise ValidationFailed(
+            f"filters.{field} must be text",
+            key="api.reports.filter_text",
+            params={"field": f"filters.{field}"},
+        )
     normalized = value.strip()
     if len(normalized) > limit:
-        raise ValidationFailed(f"filters.{field} is too long")
+        raise ValidationFailed(
+            f"filters.{field} is too long",
+            key="api.reports.filter_too_long",
+            params={"field": f"filters.{field}"},
+        )
     return normalized or None
 
 
@@ -211,19 +219,31 @@ def _date(value: Any, field: str) -> date | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"filters.{field} must be an ISO date")
+        raise ValidationFailed(
+            f"filters.{field} must be an ISO date",
+            key="api.reports.filter_iso_date",
+            params={"field": f"filters.{field}"},
+        )
     normalized = value.strip()
     if not normalized:
         return None
     if len(normalized) > 32:
-        raise ValidationFailed(f"filters.{field} is too long")
+        raise ValidationFailed(
+            f"filters.{field} is too long",
+            key="api.reports.filter_too_long",
+            params={"field": f"filters.{field}"},
+        )
     try:
         return date.fromisoformat(normalized)
     except ValueError:
         try:
             return datetime.fromisoformat(normalized).date()
         except ValueError as exc:
-            raise ValidationFailed(f"filters.{field} must be an ISO date") from exc
+            raise ValidationFailed(
+                f"filters.{field} must be an ISO date",
+                key="api.reports.filter_iso_date",
+                params={"field": f"filters.{field}"},
+            ) from exc
 
 
 def asset_filters(filters: Any) -> dict[str, Any]:
@@ -231,7 +251,9 @@ def asset_filters(filters: Any) -> dict[str, Any]:
     values = _filters(filters)
     archived = values.get("archived")
     if archived is not None and type(archived) is not bool:
-        raise ValidationFailed("filters.archived must be a boolean")
+        raise ValidationFailed(
+            "filters.archived must be a boolean", key="api.reports.filter_archived_boolean"
+        )
     named = {
         "query": _text(values.get("search"), "search"),
         "category": _text(values.get("category"), "category"),
@@ -255,7 +277,9 @@ def history_filters(filters: Any) -> dict[str, Any]:
     start = _date(values.get("from"), "from")
     end = _date(values.get("to"), "to")
     if start is not None and end is not None and start > end:
-        raise ValidationFailed("filters.from must not be after filters.to")
+        raise ValidationFailed(
+            "filters.from must not be after filters.to", key="api.reports.filter_range_order"
+        )
     return {
         "start": start,
         "end": end,
@@ -271,7 +295,9 @@ def warranty_filter(filters: Any) -> str | None:
         return None
     if not isinstance(value, str) or value not in WARRANTY_FILTERS:
         raise ValidationFailed(
-            "filters.warrantyFilter must be one of " + ", ".join(WARRANTY_FILTERS)
+            "filters.warrantyFilter must be one of " + ", ".join(WARRANTY_FILTERS),
+            key="api.reports.warranty_filter_allowed",
+            params={"allowed": ", ".join(WARRANTY_FILTERS)},
         )
     return None if value == "all" else value
 
@@ -280,12 +306,14 @@ def _asset_ids(asset_ids: Iterable[Any] | None) -> list[str]:
     if asset_ids is None:
         return []
     if isinstance(asset_ids, str) or not isinstance(asset_ids, Iterable):
-        raise ValidationFailed("assetIds must be a list")
+        raise ValidationFailed("assetIds must be a list", key="api.reports.asset_ids_list")
     ordered: list[str] = []
     seen: set[str] = set()
     for value in asset_ids:
         if not isinstance(value, str) or not value.strip():
-            raise ValidationFailed("assetIds must contain asset UUID strings")
+            raise ValidationFailed(
+                "assetIds must contain asset UUID strings", key="api.reports.asset_ids_uuid"
+            )
         normalized = value.strip()
         if normalized not in seen:
             seen.add(normalized)
@@ -304,7 +332,11 @@ def select_assets(
     """Resolve the bounded selection; explicit ids and filters intersect."""
     ids = _asset_ids(asset_ids)
     if len(ids) > max_assets:
-        raise ValidationFailed(f"selection exceeds {max_assets} assets")
+        raise ValidationFailed(
+            f"selection exceeds {max_assets} assets",
+            key="api.reports.selection_limit",
+            params={"limit": max_assets},
+        )
     search_filters = asset_filters(filters)
     if ids:
         if not search_filters:
@@ -319,7 +351,10 @@ def select_assets(
     probe = inventory.search(principal, limit=1, offset=0, **search_filters)
     if probe.total > max_assets:
         raise ValidationFailed(
-            f"selection matches {probe.total} assets; the limit is {max_assets}; narrow the filters"
+            f"selection matches {probe.total} assets; the limit is {max_assets}; "
+            "narrow the filters",
+            key="api.reports.selection_too_broad",
+            params={"total": probe.total, "limit": max_assets},
         )
     selected = []
     offset = 0
@@ -364,7 +399,11 @@ def _canonical_fields(fields: Sequence[str] | None) -> tuple[str, ...]:
     normalized: list[str] = []
     for key in fields:
         if key not in ASSET_FIELDS:
-            raise ValidationFailed(f"unsupported asset field: {key}")
+            raise ValidationFailed(
+                f"unsupported asset field: {key}",
+                key="api.reports.unsupported_asset_field",
+                params={"field": key},
+            )
         if key not in normalized:
             normalized.append(key)
     return tuple(normalized)
@@ -468,7 +507,9 @@ def _technical_history_rows(
                 continue
             if len(selected) >= HISTORY_ROWS_LIMIT:
                 raise ValidationFailed(
-                    f"history selection exceeds {HISTORY_ROWS_LIMIT} rows; narrow the filters"
+                    f"history selection exceeds {HISTORY_ROWS_LIMIT} rows; narrow the filters",
+                    key="api.reports.history_rows_limit",
+                    params={"limit": HISTORY_ROWS_LIMIT},
                 )
             selected.append(
                 (
@@ -524,7 +565,9 @@ def history_rows(
                     continue
                 if len(selected) >= HISTORY_ROWS_LIMIT:
                     raise ValidationFailed(
-                        f"history selection exceeds {HISTORY_ROWS_LIMIT} rows; narrow the filters"
+                        f"history selection exceeds {HISTORY_ROWS_LIMIT} rows; narrow the filters",
+                        key="api.reports.history_rows_limit",
+                        params={"limit": HISTORY_ROWS_LIMIT},
                     )
                 selected.append(
                     (

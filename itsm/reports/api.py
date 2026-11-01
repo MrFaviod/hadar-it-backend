@@ -69,7 +69,9 @@ def create_reports_router() -> APIRouter:
     ):
         payload = body.model_dump()
         if payload["id"] != template_id:
-            raise ValidationFailed("template id must match the URL")
+            raise ValidationFailed(
+                "template id must match the URL", key="api.reports.template_id_url_mismatch"
+            )
         return service.save_template(context.principal, payload)
 
     @router.delete("/reports/templates/{template_id}")
