@@ -328,6 +328,8 @@ CASES = [
         422,
         "api.dashboard.period_allowed",
         {"allowed": "24h, 7d, 30d"},
+    ),
+    (
         "monitoring",
         "GET",
         "/monitoring/alerts/00000000-0000-0000-0000-000000000000",
