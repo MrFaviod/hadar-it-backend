@@ -29,6 +29,7 @@ rejected. Package limits applied by both the host and the fixed validator:
 | `frontend` | `pages`, `assetPanels`, optional `widgets`, `actions`, `contributions` and `entry`. |
 | `schedules` | `{name,handler,intervalSeconds,permission}`; interval 60–2592000 seconds; sandboxed only. |
 | `skills` | `{name,description,path}` where `path` is exactly `skills/<name>/SKILL.md`. |
+| `i18n` | Optional `{sourceLocale, catalogs}`: the module's own `ext.<id>.*` translations under `i18n/*.json`. See [i18n](i18n.md). |
 
 ## Runtimes
 

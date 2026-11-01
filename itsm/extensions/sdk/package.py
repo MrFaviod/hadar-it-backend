@@ -19,7 +19,7 @@ from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
 
-from .contract import ManifestError, validate_manifest
+from .contract import ID_PATTERN, LOCALE_PATTERN, VERSION_PATTERN, ManifestError, validate_manifest
 
 MAX_ARCHIVE_BYTES = 4 * 1024 * 1024
 MAX_EXPANDED_BYTES = 8 * 1024 * 1024
@@ -29,6 +29,11 @@ MAX_FILE_BYTES = 1024 * 1024
 ROOT_FILES = frozenset({"extension.json", "backend.py", "frontend.js"})
 SKILL_PATTERN = re.compile(r"^skills/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)/SKILL\.md$")
 TEST_PATTERN = re.compile(r"^tests/[A-Za-z_][A-Za-z0-9_]*\.py$")
+#: Language-pack and extension catalogs/docs live under ``i18n/`` only, so a
+#: package can never smuggle an arbitrary file behind a declared catalog path.
+I18N_PATTERN = re.compile(
+    r"^i18n/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\.(?:json|md)$"
+)
 
 
 class PackageError(ValueError):
@@ -63,6 +68,7 @@ def allowed_path(path: str) -> bool:
         path in ROOT_FILES
         or SKILL_PATTERN.fullmatch(path) is not None
         or TEST_PATTERN.fullmatch(path) is not None
+        or I18N_PATTERN.fullmatch(path) is not None
     )
 
 
@@ -168,8 +174,42 @@ def load_manifest(files: Mapping[str, str]) -> dict[str, Any]:
     return _decode_json_object(text)
 
 
+def _declared_i18n_paths(manifest: Mapping[str, Any]) -> set[str]:
+    kind = manifest.get("kind", "extension")
+    block = manifest.get("catalogs") if kind == "language-pack" else manifest.get("i18n")
+    catalogs = block if kind == "language-pack" else (block or {}).get("catalogs")
+    declared = {str(path) for path in (catalogs or {}).values()}
+    for topics in (manifest.get("docs") or {}).values():
+        declared |= {str(path) for path in (topics or {}).values()}
+    return declared
+
+
+def _validate_i18n_layout(files: Mapping[str, str], manifest: Mapping[str, Any]) -> None:
+    declared = _declared_i18n_paths(manifest)
+    missing = sorted(path for path in declared if path not in files)
+    if missing:
+        raise PackageError(f"declared i18n file is missing: {', '.join(missing)}")
+    undeclared = sorted(
+        path for path in files if I18N_PATTERN.fullmatch(path) and path not in declared
+    )
+    if undeclared:
+        raise PackageError(f"i18n file is not declared in the manifest: {', '.join(undeclared)}")
+
+
 def validate_layout(files: Mapping[str, str], manifest: Mapping[str, Any]) -> None:
-    """Require exactly the files the manifest's runtime and views declare."""
+    """Require exactly the files the manifest's kind, runtime and views declare."""
+    if manifest.get("kind") == "language-pack":
+        # D10: a language pack has no runtime, storage or operations; it ships
+        # catalogs and localized docs and nothing executable.
+        for forbidden in ("backend.py", "frontend.js"):
+            if forbidden in files:
+                raise PackageError(f"a language pack carries no runtime code; remove {forbidden}")
+        _validate_i18n_layout(files, manifest)
+        extra = sorted(set(files) - {"extension.json"} - _declared_i18n_paths(manifest))
+        if extra:
+            raise PackageError(f"unsupported package path: {extra[0]}")
+        return
+    _validate_i18n_layout(files, manifest)
     required = {"extension.json"}
     runtime = manifest.get("runtime")
     if runtime == "sandboxed":
@@ -197,10 +237,54 @@ def validate_layout(files: Mapping[str, str], manifest: Mapping[str, Any]) -> No
     for path in extra:
         if SKILL_PATTERN.fullmatch(path):
             raise PackageError(f"skill file is not declared in the manifest: {path}")
+        if I18N_PATTERN.fullmatch(path):
+            continue
         if TEST_PATTERN.fullmatch(path) is None:
             raise PackageError(f"unsupported package path: {path}")
     if not any(TEST_PATTERN.fullmatch(path) for path in files):
         raise PackageError("package must contain at least one tests/*.py file")
+
+
+PACK_KIND = "language-pack"
+
+
+def language_pack_errors(manifest: Mapping[str, Any]) -> list[str]:
+    """The pack checks the SDK can make without the host i18n engine.
+
+    The authoritative D10 rules live in the host i18n package, which the
+    validator image does not ship. Here the SDK only proves that the archive is
+    a pack at all and that every declared catalog/doc exists, so a pack can be
+    built, inspected and submitted from a workspace before the host revalidates
+    it with the full engine.
+    """
+    problems: list[str] = []
+    if manifest.get("sdkVersion") != 2:
+        problems.append("sdkVersion must be 2")
+    if not isinstance(manifest.get("id"), str) or not ID_PATTERN.fullmatch(manifest["id"]):
+        problems.append("id must be a lowercase hyphenated identifier")
+    if not isinstance(manifest.get("version"), str) or not VERSION_PATTERN.fullmatch(
+        manifest["version"]
+    ):
+        problems.append("version must be X.Y.Z")
+    if not str(manifest.get("name") or "").strip():
+        problems.append("name is required")
+    locales = manifest.get("locales")
+    if not isinstance(locales, list) or not locales:
+        problems.append("locales must list at least one locale")
+    else:
+        seen: set[str] = set()
+        for item in locales:
+            tag = item.get("tag") if isinstance(item, Mapping) else None
+            if not isinstance(tag, str) or not LOCALE_PATTERN.fullmatch(tag):
+                problems.append(f"invalid locale tag: {tag}")
+                continue
+            if tag.lower() in seen:
+                problems.append(f"duplicate locale tag: {tag}")
+            seen.add(tag.lower())
+    catalogs = manifest.get("catalogs")
+    if not isinstance(catalogs, Mapping) or not catalogs:
+        problems.append("catalogs must map a locale to an i18n/*.json path")
+    return problems
 
 
 def build_package(
@@ -223,10 +307,15 @@ def build_package(
             raise PackageError(f"binary or NUL content is not allowed: {name}")
         normalized[name] = content
     manifest = load_manifest(normalized)
-    try:
-        manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
-    except ManifestError as exc:
-        raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
+    if manifest.get("kind") == PACK_KIND:
+        problems = language_pack_errors(manifest)
+        if problems:
+            raise PackageError("manifest invalid: " + "; ".join(problems))
+    else:
+        try:
+            manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
+        except ManifestError as exc:
+            raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
     validate_layout(normalized, manifest)
 
     buffer = io.BytesIO()
@@ -256,10 +345,15 @@ def parse_package(
 ) -> BuiltPackage:
     files = read_zip(data, limits)
     manifest = load_manifest(files)
-    try:
-        manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
-    except ManifestError as exc:
-        raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
+    if manifest.get("kind") == PACK_KIND:
+        problems = language_pack_errors(manifest)
+        if problems:
+            raise PackageError("manifest invalid: " + "; ".join(problems))
+    else:
+        try:
+            manifest = validate_manifest(manifest, known_core_permissions=known_core_permissions)
+        except ManifestError as exc:
+            raise PackageError("manifest invalid: " + "; ".join(exc.errors)) from exc
     validate_layout(files, manifest)
     return BuiltPackage(
         data=data,

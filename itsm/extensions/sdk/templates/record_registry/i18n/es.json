@@ -1,0 +1,8 @@
+{
+  "ext.{{EXT_ID}}.title": "Registros",
+  "ext.{{EXT_ID}}.page.records": "Registros",
+  "ext.{{EXT_ID}}.field.title": "Título",
+  "ext.{{EXT_ID}}.field.status": "Estado",
+  "ext.{{EXT_ID}}.operation.list": "Consultar registros",
+  "ext.{{EXT_ID}}.operation.create": "Crear registro"
+}

@@ -183,8 +183,14 @@ def declared_locales(manifest: Mapping[str, Any]) -> tuple[str, ...]:
 def pack_manifest_errors(manifest: Mapping[str, Any]) -> list[str]:
     """The structural D10 rules that need no catalog contents."""
     problems: list[str] = []
+    if manifest.get("kind") != "language-pack":
+        problems.append("kind must be language-pack")
+    if manifest.get("sdkVersion") != 2:
+        problems.append("sdkVersion must be 2")
     if not str(manifest.get("id") or ""):
         problems.append("a language pack needs an id")
+    if not str(manifest.get("name") or "").strip():
+        problems.append("a language pack needs a name")
     version = manifest.get("version")
     if not isinstance(version, str) or not VERSION.match(version):
         problems.append(f"version must be X.Y.Z: {version!r}")
@@ -300,7 +306,11 @@ def validate_language_pack(
             problems.append(f"locale {locale} has no catalog")
 
     for locale, catalog in catalogs.items():
-        owned = (owner_catalogs or {}).get(locale, {})
+        # Owners are keyed canonically (``pt-br``); a manifest may declare
+        # ``pt-BR``, so accept either spelling of the same locale.
+        normalized = str(locale).replace("_", "-").lower()
+        owners = owner_catalogs or {}
+        owned = owners.get(locale) or owners.get(normalized) or {}
         for key, message in catalog.items():
             problems.extend(key_errors(key))
             source = _source_for(key, sources or {})
@@ -333,9 +343,10 @@ def validate_i18n_files(
     problems: list[str] = []
     kind = manifest.get("kind", "extension")
     block = manifest.get("catalogs") if kind == "language-pack" else manifest.get("i18n")
+    declared = block if kind == "language-pack" else (block or {}).get("catalogs")
     catalogs: dict[str, dict[str, str]] = {}
-    for locale, path in (block or {}).items():
-        text = files.get(str(path)) if isinstance(block, Mapping) else None
+    for locale, path in (declared or {}).items():
+        text = files.get(str(path))
         if text is None:
             problems.append(f"package is missing declared catalog: {path}")
             continue
@@ -363,6 +374,36 @@ def validate_i18n_files(
     elif block:
         problems.extend(validate_extension_catalogs(str(manifest.get("id") or ""), block, catalogs))
     return problems
+
+
+def read_i18n_content(
+    manifest: Mapping[str, Any], files: Mapping[str, str]
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Parse the catalogs and docs a manifest declares out of one file mapping.
+
+    The caller has already validated the declarations (``validate_i18n_files``);
+    this returns the parsed content the registry stores, so a package is parsed
+    exactly once per admission path.
+    """
+    kind = manifest.get("kind", "extension")
+    block = manifest.get("catalogs") if kind == "language-pack" else manifest.get("i18n")
+    declared = block if kind == "language-pack" else (block or {}).get("catalogs")
+    catalogs: dict[str, dict[str, str]] = {}
+    if isinstance(declared, Mapping):
+        for locale, path in declared.items():
+            text = files.get(str(path))
+            if text is not None:
+                catalogs[str(locale)] = parse_catalog(str(text), str(path))
+    docs: dict[str, dict[str, str]] = {}
+    if kind == "language-pack":
+        for locale, topics in (manifest.get("docs") or {}).items():
+            if not isinstance(topics, Mapping):
+                continue
+            for topic, path in topics.items():
+                text = files.get(str(path))
+                if text is not None:
+                    docs.setdefault(str(locale), {})[str(topic)] = str(text)
+    return catalogs, docs
 
 
 def compatibility_matches(range_text: str, version: str) -> bool | None:

@@ -1,0 +1,8 @@
+{
+  "ext.{{EXT_ID}}.title": "Records",
+  "ext.{{EXT_ID}}.page.records": "Records",
+  "ext.{{EXT_ID}}.field.title": "Title",
+  "ext.{{EXT_ID}}.field.status": "Status",
+  "ext.{{EXT_ID}}.operation.list": "View records",
+  "ext.{{EXT_ID}}.operation.create": "Create record"
+}

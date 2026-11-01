@@ -1,0 +1,11 @@
+{
+  "ext.software-licenses.title": "Licencias",
+  "ext.software-licenses.page.licenses": "Licencias",
+  "ext.software-licenses.page.assignments": "Asignaciones",
+  "ext.software-licenses.operation.list": "Ver licencias",
+  "ext.software-licenses.operation.assign": "Asignar licencia",
+  "ext.software-licenses.field.product": "Producto",
+  "ext.software-licenses.field.vendor": "Proveedor",
+  "ext.software-licenses.field.seats": "Puestos",
+  "ext.software-licenses.field.expiresAt": "Vence"
+}

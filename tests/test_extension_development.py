@@ -240,6 +240,8 @@ def test_generate_writes_complete_working_record_registry(tmp_path: Path) -> Non
     assert set(generated.files) == {
         "extension.json",
         "backend.py",
+        "i18n/en.json",
+        "i18n/es.json",
         "skills/record-registry/SKILL.md",
         "tests/test_backend.py",
     }
@@ -282,6 +284,8 @@ def test_generate_writes_complete_working_record_registry(tmp_path: Path) -> Non
     )
     assert set(declarative.files) == {
         "extension.json",
+        "i18n/en.json",
+        "i18n/es.json",
         "skills/notes-board/SKILL.md",
         "tests/test_module.py",
     }
@@ -365,7 +369,7 @@ def test_real_harness_validates_generated_package_operations_and_migrations(
     checks = {item["name"]: item for item in report["checks"]}
     assert set(checks) >= REQUIRED_CHECKS
     assert all(item["status"] == "passed" for item in checks.values())
-    assert checks["archive"]["detail"].startswith("4 files;")
+    assert checks["archive"]["detail"].startswith("6 files;")
     assert "expanded bytes" in checks["archive"]["detail"]
     assert "backend.py" in checks["archive"]["detail"]
     assert "def register" not in checks["archive"]["detail"]
@@ -742,6 +746,8 @@ def test_workspace_create_list_read_write_is_actor_owned(
     assert set(created["files"]) == {
         "extension.json",
         "backend.py",
+        "i18n/en.json",
+        "i18n/es.json",
         "skills/record-registry/SKILL.md",
         "tests/test_backend.py",
     }

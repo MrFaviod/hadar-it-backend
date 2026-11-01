@@ -13,7 +13,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 
 from itsm.extensions.host import (
     ExtensionConflict,
@@ -76,6 +76,15 @@ class RollbackBody(BaseModel):
 class UninstallBody(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
+    expectedVersion: int
+
+
+class ReviewBody(BaseModel):
+    """D10: publish (``reviewed``) or withdraw (``draft``) a pack's translations."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    status: str = Field(min_length=1, max_length=16)
     expectedVersion: int
 
 
@@ -237,6 +246,21 @@ def create_extension_router() -> APIRouter:
     ) -> dict[str, Any]:
         return host.uninstall(
             context.principal, extension_id, expected_version=body.expectedVersion
+        )
+
+    @router.post("/{extension_id}/review")
+    def review(
+        extension_id: str,
+        body: ReviewBody,
+        context: MutationDependency,
+        host: HostDependency,
+    ) -> dict[str, Any]:
+        """Deferred review of one installed language pack; drafts stay inactive."""
+        return host.review_language_pack(
+            context.principal,
+            extension_id,
+            status=body.status,
+            expected_version=body.expectedVersion,
         )
 
     @router.post("/{extension_id}/events/reset")

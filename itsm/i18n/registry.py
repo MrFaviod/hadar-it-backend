@@ -455,6 +455,23 @@ def _pack_order(rows: Iterable[_ProviderRows]) -> list[_ProviderRows]:
     return sorted(rows, key=lambda row: (row.provider.priority, row.provider.id))
 
 
+def owner_catalogs(session: Session) -> dict[str, dict[str, str]]:
+    """The text every catalog owner already defines per canonical tag.
+
+    Owners are the core catalogs plus active extension providers. Packs and
+    custom translations are deliberately excluded: a new pack may fill or
+    override an owner key, but it must not be rejected because another pack
+    filled the same gap earlier (D5/D6).
+    """
+    owners: dict[str, dict[str, str]] = {tag: dict(load_catalog(tag) or {}) for tag in CORE_LOCALES}
+    rows = [row for row in _load_providers(session) if row.provider.kind == EXTENSION]
+    for row in sorted(rows, key=lambda item: item.provider.id):
+        for locale, entries in row.entries.items():
+            canonical = canonical_tag(locale) or locale
+            owners.setdefault(canonical, {}).update(entries)
+    return owners
+
+
 def snapshot(session: Session) -> Snapshot:
     """Resolve every installed locale from the stored provider rows."""
     rows = _load_providers(session)

@@ -35,7 +35,8 @@ try:
     from ..package import (
         DEFAULT_LIMITS,
         ArchiveLimits,
-        PackageError,  # noqa: F401
+        PackageError,
+        language_pack_errors,
         load_manifest,
         read_zip,
         validate_layout,
@@ -53,6 +54,7 @@ except ImportError:  # pragma: no cover - only the fixed image layout
     from itsm.extensions.sdk.package import (  # type: ignore[no-redef]
         DEFAULT_LIMITS,
         ArchiveLimits,
+        language_pack_errors,
         load_manifest,
         read_zip,
         validate_layout,
@@ -1138,13 +1140,17 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
     if files is None:
         return _finish(frame.digest, checks, errors, engine)
     manifest: dict[str, Any] = {}
+    is_pack = load_manifest(files).get("kind") == "language-pack"
 
     def manifest_check() -> str:
-        manifest.update(
-            validate_manifest(
-                load_manifest(files), known_core_permissions=frame.known_core_permissions
-            )
-        )
+        raw = load_manifest(files)
+        if raw.get("kind") == "language-pack":
+            problems = language_pack_errors(raw)
+            if problems:
+                raise PackageError("; ".join(problems))
+            manifest.update(raw)
+            return f"{manifest['id']} {manifest['version']} kind=language-pack"
+        manifest.update(validate_manifest(raw, known_core_permissions=frame.known_core_permissions))
         return f"{manifest['id']} {manifest['version']} schema={manifest['schemaVersion']}"
 
     if record("manifest", manifest_check) is None:
@@ -1152,9 +1158,15 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
 
     def layout_check() -> str:
         validate_layout(files, manifest)
+        if is_pack:
+            return f"{len(files)} files; language pack (no runtime)"
         return f"{len(files)} files; {len(manifest['skills'])} skill(s); tests/ present"
 
     if record("layout", layout_check) is None:
+        return _finish(frame.digest, checks, errors, engine)
+    if is_pack:
+        # D10: a language pack carries catalogs and docs only, so there is no
+        # runtime, frontend or execution evidence to collect.
         return _finish(frame.digest, checks, errors, engine)
     runtime = manifest["runtime"]
     if runtime == "sandboxed":

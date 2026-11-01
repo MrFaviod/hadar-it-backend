@@ -401,5 +401,12 @@
       "path": "skills/license-guide/SKILL.md",
       "description": "Cómo trabajar con licencias y sus referencias a activos."
     }
-  ]
+  ],
+  "i18n": {
+    "sourceLocale": "es",
+    "catalogs": {
+      "es": "i18n/es.json",
+      "en": "i18n/en.json"
+    }
+  }
 }

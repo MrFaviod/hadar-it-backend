@@ -464,6 +464,31 @@
           }
         }
       }
+    },
+    "i18n": {
+      "description": "Optional translation block: the module owns only its own ext.<id>.* namespace and cannot override another namespace; a language pack is the only way to replace an existing translation.",
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "sourceLocale",
+        "catalogs"
+      ],
+      "properties": {
+        "sourceLocale": {
+          "type": "string",
+          "pattern": "^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$"
+        },
+        "catalogs": {
+          "type": "object",
+          "minProperties": 1,
+          "maxProperties": 32,
+          "additionalProperties": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9][A-Za-z0-9._/-]*\\.json$",
+            "maxLength": 200
+          }
+        }
+      }
     }
   },
   "$defs": {

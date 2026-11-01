@@ -1,0 +1,20 @@
+{
+  "api.auth.authentication_required": "É necessário autenticar-se.",
+  "api.error.conflict": "Conflito com o estado atual.",
+  "api.error.forbidden": "Acesso negado.",
+  "api.error.not_found": "Não encontrado.",
+  "api.i18n.locale_count": "{count} idioma instalado | {count} idiomas instalados",
+  "api.i18n.text_unavailable": "Texto indisponível.",
+  "api.i18n.unknown_doc_topic": "Não há documentação para {topic} em {locale}.",
+  "api.i18n.unknown_locale": "O idioma {locale} não está instalado.",
+  "api.validation.required": "Este campo é obrigatório.",
+  "ext.software-licenses.title": "Licenças",
+  "ext.software-licenses.page.licenses": "Licenças",
+  "ext.software-licenses.page.assignments": "Atribuições",
+  "ext.software-licenses.operation.list": "Ver licenças",
+  "ext.software-licenses.operation.assign": "Atribuir licença",
+  "ext.software-licenses.field.product": "Produto",
+  "ext.software-licenses.field.vendor": "Fornecedor",
+  "ext.software-licenses.field.seats": "Postos",
+  "ext.software-licenses.field.expiresAt": "Vence em"
+}
