@@ -15,6 +15,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from itsm.config import Settings
+from itsm.i18n.labels import LabelError, label_view, validate_label
 from itsm.identity.service import Conflict, IdentityService, NotFound, Principal, ValidationFailed
 from itsm.inventory.catalog_defaults import COMMON_KEYS, FIELD_TYPES
 from itsm.inventory.catalog_models import InventoryCatalogEntry
@@ -99,11 +100,47 @@ class InventoryCatalog:
     """Business-layer authorization and non-destructive metadata configuration."""
 
     def __init__(
-        self, session: Session, settings: Settings, *, identity: IdentityService | None = None
+        self,
+        session: Session,
+        settings: Settings,
+        *,
+        identity: IdentityService | None = None,
+        locale: str | None = None,
     ):
         self.session = session
         self.settings = settings
         self.identity = identity or IdentityService(session, settings)
+        self._locale = locale
+
+    @property
+    def label_locale(self) -> str:
+        """Request locale the stored locale maps are rendered for.
+
+        A caller without a request locale (agent, worker, CLI) gets the
+        installation default instead of a hard-coded tag.
+        """
+        if self._locale is None:
+            from itsm.i18n.settings import read_installation_settings
+
+            self._locale = read_installation_settings(self.session).default_locale
+        return self._locale
+
+    def _label_pair(
+        self, payload: Mapping[str, Any], *, field: str = "label", limit: int = 120
+    ) -> tuple[str, dict[str, str] | None]:
+        try:
+            return validate_label(
+                payload.get("label"), payload.get("labels"), field=field, limit=limit
+            )
+        except LabelError as exc:
+            raise ValidationFailed(str(exc)) from None
+
+    def _rendered(self, payload: Mapping[str, Any]) -> dict[str, Any]:
+        """Stored row -> public view: resolved text plus the full label map."""
+        item = deepcopy(dict(payload))
+        if "label" in item:
+            item.update(label_view(item["label"], item.get("labels"), self.label_locale))
+        return item
 
     def _entry(self, kind: str, key: str) -> InventoryCatalogEntry | None:
         return self.session.get(InventoryCatalogEntry, (kind, key))
@@ -120,7 +157,10 @@ class InventoryCatalog:
 
     def get(self, principal: Principal) -> dict[str, Any]:
         self.identity.authorize(principal, "assets.view", resource="inventory:config")
-        result = {kind: self._items(kind) for kind in ("fields", "categories", "statuses")}
+        result = {
+            kind: [self._rendered(item) for item in self._items(kind)]
+            for kind in ("fields", "categories", "statuses")
+        }
         result["rules"] = {item["id"]: item for item in self._items("rules")}
         result["commonFields"] = list(COMMON_KEYS)
         production = self.settings.environment == "production"
@@ -138,18 +178,17 @@ class InventoryCatalog:
         return result
 
     def category(self, value: str | None) -> dict[str, Any] | None:
-        """Resolve stable keys or existing free-text labels; legacy labels remain valid."""
+        """Resolve stable keys or any locale's label text; ids always win."""
         if not value:
             return None
         key = value.casefold()
-        return next(
-            (
-                item
-                for item in self._items("categories")
-                if item["id"].casefold() == key or item["label"].casefold() == key
-            ),
-            None,
-        )
+        for item in self._items("categories"):
+            if item["id"].casefold() == key:
+                return item
+            texts = {item["label"], *item.get("labels", {}).values()}
+            if any(str(text).casefold() == key for text in texts):
+                return item
+        return None
 
     def validate_status(self, value: str) -> str:
         entry = self._entry("statuses", value)
@@ -234,6 +273,7 @@ class InventoryCatalog:
         allowed = {
             "key",
             "label",
+            "labels",
             "type",
             "active",
             "required",
@@ -249,9 +289,10 @@ class InventoryCatalog:
         kind = payload.get("type", "text")
         if not isinstance(kind, str) or kind not in FIELD_TYPES:
             raise ValidationFailed("unsupported field type")
+        label_text, labels = self._label_pair(payload)
         result = dict(
             key=payload["key"],
-            label=text(payload.get("label"), "label"),
+            label=label_text,
             type=kind,
             active=boolean(payload.get("active", True), "active"),
             required=boolean(payload.get("required", False), "required"),
@@ -263,6 +304,8 @@ class InventoryCatalog:
         if isinstance(length, bool) or not isinstance(length, int) or not 1 <= length <= 500:
             raise ValidationFailed("maxLength must be between 1 and 500")
         result["maxLength"] = length
+        if labels:
+            result["labels"] = labels
         if kind == "select" and not result["options"]:
             raise ValidationFailed("select requires options")
         for bound in ("minimum", "maximum"):
@@ -285,6 +328,7 @@ class InventoryCatalog:
             {
                 "id",
                 "label",
+                "labels",
                 "prefix",
                 "type",
                 "icon",
@@ -299,15 +343,18 @@ class InventoryCatalog:
         prefix = text(payload.get("prefix", "OTRO"), "prefix", 6).upper()
         if not re.fullmatch(r"[A-Z0-9]+", prefix):
             raise ValidationFailed("prefix must contain letters and digits only")
+        label_text, labels = self._label_pair(payload, limit=64)
         result = dict(
             id=payload["id"],
-            label=text(payload.get("label"), "label", 64),
+            label=label_text,
             prefix=prefix,
             type=text(payload.get("type", "Equipo"), "type", 64),
             icon=text(payload.get("icon", "box"), "icon", 32),
             active=boolean(payload.get("active", True), "active"),
             fov=boolean(payload.get("fov", False), "fov"),
         )
+        if labels:
+            result["labels"] = labels
         for group in ("quick", "advanced", "tech"):
             result[group] = keys(payload.get(group, []), group)
         if set(result["quick"]) & set(result["advanced"]):
@@ -320,17 +367,21 @@ class InventoryCatalog:
         return result
 
     def _status(self, payload: dict[str, Any]) -> dict[str, Any]:
-        self._unknown(payload, {"id", "label", "tone", "final", "active"})
+        self._unknown(payload, {"id", "label", "labels", "tone", "final", "active"})
         tone = payload.get("tone", "ok")
         if not isinstance(tone, str) or tone not in {"ok", "hold", "warn", "down"}:
             raise ValidationFailed("unsupported status tone")
-        return dict(
+        label_text, labels = self._label_pair(payload)
+        result = dict(
             id=payload["id"],
-            label=text(payload.get("label"), "label"),
+            label=label_text,
             tone=tone,
             final=boolean(payload.get("final", False), "final"),
             active=boolean(payload.get("active", True), "active"),
         )
+        if labels:
+            result["labels"] = labels
+        return result
 
     def _rule(self, key: str, payload: dict[str, Any], old: dict[str, Any]) -> dict[str, Any]:
         if key == "transitions":
@@ -424,4 +475,4 @@ class InventoryCatalog:
         self.identity.record_operation(
             principal, action="inventory.config_updated", resource=f"inventory:config:{kind}:{key}"
         )
-        return deepcopy(checked)
+        return self._rendered(checked)

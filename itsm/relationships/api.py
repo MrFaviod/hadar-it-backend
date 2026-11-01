@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import AuthContext, IdentityService
 from itsm.relationships.service import (
@@ -19,21 +20,28 @@ from itsm.relationships.service import (
     RelationshipService,
 )
 
+#: Legacy text or an installed-tag map; the service validates the shape (D9).
+LabelValue = Annotated[str, Field(min_length=1, max_length=80)] | dict[str, str]
+
 
 class RelationshipTypeInput(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     key: str = Field(min_length=2, max_length=32)
-    forwardLabel: str = Field(min_length=1, max_length=80)
-    inverseLabel: str = Field(min_length=1, max_length=80)
+    forwardLabel: LabelValue
+    inverseLabel: LabelValue
+    forwardLabels: dict[str, str] | None = None
+    inverseLabels: dict[str, str] | None = None
     containment: bool = False
 
 
 class RelationshipTypePatch(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    forwardLabel: str | None = Field(default=None, min_length=1, max_length=80)
-    inverseLabel: str | None = Field(default=None, min_length=1, max_length=80)
+    forwardLabel: LabelValue | None = None
+    inverseLabel: LabelValue | None = None
+    forwardLabels: dict[str, str] | None = None
+    inverseLabels: dict[str, str] | None = None
     containment: bool | None = None
     active: bool | None = None
 
@@ -86,6 +94,7 @@ def get_relationship_service(request: Request) -> Iterator[RelationshipService]:
             request.app.state.settings,
             identity=identity,
             source="rest",
+            locale=resolve_request_locale(request),
         )
     finally:
         session.close()
@@ -98,6 +107,8 @@ MutationDependency = Annotated[AuthContext, Depends(mutation_guard)]
 _TYPE_ALIASES = {
     "forwardLabel": "forward_label",
     "inverseLabel": "inverse_label",
+    "forwardLabels": "forward_labels",
+    "inverseLabels": "inverse_labels",
 }
 _RELATION_ALIASES = {"typeKey": "type_key", "effectiveAt": "effective_at"}
 
@@ -181,6 +192,8 @@ def create_relationship_router() -> APIRouter:
             payload.key,
             forward_label=payload.forwardLabel,
             inverse_label=payload.inverseLabel,
+            forward_labels=payload.forwardLabels,
+            inverse_labels=payload.inverseLabels,
             containment=payload.containment,
         ).as_payload()
 

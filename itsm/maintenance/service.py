@@ -33,6 +33,7 @@ from sqlalchemy.orm import Session
 from itsm.config import Settings
 from itsm.directory.models import DirectoryPerson
 from itsm.directory.service import DirectoryService
+from itsm.i18n.labels import state_label
 from itsm.identity.clock import utcnow
 from itsm.identity.service import (
     Conflict,
@@ -305,6 +306,7 @@ class MaintenancePlanView:
     responsible_person_id: str | None
     responsible_label: str | None
     status: str
+    status_label: str
     scheduled_on: date
     last_completed_on: date | None
     due_on: date
@@ -327,6 +329,7 @@ class MaintenancePlanView:
             "responsiblePersonId": self.responsible_person_id,
             "responsibleLabel": self.responsible_label,
             "status": self.status,
+            "statusLabel": self.status_label,
             "scheduledOn": _iso_date(self.scheduled_on),
             "lastCompletedOn": _iso_date(self.last_completed_on),
             "dueOn": _iso_date(self.due_on),
@@ -410,12 +413,23 @@ class MaintenanceService:
         identity: IdentityService | None = None,
         inventory: InventoryService | None = None,
         source: str = "internal",
+        locale: str | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._identity = identity or IdentityService(session, settings)
-        self._inventory = inventory or InventoryService(session, settings)
+        self._locale = locale
+        self._inventory = inventory or InventoryService(session, settings, locale=locale)
         self._source = _history_source(source)
+
+    @property
+    def label_locale(self) -> str:
+        """Request locale for fixed state labels; workers get the install default."""
+        if self._locale is None:
+            from itsm.i18n.settings import read_installation_settings
+
+            self._locale = read_installation_settings(self._session).default_locale
+        return self._locale
 
     # ---------------------------------------------------------------- helpers
     def _catalog_categories(self) -> list[dict[str, Any]]:
@@ -600,6 +614,7 @@ class MaintenanceService:
                 else None
             ),
             status=effective.status,
+            status_label=state_label("api.maintenance.status", effective.status, self.label_locale),
             scheduled_on=effective.scheduled_on,
             last_completed_on=effective.last_completed_on,
             due_on=effective.due_on,

@@ -49,6 +49,7 @@ def test_create_read_and_search_return_the_same_asset(
 
     assert created["quickCode"] == "SITE-DEMO-001"
     assert created["status"] == "in_use"
+    assert created["statusLabel"] == "En uso"
     assert created["site"] == "Example Site"
     assert set(created) == {
         "id",
@@ -64,6 +65,7 @@ def test_create_read_and_search_return_the_same_asset(
         "location",
         "responsible",
         "status",
+        "statusLabel",
         "description",
         "cost",
         "technical",

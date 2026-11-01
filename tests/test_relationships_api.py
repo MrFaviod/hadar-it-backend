@@ -27,6 +27,8 @@ RELATIONSHIP_KEYS = {
     "typeKey",
     "forwardLabel",
     "inverseLabel",
+    "forwardLabels",
+    "inverseLabels",
     "containment",
     "typeActive",
     "sourceId",

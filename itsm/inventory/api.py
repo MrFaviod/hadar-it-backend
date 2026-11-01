@@ -10,6 +10,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import AuthContext, IdentityService, ValidationFailed
 from itsm.inventory.media import MAX_IMAGE_BYTES
@@ -129,6 +130,7 @@ class AssetPayload(BaseModel):
     positionX: str | None
     positionY: str | None
     status: str
+    statusLabel: str
     description: str | None
     cost: str | None
     technical: dict[str, Any] | None
@@ -309,7 +311,11 @@ def get_inventory_service(request: Request) -> Iterator[InventoryService]:
         request.state.session = session
         request.state.identity = identity
         yield InventoryService(
-            session, request.app.state.settings, identity=identity, source="rest"
+            session,
+            request.app.state.settings,
+            identity=identity,
+            source="rest",
+            locale=resolve_request_locale(request),
         )
     finally:
         session.close()

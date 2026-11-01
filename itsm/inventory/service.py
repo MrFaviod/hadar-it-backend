@@ -33,6 +33,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from itsm.config import Settings
+from itsm.i18n.labels import state_label
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.permissions import HUMAN_ACTOR_KIND
 from itsm.identity.service import (
@@ -385,6 +386,7 @@ class AssetView:
     position_x: str | None
     position_y: str | None
     status: str
+    status_label: str
     description: str | None
     cost: Decimal | None
     technical: Mapping[str, Any] | None
@@ -416,6 +418,7 @@ class AssetView:
             "positionX": self.position_x,
             "positionY": self.position_y,
             "status": self.status,
+            "statusLabel": self.status_label,
             "description": self.description,
             "cost": _stored_cost(self.cost),
             "technical": None if self.technical is None else dict(self.technical),
@@ -591,12 +594,14 @@ class InventoryService:
         *,
         identity: IdentityService | None = None,
         source: str = DEFAULT_HISTORY_SOURCE,
+        locale: str | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._identity = identity or IdentityService(session, settings)
         self._source = _history_source(source)
-        self._catalog = InventoryCatalog(session, settings, identity=self._identity)
+        self._locale = locale
+        self._catalog = InventoryCatalog(session, settings, identity=self._identity, locale=locale)
         self._pending_sequences: dict[str, int] = {}
         self._reserved_codes: set[str] = set()
 
@@ -663,6 +668,9 @@ class InventoryService:
             position_x=asset.position_x,
             position_y=asset.position_y,
             status=asset.status,
+            status_label=state_label(
+                "api.inventory.lifecycle", asset.status, self._catalog.label_locale
+            ),
             description=asset.description,
             cost=None if asset.cost is None else Decimal(asset.cost),
             technical=asset.technical,

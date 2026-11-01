@@ -26,6 +26,7 @@ from sqlalchemy.orm import Session
 from itsm.attachments.models import Attachment
 from itsm.config import Settings
 from itsm.directory.models import DirectoryPerson
+from itsm.i18n.labels import state_label
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.service import (
     Conflict,
@@ -303,6 +304,8 @@ class InterventionView:
     technician_name: str | None
     occurred_on: date
     status: str
+    type_label: str
+    status_label: str
     notes: str | None
     parts: tuple[Mapping[str, Any], ...]
     labor_cost: str | None
@@ -327,6 +330,8 @@ class InterventionView:
             "technicianName": self.technician_name,
             "occurredOn": _iso(self.occurred_on),
             "status": self.status,
+            "typeLabel": self.type_label,
+            "statusLabel": self.status_label,
             "notes": self.notes,
             "parts": [dict(part) for part in self.parts],
             "laborCost": self.labor_cost,
@@ -375,6 +380,8 @@ class IncidentView:
     description: str
     priority: str
     status: str
+    priority_label: str
+    status_label: str
     primary_asset_id: str
     primary_asset_name: str | None
     primary_asset_quick_code: str | None
@@ -394,6 +401,8 @@ class IncidentView:
             "description": self.description,
             "priority": self.priority,
             "status": self.status,
+            "priorityLabel": self.priority_label,
+            "statusLabel": self.status_label,
             "primaryAssetId": self.primary_asset_id,
             "primaryAssetName": self.primary_asset_name,
             "primaryAssetQuickCode": self.primary_asset_quick_code,
@@ -530,21 +539,35 @@ class InterventionService:
         source: str = "rest",
         plan_validator: Callable[[Principal, str], None] | None = None,
         completion_hook: Callable[[Principal, Intervention], None] | None = None,
+        locale: str | None = None,
     ):
         self._session = session
         self._settings = settings
         self._identity = identity or IdentityService(session, settings)
+        self._locale = locale
         self._inventory = InventoryService(
-            session, settings, identity=self._identity, source=source
+            session, settings, identity=self._identity, source=source, locale=locale
         )
         self._source = source
         from itsm.maintenance.service import MaintenanceService
 
         self._maintenance = MaintenanceService(
-            session, settings, identity=self._identity, source=source
+            session, settings, identity=self._identity, source=source, locale=locale
         )
         self._plan_validator = plan_validator or self._maintenance.get_plan
         self._completion_hook = completion_hook or self._complete_linked_plan
+
+    @property
+    def label_locale(self) -> str:
+        """Request locale for fixed state labels; agents get the installation default."""
+        if self._locale is None:
+            from itsm.i18n.settings import read_installation_settings
+
+            self._locale = read_installation_settings(self._session).default_locale
+        return self._locale
+
+    def _state_label(self, prefix: str, key: str) -> str:
+        return state_label(prefix, key, self.label_locale)
 
     def _complete_linked_plan(self, principal: Principal, row: Intervention) -> None:
         self._maintenance.complete_in_transaction(
@@ -715,6 +738,8 @@ class InterventionService:
             technician_name=technician_name,
             occurred_on=row.occurred_on,
             status=row.status,
+            type_label=self._state_label("api.interventions.type", row.type),
+            status_label=self._state_label("api.interventions.state", row.status),
             notes=row.notes,
             parts=line_parts,
             labor_cost=row.labor_cost,
@@ -771,6 +796,8 @@ class InterventionService:
             description=row.description,
             priority=row.priority,
             status=row.status,
+            priority_label=self._state_label("api.interventions.priority", row.priority),
+            status_label=self._state_label("api.interventions.state", row.status),
             primary_asset_id=row.primary_asset_id,
             primary_asset_name=None if asset is None else asset.name,
             primary_asset_quick_code=None if asset is None else asset.quick_code,

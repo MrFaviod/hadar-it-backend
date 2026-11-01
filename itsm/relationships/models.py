@@ -13,7 +13,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
+from sqlalchemy import JSON, Boolean, DateTime, ForeignKey, Index, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from itsm.identity.clock import utcnow
@@ -29,6 +29,9 @@ class RelationshipType(InventoryBase):
     key: Mapped[str] = mapped_column(String(32), primary_key=True)
     forward_label: Mapped[str] = mapped_column(String(80), nullable=False)
     inverse_label: Mapped[str] = mapped_column(String(80), nullable=False)
+    # Additive S4/D9 maps; the strings above stay the source text for ``es``.
+    forward_labels: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
+    inverse_labels: Mapped[dict[str, str] | None] = mapped_column(JSON, nullable=True)
     containment: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     created_at: Mapped[datetime] = mapped_column(

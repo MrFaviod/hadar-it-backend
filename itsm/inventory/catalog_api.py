@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, Request
 
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import AuthContext
 from itsm.inventory.catalog import InventoryCatalog
@@ -14,7 +15,9 @@ from itsm.inventory.catalog import InventoryCatalog
 
 def catalog_service(request: Request) -> Iterator[InventoryCatalog]:
     with request.app.state.session_factory() as session:
-        yield InventoryCatalog(session, request.app.state.settings)
+        yield InventoryCatalog(
+            session, request.app.state.settings, locale=resolve_request_locale(request)
+        )
 
 
 ServiceDependency = Annotated[InventoryCatalog, Depends(catalog_service)]

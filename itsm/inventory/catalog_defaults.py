@@ -22,6 +22,54 @@ COMMON_KEYS = (
 )
 FIELD_TYPES = frozenset({"text", "textarea", "number", "date", "select", "boolean", "url"})
 
+#: Built-in English captions; the Spanish column is the source text (D3/D9).
+_ENGLISH_FIELDS = {
+    "serial": "Serial number",
+    "cpu": "Processor",
+    "ram": "RAM",
+    "storage": "Storage",
+    "os": "Operating system",
+    "mac": "MAC address",
+    "firmware": "Firmware",
+    "ports": "Ports",
+    "rack": "Rack / unit",
+    "resolution": "Resolution",
+    "fovAngle": "Field of view",
+    "nightVision": "Night vision",
+    "poe": "PoE power",
+    "upsCapacity": "Capacity",
+    "batteryLife": "Runtime",
+    "vmHost": "Host",
+    "vmCpu": "vCPU",
+    "vmRam": "Assigned RAM",
+    "vmDisk": "Virtual disk",
+    "containerImage": "Image",
+    "containerHost": "Container host",
+    "containerPorts": "Published ports",
+}
+_ENGLISH_CATEGORIES = {
+    "computadoras": "Computers",
+    "notebooks": "Laptops",
+    "servidores": "Servers",
+    "virtualizacion": "Virtual machines",
+    "docker": "Docker containers",
+    "lxc": "LXC containers",
+    "contenedores": "Containers",
+    "switches": "Switches",
+    "routers": "Routers",
+    "impresoras": "Printers",
+    "ups": "UPS",
+    "camaras": "Cameras",
+    "monitores": "Monitors",
+    "otros": "Other devices",
+}
+_ENGLISH_STATUSES = {
+    "in_use": "Assigned",
+    "in_storage": "In storage",
+    "maintenance": "Under maintenance",
+    "retired": "Retired",
+}
+
 
 def installation_catalog() -> dict[str, list[dict[str, Any]]]:
     """Return fresh defaults, never accounts or inventory records."""
@@ -53,6 +101,7 @@ def installation_catalog() -> dict[str, list[dict[str, Any]]]:
         dict(
             key=k,
             label=label,
+            labels={"es": label, "en": _ENGLISH_FIELDS[k]},
             type=kind,
             active=True,
             required=False,
@@ -99,6 +148,7 @@ def installation_catalog() -> dict[str, list[dict[str, Any]]]:
         dict(
             id=k,
             label=label,
+            labels={"es": label, "en": _ENGLISH_CATEGORIES[k]},
             prefix=prefix,
             type=kind,
             icon=icon,
@@ -112,7 +162,14 @@ def installation_catalog() -> dict[str, list[dict[str, Any]]]:
         for k, label, prefix, kind, icon, tech in category_specs
     ]
     statuses = [
-        dict(id=k, label=label, tone=tone, final=final, active=True)
+        dict(
+            id=k,
+            label=label,
+            labels={"es": label, "en": _ENGLISH_STATUSES[k]},
+            tone=tone,
+            final=final,
+            active=True,
+        )
         for k, label, tone, final in [
             ("in_use", "Asignado", "ok", False),
             ("in_storage", "En resguardo", "hold", False),

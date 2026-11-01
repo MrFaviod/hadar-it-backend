@@ -25,6 +25,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from itsm.config import Settings
+from itsm.i18n.labels import LabelError, label_view, validate_label
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.service import (
     Conflict,
@@ -66,13 +67,25 @@ def _key(value: Any) -> str:
     return value
 
 
-def _label(value: Any, field: str) -> str:
-    if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
-    normalized = value.strip()
-    if not normalized or len(normalized) > LABEL_MAX:
-        raise ValidationFailed(f"{field} must be 1-{LABEL_MAX} characters")
-    return normalized
+def _label(value: Any, mapping: Any, field: str) -> tuple[str, dict[str, str] | None]:
+    """Accept legacy text or a locale map; ids and keys never change (S4/D9)."""
+    try:
+        return validate_label(value, mapping, field=field, limit=LABEL_MAX)
+    except LabelError as exc:
+        raise ValidationFailed(str(exc)) from None
+
+
+def _patched_label(
+    stored: str, value: Any, mapping: Any, field: str
+) -> tuple[str, dict[str, str] | None]:
+    """Merge a patch into the stored label; text wins for the source locale."""
+    if value is _UNSET and mapping is _UNSET:
+        return stored, None
+    return _label(
+        stored if value is _UNSET else value,
+        None if mapping is _UNSET else mapping,
+        field,
+    )
 
 
 def _direction(value: Any) -> str:
@@ -130,6 +143,8 @@ class RelationshipTypeView:
     key: str
     forward_label: str
     inverse_label: str
+    forward_labels: dict[str, str]
+    inverse_labels: dict[str, str]
     containment: bool
     active: bool
     created_at: datetime
@@ -140,6 +155,8 @@ class RelationshipTypeView:
             "key": self.key,
             "forwardLabel": self.forward_label,
             "inverseLabel": self.inverse_label,
+            "forwardLabels": dict(self.forward_labels),
+            "inverseLabels": dict(self.inverse_labels),
             "containment": self.containment,
             "active": self.active,
             "createdAt": as_utc(self.created_at).isoformat(),
@@ -155,6 +172,8 @@ class RelationshipView:
     type_key: str
     forward_label: str
     inverse_label: str
+    forward_labels: dict[str, str]
+    inverse_labels: dict[str, str]
     containment: bool
     active: bool
     source_id: str
@@ -173,6 +192,8 @@ class RelationshipView:
             "typeKey": self.type_key,
             "forwardLabel": self.forward_label,
             "inverseLabel": self.inverse_label,
+            "forwardLabels": dict(self.forward_labels),
+            "inverseLabels": dict(self.inverse_labels),
             "containment": self.containment,
             "typeActive": self.active,
             "sourceId": self.source_id,
@@ -295,11 +316,13 @@ class RelationshipService:
         identity: IdentityService | None = None,
         inventory: InventoryService | None = None,
         source: str = "internal",
+        locale: str | None = None,
     ) -> None:
         self._session = session
         self._settings = settings
         self._identity = identity or IdentityService(session, settings)
         self._source = _history_source(source)
+        self._locale = locale
         self._inventory = inventory or InventoryService(
             session,
             settings,
@@ -311,11 +334,24 @@ class RelationshipService:
         self._inventory_write_depth = 0
 
     # ------------------------------------------------------------------- views
+    @property
+    def label_locale(self) -> str:
+        """Request locale for label rendering; agents and workers get the default."""
+        if self._locale is None:
+            from itsm.i18n.settings import read_installation_settings
+
+            self._locale = read_installation_settings(self._session).default_locale
+        return self._locale
+
     def _type_view(self, row: RelationshipType) -> RelationshipTypeView:
+        forward = label_view(row.forward_label, row.forward_labels, self.label_locale)
+        inverse = label_view(row.inverse_label, row.inverse_labels, self.label_locale)
         return RelationshipTypeView(
             key=row.key,
-            forward_label=row.forward_label,
-            inverse_label=row.inverse_label,
+            forward_label=forward["label"],
+            inverse_label=inverse["label"],
+            forward_labels=forward["labels"],
+            inverse_labels=inverse["labels"],
             containment=bool(row.containment),
             active=bool(row.active),
             created_at=row.created_at,
@@ -325,12 +361,15 @@ class RelationshipService:
     def _view(
         self, row: Relationship, type_row: RelationshipType, *, direction: str
     ) -> RelationshipView:
-        label = type_row.forward_label if direction == "outgoing" else type_row.inverse_label
+        forward = label_view(type_row.forward_label, type_row.forward_labels, self.label_locale)
+        inverse = label_view(type_row.inverse_label, type_row.inverse_labels, self.label_locale)
         return RelationshipView(
             id=row.id,
             type_key=row.type_key,
-            forward_label=type_row.forward_label,
-            inverse_label=type_row.inverse_label,
+            forward_label=forward["label"],
+            inverse_label=inverse["label"],
+            forward_labels=forward["labels"],
+            inverse_labels=inverse["labels"],
             containment=bool(type_row.containment),
             active=bool(type_row.active),
             source_id=row.source_id,
@@ -341,7 +380,7 @@ class RelationshipService:
             created_at=row.created_at,
             updated_at=row.updated_at,
             direction=direction,
-            label=label,
+            label=forward["label"] if direction == "outgoing" else inverse["label"],
         )
 
     def _type_map(self, rows: Iterable[Relationship]) -> dict[str, RelationshipType]:
@@ -533,6 +572,8 @@ class RelationshipService:
         *,
         forward_label: Any,
         inverse_label: Any,
+        forward_labels: Any = None,
+        inverse_labels: Any = None,
         containment: Any = False,
     ) -> RelationshipTypeView:
         self._identity.authorize(principal, "config.general", resource="inventory:relationships")
@@ -542,10 +583,14 @@ class RelationshipService:
         if self._session.get(RelationshipType, checked_key) is not None:
             raise Conflict("relationship type already exists")
         now = utcnow()
+        forward_text, forward_map = _label(forward_label, forward_labels, "forwardLabel")
+        inverse_text, inverse_map = _label(inverse_label, inverse_labels, "inverseLabel")
         row = RelationshipType(
             key=checked_key,
-            forward_label=_label(forward_label, "forwardLabel"),
-            inverse_label=_label(inverse_label, "inverseLabel"),
+            forward_label=forward_text,
+            inverse_label=inverse_text,
+            forward_labels=forward_map,
+            inverse_labels=inverse_map,
             containment=containment,
             active=True,
             created_at=now,
@@ -568,15 +613,27 @@ class RelationshipService:
         *,
         forward_label: Any = _UNSET,
         inverse_label: Any = _UNSET,
+        forward_labels: Any = _UNSET,
+        inverse_labels: Any = _UNSET,
         containment: Any = _UNSET,
         active: Any = _UNSET,
     ) -> RelationshipTypeView:
         self._identity.authorize(principal, "config.general", resource="inventory:relationships")
         row = self._type(key)
-        if forward_label is not _UNSET:
-            row.forward_label = _label(forward_label, "forwardLabel")
-        if inverse_label is not _UNSET:
-            row.inverse_label = _label(inverse_label, "inverseLabel")
+        if forward_label is not _UNSET or forward_labels is not _UNSET:
+            row.forward_label, row.forward_labels = _patched_label(
+                row.forward_label,
+                forward_label,
+                forward_labels,
+                "forwardLabel",
+            )
+        if inverse_label is not _UNSET or inverse_labels is not _UNSET:
+            row.inverse_label, row.inverse_labels = _patched_label(
+                row.inverse_label,
+                inverse_label,
+                inverse_labels,
+                "inverseLabel",
+            )
         if containment is not _UNSET:
             if not isinstance(containment, bool):
                 raise ValidationFailed("containment must be a boolean")
