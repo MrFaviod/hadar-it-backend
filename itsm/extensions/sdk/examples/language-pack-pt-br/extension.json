@@ -1,0 +1,33 @@
+{
+  "sdkVersion": 2,
+  "kind": "language-pack",
+  "id": "pt-br",
+  "name": "Português (Brasil)",
+  "version": "1.0.0",
+  "locales": [
+    {
+      "tag": "pt-BR",
+      "name": "Portuguese (Brazil)",
+      "nativeName": "Português (Brasil)"
+    }
+  ],
+  "compatibility": {
+    "core": "^0.1.0",
+    "extensions": {
+      "software-licenses": "^1.0.0"
+    }
+  },
+  "catalogs": {
+    "pt-BR": "i18n/pt-BR.json"
+  },
+  "overrides": [],
+  "priority": 10,
+  "docs": {
+    "pt-BR": {
+      "licenses": "i18n/docs/pt-BR/licenses.md"
+    }
+  },
+  "review": {
+    "status": "draft"
+  }
+}

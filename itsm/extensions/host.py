@@ -35,6 +35,7 @@ from sqlalchemy import delete, select, update
 from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session, sessionmaker
 
+from itsm import __version__
 from itsm.config import Settings
 from itsm.events.feed import EntityEventFeed, UnknownConsumer
 from itsm.events.references import resolve_entities
@@ -108,6 +109,10 @@ from itsm.extensions.models import (
 )
 from itsm.extensions.runtime import sqlite_store
 from itsm.extensions.sdk import contract as sdk_contract
+from itsm.i18n import packs as i18n_packs
+from itsm.i18n import registry as i18n_registry
+from itsm.i18n.catalog import load_catalog as load_i18n_catalog
+from itsm.i18n.registry import LocaleName, ProviderPayload
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.models import Identity, IdentityRolePolicy
 from itsm.identity.permissions import (
@@ -576,8 +581,10 @@ class ExtensionHostService:
             raise ExtensionNotFound("extension has no installed version")
         manifest = json.loads(version_row.manifest_json)
         runtime = manifest.get("runtime", "sandboxed")
+        frontend = manifest.get("frontend") or {}
         return {
             "id": module.id,
+            "kind": manifest.get("kind", "extension"),
             "manifest": manifest,
             "digest": version_row.digest,
             "enabled": module.enabled,
@@ -589,10 +596,10 @@ class ExtensionHostService:
             "sandboxed": runtime == "sandboxed",
             "frontendUrl": (
                 self._frontend_url(module.id, version_row.digest)
-                if module.enabled and manifest["frontend"].get("entry")
+                if module.enabled and frontend.get("entry")
                 else None
             ),
-            "operations": manifest["operations"],
+            "operations": manifest.get("operations") or [],
         }
 
     def _event_payload(self, event: Any) -> dict[str, Any]:
@@ -620,6 +627,8 @@ class ExtensionHostService:
         candidate: ExtensionCandidate,
     ) -> dict[str, Any]:
         manifest = json.loads(candidate.manifest_json)
+        if manifest.get("kind") == "language-pack":
+            return self._language_pack_candidate_detail(session, candidate, manifest)
         module = storage.get_module(session, candidate.extension_id)
         current_version_row = (
             storage.get_active_version(session, module) if module is not None else None
@@ -729,7 +738,9 @@ class ExtensionHostService:
                     continue
                 manifest = json.loads(version_row.manifest_json)
                 operations = [
-                    item for item in manifest["operations"] if item["permission"] in permissions
+                    item
+                    for item in manifest.get("operations") or []
+                    if item["permission"] in permissions
                 ]
                 if not superadmin and (not module.enabled or not operations):
                     continue
@@ -753,7 +764,11 @@ class ExtensionHostService:
                 raise ExtensionNotFound("extension has no installed version")
             manifest = json.loads(version_row.manifest_json)
             permissions = self._effective_permissions(session, principal)
-            return [item for item in manifest["operations"] if item["permission"] in permissions]
+            return [
+                item
+                for item in manifest.get("operations") or []
+                if item["permission"] in permissions
+            ]
 
     def frontend_script(self, principal: Principal, extension_id: str, *, digest: str) -> bytes:
         with self._session_factory() as session:
@@ -1509,7 +1524,7 @@ class ExtensionHostService:
             digest=package.digest,
             manifest_json=json.dumps(manifest, sort_keys=True, separators=(",", ":")),
             package_bytes=package.package_bytes,
-            schema_version=manifest["schemaVersion"],
+            schema_version=int(manifest.get("schemaVersion") or 0),
             state="pending",
             revision=1,
             submitted_by=principal.actor_id,
@@ -1778,11 +1793,22 @@ class ExtensionHostService:
                 raise ExtensionConflict("candidate is not pending")
             if not hmac.compare_digest(digest.lower(), candidate.digest):
                 raise ExtensionDigestMismatch("candidate digest does not match")
-            if candidate.validation_report_json is None:
-                raise ExtensionValidationFailed("candidate has no trusted validation report")
-            report = json.loads(candidate.validation_report_json)
-            if report.get("status") != "passed" or candidate.validation_digest != candidate.digest:
-                raise ExtensionValidationFailed("candidate validation did not pass")
+            raw_manifest = json.loads(candidate.manifest_json)
+            is_language_pack = (
+                isinstance(raw_manifest, Mapping) and raw_manifest.get("kind") == "language-pack"
+            )
+            if not is_language_pack:
+                # A language pack carries no code, so there is nothing for the
+                # fixed validator container to execute; catalogs are validated
+                # by the pack contract instead.
+                if candidate.validation_report_json is None:
+                    raise ExtensionValidationFailed("candidate has no trusted validation report")
+                report = json.loads(candidate.validation_report_json)
+                if (
+                    report.get("status") != "passed"
+                    or candidate.validation_digest != candidate.digest
+                ):
+                    raise ExtensionValidationFailed("candidate validation did not pass")
             module = storage.get_module(session, candidate.extension_id)
             current_revision = module.revision if module is not None else None
             current_version = module.active_version if module is not None else None
@@ -1793,7 +1819,7 @@ class ExtensionHostService:
             if candidate.base_version != current_version:
                 raise ExtensionStale("candidate baseline version is stale")
             manifest = package_contract.validate_manifest_dict(
-                json.loads(candidate.manifest_json),
+                raw_manifest,
                 known_core_permissions=PERMISSION_CODES,
             )
             if (
@@ -1803,6 +1829,16 @@ class ExtensionHostService:
                 <= package_contract.version_key(module.active_version)
             ):
                 raise ExtensionConflict("candidate version is not newer than installed")
+            if is_language_pack:
+                return self._approve_language_pack(
+                    session,
+                    principal,
+                    candidate,
+                    manifest,
+                    module=module,
+                    current_revision=current_revision,
+                    current_version=current_version,
+                )
             from_schema = module.data_schema_version if module is not None else 0
             to_schema = manifest["schemaVersion"]
             plan = package_contract.migration_plan(manifest, from_schema, to_schema)
@@ -1971,6 +2007,7 @@ class ExtensionHostService:
                 owner_id=principal.actor_id,
                 now=now,
             )
+            self._write_extension_i18n(session, candidate, manifest)
             storage.record_event(
                 session,
                 extension_id=candidate.extension_id,
@@ -2009,6 +2046,366 @@ class ExtensionHostService:
         except IntegrityError:
             session.rollback()
             raise ExtensionConflict("candidate installation conflicted with stored state") from None
+        except SQLAlchemyError:
+            session.rollback()
+            raise
+        finally:
+            session.close()
+
+    # ------------------------------------------------------- i18n packs (D10)
+    def _language_pack_candidate_detail(
+        self,
+        session: Session,
+        candidate: ExtensionCandidate,
+        manifest: Mapping[str, Any],
+    ) -> dict[str, Any]:
+        """One candidate view for a language pack: no permissions, no migrations."""
+        module = storage.get_module(session, candidate.extension_id)
+        report = (
+            json.loads(candidate.validation_report_json)
+            if candidate.validation_report_json
+            else None
+        )
+        return {
+            "id": candidate.id,
+            "extensionId": candidate.extension_id,
+            "manifest": manifest,
+            "version": candidate.version,
+            "digest": candidate.digest,
+            "state": candidate.state,
+            "revision": candidate.revision,
+            "submittedBy": candidate.submitted_by,
+            "submittedAt": _iso(candidate.submitted_at),
+            "validatedAt": _iso(candidate.validated_at),
+            "approvedAt": _iso(candidate.approved_at),
+            "baseVersion": candidate.base_version,
+            "baseRevision": candidate.base_revision,
+            "currentVersion": module.active_version if module is not None else None,
+            "currentRevision": module.revision if module is not None else None,
+            "validationStatus": None if report is None else report.get("status"),
+            "validation": report,
+            "reviewStatus": (manifest.get("review") or {}).get("status"),
+            "permissionDelta": {
+                "added": [],
+                "removed": [],
+                "core": [],
+                "grantedTo": "none",
+                "note": "A language pack declares no permissions and grants none.",
+            },
+            "migrationPlan": {
+                "from": 0,
+                "to": 0,
+                "required": False,
+                "compatible": True,
+                "steps": [],
+            },
+            "trust": {
+                "model": "declarative-catalogs",
+                "sandboxed": False,
+                "runtime": None,
+                "statement": (
+                    "A language pack carries catalogs and localized docs only. The host "
+                    "never executes code from it and stores it through the versioned "
+                    "catalog registry; a draft pack stays inactive until reviewed."
+                ),
+            },
+            "rollbackCompatible": False,
+            "history": self._history(session, candidate.extension_id),
+        }
+
+    def _installed_extension_versions(self, session: Session) -> dict[str, str]:
+        """Installed code modules (packs excluded) and their active versions."""
+        versions: dict[str, str] = {}
+        for module in session.scalars(select(ExtensionModule)):
+            version_row = storage.get_active_version(session, module)
+            if version_row is None:
+                continue
+            manifest = json.loads(version_row.manifest_json)
+            if manifest.get("kind") == "language-pack":
+                continue
+            versions[module.id] = version_row.version
+        return versions
+
+    def _i18n_sources(self, session: Session) -> dict[str, dict[str, str]]:
+        """Source-locale catalogs a pack's translations are checked against."""
+        sources: dict[str, dict[str, str]] = {"core": dict(load_i18n_catalog("es") or {})}
+        for module in session.scalars(select(ExtensionModule)):
+            version_row = storage.get_active_version(session, module)
+            if version_row is None:
+                continue
+            manifest = json.loads(version_row.manifest_json)
+            block = manifest.get("i18n")
+            if manifest.get("kind") == "language-pack" or not block:
+                continue
+            try:
+                catalogs, _docs = package_contract.package_i18n(manifest, version_row.package_bytes)
+            except package_contract.PackageError:
+                continue
+            source_locale = str(block.get("sourceLocale") or "")
+            if source_locale in catalogs:
+                sources[module.id] = catalogs[source_locale]
+        return sources
+
+    def _write_extension_i18n(
+        self, session: Session, candidate: ExtensionCandidate, manifest: Mapping[str, Any]
+    ) -> None:
+        """Register or remove a module's own ``ext.<id>.*`` catalogs on install."""
+        if not manifest.get("i18n"):
+            # An upgrade that drops the block stops contributing translations.
+            i18n_registry.delete_provider(session, candidate.extension_id)
+            return
+        catalogs, _docs = package_contract.package_i18n(manifest, candidate.package_bytes)
+        i18n_registry.write_provider(
+            session,
+            ProviderPayload(
+                provider_id=candidate.extension_id,
+                kind=i18n_registry.EXTENSION,
+                version=candidate.version,
+                catalogs=catalogs,
+            ),
+        )
+
+    def _approve_language_pack(
+        self,
+        session: Session,
+        principal: Principal,
+        candidate: ExtensionCandidate,
+        manifest: Mapping[str, Any],
+        *,
+        module: ExtensionModule | None,
+        current_revision: int | None,
+        current_version: str | None,
+    ) -> dict[str, Any]:
+        """Install or update one language pack through the versioned registry."""
+        catalogs, docs = package_contract.package_i18n(manifest, candidate.package_bytes)
+        problems = i18n_packs.compatibility_errors(
+            manifest,
+            core_version=__version__,
+            extension_versions=self._installed_extension_versions(session),
+        )
+        if not problems:
+            problems = i18n_packs.validate_language_pack(
+                manifest,
+                catalogs,
+                sources=self._i18n_sources(session),
+                owner_catalogs=i18n_registry.owner_catalogs(session),
+            )
+        if problems:
+            raise ExtensionValidationFailed(
+                "language pack rejected: " + "; ".join(problems[:6]),
+                errors=problems,
+            )
+        now = self._now()
+        previous_digest = self._current_digest(session, candidate.extension_id)
+        candidate_revision = candidate.revision
+        claimed = session.execute(
+            update(ExtensionCandidate)
+            .where(
+                ExtensionCandidate.id == candidate.id,
+                ExtensionCandidate.state == "pending",
+                ExtensionCandidate.revision == candidate_revision,
+            )
+            .values(
+                state="installing",
+                revision=candidate_revision + 1,
+                approved_by=principal.actor_id,
+                approved_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if claimed.rowcount != 1:
+            raise ExtensionStale("candidate changed before approval")
+        description = str(manifest.get("description") or "Language pack")
+        if module is None:
+            module = ExtensionModule(
+                id=candidate.extension_id,
+                name=str(manifest["name"]),
+                description=description,
+                enabled=True,
+                active_version=candidate.version,
+                data_schema_version=0,
+                revision=1,
+                created_at=now,
+                updated_at=now,
+            )
+            session.add(module)
+            session.flush()
+            installed_revision = 1
+        else:
+            installed_revision = int(current_revision or 0) + 1
+            claimed_module = session.execute(
+                update(ExtensionModule)
+                .where(
+                    ExtensionModule.id == module.id,
+                    ExtensionModule.revision == current_revision,
+                )
+                .values(revision=installed_revision, updated_at=now)
+                .execution_options(synchronize_session=False)
+            )
+            if claimed_module.rowcount != 1:
+                raise ExtensionStale("installed version changed before approval")
+        review_status = str((manifest.get("review") or {}).get("status"))
+        locales = tuple(
+            LocaleName(
+                tag=str(item["tag"]),
+                name=str(item["name"]),
+                native_name=str(item["nativeName"]),
+            )
+            for item in manifest.get("locales") or []
+        )
+        i18n_registry.write_provider(
+            session,
+            ProviderPayload(
+                provider_id=candidate.extension_id,
+                kind=i18n_registry.LANGUAGE_PACK,
+                version=candidate.version,
+                priority=int(manifest.get("priority") or 0),
+                review_status=review_status,
+                locales=locales,
+                catalogs=catalogs,
+                overrides=tuple(str(key) for key in manifest.get("overrides") or ()),
+                docs=docs,
+            ),
+        )
+        version_row = ExtensionVersion(
+            extension_id=candidate.extension_id,
+            version=candidate.version,
+            digest=candidate.digest,
+            manifest_json=candidate.manifest_json,
+            package_bytes=candidate.package_bytes,
+            schema_version=0,
+            installed_by=principal.actor_id,
+            installed_at=now,
+        )
+        session.add(version_row)
+        session.flush()
+        updated = session.execute(
+            update(ExtensionModule)
+            .where(
+                ExtensionModule.id == module.id,
+                ExtensionModule.revision == installed_revision,
+            )
+            .values(
+                name=str(manifest["name"]),
+                description=description,
+                active_version=candidate.version,
+                data_schema_version=0,
+                updated_at=now,
+            )
+            .execution_options(synchronize_session=False)
+        )
+        if updated.rowcount != 1:
+            raise ExtensionStale("installed version changed before approval")
+        installed = session.execute(
+            update(ExtensionCandidate)
+            .where(
+                ExtensionCandidate.id == candidate.id,
+                ExtensionCandidate.state == "installing",
+            )
+            .values(state="installed", revision=candidate_revision + 2)
+            .execution_options(synchronize_session=False)
+        )
+        if installed.rowcount != 1:
+            raise ExtensionStale("candidate changed during approval")
+        storage.record_event(
+            session,
+            extension_id=candidate.extension_id,
+            action="extension.installed",
+            actor_id=principal.actor_id,
+            detail={
+                "kind": "language-pack",
+                "version": candidate.version,
+                "digest": candidate.digest,
+                "fromVersion": current_version,
+                "fromDigest": previous_digest,
+                "reviewStatus": review_status,
+                "locales": [locale.tag for locale in locales],
+                "priority": int(manifest.get("priority") or 0),
+                "revision": installed_revision,
+            },
+        )
+        IdentityService(session, self._settings).record_operation(
+            principal,
+            action="extensions.installed",
+            resource=f"extension:{candidate.extension_id}",
+            commit=False,
+        )
+        session.commit()
+        self._drop_cache(candidate.extension_id)
+        session.expire_all()
+        refreshed = session.get(ExtensionCandidate, candidate.id)
+        return self._candidate_detail(session, refreshed) if refreshed else {}
+
+    def review_language_pack(
+        self,
+        principal: Principal,
+        extension_id: str,
+        *,
+        status: str,
+        expected_version: int,
+    ) -> dict[str, Any]:
+        """Publish or withdraw an installed pack's translations (D10 review)."""
+        self.authorize_fresh(
+            principal, "system.modules", resource=f"extension:{extension_id}:review"
+        )
+        if status not in i18n_registry.REVIEW_STATUSES:
+            raise ExtensionValidationFailed("review status must be draft or reviewed")
+        if (
+            isinstance(expected_version, bool)
+            or not isinstance(expected_version, int)
+            or expected_version < 0
+        ):
+            raise ExtensionValidationFailed("expectedVersion must be a non-negative integer")
+        session = self._session_factory()
+        try:
+            self._require_human_superadmin(session, principal)
+            module = storage.get_module(session, extension_id)
+            if module is None:
+                raise ExtensionNotFound("extension not found")
+            version_row = storage.get_active_version(session, module)
+            if version_row is None:
+                raise ExtensionNotFound("extension has no installed version")
+            manifest = json.loads(version_row.manifest_json)
+            if manifest.get("kind") != "language-pack":
+                raise ExtensionValidationFailed("only a language pack carries a review status")
+            if module.revision != expected_version:
+                raise ExtensionStale("installed revision changed")
+            if not i18n_registry.set_review_status(session, extension_id, status):
+                raise ExtensionNotFound("language pack is not installed")
+            result = session.execute(
+                update(ExtensionModule)
+                .where(
+                    ExtensionModule.id == module.id,
+                    ExtensionModule.revision == module.revision,
+                )
+                .values(revision=module.revision + 1, updated_at=self._now())
+                .execution_options(synchronize_session=False)
+            )
+            if result.rowcount != 1:
+                raise ExtensionStale("installed revision changed")
+            storage.record_event(
+                session,
+                extension_id=extension_id,
+                action="extension.i18n.reviewed",
+                actor_id=principal.actor_id,
+                detail={"version": version_row.version, "status": status},
+            )
+            IdentityService(session, self._settings).record_operation(
+                principal,
+                action="extensions.i18n.reviewed",
+                resource=f"extension:{extension_id}",
+                commit=False,
+            )
+            session.commit()
+            return {
+                "id": extension_id,
+                "reviewStatus": status,
+                "revision": module.revision + 1,
+                "version": version_row.version,
+            }
+        except PermissionDenied, ExtensionHostError:
+            session.rollback()
+            raise
         except SQLAlchemyError:
             session.rollback()
             raise
@@ -2725,6 +3122,7 @@ class ExtensionHostService:
                     )
                 )
             session.delete(module)
+            i18n_removed = i18n_registry.delete_provider(session, extension_id)
             storage.record_event(
                 session,
                 extension_id=extension_id,
@@ -2735,6 +3133,7 @@ class ExtensionHostService:
                     "digest": version_row.digest if version_row is not None else None,
                     "dataRetained": True,
                     "dataPath": str(self.module_dir(extension_id)),
+                    "i18nProviderRemoved": i18n_removed,
                 },
             )
             IdentityService(session, self._settings).record_operation(

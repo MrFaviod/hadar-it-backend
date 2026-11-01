@@ -40,6 +40,8 @@ only allowed for an isolated iframe component declared as
 - `references/frontend.md` documents declarative views and the isolated bridge.
 - `references/collections.md`, `references/migrations.md` and
   `references/security.md` cover durable data, snapshots and the isolation model.
+- `references/i18n.md` covers the optional `i18n` block, the language-pack kind,
+  namespaces and review.
 
 Use `extension_sdk_index` and `extension_sdk_reference` through the shared agent
 tool dispatcher, or read the packaged files directly.

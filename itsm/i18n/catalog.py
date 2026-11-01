@@ -27,13 +27,30 @@ def installed_locales() -> tuple[str, ...]:
 
 
 def resolve_installed_locale(tag: str | None) -> str | None:
-    """Return the installed tag for ``tag`` or ``None`` when it is unknown."""
+    """Return the installed tag for ``tag`` or ``None`` when it is unknown.
+
+    A reviewed language pack makes its locale installed for every caller, so the
+    registry snapshot is consulted first; the core catalogs remain the answer
+    when no registry is configured (CLI, migrations, unit imports).
+    """
     if not tag:
         return None
     normalized = str(tag).strip().replace("_", "-").lower()
     if not normalized:
         return None
-    parts = normalized.split("-")
+    from itsm.i18n import registry
+
+    snapshot = registry.current_snapshot()
+    if snapshot is not None:
+        resolved = snapshot.resolve(normalized)
+        if resolved is not None:
+            return resolved
+    return _core_installed_locale(normalized)
+
+
+def _core_installed_locale(tag: str) -> str | None:
+    """Resolve against the core catalogs only; never consults the registry."""
+    parts = tag.split("-")
     while parts:
         candidate = "-".join(parts)
         if candidate in CORE_LOCALES:
@@ -45,7 +62,7 @@ def resolve_installed_locale(tag: str | None) -> str | None:
 @cache
 def load_catalog(locale: str) -> dict[str, str] | None:
     """Load one installed catalog, or ``None`` when no file backs that locale."""
-    installed = resolve_installed_locale(locale)
+    installed = _core_installed_locale(str(locale).strip().replace("_", "-").lower())
     if installed is None:
         return None
     path = CATALOG_DIR / f"{installed}.json"

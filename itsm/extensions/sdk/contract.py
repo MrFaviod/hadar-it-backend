@@ -32,6 +32,10 @@ COMPONENT_PATTERN = re.compile(r"^[A-Z][A-Za-z0-9]{1,63}$")
 PERMISSION_SUFFIX_PATTERN = re.compile(r"^[a-z][a-z0-9_]{1,63}$")
 VERSION_PATTERN = re.compile(r"^[0-9]+\.[0-9]+\.[0-9]+$")
 SKILL_PATH_PATTERN = re.compile(r"^skills/([a-z][a-z0-9]*(?:-[a-z0-9]+)*)/SKILL\.md$")
+LOCALE_PATTERN = re.compile(r"^[A-Za-z]{2,8}(?:-[A-Za-z0-9]{1,8})*$")
+I18N_CATALOG_PATTERN = re.compile(
+    r"^i18n/(?:[A-Za-z0-9][A-Za-z0-9._-]*/)*[A-Za-z0-9][A-Za-z0-9._-]*\.json$"
+)
 
 RUNTIMES = ("declarative", "sandboxed")
 CAPABILITIES = ("assets.read", "assets.write", "incidents.read", "incidents.write", "notify")
@@ -438,10 +442,42 @@ def _declaration_asset_field_errors(
     return errors
 
 
+def _i18n_errors(manifest: Mapping[str, Any]) -> list[str]:
+    """The namespace rules the SDK can check from the manifest alone.
+
+    Catalog *contents* are checked by the host admission path (which also knows
+    the installed owner catalogs); here the SDK only proves that a module can
+    address its own namespace under ``i18n/`` and that it cannot ask to replace
+    somebody else's text.  This module never imports the host i18n package: the
+    validator image ships ``itsm/extensions/sdk`` alone.
+    """
+    errors: list[str] = []
+    block = manifest.get("i18n")
+    if block is None:
+        return errors
+    if not isinstance(block, Mapping):
+        return ["i18n must be an object"]
+    if "overrides" in block:
+        errors.append("i18n.overrides is not allowed; use a language pack to replace keys")
+    catalogs = block.get("catalogs")
+    if not isinstance(catalogs, Mapping) or not catalogs:
+        errors.append("i18n.catalogs must map a locale to an i18n/*.json path")
+        catalogs = {}
+    for locale, path in catalogs.items():
+        if not isinstance(locale, str) or not LOCALE_PATTERN.fullmatch(locale):
+            errors.append(f"i18n.catalogs has an invalid locale: {locale}")
+        if not isinstance(path, str) or not I18N_CATALOG_PATTERN.fullmatch(path) or "../" in path:
+            errors.append(f"i18n.catalogs path must be a relative i18n/*.json path: {path}")
+    source = block.get("sourceLocale")
+    if not isinstance(source, str) or source not in catalogs:
+        errors.append("i18n.sourceLocale must be one of the declared catalogs")
+    return errors
+
+
 def _semantic_errors(
     manifest: Mapping[str, Any], known_core_permissions: Collection[str]
 ) -> list[str]:
-    errors: list[str] = []
+    errors: list[str] = _i18n_errors(manifest)
     try:
         extension_id = manifest["id"]
         prefix = permission_prefix(extension_id)

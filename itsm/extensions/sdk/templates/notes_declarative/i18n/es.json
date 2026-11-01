@@ -1,0 +1,9 @@
+{
+  "ext.{{EXT_ID}}.title": "Notas",
+  "ext.{{EXT_ID}}.page.notes": "Notas",
+  "ext.{{EXT_ID}}.empty": "Todavía no hay notas.",
+  "ext.{{EXT_ID}}.field.title": "Título",
+  "ext.{{EXT_ID}}.field.status": "Estado",
+  "ext.{{EXT_ID}}.operation.list": "Consultar notas",
+  "ext.{{EXT_ID}}.operation.manage": "Gestionar notas"
+}

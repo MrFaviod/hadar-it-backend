@@ -5,6 +5,13 @@
   "name": "{{EXT_NAME}}",
   "description": "{{EXT_DESCRIPTION}}",
   "version": "{{EXT_VERSION}}",
+  "i18n": {
+    "sourceLocale": "es",
+    "catalogs": {
+      "es": "i18n/es.json",
+      "en": "i18n/en.json"
+    }
+  },
   "storage": {"engine": "sqlite"},
   "capabilities": [],
   "permissions": [

@@ -18,7 +18,7 @@ import re
 import stat
 import sys
 import zipfile
-from collections.abc import Collection, Mapping
+from collections.abc import Collection, Mapping, Sequence
 from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
@@ -199,7 +199,19 @@ def validate_manifest_dict(
     *,
     known_core_permissions: Collection[str] = PERMISSION_CODES,
 ) -> dict[str, Any]:
-    """Validate with the single T3-owned schema/semantic contract."""
+    """Validate with the single T3-owned schema/semantic contract.
+
+    A language pack (D10) is a different package kind: it declares catalogs and
+    compatibility instead of runtime, permissions or operations, so it is
+    validated by the i18n pack contract and never by the extension schema.
+    """
+    if isinstance(data, Mapping) and data.get("kind") == "language-pack":
+        from itsm.i18n import packs
+
+        problems = packs.pack_manifest_errors(data)
+        if problems:
+            raise ManifestValidationError(problems)
+        return dict(data)
     try:
         from itsm.extensions.sdk.contract import ManifestError, validate_manifest
     except ImportError as exc:  # pragma: no cover - packaging defect, not user input
@@ -211,6 +223,57 @@ def validate_manifest_dict(
     if not isinstance(manifest, dict):
         raise PackageError("the canonical extension contract returned an invalid manifest")
     return manifest
+
+
+def _inspect_language_pack(
+    *,
+    digest: str,
+    data: bytes,
+    manifest: Mapping[str, Any],
+    members: Mapping[str, bytes],
+    text_members: Mapping[str, str],
+    names: Sequence[str],
+) -> PackageContents:
+    """Admit a language pack: catalogs and docs only, never executable code."""
+    from itsm.i18n import packs
+
+    for forbidden in ("backend.py", "frontend.js", "extension.py"):
+        if forbidden in members:
+            raise PackageError(
+                f"a language pack carries no runtime code; remove {forbidden} from the package"
+            )
+    problems = packs.validate_i18n_files(manifest, text_members)
+    if problems:
+        raise ManifestValidationError(problems)
+    return PackageContents(
+        digest=digest,
+        package_bytes=data,
+        manifest=manifest,
+        backend_source="",
+        frontend_bytes=b"",
+        frontend_source="",
+        skill_sources={},
+        test_files=tuple(name for name in names if name.startswith("tests/")),
+        file_names=tuple(names),
+    )
+
+
+def package_i18n(
+    manifest: Mapping[str, Any], package_bytes: bytes
+) -> tuple[dict[str, dict[str, str]], dict[str, dict[str, str]]]:
+    """Parse the declared catalogs and docs out of an installed package."""
+    from itsm.i18n import packs
+
+    files: dict[str, str] = {}
+    try:
+        with zipfile.ZipFile(io.BytesIO(package_bytes)) as archive:
+            for info in archive.infolist():
+                if info.is_dir():
+                    continue
+                files[info.filename] = _decode(info.filename, archive.read(info))
+    except zipfile.BadZipFile:
+        raise PackageError("installed package is not a valid ZIP archive") from None
+    return packs.read_i18n_content(manifest, files)
 
 
 def validate_arguments(parameters: Mapping[str, Any], arguments: Mapping[str, Any]) -> None:
@@ -489,6 +552,22 @@ def inspect_package(
     except json.JSONDecodeError as exc:
         raise PackageError(f"extension.json is not valid JSON: {exc.msg}") from None
     manifest = validate_manifest_dict(raw_manifest, known_core_permissions=known_core_permissions)
+    text_members = {name: _decode(name, value) for name, value in members.items()}
+    if manifest.get("kind") == "language-pack":
+        return _inspect_language_pack(
+            digest=digest,
+            data=data,
+            manifest=manifest,
+            members=members,
+            text_members=text_members,
+            names=names,
+        )
+    if manifest.get("i18n"):
+        from itsm.i18n import packs
+
+        problems = packs.validate_i18n_files(manifest, text_members)
+        if problems:
+            raise ManifestValidationError(problems)
 
     skill_paths = _declared_skills(manifest)
     for path in skill_paths:
