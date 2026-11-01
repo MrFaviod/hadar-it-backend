@@ -59,7 +59,11 @@ def is_camera_category(category: str | None) -> bool:
 def validate_role(role: Any) -> str:
     """Accept only the two documented image roles."""
     if role not in MEDIA_ROLES:
-        raise ValidationFailed("image role must be one of: " + ", ".join(MEDIA_ROLES))
+        raise ValidationFailed(
+            "image role must be one of: " + ", ".join(MEDIA_ROLES),
+            key="api.inventory.image_role_allowed",
+            params={"allowed": ", ".join(MEDIA_ROLES)},
+        )
     return role
 
 
@@ -67,15 +71,25 @@ def validate_image(*, role: Any, category: str | None, data: Any) -> ImageUpload
     """Validate one upload; every rejection happens before any write."""
     checked_role = validate_role(role)
     if not isinstance(data, bytes | bytearray | memoryview):
-        raise ValidationFailed("image must be binary data")
+        raise ValidationFailed("image must be binary data", key="api.inventory.image_binary")
     payload = bytes(data)
     if not payload:
-        raise ValidationFailed("image is empty")
+        raise ValidationFailed("image is empty", key="api.inventory.image_empty")
     if len(payload) > MAX_IMAGE_BYTES:
-        raise ValidationFailed(f"image must be at most {MAX_IMAGE_BYTES // 1024} KiB")
+        raise ValidationFailed(
+            f"image must be at most {MAX_IMAGE_BYTES // 1024} KiB",
+            key="api.inventory.image_too_large",
+            params={"limit": MAX_IMAGE_BYTES // 1024},
+        )
     content_type = detect_image_type(payload)
     if content_type is None:
-        raise ValidationFailed("image must be a PNG, JPEG, WebP or GIF file")
+        raise ValidationFailed(
+            "image must be a PNG, JPEG, WebP or GIF file",
+            key="api.inventory.image_type_allowed",
+        )
     if checked_role == FOV_ROLE and not is_camera_category(category):
-        raise ValidationFailed("fov image requires a camera category")
+        raise ValidationFailed(
+            "fov image requires a camera category",
+            key="api.inventory.fov_camera_category",
+        )
     return ImageUpload(content_type=content_type, data=payload, size=len(payload))

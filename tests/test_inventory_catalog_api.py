@@ -5,6 +5,7 @@ from __future__ import annotations
 from copy import deepcopy
 
 import pytest
+from itsm.i18n import t
 from tests.inventory_support import READER, prepare, sign_in_as
 
 
@@ -114,15 +115,30 @@ def test_invalid_configuration_is_atomic(signed_in_client, resource, key, payloa
 
 
 @pytest.mark.parametrize(
-    "resource,key,payload,message",
+    "resource,key,payload,error_key",
     [
-        ("statuses", "probe", {"label": "Probe", "tone": ["ok"]}, "unsupported status tone"),
-        ("rules", "identification", {"separator": ["-"]}, "unsupported quick code separator"),
-        ("rules", "identification", {"order": {"a": 1}}, "unsupported code component order"),
+        (
+            "statuses",
+            "probe",
+            {"label": "Probe", "tone": ["ok"]},
+            "api.inventory.status_tone_allowed",
+        ),
+        (
+            "rules",
+            "identification",
+            {"separator": ["-"]},
+            "api.inventory.code_separator_allowed",
+        ),
+        (
+            "rules",
+            "identification",
+            {"order": {"a": 1}},
+            "api.inventory.code_component_order_allowed",
+        ),
     ],
 )
 def test_malformed_enums_return_422_without_changing_state(
-    signed_in_client, resource, key, payload, message
+    signed_in_client, resource, key, payload, error_key
 ):
     client, auth = signed_in_client()
     config_before = client.get("/api/v1/inventory/config").json()
@@ -131,7 +147,13 @@ def test_malformed_enums_return_422_without_changing_state(
     assert client.get("/api/v1/inventory/config").json() == config_before
     assert client.get("/api/v1/assets").json() == assets_before
     assert rejected.status_code == 422, rejected.text
-    assert rejected.json()["error"] == {"code": "validation_error", "message": message}
+    error = rejected.json()["error"]
+    assert (error["code"], error["key"], error["params"]) == (
+        "validation_error",
+        error_key,
+        {},
+    )
+    assert error["message"] == t(error_key, "es")
 
 
 def test_field_evolution_never_drops_existing_type_or_options(signed_in_client):

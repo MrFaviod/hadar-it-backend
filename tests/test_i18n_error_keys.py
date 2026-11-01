@@ -58,6 +58,11 @@ GROUP_A = frozenset(
         "system",
         "search",
         "events",
+        "dashboard",
+        "inventory",
+        "operations",
+        "relationships",
+        "reports",
     }
 )
 
@@ -66,15 +71,10 @@ PENDING = frozenset(
     {
         "agent_integrations",
         "agents",
-        "dashboard",
         "extensions",
-        "inventory",
         "mcp",
         "monitoring",
         "notifications",
-        "operations",
-        "relationships",
-        "reports",
     }
 )
 
@@ -296,6 +296,38 @@ CASES = [
         404,
         "api.appearance.appearance_resource_not_found",
         {},
+    ),
+    (
+        "inventory",
+        "GET",
+        "/assets/not-a-uuid",
+        404,
+        "api.inventory.asset_not_found",
+        {},
+    ),
+    (
+        "relationships",
+        "DELETE",
+        "/relationships/00000000-0000-0000-0000-000000000000",
+        404,
+        "api.relationships.relationship_not_found",
+        {},
+    ),
+    (
+        "reports",
+        "GET",
+        "/reports/jobs/00000000-0000-0000-0000-000000000000",
+        404,
+        "api.reports.job_not_found",
+        {},
+    ),
+    (
+        "dashboard",
+        "GET",
+        "/dashboard?period=bogus",
+        422,
+        "api.dashboard.period_allowed",
+        {"allowed": "24h, 7d, 30d"},
     ),
 ]
 

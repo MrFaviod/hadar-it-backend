@@ -133,7 +133,10 @@ _HISTORY_FIELDS = (
 def _assert_not_archived(asset: Asset) -> None:
     """Archived assets keep their organization frozen; a return is still allowed."""
     if asset.archived_at is not None:
-        raise Conflict("archived assets cannot change their organization")
+        raise Conflict(
+            "archived assets cannot change their organization",
+            key="api.inventory.archived_organization_frozen",
+        )
 
 
 def _iso(value: datetime) -> str:
@@ -148,44 +151,69 @@ def _escape_like(value: str) -> str:
 def _text(value: Any, field: str, *, required: bool = False) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required",
+                key="api.validation.field_required",
+                params={"field": field},
+            )
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text",
+            key="api.validation.field_text",
+            params={"field": field},
+        )
     normalized = value.strip()
     if not normalized:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required",
+                key="api.validation.field_required",
+                params={"field": field},
+            )
         return None
     limit = FIELD_LIMITS.get(field, SEARCH_TEXT_LIMIT)
     if len(normalized) > limit:
-        raise ValidationFailed(f"{field} must be at most {limit} characters")
+        raise ValidationFailed(
+            f"{field} must be at most {limit} characters",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": limit},
+        )
     return normalized
 
 
 def _quick_code(value: Any, *, required: bool = True) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed("quickCode is required")
+            raise ValidationFailed("quickCode is required", key="api.inventory.quick_code_required")
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("quickCode must be text")
+        raise ValidationFailed(
+            "quickCode must be text",
+            key="api.validation.field_text",
+            params={"field": "quickCode"},
+        )
     normalized = value.strip()
     if not normalized:
         if required:
-            raise ValidationFailed("quickCode is required")
+            raise ValidationFailed("quickCode is required", key="api.inventory.quick_code_required")
         return None
     if not _QUICK_CODE_PATTERN.match(normalized):
         raise ValidationFailed(
             "quickCode must be 1-32 characters using letters, digits, "
-            "dot, dash, slash or underscore"
+            "dot, dash, slash or underscore",
+            key="api.inventory.quick_code_format",
         )
     return normalized
 
 
 def _status(value: Any) -> str:
     if not isinstance(value, str) or value not in STATUSES:
-        raise ValidationFailed(f"status must be one of {', '.join(STATUSES)}")
+        raise ValidationFailed(
+            f"status must be one of {', '.join(STATUSES)}",
+            key="api.inventory.status_allowed",
+            params={"allowed": ", ".join(STATUSES)},
+        )
     return value
 
 
@@ -196,7 +224,9 @@ def _ip(value: Any) -> str | None:
     try:
         ipaddress.ip_address(text)
     except ValueError:
-        raise ValidationFailed("ip must be a valid IPv4 or IPv6 address") from None
+        raise ValidationFailed(
+            "ip must be a valid IPv4 or IPv6 address", key="api.inventory.ip_invalid"
+        ) from None
     return text
 
 
@@ -205,15 +235,27 @@ def _cost(value: Any) -> Decimal | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int | float | Decimal | str):
-        raise ValidationFailed("cost must be a non-negative number")
+        raise ValidationFailed(
+            "cost must be a non-negative number", key="api.inventory.cost_number"
+        )
     try:
         amount = Decimal(str(value).strip())
     except InvalidOperation:
-        raise ValidationFailed("cost must be a non-negative number") from None
+        raise ValidationFailed(
+            "cost must be a non-negative number", key="api.inventory.cost_number"
+        ) from None
     if not amount.is_finite() or amount < 0 or amount > COST_LIMIT:
-        raise ValidationFailed(f"cost must be between 0 and {COST_LIMIT}")
+        raise ValidationFailed(
+            f"cost must be between 0 and {COST_LIMIT}",
+            key="api.inventory.cost_range",
+            params={"maximum": str(COST_LIMIT)},
+        )
     if amount != amount.quantize(COST_QUANTUM):
-        raise ValidationFailed("cost must have at most 2 decimals")
+        raise ValidationFailed(
+            "cost must have at most 2 decimals",
+            key="api.inventory.cost_decimals",
+            params={"decimals": 2},
+        )
     return amount.quantize(COST_QUANTUM)
 
 
@@ -222,18 +264,32 @@ def _technical_scalar(key: str, value: Any) -> Any:
         return value
     if isinstance(value, int | float | Decimal):
         if isinstance(value, float) and not math.isfinite(value):
-            raise ValidationFailed(f"technical.{key} must be a finite number")
+            raise ValidationFailed(
+                f"technical.{key} must be a finite number",
+                key="api.inventory.technical_number",
+                params={"field": f"technical.{key}"},
+            )
         amount = Decimal(str(value))
         if not amount.is_finite() or abs(amount) > TECHNICAL_NUMBER_LIMIT:
-            raise ValidationFailed(f"technical.{key} is out of range")
+            raise ValidationFailed(
+                f"technical.{key} is out of range",
+                key="api.inventory.technical_number_range",
+                params={"field": f"technical.{key}"},
+            )
         return int(amount) if isinstance(value, int) else float(value)
     if isinstance(value, str):
         if len(value) > TECHNICAL_TEXT_MAX:
             raise ValidationFailed(
-                f"technical.{key} must be at most {TECHNICAL_TEXT_MAX} characters"
+                f"technical.{key} must be at most {TECHNICAL_TEXT_MAX} characters",
+                key="api.inventory.technical_text_max",
+                params={"field": f"technical.{key}", "limit": TECHNICAL_TEXT_MAX},
             )
         return value
-    raise ValidationFailed(f"technical.{key} must be text, a number or a boolean")
+    raise ValidationFailed(
+        f"technical.{key} must be text, a number or a boolean",
+        key="api.inventory.technical_value_type",
+        params={"field": f"technical.{key}"},
+    )
 
 
 def _technical(value: Any) -> dict[str, Any] | None:
@@ -241,16 +297,27 @@ def _technical(value: Any) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
-        raise ValidationFailed("technical must be an object")
+        raise ValidationFailed("technical must be an object", key="api.inventory.technical_object")
     if len(value) > TECHNICAL_KEYS_MAX:
-        raise ValidationFailed(f"technical is limited to {TECHNICAL_KEYS_MAX} keys")
+        raise ValidationFailed(
+            f"technical is limited to {TECHNICAL_KEYS_MAX} keys",
+            key="api.inventory.technical_keys_limit",
+            params={"limit": TECHNICAL_KEYS_MAX},
+        )
     prepared: dict[str, Any] = {}
     for key, item in value.items():
         if not isinstance(key, str) or not _TECHNICAL_KEY_PATTERN.match(key):
-            raise ValidationFailed("technical keys must be 1-64 characters starting with a letter")
+            raise ValidationFailed(
+                "technical keys must be 1-64 characters starting with a letter",
+                key="api.inventory.technical_key_format",
+            )
         if isinstance(item, list):
             if len(item) > TECHNICAL_LIST_MAX:
-                raise ValidationFailed(f"technical.{key} is limited to {TECHNICAL_LIST_MAX} values")
+                raise ValidationFailed(
+                    f"technical.{key} is limited to {TECHNICAL_LIST_MAX} values",
+                    key="api.inventory.technical_list_limit",
+                    params={"field": f"technical.{key}", "limit": TECHNICAL_LIST_MAX},
+                )
             prepared[key] = [_technical_scalar(key, entry) for entry in item]
         else:
             prepared[key] = _technical_scalar(key, item)
@@ -260,15 +327,27 @@ def _technical(value: Any) -> dict[str, Any] | None:
 def _reason(value: Any, *, required: bool) -> str | None:
     if value is None or (isinstance(value, str) and not value.strip()):
         if required:
-            raise ValidationFailed("reason is required")
+            raise ValidationFailed("reason is required", key="api.inventory.reason_required")
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("reason must be text")
+        raise ValidationFailed(
+            "reason must be text",
+            key="api.validation.field_text",
+            params={"field": "reason"},
+        )
     normalized = value.strip()
     if len(normalized) < REASON_MIN:
-        raise ValidationFailed(f"reason must be at least {REASON_MIN} characters")
+        raise ValidationFailed(
+            f"reason must be at least {REASON_MIN} characters",
+            key="api.inventory.reason_min",
+            params={"minimum": REASON_MIN},
+        )
     if len(normalized) > REASON_MAX:
-        raise ValidationFailed(f"reason must be at most {REASON_MAX} characters")
+        raise ValidationFailed(
+            f"reason must be at most {REASON_MAX} characters",
+            key="api.inventory.reason_max",
+            params={"limit": REASON_MAX},
+        )
     return normalized
 
 
@@ -277,12 +356,20 @@ def _notes(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("notes must be text")
+        raise ValidationFailed(
+            "notes must be text",
+            key="api.validation.field_text",
+            params={"field": "notes"},
+        )
     normalized = value.strip()
     if not normalized:
         return None
     if len(normalized) > NOTES_MAX:
-        raise ValidationFailed(f"notes must be at most {NOTES_MAX} characters")
+        raise ValidationFailed(
+            f"notes must be at most {NOTES_MAX} characters",
+            key="api.validation.field_max_length",
+            params={"field": "notes", "limit": NOTES_MAX},
+        )
     return normalized
 
 
@@ -291,36 +378,57 @@ def _effective_at(value: Any) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, datetime):
-        raise ValidationFailed("effectiveAt must be an ISO timestamp")
+        raise ValidationFailed(
+            "effectiveAt must be an ISO timestamp", key="api.inventory.effective_at_iso8601"
+        )
     if value.tzinfo is None or value.utcoffset() is None:
-        raise ValidationFailed("effectiveAt must include a timezone")
+        raise ValidationFailed(
+            "effectiveAt must include a timezone", key="api.inventory.effective_at_timezone"
+        )
     return as_utc(value)
 
 
 def _history_source(value: Any) -> str:
     if not isinstance(value, str) or value not in HISTORY_SOURCES:
-        raise ValidationFailed("source must be one of " + ", ".join(sorted(HISTORY_SOURCES)))
+        raise ValidationFailed(
+            "source must be one of " + ", ".join(sorted(HISTORY_SOURCES)),
+            key="api.inventory.history_source_allowed",
+            params={"allowed": ", ".join(sorted(HISTORY_SOURCES))},
+        )
     return value
 
 
 def _entity_type(value: Any) -> str:
     if not isinstance(value, str) or not _ENTITY_TYPE_PATTERN.match(value):
-        raise ValidationFailed("entityType must be 2-32 lowercase letters, digits or underscore")
+        raise ValidationFailed(
+            "entityType must be 2-32 lowercase letters, digits or underscore",
+            key="api.inventory.entity_type_format",
+        )
     return value
 
 
 def _entity_id(value: Any) -> str:
     if not isinstance(value, str) or not value.strip() or len(value.strip()) > 36:
-        raise ValidationFailed("entityId must be 1-36 characters")
+        raise ValidationFailed(
+            "entityId must be 1-36 characters",
+            key="api.inventory.entity_id_format",
+            params={"maximum": 36},
+        )
     return value.strip()
 
 
 def reference_ids(values: Any, limit: int = MAX_LIMIT) -> list[str]:
     """Validate and de-duplicate permanent ids before a batched read."""
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise ValidationFailed("ids must be a list of permanent identifiers")
+        raise ValidationFailed(
+            "ids must be a list of permanent identifiers", key="api.inventory.ids_list"
+        )
     if len(values) > limit:
-        raise ValidationFailed(f"at most {limit} ids may be resolved at once")
+        raise ValidationFailed(
+            f"at most {limit} ids may be resolved at once",
+            key="api.inventory.ids_limit",
+            params={"limit": limit},
+        )
     ordered: list[str] = []
     for value in values:
         identifier = _entity_id(value)
@@ -737,10 +845,16 @@ class InventoryService:
         self, values: Mapping[str, Any], *, principal: Principal | None = None
     ) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("asset payload must be an object")
+            raise ValidationFailed(
+                "asset payload must be an object", key="api.inventory.asset_payload_object"
+            )
         unknown = sorted(set(values) - set(ASSET_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported asset fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported asset fields: {', '.join(unknown)}",
+                key="api.inventory.unsupported_asset_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         prepared: dict[str, Any] = {"name": _text(values.get("name"), "name", required=True)}
         for field in ASSET_FIELDS:
             if field == "name" or field not in values or values[field] is None:
@@ -773,12 +887,18 @@ class InventoryService:
         principal: Principal | None = None,
     ) -> dict[str, Any]:
         if not isinstance(changes, Mapping):
-            raise ValidationFailed("asset payload must be an object")
+            raise ValidationFailed(
+                "asset payload must be an object", key="api.inventory.asset_payload_object"
+            )
         if "id" in changes:
-            raise ValidationFailed("asset id is immutable")
+            raise ValidationFailed("asset id is immutable", key="api.inventory.asset_id_immutable")
         unknown = sorted(set(changes) - set(ASSET_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported asset fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported asset fields: {', '.join(unknown)}",
+                key="api.inventory.unsupported_asset_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         prepared: dict[str, Any] = {}
         for field, value in changes.items():
             if field == "name":
@@ -792,7 +912,9 @@ class InventoryService:
             else:
                 prepared[field] = _normalize(field, value)
         if not prepared:
-            raise ValidationFailed("at least one field must be provided")
+            raise ValidationFailed(
+                "at least one field must be provided", key="api.inventory.changes_required"
+            )
         if principal is not None:
             self._organize(prepared, stored=self._snapshot(asset), principal=principal)
         return prepared
@@ -831,7 +953,7 @@ class InventoryService:
         if exclude_id is not None:
             statement = statement.where(Asset.id != exclude_id)
         if self._session.execute(statement).first() is not None:
-            raise Conflict("quickCode already exists")
+            raise Conflict("quickCode already exists", key="api.inventory.quick_code_exists")
 
     def _generate_quick_code(self) -> str:
         for _ in range(5):
@@ -843,18 +965,21 @@ class InventoryService:
                 is None
             ):
                 return candidate
-        raise Conflict("could not allocate a unique quickCode")
+        raise Conflict(
+            "could not allocate a unique quickCode",
+            key="api.inventory.quick_code_allocation_failed",
+        )
 
     def _asset(self, asset_id: Any) -> Asset:
         if not isinstance(asset_id, str):
-            raise ValidationFailed("asset id is required")
+            raise ValidationFailed("asset id is required", key="api.inventory.asset_id_required")
         try:
             UUID(asset_id)
         except ValueError:
-            raise NotFound("asset not found") from None
+            raise NotFound("asset not found", key="api.inventory.asset_not_found") from None
         asset = self._session.get(Asset, asset_id)
         if asset is None:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.inventory.asset_not_found")
         return asset
 
     # ------------------------------------------------------------ operations
@@ -916,16 +1041,25 @@ class InventoryService:
         _assert_not_archived(asset)
         checked = organization.reference(person_id, "personId")
         if checked is None:
-            raise ValidationFailed("personId is required")
+            raise ValidationFailed(
+                "personId is required",
+                key="api.validation.field_required",
+                params={"field": "personId"},
+            )
         try:
             label = self._directory().person_label(principal, checked, require_active=True)
         except Conflict as error:
-            raise ValidationFailed(str(error)) from None
+            raise ValidationFailed(
+                str(error), key="api.inventory.responsible_not_available"
+            ) from None
         note = _reason(reason, required=False)
         observations = _notes(notes)
         effective = _effective_at(effective_at)
         if asset.responsible_person_id == checked and asset.responsible == label:
-            raise Conflict("the person is already responsible for this asset")
+            raise Conflict(
+                "the person is already responsible for this asset",
+                key="api.inventory.already_responsible",
+            )
         before = self._snapshot(asset)
         asset.responsible_person_id = checked
         asset.responsible = label
@@ -959,7 +1093,7 @@ class InventoryService:
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
         if asset.responsible_person_id is None and asset.responsible is None:
-            raise Conflict("asset has no responsible person")
+            raise Conflict("asset has no responsible person", key="api.inventory.no_responsible")
         note = _reason(reason, required=False)
         observations = _notes(notes)
         effective = _effective_at(effective_at)
@@ -999,7 +1133,9 @@ class InventoryService:
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         _assert_not_archived(asset)
         if site_id is None and location_id is _UNSET:
-            raise ValidationFailed("siteId or locationId is required")
+            raise ValidationFailed(
+                "siteId or locationId is required", key="api.inventory.place_required"
+            )
         changes: dict[str, Any] = {}
         if site_id is not None:
             changes["site_id"] = site_id
@@ -1011,7 +1147,9 @@ class InventoryService:
             for field in prepared
             if field in _HISTORY_FIELDS
         ):
-            raise Conflict("asset is already in that location")
+            raise Conflict(
+                "asset is already in that location", key="api.inventory.already_in_location"
+            )
         note = _reason(reason, required=False)
         observations = _notes(notes)
         effective = _effective_at(effective_at)
@@ -1078,11 +1216,21 @@ class InventoryService:
         """Bounded SQL search; the same interface can later be backed by Meilisearch."""
         self._identity.authorize(principal, "assets.view", resource="inventory:assets")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
-            raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+            raise ValidationFailed(
+                f"limit must be between 1 and {MAX_LIMIT}",
+                key="api.validation.limit_range",
+                params={"maximum": MAX_LIMIT},
+            )
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValidationFailed("offset must be zero or greater")
+            raise ValidationFailed(
+                "offset must be zero or greater", key="api.validation.offset_non_negative"
+            )
         if archived is not None and not isinstance(archived, bool):
-            raise ValidationFailed("archived must be a boolean")
+            raise ValidationFailed(
+                "archived must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "archived"},
+            )
 
         filters: list[ColumnElement[bool]] = []
         text_query = _text(query, "query")
@@ -1119,7 +1267,9 @@ class InventoryService:
             filters.append(Asset.quick_code_key == quick_code_value.lower())
         if asset_id is not None:
             if not isinstance(asset_id, str):
-                raise ValidationFailed("asset id is required")
+                raise ValidationFailed(
+                    "asset id is required", key="api.inventory.asset_id_required"
+                )
             try:
                 UUID(asset_id)
             except ValueError:
@@ -1159,16 +1309,24 @@ class InventoryService:
         """Bounded organizational map: sites plus the assets that declare a position."""
         self._identity.authorize(principal, "assets.view", resource="inventory:assets")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= MAX_LIMIT:
-            raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+            raise ValidationFailed(
+                f"limit must be between 1 and {MAX_LIMIT}",
+                key="api.validation.limit_range",
+                params={"maximum": MAX_LIMIT},
+            )
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValidationFailed("offset must be zero or greater")
+            raise ValidationFailed(
+                "offset must be zero or greater", key="api.validation.offset_non_negative"
+            )
         directory = self._directory()
         checked = organization.reference(site_id, "siteId")
         site_total = 0
         if checked is not None:
             view = directory.get_location(principal, checked)
             if view.level != "site":
-                raise ValidationFailed("siteId must reference a site")
+                raise ValidationFailed(
+                    "siteId must reference a site", key="api.inventory.site_reference"
+                )
             sites: tuple[Any, ...] = (view,)
             site_total = 1
         else:
@@ -1231,15 +1389,23 @@ class InventoryService:
         updates = list(update)
         total = len(creates) + len(updates)
         if total == 0:
-            raise ValidationFailed("batch requires at least one operation")
+            raise ValidationFailed(
+                "batch requires at least one operation", key="api.inventory.batch_required"
+            )
         if total > BATCH_LIMIT:
-            raise ValidationFailed(f"batch is limited to {BATCH_LIMIT} operations")
+            raise ValidationFailed(
+                f"batch is limited to {BATCH_LIMIT} operations",
+                key="api.inventory.batch_limit",
+                params={"limit": BATCH_LIMIT},
+            )
 
         for _ in creates:
             self._identity.authorize(principal, "assets.edit", resource="inventory:assets")
         for changes in updates:
             if not isinstance(changes, Mapping):
-                raise ValidationFailed("each update must be an object")
+                raise ValidationFailed(
+                    "each update must be an object", key="api.inventory.batch_update_object"
+                )
             asset = self._asset(changes.get("id"))
             self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
             if "responsible" in changes or "responsible_person_id" in changes:
@@ -1255,7 +1421,7 @@ class InventoryService:
                 )
             key = prepared["quick_code"].lower()
             if key in seen_keys:
-                raise Conflict("quickCode already exists")
+                raise Conflict("quickCode already exists", key="api.inventory.quick_code_exists")
             seen_keys.add(key)
             prepared_creates.append(prepared)
 
@@ -1272,7 +1438,9 @@ class InventoryService:
             if "quick_code" in prepared:
                 key = prepared["quick_code"].lower()
                 if key in update_keys:
-                    raise Conflict("quickCode already exists")
+                    raise Conflict(
+                        "quickCode already exists", key="api.inventory.quick_code_exists"
+                    )
                 update_keys.add(key)
                 self._assert_quick_code_free(prepared["quick_code"], exclude_id=asset.id)
             prepared_updates.append((asset, prepared, self._snapshot(asset)))
@@ -1330,12 +1498,20 @@ class InventoryService:
         }
         if changes is not None:
             if not isinstance(changes, Mapping):
-                raise ValidationFailed("asset payload must be an object")
+                raise ValidationFailed(
+                    "asset payload must be an object", key="api.inventory.asset_payload_object"
+                )
             if "id" in changes:
-                raise ValidationFailed("asset id is immutable")
+                raise ValidationFailed(
+                    "asset id is immutable", key="api.inventory.asset_id_immutable"
+                )
             unknown = sorted(set(changes) - set(ASSET_FIELDS))
             if unknown:
-                raise ValidationFailed(f"unsupported asset fields: {', '.join(unknown)}")
+                raise ValidationFailed(
+                    f"unsupported asset fields: {', '.join(unknown)}",
+                    key="api.inventory.unsupported_asset_fields",
+                    params={"fields": ", ".join(unknown)},
+                )
             values.update(changes)
         prepared = self._prepare_create(values, principal=principal)
         if "responsible" in prepared or "responsible_person_id" in prepared:
@@ -1357,7 +1533,7 @@ class InventoryService:
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if asset.archived_at is not None:
-            raise Conflict("asset is already archived")
+            raise Conflict("asset is already archived", key="api.inventory.already_archived")
         self._assert_no_active_redundancy_membership(asset.id)
         note = _reason(reason, required=False)
         before = self._snapshot(asset)
@@ -1378,7 +1554,7 @@ class InventoryService:
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if asset.archived_at is None:
-            raise Conflict("asset is not archived")
+            raise Conflict("asset is not archived", key="api.inventory.not_archived")
         before = self._snapshot(asset)
         organization.validate_stored(before, directory=self._directory(), principal=principal)
         asset.archived_at = None
@@ -1399,7 +1575,7 @@ class InventoryService:
         note = _reason(reason, required=True)
         assert note is not None
         if asset.status == "retired":
-            raise Conflict("asset is already retired")
+            raise Conflict("asset is already retired", key="api.inventory.already_retired")
         if asset.responsible is not None or asset.responsible_person_id is not None:
             self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
         before = self._snapshot(asset)
@@ -1440,20 +1616,31 @@ class InventoryService:
                 resource=f"asset:{asset.id}",
                 outcome="denied",
             )
-            raise PermissionDenied("only a human identity may purge an asset")
+            raise PermissionDenied(
+                "only a human identity may purge an asset", key="api.inventory.purge_human_only"
+            )
         production = self._settings.environment == "production"
         if production:
             self._identity.authorize(principal, "assets.purge", resource=f"asset:{asset.id}")
             if asset.archived_at is None:
-                raise Conflict("only an archived asset can be purged")
+                raise Conflict(
+                    "only an archived asset can be purged",
+                    key="api.inventory.purge_requires_archive",
+                )
         else:
             self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if confirm is not True:
-            raise ValidationFailed("permanent purge requires explicit confirmation")
+            raise ValidationFailed(
+                "permanent purge requires explicit confirmation",
+                key="api.inventory.purge_confirmation_required",
+            )
         note: str | None
         if production:
             if not isinstance(typed_id, str) or typed_id.strip() != asset.id:
-                raise ValidationFailed("permanent purge requires the asset id to be typed exactly")
+                raise ValidationFailed(
+                    "permanent purge requires the asset id to be typed exactly",
+                    key="api.inventory.purge_typed_id_mismatch",
+                )
             note = _reason(reason, required=True)
         else:
             note = _reason(reason, required=False)
@@ -1466,11 +1653,17 @@ class InventoryService:
         from itsm.workflows.models import Warranty
 
         if self._session.get(Warranty, asset.id) is not None:
-            raise Conflict("asset has an individual warranty; remove it before a permanent purge")
+            raise Conflict(
+                "asset has an individual warranty; remove it before a permanent purge",
+                key="api.inventory.purge_warranty_block",
+            )
         if self._session.scalar(
             select(Attachment.id).where(Attachment.asset_id == asset.id).limit(1)
         ):
-            raise Conflict("asset has attachments; delete them before a permanent purge")
+            raise Conflict(
+                "asset has attachments; delete them before a permanent purge",
+                key="api.inventory.purge_attachments_block",
+            )
         from itsm.interventions.models import Incident, IncidentAsset, Intervention
         from itsm.maintenance.models import MaintenancePlan
 
@@ -1481,7 +1674,10 @@ class InventoryService:
             select(IncidentAsset.incident_id).where(IncidentAsset.asset_id == asset.id),
         )
         if any(self._session.scalar(query.limit(1)) for query in technical_references):
-            raise Conflict("asset has technical history or maintenance plans; it cannot be purged")
+            raise Conflict(
+                "asset has technical history or maintenance plans; it cannot be purged",
+                key="api.inventory.purge_history_block",
+            )
         self._session.execute(delete(AssetMedia).where(AssetMedia.asset_id == asset.id))
         self._session.add(
             AssetTombstone(
@@ -1510,23 +1706,29 @@ class InventoryService:
     ) -> HistoryPage:
         """Read the append-only history of an asset id, including a purged one."""
         if not isinstance(asset_id, str):
-            raise ValidationFailed("asset id is required")
+            raise ValidationFailed("asset id is required", key="api.inventory.asset_id_required")
         try:
             UUID(asset_id)
         except ValueError:
-            raise NotFound("asset not found") from None
+            raise NotFound("asset not found", key="api.inventory.asset_not_found") from None
         self._identity.authorize(principal, "assets.view", resource=f"asset:{asset_id}")
         if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= HISTORY_LIMIT:
-            raise ValidationFailed(f"limit must be between 1 and {HISTORY_LIMIT}")
+            raise ValidationFailed(
+                f"limit must be between 1 and {HISTORY_LIMIT}",
+                key="api.validation.limit_range",
+                params={"maximum": HISTORY_LIMIT},
+            )
         if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-            raise ValidationFailed("offset must be zero or greater")
+            raise ValidationFailed(
+                "offset must be zero or greater", key="api.validation.offset_non_negative"
+            )
         total = int(
             self._session.execute(
                 select(func.count(AssetHistory.id)).where(AssetHistory.asset_id == asset_id)
             ).scalar_one()
         )
         if total == 0 and self._session.get(Asset, asset_id) is None:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.inventory.asset_not_found")
         rows = self._session.execute(
             select(AssetHistory)
             .where(AssetHistory.asset_id == asset_id)
@@ -1550,7 +1752,7 @@ class InventoryService:
         checked_role = validate_role(role)
         media = self._media(asset.id, checked_role)
         if media is None:
-            raise NotFound("image not found")
+            raise NotFound("image not found", key="api.inventory.image_not_found")
         return ImageContent(
             role=checked_role, content_type=media.content_type, data=bytes(media.data)
         )
@@ -1599,7 +1801,7 @@ class InventoryService:
         checked_role = validate_role(role)
         media = self._media(asset.id, checked_role)
         if media is None:
-            raise NotFound("image not found")
+            raise NotFound("image not found", key="api.inventory.image_not_found")
         self._session.delete(media)
         self._flush_or_conflict()
         self._identity.record_operation(
@@ -1752,7 +1954,10 @@ class InventoryService:
             .limit(1)
         ).first()
         if related is not None:
-            raise Conflict("asset has relationships; remove them before a permanent purge")
+            raise Conflict(
+                "asset has relationships; remove them before a permanent purge",
+                key="api.inventory.purge_relationships_block",
+            )
 
     def _assert_no_redundancy_membership(self, asset_id: str) -> None:
         """Purge guard: a redundancy member must be removed from its group first."""
@@ -1765,7 +1970,8 @@ class InventoryService:
         ).first()
         if member is not None:
             raise Conflict(
-                "asset belongs to a redundancy group; remove it from the group before a purge"
+                "asset belongs to a redundancy group; remove it from the group before a purge",
+                key="api.inventory.purge_redundancy_block",
             )
 
     def _assert_no_active_redundancy_membership(self, asset_id: str) -> None:
@@ -1782,7 +1988,10 @@ class InventoryService:
             .limit(1)
         ).first()
         if member is not None:
-            raise Conflict("an active redundancy group cannot include archived assets")
+            raise Conflict(
+                "an active redundancy group cannot include archived assets",
+                key="api.inventory.redundancy_active_archive_block",
+            )
 
     def _new_asset(self, prepared: Mapping[str, Any]) -> Asset:
         now = utcnow()
@@ -1801,7 +2010,9 @@ class InventoryService:
             candidate = str(uuid4())
             if self._session.get(AssetTombstone, candidate) is None:
                 return candidate
-        raise Conflict("could not allocate a unique asset id")
+        raise Conflict(
+            "could not allocate a unique asset id", key="api.inventory.asset_id_allocation_failed"
+        )
 
     def _apply(self, asset: Asset, prepared: Mapping[str, Any]) -> None:
         for field, value in prepared.items():
@@ -1853,7 +2064,9 @@ class InventoryService:
             self._session.flush()
         except IntegrityError:
             self._session.rollback()
-            raise Conflict("quickCode already exists") from None
+            raise Conflict(
+                "quickCode already exists", key="api.inventory.quick_code_exists"
+            ) from None
 
 
 __all__ = [

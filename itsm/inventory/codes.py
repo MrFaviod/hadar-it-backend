@@ -43,7 +43,10 @@ def serialized(method):
                     .values(next_value=InventoryCodeSequence.next_value)
                 )
                 if result.rowcount != 1:
-                    raise Conflict("inventory schema is not ready; run migrations")
+                    raise Conflict(
+                        "inventory schema is not ready; run migrations",
+                        key="api.inventory.schema_not_ready",
+                    )
             return method(self, *args, **kwargs)
         except Exception:
             self._session.rollback()
@@ -89,7 +92,10 @@ def allocate(
         prefix = rules["separator"].join(parts) + rules["separator"]
         start, pad = 1, rules["quickPad"]
     if len(prefix) + pad > 32 or start > 2_000_000_000:
-        raise ValidationFailed("quickCode sequence exceeds the supported format")
+        raise ValidationFailed(
+            "quickCode sequence exceeds the supported format",
+            key="api.inventory.sequence_format",
+        )
     key = prefix.lower()
     sequence = service._session.get(InventoryCodeSequence, key)
     pending = service._pending_sequences.get(key, sequence.next_value if sequence else start)
@@ -97,7 +103,9 @@ def allocate(
     for _ in range(10000):
         code = prefix + str(candidate).zfill(pad)
         if len(code) > 32 or candidate > 2_000_000_000:
-            raise Conflict("quickCode sequence is exhausted")
+            raise Conflict(
+                "quickCode sequence is exhausted", key="api.inventory.sequence_exhausted"
+            )
         query = select(Asset.id).where(Asset.quick_code_key == code.lower())
         if exclude_id:
             query = query.where(Asset.id != exclude_id)
@@ -108,4 +116,7 @@ def allocate(
             service._reserved_codes = reserved
             return code
         candidate += 1
-    raise Conflict("could not find an available quickCode within the allocation bound")
+    raise Conflict(
+        "could not find an available quickCode within the allocation bound",
+        key="api.inventory.quick_code_unavailable",
+    )

@@ -40,18 +40,34 @@ SEARCH_KINDS: frozenset[str] = frozenset(
 def bounded_page(limit: Any, offset: Any) -> tuple[int, int]:
     """Clamp one tool page so a model cannot request unbounded rows."""
     if isinstance(limit, bool) or not isinstance(limit, int):
-        raise ValidationFailed("limit must be an integer")
+        raise ValidationFailed(
+            "limit must be an integer",
+            key="api.validation.field_integer",
+            params={"field": "limit"},
+        )
     if isinstance(offset, bool) or not isinstance(offset, int):
-        raise ValidationFailed("offset must be an integer")
+        raise ValidationFailed(
+            "offset must be an integer",
+            key="api.validation.field_integer",
+            params={"field": "offset"},
+        )
     return max(1, min(limit, MAX_RESULTS)), max(0, offset)
 
 
 def _text(value: Any, field: str, maximum: int) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text",
+            key="api.validation.field_text",
+            params={"field": field},
+        )
     normalized = value.strip()
     if not normalized or len(normalized) > maximum:
-        raise ValidationFailed(f"{field} must be 1-{maximum} characters")
+        raise ValidationFailed(
+            f"{field} must be 1-{maximum} characters",
+            key="api.operations.field_length_range",
+            params={"field": field, "maximum": maximum},
+        )
     return normalized
 
 
@@ -65,11 +81,18 @@ def _kinds(value: Any) -> list[str] | None:
     if value is None:
         return None
     if not isinstance(value, list) or any(not isinstance(item, str) for item in value):
-        raise ValidationFailed("kinds must be a list of known result types")
+        raise ValidationFailed(
+            "kinds must be a list of known result types",
+            key="api.operations.kinds_known_types",
+        )
     unique = list(dict.fromkeys(value))
     unknown = sorted(set(unique) - SEARCH_KINDS)
     if unknown:
-        raise ValidationFailed(f"unknown result kinds: {', '.join(unknown)}")
+        raise ValidationFailed(
+            f"unknown result kinds: {', '.join(unknown)}",
+            key="api.operations.unknown_result_kinds",
+            params={"kinds": ", ".join(unknown)},
+        )
     return unique or None
 
 

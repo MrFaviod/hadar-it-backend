@@ -127,7 +127,10 @@ def _default_template(family: str, labels: Mapping[str, Any] | None) -> dict[str
     candidate = "inventory-sheet" if labels is not None else DEFAULT_TEMPLATE_BY_FAMILY[family]
     template = _builtin(candidate)
     if template is None:
-        raise ValidationFailed("no default template exists for this family")
+        raise ValidationFailed(
+            "no default template exists for this family",
+            key="api.reports.default_template_missing",
+        )
     return template
 
 
@@ -196,11 +199,11 @@ class ReportService:
 
     # ------------------------------------------------------------- plumbing
     @staticmethod
-    def _validated(model: type[Any], payload: Any, message: str) -> Any:
+    def _validated(model: type[Any], payload: Any, message: str, *, key: str) -> Any:
         try:
             return model.model_validate(payload)
         except ValidationError as exc:
-            raise ValidationFailed(message) from exc
+            raise ValidationFailed(message, key=key) from exc
 
     def _services(
         self, session: Session
@@ -223,9 +226,12 @@ class ReportService:
             return request
         if isinstance(request, Mapping):
             return ReportService._validated(
-                ReportRequest, dict(request), "report request is invalid"
+                ReportRequest,
+                dict(request),
+                "report request is invalid",
+                key="api.reports.request_invalid",
             )
-        raise ValidationFailed("report request must be an object")
+        raise ValidationFailed("report request must be an object", key="api.reports.request_object")
 
     @staticmethod
     def _request_dump(model: ReportRequest) -> dict[str, Any]:
@@ -234,19 +240,36 @@ class ReportService:
     def _validate_semantics(self, request: Mapping[str, Any]) -> None:
         family = request.get("family")
         if family not in {"inventory", "history", "warranty"}:
-            raise ValidationFailed("family must be inventory, history or warranty")
+            raise ValidationFailed(
+                "family must be inventory, history or warranty",
+                key="api.reports.family_allowed",
+                params={"allowed": "inventory, history, warranty"},
+            )
         labels = request.get("labels")
         output = request.get("output") or "pdf"
         mode = request.get("mode") or "consolidated"
         if output not in DOCUMENT_MIMES:
-            raise ValidationFailed("output must be pdf, csv or xlsx")
+            raise ValidationFailed(
+                "output must be pdf, csv or xlsx",
+                key="api.reports.output_allowed",
+                params={"allowed": "pdf, csv, xlsx"},
+            )
         if mode not in {"consolidated", "individual"}:
-            raise ValidationFailed("mode must be consolidated or individual")
+            raise ValidationFailed(
+                "mode must be consolidated or individual",
+                key="api.reports.mode_allowed",
+                params={"allowed": "consolidated, individual"},
+            )
         if labels is not None:
             if family != "inventory":
-                raise ValidationFailed("labels are only available for the inventory family")
+                raise ValidationFailed(
+                    "labels are only available for the inventory family",
+                    key="api.reports.labels_inventory_only",
+                )
             if output != "pdf":
-                raise ValidationFailed("labels require the pdf output")
+                raise ValidationFailed(
+                    "labels require the pdf output", key="api.reports.labels_pdf_only"
+                )
         allowed_fields = (
             ASSET_FIELDS
             if family == "inventory"
@@ -256,39 +279,58 @@ class ReportService:
         )
         for field in request.get("fields") or []:
             if field not in allowed_fields:
-                raise ValidationFailed(f"unsupported report field: {field}")
+                raise ValidationFailed(
+                    f"unsupported report field: {field}",
+                    key="api.reports.unsupported_report_field",
+                    params={"field": field},
+                )
         filters = request.get("filters") or {}
         asset_filters(filters)
         history_filters(filters)
         warranty_filter(filters)
         name = request.get("name")
         if name is not None and (not isinstance(name, str) or len(name.strip()) > 160):
-            raise ValidationFailed("name must be at most 160 characters")
+            raise ValidationFailed(
+                "name must be at most 160 characters",
+                key="api.reports.name_max_length",
+                params={"limit": 160},
+            )
 
     def _resolve_template(self, session: Session, request: Mapping[str, Any]) -> dict[str, Any]:
         family = request["family"]
         inline = request.get("template")
         if inline is not None:
             definition = self._validated(
-                TemplateDefinition, inline, "template definition is invalid"
+                TemplateDefinition,
+                inline,
+                "template definition is invalid",
+                key="api.reports.template_invalid",
             ).model_dump()
             self._assert_custom_template(definition, family)
             if len(str(definition).encode()) > MAX_TEMPLATE_BYTES:
-                raise ValidationFailed("template definition is too large")
+                raise ValidationFailed(
+                    "template definition is too large", key="api.reports.template_too_large"
+                )
             return definition
         template_id = request.get("templateId")
         if template_id:
             template = _builtin(template_id)
             if template is not None:
                 if template["family"] != family:
-                    raise ValidationFailed("template family does not match the request")
+                    raise ValidationFailed(
+                        "template family does not match the request",
+                        key="api.reports.template_family_mismatch",
+                    )
                 return template
             row = session.get(ReportTemplate, template_id)
             if row is None:
-                raise NotFound("template not found")
+                raise NotFound("template not found", key="api.reports.template_not_found")
             definition = TemplateDefinition.model_validate(row.definition).model_dump()
             if definition["family"] != family:
-                raise ValidationFailed("template family does not match the request")
+                raise ValidationFailed(
+                    "template family does not match the request",
+                    key="api.reports.template_family_mismatch",
+                )
             return definition
         return _default_template(family, request.get("labels"))
 
@@ -299,11 +341,17 @@ class ReportService:
             not isinstance(template_id, str)
             or re.fullmatch(TEMPLATE_ID_PATTERN, template_id) is None
         ):
-            raise ValidationFailed("template id is invalid")
+            raise ValidationFailed("template id is invalid", key="api.reports.template_id_invalid")
         if template_id in BUILTIN_IDS:
-            raise ValidationFailed("builtin template ids are reserved")
+            raise ValidationFailed(
+                "builtin template ids are reserved",
+                key="api.reports.builtin_template_ids_reserved",
+            )
         if definition.get("family") != family:
-            raise ValidationFailed("template family does not match the request")
+            raise ValidationFailed(
+                "template family does not match the request",
+                key="api.reports.template_family_mismatch",
+            )
 
     def _stored_settings(self, session: Session) -> dict[str, Any]:
         row = session.get(ReportSettings, 1)
@@ -330,12 +378,13 @@ class ReportService:
 
     def _validate_base_url(self, value: Any) -> str:
         if not isinstance(value, str):
-            raise ValidationFailed("baseUrl must be text")
+            raise ValidationFailed("baseUrl must be text", key="api.reports.base_url_text")
         try:
             return type(self.settings)._validate_report_base_url(value)
         except ValueError as exc:
             raise ValidationFailed(
-                "baseUrl must use http(s) without credentials, query or fragment"
+                "baseUrl must use http(s) without credentials, query or fragment",
+                key="api.reports.base_url_invalid",
             ) from exc
 
     def _logo_bytes(
@@ -399,7 +448,11 @@ class ReportService:
             fallback_fields = DEFAULT_WARRANTY_FIELDS
         for field in requested_fields:
             if field not in allowed_fields:
-                raise ValidationFailed(f"unsupported report field: {field}")
+                raise ValidationFailed(
+                    f"unsupported report field: {field}",
+                    key="api.reports.unsupported_report_field",
+                    params={"field": field},
+                )
         if requested_fields:
             fields = requested_fields
         elif family == "inventory":
@@ -411,7 +464,7 @@ class ReportService:
             fields = fallback_fields
         group = dump.get("group") or "none"
         if group not in GROUP_FIELDS:
-            raise ValidationFailed("unsupported group")
+            raise ValidationFailed("unsupported group", key="api.reports.unsupported_group")
         assets = select_assets(
             inventory,
             principal,
@@ -468,7 +521,11 @@ class ReportService:
 
     def _assert_image_budget(self, assets: int) -> None:
         if assets > self.settings.report_max_assets:
-            raise ValidationFailed("selection exceeds the report asset limit")
+            raise ValidationFailed(
+                "selection exceeds the report asset limit",
+                key="api.reports.selection_limit",
+                params={"limit": self.settings.report_max_assets},
+            )
 
     @staticmethod
     def _load_images(
@@ -547,7 +604,10 @@ class ReportService:
             ).scalars()
             custom = [
                 self._validated(
-                    TemplateDefinition, row.definition, "stored template is invalid"
+                    TemplateDefinition,
+                    row.definition,
+                    "stored template is invalid",
+                    key="api.reports.stored_template_invalid",
                 ).model_dump()
                 for row in rows
             ]
@@ -560,13 +620,18 @@ class ReportService:
 
     def save_template(self, principal: Principal, template: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(template, Mapping):
-            raise ValidationFailed("template must be an object")
+            raise ValidationFailed("template must be an object", key="api.reports.template_object")
         definition = self._validated(
-            TemplateDefinition, dict(template), "template definition is invalid"
+            TemplateDefinition,
+            dict(template),
+            "template definition is invalid",
+            key="api.reports.template_invalid",
         ).model_dump()
         self._assert_custom_template(definition, str(definition.get("family")))
         if len(str(definition).encode()) > MAX_TEMPLATE_BYTES:
-            raise ValidationFailed("template definition is too large")
+            raise ValidationFailed(
+                "template definition is too large", key="api.reports.template_too_large"
+            )
         with self.session_factory() as session:
             identity, _, _ = self._services(session)
             identity.authorize(principal, "assets.edit", resource="reports:templates")
@@ -604,15 +669,18 @@ class ReportService:
             not isinstance(template_id, str)
             or re.fullmatch(TEMPLATE_ID_PATTERN, template_id) is None
         ):
-            raise ValidationFailed("template id is invalid")
+            raise ValidationFailed("template id is invalid", key="api.reports.template_id_invalid")
         if template_id in BUILTIN_IDS:
-            raise ValidationFailed("builtin templates are read-only")
+            raise ValidationFailed(
+                "builtin templates are read-only",
+                key="api.reports.builtin_templates_read_only",
+            )
         with self.session_factory() as session:
             identity, _, _ = self._services(session)
             identity.authorize(principal, "assets.edit", resource="reports:templates")
             row = session.get(ReportTemplate, template_id)
             if row is None:
-                raise NotFound("template not found")
+                raise NotFound("template not found", key="api.reports.template_not_found")
             session.delete(row)
             session.commit()
             identity.record_operation(
@@ -631,15 +699,18 @@ class ReportService:
 
     def save_settings(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
-            raise ValidationFailed("settings must be an object")
+            raise ValidationFailed("settings must be an object", key="api.reports.settings_object")
         parsed = self._validated(
-            ReportSettingsInput, dict(payload), "report settings are invalid"
+            ReportSettingsInput,
+            dict(payload),
+            "report settings are invalid",
+            key="api.reports.settings_invalid",
         ).model_dump()
         base_url = self._validate_base_url(parsed.get("baseUrl") or self.settings.report_base_url)
         branding = dict(parsed.get("branding") or {})
         logo_id = branding.get("logoAttachmentId")
         if len(str(parsed).encode()) > MAX_SETTINGS_BYTES:
-            raise ValidationFailed("settings are too large")
+            raise ValidationFailed("settings are too large", key="api.reports.settings_too_large")
         with self.session_factory() as session:
             identity, _, _ = self._services(session)
             identity.authorize(principal, "config.general", resource="reports:settings")
@@ -653,7 +724,8 @@ class ReportService:
                     or row.size > min(self.settings.attachment_max_bytes, MAX_LOGO_BYTES)
                 ):
                     raise ValidationFailed(
-                        "logoAttachmentId must reference an existing raster attachment"
+                        "logoAttachmentId must reference an existing raster attachment",
+                        key="api.reports.logo_attachment_raster",
                     )
                 identity.authorize(principal, "assets.view", resource=f"asset:{row.asset_id}")
             stored = {
@@ -696,7 +768,8 @@ class ReportService:
             html = composition.preview_html(document)
             if len(html.encode("utf-8")) > self.settings.report_max_document_bytes:
                 raise ValidationFailed(
-                    "preview exceeds the document size limit; narrow the selection"
+                    "preview exceeds the document size limit; narrow the selection",
+                    key="api.reports.preview_too_large",
                 )
             return {
                 "html": html,
@@ -802,7 +875,11 @@ class ReportService:
 
     def jobs(self, principal: Principal, limit: int = 50) -> dict[str, Any]:
         if type(limit) is not int or not 1 <= limit <= MAX_JOB_LIMIT:
-            raise ValidationFailed(f"limit must be 1-{MAX_JOB_LIMIT}")
+            raise ValidationFailed(
+                f"limit must be 1-{MAX_JOB_LIMIT}",
+                key="api.reports.job_limit_range",
+                params={"limit": MAX_JOB_LIMIT},
+            )
         with self.session_factory() as session:
             identity, _, _ = self._services(session)
             identity.authorize(principal, "assets.view", resource="reports:jobs")
@@ -826,7 +903,7 @@ class ReportService:
             if job is None or (
                 job.owner_id != principal.actor_id and not self._is_admin(principal)
             ):
-                raise NotFound("job not found")
+                raise NotFound("job not found", key="api.reports.job_not_found")
             return self._job_wire(session, job)
 
     def download(self, principal: Principal, document_id: str) -> tuple[dict[str, Any], bytes]:
@@ -835,14 +912,14 @@ class ReportService:
             identity.authorize(principal, "assets.view", resource="reports:documents")
             document = session.get(ReportDocument, document_id)
             if document is None or document.deleted_at is not None:
-                raise NotFound("document not found")
+                raise NotFound("document not found", key="api.reports.document_not_found")
             if document.owner_id != principal.actor_id and not self._is_admin(principal):
-                raise NotFound("document not found")
+                raise NotFound("document not found", key="api.reports.document_not_found")
             cutoff = utcnow() - timedelta(days=self.settings.report_retention_days)
             if as_utc(document.created_at) <= cutoff:
                 document.deleted_at = utcnow()
                 session.commit()
-                raise NotFound("document expired")
+                raise NotFound("document expired", key="api.reports.document_expired")
             data = self._storage_backend().read(
                 document.blob_key, self.settings.report_max_document_bytes
             )
@@ -913,15 +990,23 @@ class ReportService:
     @staticmethod
     def _share_fields(fields: Any) -> list[str]:
         if isinstance(fields, str) or not isinstance(fields, Iterable):
-            raise ValidationFailed("fields must be a list of public field keys")
+            raise ValidationFailed(
+                "fields must be a list of public field keys", key="api.reports.fields_list"
+            )
         selected: list[str] = []
         for field in fields:
             if not isinstance(field, str) or field not in PUBLIC_FIELDS:
-                raise ValidationFailed("public fields must be one of " + ", ".join(PUBLIC_FIELDS))
+                raise ValidationFailed(
+                    "public fields must be one of " + ", ".join(PUBLIC_FIELDS),
+                    key="api.reports.public_fields_allowed",
+                    params={"allowed": ", ".join(PUBLIC_FIELDS)},
+                )
             if field not in selected:
                 selected.append(field)
         if not selected:
-            raise ValidationFailed("at least one public field is required")
+            raise ValidationFailed(
+                "at least one public field is required", key="api.reports.public_field_required"
+            )
         return selected
 
     def create_share(
@@ -936,7 +1021,9 @@ class ReportService:
             type(expires_in_days) is not int
             or not SHARE_DAYS_MIN <= expires_in_days <= SHARE_DAYS_MAX
         ):
-            raise ValidationFailed("expiresInDays must be 1-365")
+            raise ValidationFailed(
+                "expiresInDays must be 1-365", key="api.reports.expiry_days_range"
+            )
         with self.session_factory() as session:
             identity, inventory, _ = self._services(session)
             identity.authorize(principal, "reports.share", resource="reports:shares")
@@ -977,7 +1064,7 @@ class ReportService:
             identity.authorize(principal, "reports.share", resource="reports:shares")
             row = session.get(ReportShare, share_id)
             if row is None:
-                raise NotFound("share not found")
+                raise NotFound("share not found", key="api.reports.share_not_found")
             if row.revoked_at is None:
                 row.revoked_at = utcnow()
                 row.revoked_by = principal.username
@@ -993,23 +1080,23 @@ class ReportService:
     def public_report(self, token: str) -> dict[str, Any]:
         """Anonymous, tokenized, independently re-authorized projection only."""
         if not isinstance(token, str) or not 20 <= len(token) <= 200:
-            raise NotFound("report not found")
+            raise NotFound("report not found", key="api.reports.report_not_found")
         token_digest = _hash_token(token)
         with self.session_factory() as session:
             row = session.execute(
                 select(ReportShare).where(ReportShare.token_hash == token_digest)
             ).scalar_one_or_none()
             if row is None or row.revoked_at is not None or as_utc(row.expires_at) <= utcnow():
-                raise NotFound("report not found")
+                raise NotFound("report not found", key="api.reports.report_not_found")
             asset = session.get(Asset, row.asset_id)
             if asset is None:
-                raise NotFound("report not found")
+                raise NotFound("report not found", key="api.reports.report_not_found")
             identity, _, _ = self._services(session)
             try:
                 issuer = identity.resolve_actor(row.issuer_id)
                 identity.authorize(issuer, "reports.share", resource=f"report-share:{row.id}")
             except (PermissionDenied, NotFound) as exc:
-                raise NotFound("report not found") from exc
+                raise NotFound("report not found", key="api.reports.report_not_found") from exc
             return {
                 "asset": public_asset(session, asset, list(row.fields or [])),
                 "fields": list(row.fields or []),
@@ -1023,7 +1110,9 @@ class ReportService:
         executor = dict(job.executor or {})
         actor_id = executor.get("actorId")
         if not isinstance(actor_id, str) or not actor_id:
-            raise PermissionDenied("report executor is not available")
+            raise PermissionDenied(
+                "report executor is not available", key="api.reports.executor_unavailable"
+            )
         principal = identity.resolve_actor(
             actor_id,
             scopes=frozenset(executor.get("scopes") or ()),
@@ -1043,11 +1132,17 @@ class ReportService:
                     or row.revoked_at is not None
                     or as_utc(row.expires_at) <= utcnow()
                 ):
-                    raise PermissionDenied("report executor session is no longer valid")
+                    raise PermissionDenied(
+                        "report executor session is no longer valid",
+                        key="api.reports.executor_session_invalid",
+                    )
         else:
             digest = executor.get("credentialDigest")
             if not isinstance(digest, str) or not digest:
-                raise PermissionDenied("report executor credential is not available")
+                raise PermissionDenied(
+                    "report executor credential is not available",
+                    key="api.reports.executor_credential_missing",
+                )
             credential = session.execute(
                 select(IdentityCredential).where(
                     IdentityCredential.identity_id == principal.actor_id,
@@ -1056,7 +1151,10 @@ class ReportService:
                 )
             ).scalar_one_or_none()
             if credential is None:
-                raise PermissionDenied("report executor credential is no longer valid")
+                raise PermissionDenied(
+                    "report executor credential is no longer valid",
+                    key="api.reports.executor_credential_invalid",
+                )
         identity.authorize(principal, "assets.view", resource=f"report-job:{job.id}")
         return principal
 
@@ -1111,9 +1209,12 @@ class ReportService:
         data: bytes,
     ) -> ReportDocument:
         if not data:
-            raise ValidationFailed("report output is empty")
+            raise ValidationFailed("report output is empty", key="api.reports.output_empty")
         if len(data) > self.settings.report_max_document_bytes:
-            raise ValidationFailed("report output exceeds the document size limit")
+            raise ValidationFailed(
+                "report output exceeds the document size limit",
+                key="api.reports.output_too_large",
+            )
         blob_key = uuid4().hex
         storage = self._storage_backend()
         storage.put(blob_key, data)
@@ -1268,7 +1369,7 @@ class ReportService:
         with self.session_factory() as session:
             job = session.get(ReportJob, job_id)
             if job is None:
-                raise NotFound("job not found")
+                raise NotFound("job not found", key="api.reports.job_not_found")
             if job.status == "completed":
                 return self._job_wire(session, job)
             now = utcnow()
