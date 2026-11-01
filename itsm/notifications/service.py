@@ -131,27 +131,56 @@ _SCHEDULE_KEYS = frozenset({"timezone", "start", "end"})
 
 def _text(value: Any, field: str, limit: int, *, required: bool = False) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text",
+            key="api.validation.field_text",
+            params={"field": field},
+        )
     cleaned = value.strip()
     if required and not cleaned:
-        raise ValidationFailed(f"{field} is required")
+        raise ValidationFailed(
+            f"{field} is required", key="api.validation.field_required", params={"field": field}
+        )
     if len(value) > limit:
-        raise ValidationFailed(f"{field} is too long")
+        raise ValidationFailed(
+            f"{field} is too long",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": limit},
+        )
     return value if not required else cleaned
 
 
 def _integer(value: Any, field: str, minimum: int, maximum: int) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValidationFailed(f"{field} must be an integer")
+        raise ValidationFailed(
+            f"{field} must be an integer",
+            key="api.validation.field_integer",
+            params={"field": field},
+        )
     if not minimum <= value <= maximum:
-        raise ValidationFailed(f"{field} is out of range")
+        raise ValidationFailed(
+            f"{field} is out of range",
+            key="api.notifications.integer_range",
+            params={"field": field, "minimum": minimum, "maximum": maximum},
+        )
     return value
 
 
 def _entity_id(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _ENTITY_ID.fullmatch(value):
-        raise ValidationFailed(f"{field} is invalid")
+        raise ValidationFailed(
+            f"{field} is invalid",
+            key="api.notifications.identifier_invalid",
+            params={"field": field},
+        )
     return value
+
+
+def _missing(field: str) -> NotFound:
+    """One localized not-found error for a notification resource label."""
+    return NotFound(
+        f"{field} not found", key="api.notifications.record_not_found", params={"field": field}
+    )
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -170,12 +199,14 @@ def _safe_url(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("url must be text")
+        raise ValidationFailed(
+            "url must be text", key="api.validation.field_text", params={"field": "url"}
+        )
     cleaned = value.strip()
     if not cleaned:
         return None
     if len(cleaned) > MAX_EVENT_URL or any(character.isspace() for character in cleaned):
-        raise ValidationFailed("url is invalid")
+        raise ValidationFailed("url is invalid", key="api.notifications.url_invalid")
     if cleaned.startswith("/") and not cleaned.startswith("//"):
         return cleaned
     try:
@@ -183,14 +214,17 @@ def _safe_url(value: Any) -> str | None:
 
         parts = urlsplit(cleaned)
     except ValueError as exc:
-        raise ValidationFailed("url is invalid") from exc
+        raise ValidationFailed("url is invalid", key="api.notifications.url_invalid") from exc
     if (
         parts.scheme not in {"http", "https"}
         or not parts.hostname
         or parts.username is not None
         or parts.password is not None
     ):
-        raise ValidationFailed("url must be an http(s) URL or an absolute path")
+        raise ValidationFailed(
+            "url must be an http(s) URL or an absolute path",
+            key="api.notifications.url_shape",
+        )
     return cleaned
 
 
@@ -261,15 +295,27 @@ def _message_part(value: Any, part: str) -> dict[str, Any] | None:
     if value is None:
         return None
     if not isinstance(value, Mapping):
-        raise ValidationFailed(f"message.{part} must be an object")
+        raise ValidationFailed(
+            f"message.{part} must be an object",
+            key="api.notifications.message_part_object",
+            params={"part": part},
+        )
     unknown = set(value) - {"key", "params"}
     if unknown:
-        raise ValidationFailed(f"message.{part} has unknown fields")
+        raise ValidationFailed(
+            f"message.{part} has unknown fields",
+            key="api.notifications.message_part_unknown_fields",
+            params={"part": part},
+        )
     try:
         key = normalize_key(value.get("key"))
         params = normalize_params(value.get("params"))
     except ValueError as exc:
-        raise ValidationFailed(str(exc)) from exc
+        raise ValidationFailed(
+            str(exc),
+            key="api.notifications.message_part_invalid",
+            params={"part": part, "reason": str(exc)},
+        ) from exc
     return {"key": key, "params": params}
 
 
@@ -283,13 +329,17 @@ def normalize_message(message: Any) -> dict[str, Any] | None:
     if message is None:
         return None
     if not isinstance(message, Mapping):
-        raise ValidationFailed("message must be an object")
+        raise ValidationFailed("message must be an object", key="api.notifications.message_object")
     unknown = set(message) - {"title", "body"}
     if unknown:
-        raise ValidationFailed("message has unknown fields")
+        raise ValidationFailed(
+            "message has unknown fields", key="api.notifications.message_unknown_fields"
+        )
     parts = {part: _message_part(message.get(part), part) for part in ("title", "body")}
     if parts["title"] is None:
-        raise ValidationFailed("message.title is required")
+        raise ValidationFailed(
+            "message.title is required", key="api.notifications.message_title_required"
+        )
     return {part: value for part, value in parts.items() if value is not None}
 
 
@@ -422,19 +472,30 @@ class NotificationService:
             .values(updated_at=now)
         )
         if result.rowcount != 1:
-            raise Conflict("notification schema is not ready; run migrations")
+            raise Conflict(
+                "notification schema is not ready; run migrations",
+                key="api.notifications.schema_not_ready",
+            )
 
     # ----------------------------------------------------------- validation
     def _recipient_values(self, values: Iterable[Any], field: str) -> list[str]:
         if not isinstance(values, (list, tuple)):
-            raise ValidationFailed(f"{field} must be a list")
+            raise ValidationFailed(
+                f"{field} must be a list",
+                key="api.notifications.field_list",
+                params={"field": field},
+            )
         cleaned: list[str] = []
         for value in values:
             identity_id = _entity_id(value, field)
             if identity_id not in cleaned:
                 cleaned.append(identity_id)
         if len(cleaned) > MAX_RECIPIENTS:
-            raise ValidationFailed(f"{field} has too many identities")
+            raise ValidationFailed(
+                f"{field} has too many identities",
+                key="api.notifications.recipients_too_many",
+                params={"field": field, "limit": MAX_RECIPIENTS},
+            )
         identities = {
             identity.id: identity
             for identity in self._session.execute(
@@ -445,51 +506,82 @@ class NotificationService:
         for identity_id in cleaned:
             identity = identities.get(identity_id)
             if identity is None:
-                raise ValidationFailed("recipient is unknown")
+                raise ValidationFailed(
+                    "recipient is unknown", key="api.notifications.recipient_unknown"
+                )
             if identity.actor_kind != HUMAN_ACTOR_KIND:
-                raise ValidationFailed("recipient must be a human identity")
+                raise ValidationFailed(
+                    "recipient must be a human identity", key="api.notifications.recipient_human"
+                )
             if not identity.active:
-                raise ValidationFailed("recipient is not active")
+                raise ValidationFailed(
+                    "recipient is not active", key="api.notifications.recipient_inactive"
+                )
             if "assets.view" not in policy.permissions(identity.role_id):
-                raise ValidationFailed("recipient cannot view assets")
+                raise ValidationFailed(
+                    "recipient cannot view assets", key="api.notifications.recipient_permission"
+                )
         return cleaned
 
     def _channel_values(self, values: Iterable[Any]) -> list[str]:
         if not isinstance(values, (list, tuple)):
-            raise ValidationFailed("channelIds must be a list")
+            raise ValidationFailed(
+                "channelIds must be a list",
+                key="api.notifications.field_list",
+                params={"field": "channelIds"},
+            )
         cleaned: list[str] = []
         for value in values:
             channel_id = _entity_id(value, "channelId")
             if channel_id not in cleaned:
                 cleaned.append(channel_id)
         if not cleaned:
-            raise ValidationFailed("a rule needs at least one channel")
+            raise ValidationFailed(
+                "a rule needs at least one channel", key="api.notifications.rule_channel_required"
+            )
         if len(cleaned) > MAX_CHANNELS_PER_RULE:
-            raise ValidationFailed("a rule has too many channels")
+            raise ValidationFailed(
+                "a rule has too many channels",
+                key="api.notifications.rule_channel_limit",
+                params={"limit": MAX_CHANNELS_PER_RULE},
+            )
         for channel_id in cleaned:
             if self._session.get(NotificationChannel, channel_id) is None:
-                raise ValidationFailed("channel is unknown")
+                raise ValidationFailed(
+                    "channel is unknown", key="api.notifications.channel_unknown"
+                )
         return cleaned
 
     def _schedule_values(self, value: Any) -> tuple[str | None, str | None, str | None]:
         if value is None:
             return None, None, None
         if not isinstance(value, Mapping):
-            raise ValidationFailed("schedule must be an object or null")
+            raise ValidationFailed(
+                "schedule must be an object or null", key="api.notifications.schedule_object"
+            )
         unknown = set(value) - _SCHEDULE_KEYS
         if unknown or set(value) != _SCHEDULE_KEYS:
-            raise ValidationFailed("schedule must contain timezone, start and end")
+            raise ValidationFailed(
+                "schedule must contain timezone, start and end",
+                key="api.notifications.schedule_fields",
+            )
         timezone = _text(value["timezone"], "schedule timezone", 64, required=True)
         start = _text(value["start"], "schedule start", 5, required=True)
         end = _text(value["end"], "schedule end", 5, required=True)
         if _TIMES.fullmatch(start) is None or _TIMES.fullmatch(end) is None:
-            raise ValidationFailed("schedule times must use HH:MM")
+            raise ValidationFailed(
+                "schedule times must use HH:MM", key="api.notifications.schedule_time_shape"
+            )
         if start == end:
-            raise ValidationFailed("schedule start and end must differ")
+            raise ValidationFailed(
+                "schedule start and end must differ", key="api.notifications.schedule_times_differ"
+            )
         try:
             ZoneInfo(timezone)
         except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValidationFailed("schedule timezone is unknown") from exc
+            raise ValidationFailed(
+                "schedule timezone is unknown", key="api.notifications.schedule_timezone_unknown"
+            ) from exc
         return timezone, start, end
 
     def _channel_row(
@@ -497,49 +589,80 @@ class NotificationService:
     ) -> NotificationChannel:
         unknown = set(values) - _CHANNEL_KEYS
         if unknown:
-            raise ValidationFailed("channel contains unsupported fields")
+            raise ValidationFailed(
+                "channel contains unsupported fields",
+                key="api.notifications.channel_unknown_fields",
+            )
         now = utcnow()
         kind = values.get("kind", existing.kind if existing else UNSET)
         if kind is UNSET:
-            raise ValidationFailed("kind is required")
+            raise ValidationFailed(
+                "kind is required", key="api.validation.field_required", params={"field": "kind"}
+            )
         if kind not in CHANNEL_KINDS:
-            raise ValidationFailed("channel kind is invalid")
+            raise ValidationFailed(
+                "channel kind is invalid", key="api.notifications.channel_kind_invalid"
+            )
         name = values.get("name", existing.name if existing else UNSET)
         if name is UNSET:
-            raise ValidationFailed("name is required")
+            raise ValidationFailed(
+                "name is required", key="api.validation.field_required", params={"field": "name"}
+            )
         name = _text(name, "name", 120, required=True)
         enabled = values.get("enabled", existing.enabled if existing else True)
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         supplied_ref = values.get("secretRef", existing.secret_ref if existing else None)
         if supplied_ref is not None and (
             not isinstance(supplied_ref, str) or not SECRET_REFERENCE.fullmatch(supplied_ref)
         ):
-            raise ValidationFailed("secretRef is invalid")
+            raise ValidationFailed(
+                "secretRef is invalid", key="api.notifications.secret_ref_invalid"
+            )
         if kind == CHANNEL_INTERNAL:
             if supplied_ref is not None:
-                raise ValidationFailed("internal channels do not use a secretRef")
+                raise ValidationFailed(
+                    "internal channels do not use a secretRef",
+                    key="api.notifications.secret_ref_forbidden",
+                )
         elif not supplied_ref:
-            raise ValidationFailed("external channels need a secretRef")
+            raise ValidationFailed(
+                "external channels need a secretRef", key="api.notifications.secret_ref_required"
+            )
 
         supplied_config = values.get("config", existing.config if existing else {})
         if not isinstance(supplied_config, Mapping):
-            raise ValidationFailed("config must be an object")
+            raise ValidationFailed(
+                "config must be an object", key="api.notifications.config_object"
+            )
         cleaned_config: dict[str, str] = {}
         for key, item in supplied_config.items():
             if not isinstance(key, str) or not isinstance(item, str):
-                raise ValidationFailed("channel config values must be text")
+                raise ValidationFailed(
+                    "channel config values must be text",
+                    key="api.notifications.channel_config_text",
+                )
             cleaned_config[key] = item
         try:
             cleaned_config = safe_config(kind, cleaned_config)
         except ValueError as exc:
-            raise ValidationFailed(str(exc)) from exc
+            raise ValidationFailed(
+                str(exc),
+                key="api.notifications.channel_config_invalid",
+                params={"reason": str(exc)},
+            ) from exc
 
         if existing is None:
             channel_id = values.get("id")
             channel_id = str(uuid4()) if channel_id is None else _entity_id(channel_id, "id")
             if channel_id == DEFAULT_CHANNEL_ID:
-                raise ValidationFailed("channel id is reserved")
+                raise ValidationFailed(
+                    "channel id is reserved", key="api.notifications.channel_id_reserved"
+                )
             channel = NotificationChannel(
                 id=channel_id,
                 kind=kind,
@@ -566,18 +689,28 @@ class NotificationService:
     ) -> NotificationRule:
         unknown = set(values) - _RULE_KEYS
         if unknown:
-            raise ValidationFailed("rule contains unsupported fields")
+            raise ValidationFailed(
+                "rule contains unsupported fields", key="api.notifications.rule_unknown_fields"
+            )
         now = utcnow()
         name = values.get("name", existing.name if existing else UNSET)
         if name is UNSET:
-            raise ValidationFailed("name is required")
+            raise ValidationFailed(
+                "name is required", key="api.validation.field_required", params={"field": "name"}
+            )
         name = _text(name, "name", 120, required=True)
         enabled = values.get("enabled", existing.enabled if existing else True)
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         severity = values.get("minimumSeverity", existing.minimum_severity if existing else "info")
         if severity not in SEVERITIES:
-            raise ValidationFailed("minimumSeverity is invalid")
+            raise ValidationFailed(
+                "minimumSeverity is invalid", key="api.notifications.minimum_severity_invalid"
+            )
 
         if "recipientIds" in values:
             recipients = self._recipient_values(values["recipientIds"], "recipientIds")
@@ -585,14 +718,20 @@ class NotificationService:
             recipients = list(existing.recipient_ids or []) if existing else []
         built_in = bool(existing.built_in) if existing else False
         if not recipients and not built_in:
-            raise ValidationFailed("a rule needs at least one recipient")
+            raise ValidationFailed(
+                "a rule needs at least one recipient",
+                key="api.notifications.rule_recipient_required",
+            )
 
         if "channelIds" in values:
             channels = self._channel_values(values["channelIds"])
         else:
             channels = list(existing.channel_ids or []) if existing else []
             if not channels:
-                raise ValidationFailed("a rule needs at least one channel")
+                raise ValidationFailed(
+                    "a rule needs at least one channel",
+                    key="api.notifications.rule_channel_required",
+                )
 
         if "escalationRecipientIds" in values:
             escalation = self._recipient_values(
@@ -633,13 +772,18 @@ class NotificationService:
             else (existing.max_attempts if existing else 3)
         )
         if escalate > 0 and not escalation:
-            raise ValidationFailed("escalation needs at least one recipient")
+            raise ValidationFailed(
+                "escalation needs at least one recipient",
+                key="api.notifications.escalation_recipient_required",
+            )
 
         if existing is None:
             rule_id = values.get("id")
             rule_id = str(uuid4()) if rule_id is None else _entity_id(rule_id, "id")
             if rule_id == DEFAULT_RULE_ID:
-                raise ValidationFailed("rule id is reserved")
+                raise ValidationFailed(
+                    "rule id is reserved", key="api.notifications.rule_id_reserved"
+                )
             rule = NotificationRule(
                 id=rule_id,
                 name=name,
@@ -690,7 +834,11 @@ class NotificationService:
         limit = _integer(limit, "limit", 1, MAX_LIMIT)
         offset = _integer(offset, "offset", 0, 1_000_000)
         if unread is not None and not isinstance(unread, bool):
-            raise ValidationFailed("unread must be a boolean")
+            raise ValidationFailed(
+                "unread must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "unread"},
+            )
         conditions = [NotificationInbox.recipient_id == principal.actor_id]
         # Legacy notices have no extra grant. Native extension notices retain
         # their required permission so revoked access cannot leak old content.
@@ -733,12 +881,12 @@ class NotificationService:
         notification_id = _entity_id(notification_id, "notificationId")
         item = self._session.get(NotificationInbox, notification_id)
         if item is None or item.recipient_id != principal.actor_id:
-            raise NotFound("notification not found")
+            raise _missing("notification")
         if (
             item.required_permission is not None
             and item.required_permission not in self._identity._persisted_permissions(principal)
         ):
-            raise NotFound("notification not found")
+            raise _missing("notification")
         if item.read_at is None:
             item.read_at = utcnow()
             self._session.commit()
@@ -772,7 +920,9 @@ class NotificationService:
     def save_channel(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         self._identity.authorize(principal, "config.integrations", resource="notifications.config")
         if not isinstance(values, Mapping) or not values:
-            raise ValidationFailed("channel values are required")
+            raise ValidationFailed(
+                "channel values are required", key="api.notifications.channel_values_required"
+            )
         self._ensure_defaults()
         self._lock_state(utcnow())
         channel_id = values.get("id")
@@ -782,7 +932,7 @@ class NotificationService:
             else self._session.get(NotificationChannel, _entity_id(channel_id, "id"))
         )
         if channel_id is not None and existing is None:
-            raise NotFound("channel not found")
+            raise _missing("channel")
         channel = self._channel_row(values, existing)
         self._session.flush()
         self._identity.record_operation(
@@ -795,7 +945,9 @@ class NotificationService:
     def save_rule(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         self._identity.authorize(principal, "config.integrations", resource="notifications.config")
         if not isinstance(values, Mapping) or not values:
-            raise ValidationFailed("rule values are required")
+            raise ValidationFailed(
+                "rule values are required", key="api.notifications.rule_values_required"
+            )
         self._ensure_defaults()
         self._lock_state(utcnow())
         rule_id = values.get("id")
@@ -805,7 +957,7 @@ class NotificationService:
             else self._session.get(NotificationRule, _entity_id(rule_id, "id"))
         )
         if rule_id is not None and existing is None:
-            raise NotFound("rule not found")
+            raise _missing("rule")
         rule = self._rule_row(values, existing)
         self._session.flush()
         self._identity.record_operation(
@@ -822,9 +974,9 @@ class NotificationService:
         channel_id = _entity_id(channel_id, "channelId")
         channel = self._session.get(NotificationChannel, channel_id)
         if channel is None:
-            raise NotFound("channel not found")
+            raise _missing("channel")
         if not channel.enabled:
-            raise ValidationFailed("channel is disabled")
+            raise ValidationFailed("channel is disabled", key="api.notifications.channel_disabled")
         now = utcnow()
         name = _text(channel.name, "channel name", 120, required=True)
         document = notification_document(self._session)
@@ -904,13 +1056,25 @@ class NotificationService:
         occurred_at: datetime | None = None,
     ) -> dict[str, int | bool]:
         if not isinstance(alert_id, str) or not _IDENTIFIER.fullmatch(alert_id):
-            raise ValidationFailed("alert_id is invalid")
+            raise ValidationFailed(
+                "alert_id is invalid",
+                key="api.notifications.identifier_invalid",
+                params={"field": "alert_id"},
+            )
         if not isinstance(event_key, str) or not _EVENT_KEY.fullmatch(event_key):
-            raise ValidationFailed("event_key is invalid")
+            raise ValidationFailed(
+                "event_key is invalid",
+                key="api.notifications.identifier_invalid",
+                params={"field": "event_key"},
+            )
         if not isinstance(event_type, str) or not _EVENT_TYPE.fullmatch(event_type):
-            raise ValidationFailed("event_type is invalid")
+            raise ValidationFailed(
+                "event_type is invalid",
+                key="api.notifications.identifier_invalid",
+                params={"field": "event_type"},
+            )
         if severity not in SEVERITIES:
-            raise ValidationFailed("severity is invalid")
+            raise ValidationFailed("severity is invalid", key="api.notifications.severity_invalid")
         if asset_id is not None:
             asset_id = _text(asset_id, "asset_id", 36, required=True)
         title = _text(title, "title", 200, required=True)
@@ -918,7 +1082,10 @@ class NotificationService:
         url = _safe_url(url)
         checked_message = normalize_message(message)
         if not isinstance(acknowledged, bool) or not isinstance(recovered, bool):
-            raise ValidationFailed("acknowledged and recovered must be booleans")
+            raise ValidationFailed(
+                "acknowledged and recovered must be booleans",
+                key="api.notifications.acknowledged_boolean",
+            )
         occurred = _timestamp(occurred_at)
 
         self._ensure_defaults()

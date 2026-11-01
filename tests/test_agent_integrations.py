@@ -28,6 +28,7 @@ from itsm.agent_integrations.installer import receipt_digest
 from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.runtime import ChatAction, ChatReply
 from itsm.config import Settings
+from itsm.i18n import t
 from itsm.identity.service import Conflict
 from itsm.main import create_app
 from itsm.mcp.server import TOOL_NAMES
@@ -896,7 +897,9 @@ def test_integration_identity_ceiling_denies_stronger_machine(app_client, monkey
         headers=reader,
     )
     assert denied.status_code == 403, denied.text
-    assert "permissions" in denied.json()["error"]["message"]
+    error = denied.json()["error"]
+    assert error["key"] == "api.agent_integrations.external_role_required"
+    assert error["message"] == t(error["key"], "es")
     assert engine.created == 0
 
 
@@ -931,7 +934,9 @@ def test_integration_requires_the_bound_mcp_credential_each_run(app_client, monk
         headers=admin,
     )
     assert denied.status_code == 403, denied.text
-    assert "bound identity" in denied.json()["error"]["message"]
+    error = denied.json()["error"]
+    assert error["key"] == "api.agent_integrations.credential_identity_mismatch"
+    assert error["message"] == t(error["key"], "es")
     assert other_token not in denied.text
     assert bound_token not in denied.text
     assert other_machine.actor_id != bound_machine.actor_id
@@ -1230,7 +1235,9 @@ def test_install_receipts_are_truthful_and_gate_external_chat(app_client, monkey
         headers=admin,
     )
     assert denied.status_code == 409, denied.text
-    assert "verified" in denied.json()["error"]["message"]
+    error = denied.json()["error"]
+    assert error["key"] == "api.agent_integrations.profile_not_verified"
+    assert error["message"] == t(error["key"], "es")
 
     installed = install_verified(
         client, admin, instance, machine.actor_id, receipt={"status": "verified", "verified": True}
@@ -2414,7 +2421,10 @@ def test_first_install_still_requires_a_skill_selection(app_client, monkeypatch)
         headers=admin,
     )
     assert response.status_code == 422, response.text
-    assert response.json()["error"]["message"] == "skills are required for the first installation"
+    assert response.json()["error"]["key"] == "api.agent_integrations.skills_first_installation"
+    assert response.json()["error"]["message"] == t(
+        "api.agent_integrations.skills_first_installation", "es"
+    )
     assert installer.calls == []
     assert client.get(f"{API}/agent/integrations", headers=admin).json()["installations"] == []
 
@@ -2904,7 +2914,10 @@ def test_direct_engine_rejects_a_provider_selection(app_client, monkeypatch) -> 
         },
     )
     assert rejected.status_code == 422, rejected.text
-    assert rejected.json()["error"]["message"] == "direct engines cannot select a provider"
+    assert rejected.json()["error"]["key"] == "api.agent_integrations.direct_provider_forbidden"
+    assert rejected.json()["error"]["message"] == t(
+        "api.agent_integrations.direct_provider_forbidden", "es"
+    )
 
     with catalog.factory()() as db:
         from itsm.agent_integrations.models import AgentSession

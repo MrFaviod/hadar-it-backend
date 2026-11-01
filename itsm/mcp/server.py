@@ -158,7 +158,11 @@ def _bounded_ids(values: list[str] | None, label: str) -> list[str] | None:
     if values is None:
         return None
     if len(values) > MAX_PAGE:
-        raise ValidationFailed(f"{label} must contain at most {MAX_PAGE} ids")
+        raise ValidationFailed(
+            f"{label} must contain at most {MAX_PAGE} ids",
+            key="api.mcp.ids_max",
+            params={"field": label, "limit": MAX_PAGE},
+        )
     return list(values)
 
 
@@ -171,7 +175,11 @@ def _optional_iso_date(value: str | None, label: str) -> date | None:
     try:
         return date.fromisoformat(value)
     except TypeError, ValueError:
-        raise ValidationFailed(f"{label} must be an ISO date (YYYY-MM-DD)") from None
+        raise ValidationFailed(
+            f"{label} must be an ISO date (YYYY-MM-DD)",
+            key="api.mcp.field_iso_date",
+            params={"field": label},
+        ) from None
 
 
 class DatabaseTokenVerifier(TokenVerifier):
@@ -1015,7 +1023,10 @@ def create_mcp_server(
             )
             if group_id is None:
                 if name is None or mode is None or specs is None:
-                    raise ValidationFailed("name, mode and members are required to create a group")
+                    raise ValidationFailed(
+                        "name, mode and members are required to create a group",
+                        key="api.mcp.group_fields_required",
+                    )
                 view = service.create(
                     principal,
                     name=name,
@@ -1192,7 +1203,9 @@ def create_mcp_server(
 
         def operation(service, principal, digest):
             if request.labels is None:
-                raise ValidationFailed("label options are required")
+                raise ValidationFailed(
+                    "label options are required", key="api.mcp.label_options_required"
+                )
             return service.generate(principal, request, credential_digest=digest)
 
         return run_report(operation)

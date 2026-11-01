@@ -479,7 +479,11 @@ def _bounded_ids(values: list[str] | None, label: str) -> list[str] | None:
     if values is None:
         return None
     if len(values) > MAX_RESULTS:
-        raise ValidationFailed(f"{label} must contain at most {MAX_RESULTS} ids")
+        raise ValidationFailed(
+            f"{label} must contain at most {MAX_RESULTS} ids",
+            key="api.agents.ids_max",
+            params={"field": label, "limit": MAX_RESULTS},
+        )
     return list(values)
 
 
@@ -492,7 +496,11 @@ def _optional_iso_date(value: str | None, label: str) -> date | None:
     try:
         return date.fromisoformat(value)
     except TypeError, ValueError:
-        raise ValidationFailed(f"{label} must be an ISO date (YYYY-MM-DD)") from None
+        raise ValidationFailed(
+            f"{label} must be an ISO date (YYYY-MM-DD)",
+            key="api.agents.field_iso_date",
+            params={"field": label},
+        ) from None
 
 
 class RedundancyMemberArg(BaseModel):
@@ -1185,7 +1193,8 @@ def build_toolset() -> FunctionToolset[AgentDeps]:
                 if group_id is None:
                     if name is None or mode is None or specs is None:
                         raise ValidationFailed(
-                            "name, mode and members are required to create a group"
+                            "name, mode and members are required to create a group",
+                            key="api.agents.group_fields_required",
                         )
                     view = redundancy.create(
                         ctx.deps.principal,
