@@ -22,6 +22,8 @@ from pydantic import (
     model_validator,
 )
 
+from itsm.i18n.catalog import resolve_installed_locale
+
 FAMILIES: tuple[str, ...] = ("inventory", "history", "warranty")
 MODES: tuple[str, ...] = ("list", "sheet")
 TEMPLATE_FORMATS: tuple[str, ...] = ("A4", "Letter")
@@ -510,6 +512,7 @@ class ReportRequest(BaseModel):
     mode: Literal["consolidated", "individual"] = "consolidated"
     output: Output = "pdf"
     name: str = Field(default="Reporte", max_length=160)
+    locale: str | None = Field(default=None, max_length=35)
     labels: LabelOptions | None = None
 
     @field_validator("name")
@@ -519,6 +522,16 @@ class ReportRequest(BaseModel):
         if not text:
             raise ValueError("report name is required")
         return text
+
+    @field_validator("locale")
+    @classmethod
+    def _installed_locale(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        resolved = resolve_installed_locale(value)
+        if resolved is None:
+            raise ValueError(f"unknown locale: {value}")
+        return resolved
 
     @field_validator("assetIds")
     @classmethod

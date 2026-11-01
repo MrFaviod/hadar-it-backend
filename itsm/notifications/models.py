@@ -93,6 +93,7 @@ class NotificationEvent(NotificationBase):
     asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     title: Mapped[str] = mapped_column(String(200), nullable=False)
     body: Mapped[str] = mapped_column(Text, nullable=False)
+    message: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
     url: Mapped[str | None] = mapped_column(String(500), nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     acknowledged: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)

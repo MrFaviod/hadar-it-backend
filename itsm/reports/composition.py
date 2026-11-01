@@ -1,8 +1,8 @@
 """Deterministic HTML/CSS composition for reports and physical labels.
 
-This module is intentionally free of FastAPI, SQLAlchemy and settings imports.
-It receives already authorized and projected data, validates it against the
-shared schemas and emits self-contained HTML whose only image sources are
+This module imports no FastAPI, SQLAlchemy or settings objects at run time: it
+receives already authorized and projected data plus the document locale, and
+emits self-contained HTML whose only image sources are
 ``resource://<registered-key>`` references.  ``preview_html`` is the sole place
 that turns those registered bytes into browser data URIs; PDF rendering never
 uses data, HTTP or file URLs.
@@ -23,11 +23,21 @@ from typing import Any
 
 from PIL import Image, ImageOps
 
+from itsm.i18n.catalog import DEFAULT_LOCALE, resolve_installed_locale
+from itsm.i18n.documents import DocumentLocale, default_document_locale
+from itsm.i18n.settings import DEFAULT_CURRENCY, DEFAULT_TIMEZONE
+from itsm.reports.labels import (
+    asset_name_label,
+    coverage_label,
+    family_label,
+    field_label,
+    label_field_label,
+    missing_group_label,
+    summary_group_label,
+)
 from itsm.reports.qr import qr_svg
 from itsm.reports.schemas import (
     FAMILY_DEFAULT_FIELDS,
-    FIELD_LABELS,
-    LABEL_FIELD_LABELS,
     LabelOptions,
     TemplateDefinition,
 )
@@ -55,20 +65,7 @@ _BRANDING_FALLBACK = {
 }
 _COLOR = re.compile(r"^#[0-9a-fA-F]{6}$")
 _RESOURCE_SRC = re.compile(r'src="resource://([^"]+)"')
-_SUMMARY_GROUP_LABELS = {
-    "byStatus": "Por estado",
-    "byCategory": "Por categoría",
-    "bySite": "Por sede",
-    "byAction": "Por acción",
-    "byActor": "Por actor",
-    "byCoverage": "Por cobertura",
-    "byType": "Por tipo",
-}
-_FAMILY_LABELS = {
-    "inventory": "Inventario",
-    "history": "Historial",
-    "warranty": "Garantías",
-}
+_PAGE_COUNTER = re.compile(r"\{(current|total)\}")
 
 
 @dataclass(frozen=True, slots=True)
@@ -162,12 +159,13 @@ _PRESET_GEOMETRY: dict[str, dict[str, float | int]] = {
 # --------------------------------------------------------------------- helpers
 
 
-def _plain(value: Any, limit: int = MAX_BLOCK_CHARS) -> str:
+def _plain(value: Any, limit: int = MAX_BLOCK_CHARS, document: DocumentLocale | None = None) -> str:
     """Plain text for HTML escaping; never interprets markup or URLs."""
     if value is None:
         return ""
     if isinstance(value, bool):
-        return "Sí" if value else "No"
+        resolved = document if document is not None else default_document_locale()
+        return resolved.t("api.reports.yes" if value else "api.reports.no")
     if isinstance(value, Mapping):
         text = json.dumps(value, ensure_ascii=False, sort_keys=True, default=str)
     elif isinstance(value, (list, tuple)):
@@ -180,13 +178,36 @@ def _plain(value: Any, limit: int = MAX_BLOCK_CHARS) -> str:
     return cleaned[:limit]
 
 
-def _escape(value: Any, limit: int = MAX_BLOCK_CHARS) -> str:
-    return html_module.escape(_plain(value, limit), quote=True)
+def _escape(
+    value: Any, limit: int = MAX_BLOCK_CHARS, document: DocumentLocale | None = None
+) -> str:
+    return html_module.escape(_plain(value, limit, document), quote=True)
 
 
-def _cell(value: Any) -> str:
-    text = _escape(value, MAX_CELL_CHARS)
+def _cell(value: Any, document: DocumentLocale | None = None) -> str:
+    text = _escape(value, MAX_CELL_CHARS, document)
     return text if text else "—"
+
+
+def _context_document(context: Mapping[str, Any]) -> DocumentLocale:
+    """The document locale carried by a validated context; Spanish by default."""
+    raw = context.get("locale")
+    if raw is None:
+        return default_document_locale()
+    if not isinstance(raw, str):
+        raise ValueError("context.locale must be a string")
+    locale = resolve_installed_locale(raw)
+    if locale is None:
+        raise ValueError(f"unknown locale: {raw}")
+    timezone = context.get("timezone") or DEFAULT_TIMEZONE
+    currency = context.get("currency") or DEFAULT_CURRENCY
+    default = context.get("defaultLocale") or DEFAULT_LOCALE
+    for name, value in (("timezone", timezone), ("currency", currency), ("defaultLocale", default)):
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"context.{name} must be a non-empty string")
+    return DocumentLocale(
+        locale=locale, timezone=timezone, currency=currency, default_locale=default
+    )
 
 
 def _mm(value: float) -> str:
@@ -294,6 +315,7 @@ def _safe_qr_url(value: Any) -> str | None:
 
 def _normalize_context(raw: Any) -> dict[str, Any]:
     context = _as_mapping(raw, "context")
+    document = _context_document(context)
 
     assets = _as_list(context.get("assets"), "context.assets")
     if len(assets) > MAX_ASSETS:
@@ -318,7 +340,7 @@ def _normalize_context(raw: Any) -> dict[str, Any]:
         if not isinstance(key, str) or not key.strip() or len(key) > 80:
             raise ValueError("column keys must be 1-80 character strings")
         if label is None:
-            label = FIELD_LABELS.get(key, key)
+            label = field_label(key, document)
         if not isinstance(label, str) or len(label) > 120:
             raise ValueError("column labels must be at most 120 characters")
         columns.append({"key": key.strip(), "label": label})
@@ -353,13 +375,32 @@ def _normalize_context(raw: Any) -> dict[str, Any]:
         "logo": context.get("logo"),
         "title": _plain(context.get("title"), MAX_TITLE_CHARS),
         "generatedAt": _plain(context.get("generatedAt"), 80),
+        "document": document,
     }
 
 
 # ------------------------------------------------------------------- report CSS
 
 
-def _report_css(branding: Mapping[str, str], template_format: str, has_footer: bool) -> str:
+def _page_counter(document: DocumentLocale) -> str:
+    """CSS page counters spliced into the localized footer template."""
+    pieces: list[str] = []
+    for part in _PAGE_COUNTER.split(document.t("api.reports.page_footer")):
+        if part == "current":
+            pieces.append("counter(page)")
+        elif part == "total":
+            pieces.append("counter(pages)")
+        elif part:
+            pieces.append('"' + part.replace("\\", "\\\\").replace('"', '\\"') + '"')
+    return " ".join(pieces) or '""'
+
+
+def _report_css(
+    branding: Mapping[str, str],
+    template_format: str,
+    has_footer: bool,
+    document: DocumentLocale,
+) -> str:
     primary = branding["primary"]
     accent = branding["accent"]
     on_primary = _contrast_text(primary)
@@ -374,7 +415,7 @@ def _report_css(branding: Mapping[str, str], template_format: str, has_footer: b
   margin: 22mm 14mm 18mm 14mm;
   @top-center {{ content: element(doc-header); vertical-align: bottom; }}
   {footer_rule}
-  @bottom-right {{ content: "Página " counter(page) " de " counter(pages);
+  @bottom-right {{ content: {_page_counter(document)};
   font-size: 7.5pt;
   color: #475569;
   }}
@@ -514,16 +555,22 @@ def _asset_value(asset: Mapping[str, Any], key: str) -> Any:
     return value
 
 
-def _asset_cards(assets: list[dict[str, Any]], fields: list[str], mode: str) -> str:
+def _asset_cards(
+    assets: list[dict[str, Any]],
+    fields: list[str],
+    mode: str,
+    document: DocumentLocale,
+) -> str:
     cards: list[str] = []
     for item in assets:
-        name = _escape(item.get("name") or item.get("quickCode") or item.get("id") or "Activo", 200)
+        fallback = item.get("name") or item.get("quickCode") or item.get("id")
+        name = _escape(fallback or asset_name_label(document), 200)
         facts: list[str] = []
         for key in fields:
-            label = FIELD_LABELS.get(key, key)
+            label = field_label(key, document)
             facts.append(
                 f'<tr><th scope="row">{_escape(label, 80)}</th>'
-                f"<td>{_cell(_asset_value(item, key))}</td></tr>"
+                f"<td>{_cell(_asset_value(item, key), document)}</td></tr>"
             )
         cards.append(
             f'<article class="asset-card{" mode-sheet" if mode == "sheet" else ""}">'
@@ -534,7 +581,7 @@ def _asset_cards(assets: list[dict[str, Any]], fields: list[str], mode: str) -> 
 
 
 def _table_columns(
-    context: Mapping[str, Any], template: TemplateDefinition
+    context: Mapping[str, Any], template: TemplateDefinition, document: DocumentLocale
 ) -> list[dict[str, str]]:
     if context["columns"]:
         return context["columns"]
@@ -545,7 +592,7 @@ def _table_columns(
         ]
     if not keys:
         keys = list(FAMILY_DEFAULT_FIELDS[template.family])
-    return [{"key": key, "label": FIELD_LABELS.get(key, key)} for key in keys]
+    return [{"key": key, "label": field_label(key, document)} for key in keys]
 
 
 def _table_rows(
@@ -562,14 +609,16 @@ def _table_rows(
     ]
 
 
-def _table_block(context: Mapping[str, Any], template: TemplateDefinition) -> str:
-    columns = _table_columns(context, template)
+def _table_block(
+    context: Mapping[str, Any], template: TemplateDefinition, document: DocumentLocale
+) -> str:
+    columns = _table_columns(context, template, document)
     rows = _table_rows(context, columns, template)
     head = "".join(f'<th scope="col">{_escape(column["label"], 120)}</th>' for column in columns)
     if not rows:
         body = (
             f'<tr><td colspan="{max(1, len(columns))}" class="doc-empty">'
-            "Sin datos para los filtros seleccionados.</td></tr>"
+            f"{document.t('api.reports.empty_rows')}</td></tr>"
         )
     else:
         parts: list[str] = []
@@ -583,14 +632,16 @@ def _table_block(context: Mapping[str, Any], template: TemplateDefinition) -> st
             if group is not None or (
                 isinstance(rows[0], Mapping) and "group" in rows[0] and group is None
             ):
-                label = _plain(group, 120) or "Sin datos"
+                label = _plain(group, 120) or missing_group_label(document)
                 parts.append(
                     f'<tr class="doc-group"><th colspan="{max(1, len(columns))}">'
                     f"{_escape(label, 120)} ({len(chunk)})</th></tr>"
                 )
             parts.extend(
                 "<tr>"
-                + "".join(f"<td>{_cell(row.get(column['key']))}</td>" for column in columns)
+                + "".join(
+                    f"<td>{_cell(row.get(column['key']), document)}</td>" for column in columns
+                )
                 + "</tr>"
                 for row in chunk
             )
@@ -604,7 +655,7 @@ def _table_block(context: Mapping[str, Any], template: TemplateDefinition) -> st
     )
 
 
-def _summary_block(summary: Mapping[str, Any]) -> str:
+def _summary_block(summary: Mapping[str, Any], document: DocumentLocale) -> str:
     charts: list[tuple[str, list[tuple[str, int]]]] = []
     for key, value in summary.items():
         if not isinstance(key, str) or not key.startswith("by") or not isinstance(value, Mapping):
@@ -615,9 +666,10 @@ def _summary_block(summary: Mapping[str, Any]) -> str:
                 continue
             if not isinstance(label, str):
                 continue
-            pairs.append((label, count))
+            visible = coverage_label(label, document) if key == "byCoverage" else label
+            pairs.append((visible, count))
         if pairs:
-            label = _SUMMARY_GROUP_LABELS.get(key, _plain(key[2:], 80).title() or key)
+            label = summary_group_label(key, document)
             charts.append((label, pairs))
 
     raw_groups = summary.get("groups")
@@ -631,9 +683,9 @@ def _summary_block(summary: Mapping[str, Any]) -> str:
                 continue
             if not isinstance(label, str):
                 continue
-            group_pairs.append((label or "Sin datos", count))
+            group_pairs.append((label or missing_group_label(document), count))
         if group_pairs:
-            charts.insert(0, ("Por grupo", group_pairs))
+            charts.insert(0, (summary_group_label("groups", document), group_pairs))
 
     total: int | None = None
     raw_total = summary.get("total")
@@ -644,20 +696,29 @@ def _summary_block(summary: Mapping[str, Any]) -> str:
 
     facts: list[str] = []
     if total is not None:
-        facts.append(f'<p class="summary-total">Total: {total}</p>')
+        text = document.t("api.reports.summary_total", count=total)
+        facts.append(f'<p class="summary-total">{_escape(text, 80)}</p>')
     cost = summary.get("cost")
     if isinstance(cost, (str, int, float)) and not isinstance(cost, bool):
-        cost_text = _plain(cost, 80)
-        if cost_text:
-            facts.append(f'<p class="summary-fact">Coste total: {_escape(cost_text, 80)}</p>')
+        amount = document.money(cost)
+        if amount:
+            facts.append(
+                f'<p class="summary-fact">'
+                f"{_escape(document.t('api.reports.summary_cost', amount=amount), 120)}</p>"
+            )
     technical = summary.get("withTechnical")
     if isinstance(technical, int) and not isinstance(technical, bool):
-        facts.append(f'<p class="summary-fact">Con datos técnicos: {technical}</p>')
+        facts.append(
+            f'<p class="summary-fact">'
+            f"{_escape(document.t('api.reports.summary_technical', count=technical), 120)}</p>"
+        )
     start, end = summary.get("from"), summary.get("to")
     if isinstance(start, str) and isinstance(end, str) and (start or end):
-        facts.append(
-            f'<p class="summary-fact">Período: {_escape(start, 40)} - {_escape(end, 40)}</p>'
+        period = document.t(
+            "api.reports.summary_period",
+            **{"from": document.day(start), "to": document.day(end)},
         )
+        facts.append(f'<p class="summary-fact">{_escape(period, 160)}</p>')
 
     if not charts and not facts:
         return ""
@@ -680,14 +741,17 @@ def _summary_block(summary: Mapping[str, Any]) -> str:
             f'<ul class="summary-rows">{"".join(rows)}</ul></div>'
         )
     return (
-        '<section class="summary-block"><h2 class="section-heading">Resumen</h2>'
+        '<section class="summary-block"><h2 class="section-heading">'
+        f"{_escape(document.t('api.reports.summary_title'), 80)}</h2>"
         + "".join(facts)
         + "".join(chart_html)
         + "</section>"
     )
 
 
-def _photo_block(context: Mapping[str, Any], resources: dict[str, bytes]) -> str:
+def _photo_block(
+    context: Mapping[str, Any], resources: dict[str, bytes], document: DocumentLocale
+) -> str:
     figures: list[str] = []
     for index, asset in enumerate(context["assets"]):
         asset_id = asset.get("id")
@@ -698,7 +762,9 @@ def _photo_block(context: Mapping[str, Any], resources: dict[str, bytes]) -> str
             continue
         key = f"photo-{index}.png"
         resources[key] = normalized
-        name = _escape(asset.get("name") or asset.get("quickCode") or "Activo", 200)
+        name = _escape(
+            asset.get("name") or asset.get("quickCode") or asset_name_label(document), 200
+        )
         figures.append(
             f'<figure><img class="doc-photo" src="resource://{key}" alt="{name}">'
             f"<figcaption>{name}</figcaption></figure>"
@@ -706,12 +772,13 @@ def _photo_block(context: Mapping[str, Any], resources: dict[str, bytes]) -> str
     if not figures:
         return ""
     return (
-        '<section class="photo-block"><h2 class="section-heading">Imágenes</h2>'
+        '<section class="photo-block"><h2 class="section-heading">'
+        f"{_escape(document.t('api.reports.images_title'), 80)}</h2>"
         f'<div class="photo-grid">{"".join(figures)}</div></section>'
     )
 
 
-def _qr_block(context: Mapping[str, Any]) -> str:
+def _qr_block(context: Mapping[str, Any], document: DocumentLocale) -> str:
     cards: list[str] = []
     for asset in context["assets"]:
         asset_id = asset.get("id")
@@ -724,7 +791,9 @@ def _qr_block(context: Mapping[str, Any]) -> str:
             svg = qr_svg(url)
         except ValueError:
             continue
-        name = _escape(asset.get("name") or asset.get("quickCode") or "Activo", 200)
+        name = _escape(
+            asset.get("name") or asset.get("quickCode") or asset_name_label(document), 200
+        )
         cards.append(
             f'<figure class="qr-card"><div class="qr">{svg}</div>'
             f'<figcaption>{name}<code class="qr-url">{_escape(url, 600)}</code>'
@@ -733,7 +802,8 @@ def _qr_block(context: Mapping[str, Any]) -> str:
     if not cards:
         return ""
     return (
-        '<section class="qr-block"><h2 class="section-heading">Código QR permanente</h2>'
+        '<section class="qr-block"><h2 class="section-heading">'
+        f"{_escape(document.t('api.reports.qr_title'), 80)}</h2>"
         f'<div class="qr-grid">{"".join(cards)}</div></section>'
     )
 
@@ -742,6 +812,7 @@ def _render_blocks(
     template: TemplateDefinition,
     context: Mapping[str, Any],
     resources: dict[str, bytes],
+    document: DocumentLocale,
 ) -> str:
     sections: list[str] = []
     for block in template.blocks:
@@ -756,22 +827,22 @@ def _render_blocks(
             if text:
                 sections.append(f'<p class="section-text">{text.replace(chr(10), "<br>")}</p>')
         elif block.type == "asset":
-            cards = _asset_cards(context["assets"], list(template.fields), template.mode)
+            cards = _asset_cards(context["assets"], list(template.fields), template.mode, document)
             if cards:
                 sections.append(f'<section class="asset-block">{cards}</section>')
             else:
                 sections.append(
-                    '<p class="doc-empty">Sin activos para los filtros seleccionados.</p>'
+                    f'<p class="doc-empty">{document.t("api.reports.empty_assets")}</p>'
                 )
         elif block.type == "table":
-            sections.append(_table_block(context, template))
+            sections.append(_table_block(context, template, document))
         elif block.type == "photo":
             if template.images:
-                sections.append(_photo_block(context, resources))
+                sections.append(_photo_block(context, resources, document))
         elif block.type == "summary":
-            sections.append(_summary_block(context["summary"]))
+            sections.append(_summary_block(context["summary"], document))
         elif block.type == "qr":
-            sections.append(_qr_block(context))
+            sections.append(_qr_block(context, document))
         elif block.type == "footer":
             if text:
                 sections.append(f'<p class="section-footer">{text}</p>')
@@ -792,6 +863,7 @@ def _compose_report(
         logo_key = None
 
     branding = context["branding"]
+    document = context["document"]
     header = _report_header(branding, logo_key)
     footer = (
         f'<div class="doc-footer">{_escape(branding["footer"], 160)}</div>'
@@ -799,16 +871,18 @@ def _compose_report(
         else ""
     )
     title = context["title"] or template.name
-    meta_parts = [_FAMILY_LABELS.get(template.family, "Documento")]
+    meta_parts = [family_label(template.family, document)]
     if branding["name"]:
         meta_parts.append(branding["name"])
     if context["generatedAt"]:
-        meta_parts.append(f"Generado: {context['generatedAt']}")
+        meta_parts.append(
+            document.t("api.reports.generated", moment=document.moment(context["generatedAt"]))
+        )
     meta = " · ".join(_escape(part, 160) for part in meta_parts)
-    body = _render_blocks(template, context, resources)
-    css = _report_css(branding, template.format, bool(branding["footer"]))
+    body = _render_blocks(template, context, resources, document)
+    css = _report_css(branding, template.format, bool(branding["footer"]), document)
     html = (
-        '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">'
+        f'<!DOCTYPE html><html lang="{_escape(document.locale, 35)}"><head><meta charset="utf-8">'
         f"<title>{_escape(title, MAX_TITLE_CHARS)}</title><style>{css}</style></head>"
         f'<body class="mode-{template.mode}">{header}{footer}'
         f'<main><h1 class="doc-title">{_escape(title, MAX_TITLE_CHARS)}</h1>'
@@ -944,18 +1018,20 @@ body {{ margin: 0; font-family: "DejaVu Sans", Arial, sans-serif; color: #0b2331
 """.strip()
 
 
-def _label_field_html(field: str, asset: Mapping[str, Any]) -> str:
+def _label_field_html(field: str, asset: Mapping[str, Any], document: DocumentLocale) -> str:
     if field == "name":
-        value = _escape(asset.get("name") or asset.get("quickCode") or "Activo", 200)
+        value = _escape(
+            asset.get("name") or asset.get("quickCode") or asset_name_label(document), 200
+        )
         return f'<span class="label-name">{value}</span>'
     if field == "id":
         return f'<span class="label-id">{_escape(asset.get("id"), 64)}</span>'
     if field == "code":
         return f'<span class="label-code">{_escape(asset.get("quickCode"), 64)}</span>'
-    label = LABEL_FIELD_LABELS.get(field, FIELD_LABELS.get(field, field))
+    label = label_field_label(field, document)
     return (
         f'<span class="label-field">{_escape(label, 80)}: '
-        f"{_cell(_asset_value(asset, field))}</span>"
+        f"{_cell(_asset_value(asset, field), document)}</span>"
     )
 
 
@@ -967,6 +1043,7 @@ def _label_cell(
     resources: dict[str, bytes],
     logo_key: str | None,
     qr_urls: Mapping[str, str],
+    document: DocumentLocale,
     left: float,
     top: float,
 ) -> str:
@@ -976,7 +1053,7 @@ def _label_cell(
     for field in fields:
         if field in {"logo", "qr"}:
             continue
-        content.append(_label_field_html(field, asset))
+        content.append(_label_field_html(field, asset, document))
     text_html = f'<td class="label-text">{"".join(content)}</td>'
 
     qr_html = ""
@@ -1010,6 +1087,7 @@ def _compose_labels(
     if len(assets) > MAX_LABELS:
         raise ValueError(f"labels exceed {MAX_LABELS} assets")
     geometry = _label_geometry(options)
+    document = context["document"]
 
     resources: dict[str, bytes] = {}
     normalized_logo = _normalize_raster(context["logo"], max_edge=MAX_LOGO_EDGE)
@@ -1041,7 +1119,7 @@ def _compose_labels(
     for page in pages:
         cells: list[str] = []
         if not page:
-            cells.append('<p class="label-empty">Sin activos para las etiquetas seleccionadas.</p>')
+            cells.append(f'<p class="label-empty">{document.t("api.reports.empty_labels")}</p>')
         for index, asset in enumerate(page):
             if asset is None:
                 continue
@@ -1056,6 +1134,7 @@ def _compose_labels(
                     resources=resources,
                     logo_key=logo_key,
                     qr_urls=context["qrUrls"],
+                    document=document,
                     left=left,
                     top=top,
                 )
@@ -1063,9 +1142,9 @@ def _compose_labels(
         pages_html.append(f'<div class="label-page">{"".join(cells)}</div>')
 
     css = _label_css(geometry)
-    title = f"Etiquetas · {template.name}"
+    title = document.t("api.reports.labels_title", name=template.name)
     html = (
-        '<!DOCTYPE html><html lang="es"><head><meta charset="utf-8">'
+        f'<!DOCTYPE html><html lang="{_escape(document.locale, 35)}"><head><meta charset="utf-8">'
         f"<title>{_escape(title, 160)}</title><style>{css}</style></head>"
         f"<body>{''.join(pages_html)}</body></html>"
     )

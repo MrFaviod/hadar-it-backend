@@ -28,6 +28,7 @@ from itsm.attachments.models import Attachment
 from itsm.attachments.service import AttachmentService, StorageUnavailable
 from itsm.attachments.storage import BlobStorage, LocalBlobStorage
 from itsm.config import Settings
+from itsm.i18n.documents import DocumentLocale, read_document_locale
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.models import IdentityCredential, IdentitySession
 from itsm.identity.permissions import ROLE_ADMIN, ROLE_SUPERADMIN
@@ -162,6 +163,7 @@ class Collected:
     base_url: str
     title: str
     labels: dict[str, Any] | None
+    document: DocumentLocale
     table: ReportTable
     qr_urls: dict[str, str]
     images: dict[str, bytes]
@@ -378,6 +380,9 @@ class ReportService:
         identity.authorize(principal, "assets.view", resource="reports:data")
         dump = self._request_dump(request)
         self._validate_semantics(dump)
+        document = read_document_locale(
+            session, locale=dump.get("locale"), identity_id=principal.actor_id
+        )
         family = dump["family"]
         output = dump.get("output") or "pdf"
         mode = dump.get("mode") or "consolidated"
@@ -415,7 +420,7 @@ class ReportService:
             max_assets=self.settings.report_max_assets,
         )
         if family == "inventory":
-            table = inventory_table(assets, fields)
+            table = inventory_table(assets, fields, document)
         elif family == "history":
             interventions = self._interventions or InterventionService(
                 session, self.settings, identity=identity, source="internal"
@@ -427,10 +432,13 @@ class ReportService:
                 assets,
                 dump.get("filters"),
                 fields,
+                document,
             )
         else:
-            table = warranty_table(warranties, principal, assets, dump.get("filters"), fields)
-        table = group_table(table, group)
+            table = warranty_table(
+                warranties, principal, assets, dump.get("filters"), fields, document
+            )
+        table = group_table(table, group, document)
         settings_wire = self._settings_wire(session, self._stored_settings(session))
         branding = settings_wire["branding"]
         base_url = self._validate_base_url(settings_wire["baseUrl"])
@@ -449,8 +457,9 @@ class ReportService:
             template=template,
             branding=self._public_branding(branding),
             base_url=base_url,
-            title=str(dump.get("name") or template.get("name") or "Reporte"),
+            title=str(dump.get("name") or template.get("name") or document.t("api.reports.title")),
             labels=dump.get("labels"),
+            document=document,
             table=table,
             qr_urls=qr_urls,
             images=images,
@@ -492,6 +501,10 @@ class ReportService:
                 if asset.id in collected.images
             },
             "logo": collected.logo,
+            "locale": collected.document.locale,
+            "timezone": collected.document.timezone,
+            "currency": collected.document.currency,
+            "defaultLocale": collected.document.default_locale,
         }
 
     def _compose(
@@ -511,7 +524,7 @@ class ReportService:
     @staticmethod
     def _subset_table(collected: Collected, asset: Any) -> ReportTable:
         if collected.family == "inventory":
-            return inventory_table([asset], collected.fields)
+            return inventory_table([asset], collected.fields, collected.document)
         rows = [row for row in collected.table.rows if row.get("assetId") == asset.id]
         counts: dict[str, int] = {}
         key = "action" if collected.family == "history" else "coverage"
@@ -695,6 +708,7 @@ class ReportService:
                 "truncated": False,
                 "template": collected.template,
                 "branding": dict(collected.branding),
+                "locale": collected.document.locale,
             }
 
     # ------------------------------------------------------------------- jobs
@@ -754,6 +768,11 @@ class ReportService:
             dump = self._request_dump(model)
             self._validate_semantics(dump)
             self._resolve_template(session, dump)
+            # Persist the effective language: asynchronous rendering must not
+            # depend on a preference the requester changes later.
+            dump["locale"] = read_document_locale(
+                session, locale=dump.get("locale"), identity_id=principal.actor_id
+            ).locale
             now = utcnow()
             job_id = str(uuid4())
             job = ReportJob(
@@ -1158,11 +1177,11 @@ class ReportService:
                 return
             mime = DOCUMENT_MIMES[collected.output]
             extension = DOCUMENT_EXTENSIONS[collected.output]
-            export = export_table(collected.table)
+            export = export_table(collected.table, collected.document)
             if collected.output == "csv":
                 payload = csv_bytes(export.rows, export.columns)
             else:
-                payload = xlsx_bytes(export.rows, export.columns)
+                payload = xlsx_bytes(export.rows, export.columns, collected.document)
             name = _document_name(collected.title, extension)
             self._store_document(session, job, asset_id=None, name=name, mime=mime, data=payload)
             job.processed = job.total

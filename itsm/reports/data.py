@@ -21,13 +21,19 @@ from openpyxl.cell import WriteOnlyCell
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+from itsm.i18n.documents import DocumentLocale, default_document_locale
 from itsm.identity.clock import as_utc
 from itsm.identity.service import NotFound, ValidationFailed
 from itsm.inventory.models import Asset
 from itsm.inventory.service import AssetView, HistoryView, InventoryService
+from itsm.reports.labels import (
+    column_label,
+    export_id_label,
+    field_label,
+    missing_group_label,
+)
 from itsm.reports.schemas import (
     ASSET_FIELDS,
-    FIELD_LABELS,
     PUBLIC_ASSET_FIELDS,
     WARRANTY_FILTERS,
 )
@@ -128,17 +134,21 @@ class ReportTable:
     assets: tuple[AssetView, ...]
 
 
-def history_columns(fields: Sequence[str]) -> list[dict[str, str]]:
-    labels = {column["key"]: column["label"] for column in HISTORY_COLUMNS}
-    return [{"key": field, "label": labels.get(field, field)} for field in fields]
+def history_columns(
+    fields: Sequence[str], document: DocumentLocale | None = None
+) -> list[dict[str, str]]:
+    return [{"key": field, "label": column_label("history", field, document)} for field in fields]
 
 
-def warranty_columns(fields: Sequence[str]) -> list[dict[str, str]]:
-    labels = {column["key"]: column["label"] for column in WARRANTY_COLUMNS}
-    return [{"key": field, "label": labels.get(field, field)} for field in fields]
+def warranty_columns(
+    fields: Sequence[str], document: DocumentLocale | None = None
+) -> list[dict[str, str]]:
+    return [{"key": field, "label": column_label("warranty", field, document)} for field in fields]
 
 
-def group_table(table: ReportTable, group: str) -> ReportTable:
+def group_table(
+    table: ReportTable, group: str, document: DocumentLocale | None = None
+) -> ReportTable:
     """Sort rows stably by one asset group and add contiguous group labels."""
     if group not in GROUP_FIELDS:
         raise ValidationFailed("unsupported group")
@@ -156,7 +166,7 @@ def group_table(table: ReportTable, group: str) -> ReportTable:
                     if group == "responsible"
                     else getattr(asset, group, None)
                 )
-        label = MISSING_GROUP_LABEL if value in (None, "") else str(value)
+        label = missing_group_label(document) if value in (None, "") else str(value)
         decorated.append((label, index, row))
     decorated.sort(key=lambda item: (item[0].casefold(), item[1]))
     grouped_counts: dict[str, int] = {}
@@ -360,8 +370,8 @@ def _canonical_fields(fields: Sequence[str] | None) -> tuple[str, ...]:
     return tuple(normalized)
 
 
-def columns(fields: Sequence[str]) -> list[dict[str, str]]:
-    return [{"key": key, "label": FIELD_LABELS[key]} for key in fields]
+def columns(fields: Sequence[str], document: DocumentLocale | None = None) -> list[dict[str, str]]:
+    return [{"key": key, "label": field_label(key, document)} for key in fields]
 
 
 def _counts(values: Iterable[Any]) -> dict[str, int]:
@@ -373,7 +383,9 @@ def _counts(values: Iterable[Any]) -> dict[str, int]:
 
 
 def inventory_table(
-    assets: Sequence[AssetView], fields: Sequence[str] | None = None
+    assets: Sequence[AssetView],
+    fields: Sequence[str] | None = None,
+    document: DocumentLocale | None = None,
 ) -> ReportTable:
     selected = _canonical_fields(fields)
     rows = []
@@ -390,7 +402,12 @@ def inventory_table(
         "bySite": _counts(asset.site for asset in assets),
         "withTechnical": sum(1 for asset in assets if asset.technical),
     }
-    return ReportTable(rows=rows, columns=columns(selected), summary=summary, assets=tuple(assets))
+    return ReportTable(
+        rows=rows,
+        columns=columns(selected, document),
+        summary=summary,
+        assets=tuple(assets),
+    )
 
 
 def _matches(
@@ -549,6 +566,7 @@ def history_table(
     assets: Sequence[AssetView],
     filters: Any,
     fields: Sequence[str] | None = None,
+    document: DocumentLocale | None = None,
 ) -> ReportTable:
     entries = history_rows(inventory, interventions, principal, assets, filters)
     selected = tuple(fields or DEFAULT_HISTORY_FIELDS)
@@ -565,7 +583,7 @@ def history_table(
     }
     return ReportTable(
         rows=rows,
-        columns=history_columns(selected),
+        columns=history_columns(selected, document),
         summary=summary,
         assets=tuple(assets),
     )
@@ -581,6 +599,7 @@ def warranty_table(
     assets: Sequence[AssetView],
     filters: Any,
     fields: Sequence[str] | None = None,
+    document: DocumentLocale | None = None,
 ) -> ReportTable:
     wanted = warranty_filter(filters)
     target = None if wanted is None else WARRANTY_FILTER_TARGETS[wanted]
@@ -637,7 +656,7 @@ def warranty_table(
     }
     return ReportTable(
         rows=projected,
-        columns=warranty_columns(selected),
+        columns=warranty_columns(selected, document),
         summary=summary,
         assets=tuple(assets),
     )
@@ -650,13 +669,13 @@ def _cell(value: Any) -> Any:
     return export_cell(value)
 
 
-def export_table(table: ReportTable) -> ReportTable:
+def export_table(table: ReportTable, document: DocumentLocale | None = None) -> ReportTable:
     """Prepend the immutable identity column when fields omitted it."""
     keys = {column["key"] for column in table.columns}
     identity = "id" if table.rows and "id" in table.rows[0] else "assetId"
     if identity in keys:
         return table
-    label = "ID" if identity == "id" else "ID de activo"
+    label = export_id_label(identity, document)
     return ReportTable(
         rows=table.rows,
         columns=[{"key": identity, "label": label}, *table.columns],
@@ -675,10 +694,19 @@ def csv_bytes(rows: Sequence[Mapping[str, Any]], columns_: Sequence[Mapping[str,
     return buffer.getvalue().encode("utf-8-sig")
 
 
-def xlsx_bytes(rows: Sequence[Mapping[str, Any]], columns_: Sequence[Mapping[str, str]]) -> bytes:
+def _sheet_name(document: DocumentLocale | None = None) -> str:
+    resolved = document if document is not None else default_document_locale()
+    return resolved.t("api.reports.sheet_name")
+
+
+def xlsx_bytes(
+    rows: Sequence[Mapping[str, Any]],
+    columns_: Sequence[Mapping[str, str]],
+    document: DocumentLocale | None = None,
+) -> bytes:
     """Write-only XLSX with every supplied value typed as text."""
     workbook = Workbook(write_only=True)
-    sheet = workbook.create_sheet("Reporte")
+    sheet = workbook.create_sheet(_sheet_name(document))
     sheet.append([column["label"] for column in columns_])
     for row in rows:
         cells = []

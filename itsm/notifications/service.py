@@ -33,6 +33,13 @@ from sqlalchemy.orm import Session
 from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.demo.state import is_demo
+from itsm.i18n.documents import (
+    normalize_key,
+    normalize_params,
+    notification_document,
+    recipient_locales,
+)
+from itsm.i18n.documents import render_message as render_catalog_message
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.models import Identity
 from itsm.identity.permissions import HUMAN_ACTOR_KIND
@@ -65,7 +72,6 @@ from itsm.notifications.models import (
 )
 
 logger = logging.getLogger("itsm.notifications")
-
 DEFAULT_CHANNEL_ID = "internal-default"
 DEFAULT_RULE_ID = "default-operations"
 DEFAULT_LIMIT = 50
@@ -78,6 +84,7 @@ MAX_RECIPIENTS = 100
 MAX_CHANNELS_PER_RULE = 20
 MAX_ATTEMPTS_LIMIT = 10
 MAX_EVENT_BODY = 4000
+MAX_MESSAGE_PARTS = 2
 MAX_EVENT_URL = 500
 UNSET: Any = object()
 
@@ -247,6 +254,62 @@ def _rule_dto(rule: NotificationRule) -> dict[str, Any]:
         "createdAt": _iso(rule.created_at),
         "updatedAt": _iso(rule.updated_at),
     }
+
+
+def _message_part(value: Any, part: str) -> dict[str, Any] | None:
+    """One localized part: a catalog key plus its bounded parameters."""
+    if value is None:
+        return None
+    if not isinstance(value, Mapping):
+        raise ValidationFailed(f"message.{part} must be an object")
+    unknown = set(value) - {"key", "params"}
+    if unknown:
+        raise ValidationFailed(f"message.{part} has unknown fields")
+    try:
+        key = normalize_key(value.get("key"))
+        params = normalize_params(value.get("params"))
+    except ValueError as exc:
+        raise ValidationFailed(str(exc)) from exc
+    return {"key": key, "params": params}
+
+
+def normalize_message(message: Any) -> dict[str, Any] | None:
+    """Validate the language-neutral message stored on the event row.
+
+    ``{"title": {"key", "params"}, "body": {"key", "params"}}`` keeps alert
+    text independent from every recipient, so fan-out renders it once per
+    recipient locale. ``None`` keeps a legacy text-only event unchanged.
+    """
+    if message is None:
+        return None
+    if not isinstance(message, Mapping):
+        raise ValidationFailed("message must be an object")
+    unknown = set(message) - {"title", "body"}
+    if unknown:
+        raise ValidationFailed("message has unknown fields")
+    parts = {part: _message_part(message.get(part), part) for part in ("title", "body")}
+    if parts["title"] is None:
+        raise ValidationFailed("message.title is required")
+    return {part: value for part, value in parts.items() if value is not None}
+
+
+def render_event_message(message: Any, locale: str, *, default_locale: str) -> dict[str, str]:
+    """Render the stored parts in one locale; a raw key never reaches a user."""
+    if not isinstance(message, Mapping):
+        return {}
+    rendered: dict[str, str] = {}
+    for part in ("title", "body"):
+        entry = message.get(part)
+        if not isinstance(entry, Mapping):
+            continue
+        text = render_catalog_message(
+            str(entry.get("key")),
+            entry.get("params"),
+            locale,
+            default_locale=default_locale,
+        )
+        rendered[part] = text
+    return rendered
 
 
 def _dedupe_key(
@@ -763,6 +826,8 @@ class NotificationService:
         if not channel.enabled:
             raise ValidationFailed("channel is disabled")
         now = utcnow()
+        name = _text(channel.name, "channel name", 120, required=True)
+        document = notification_document(self._session)
         event = NotificationEvent(
             id=str(uuid4()),
             alert_id=f"test:{channel.id}"[:64],
@@ -770,8 +835,12 @@ class NotificationService:
             event_type="test",
             severity="info",
             asset_id=None,
-            title="Prueba de notificación",
-            body=_text(channel.name, "channel name", 120, required=True),
+            title=document.t("api.notifications.test_title"),
+            body=document.t("api.notifications.test_body", channel=name),
+            message={
+                "title": {"key": "api.notifications.test_title", "params": {}},
+                "body": {"key": "api.notifications.test_body", "params": {"channel": name}},
+            },
             url=None,
             occurred_at=now,
             acknowledged=False,
@@ -780,13 +849,19 @@ class NotificationService:
         )
         self._session.add(event)
         self._session.flush()
+        # The tester is the recipient: the sample text follows their language.
+        locales = recipient_locales(self._session, [principal.actor_id])
+        title, body = self._event_texts(
+            event, principal.actor_id, locales, notification_document(self._session).locale
+        )
+        recipient_id = principal.actor_id if channel.kind == CHANNEL_INTERNAL else None
         row = NotificationOutbox(
             id=str(uuid4()),
             dedupe_key=_dedupe_key(event, None, principal.actor_id, channel.id, 0),
             event_id=event.id,
             alert_id=event.alert_id,
             rule_id=None,
-            recipient_id=principal.actor_id if channel.kind == CHANNEL_INTERNAL else None,
+            recipient_id=recipient_id,
             channel_id=channel.id,
             escalation_bucket=0,
             status=STATUS_PENDING,
@@ -795,8 +870,8 @@ class NotificationService:
             retry_interval_seconds=0,
             severity=event.severity,
             asset_id=None,
-            title=event.title,
-            body=event.body,
+            title=title,
+            body=body,
             url=None,
             next_attempt_at=now,
             created_at=now,
@@ -823,6 +898,7 @@ class NotificationService:
         title: str,
         body: str,
         url: str | None,
+        message: Mapping[str, Any] | None = None,
         acknowledged: bool = False,
         recovered: bool = False,
         occurred_at: datetime | None = None,
@@ -840,6 +916,7 @@ class NotificationService:
         title = _text(title, "title", 200, required=True)
         body = _text(body, "body", MAX_EVENT_BODY)
         url = _safe_url(url)
+        checked_message = normalize_message(message)
         if not isinstance(acknowledged, bool) or not isinstance(recovered, bool):
             raise ValidationFailed("acknowledged and recovered must be booleans")
         occurred = _timestamp(occurred_at)
@@ -867,6 +944,7 @@ class NotificationService:
             asset_id=asset_id,
             title=title,
             body=body,
+            message=checked_message,
             url=url,
             occurred_at=occurred,
             acknowledged=acknowledged,
@@ -979,10 +1057,12 @@ class NotificationService:
         )
         queued = 0
         now = utcnow()
+        default_locale = notification_document(self._session).locale
         for rule in rules:
             if SEVERITY_RANK[event.severity] < SEVERITY_RANK[rule.minimum_severity]:
                 continue
             recipient_ids = self._resolve_recipients(rule)
+            locales = recipient_locales(self._session, recipient_ids)
             channel_ids = list(rule.channel_ids or [])
             if not channel_ids:
                 continue
@@ -997,9 +1077,14 @@ class NotificationService:
                 channel = channels.get(channel_id)
                 if channel is None or not channel.enabled:
                     continue
-                targets = recipient_ids if channel.kind == CHANNEL_INTERNAL else [None]
-                if channel.kind == CHANNEL_INTERNAL and not targets:
-                    continue
+                if channel.kind == CHANNEL_INTERNAL:
+                    targets = recipient_ids
+                    if not targets:
+                        continue
+                else:
+                    # External deliveries are rendered per recipient, so every
+                    # message carries the language of the person receiving it.
+                    targets = recipient_ids or [None]
                 for recipient_id in targets:
                     if self._queue_row(
                         event,
@@ -1009,9 +1094,25 @@ class NotificationService:
                         bucket=0,
                         deliver_at=deliver_at,
                         now=now,
+                        texts=self._event_texts(event, recipient_id, locales, default_locale),
                     ):
                         queued += 1
         return queued
+
+    def _event_texts(
+        self,
+        event: NotificationEvent,
+        recipient_id: str | None,
+        locales: Mapping[str, str],
+        default_locale: str,
+    ) -> tuple[str, str]:
+        """One recipient's title and body; legacy rows keep their stored text."""
+        locale = (recipient_id and locales.get(recipient_id)) or default_locale
+        rendered = render_event_message(event.message, locale, default_locale=default_locale)
+        return (
+            rendered.get("title", event.title)[:200],
+            rendered.get("body", event.body)[:MAX_EVENT_BODY],
+        )
 
     def _queue_row(
         self,
@@ -1023,8 +1124,10 @@ class NotificationService:
         bucket: int,
         deliver_at: datetime,
         now: datetime,
+        texts: tuple[str, str] | None = None,
     ) -> bool:
         rule_id = None if rule is None else rule.id
+        title, body = texts if texts is not None else (event.title, event.body)
         row = NotificationOutbox(
             id=str(uuid4()),
             dedupe_key=_dedupe_key(event, rule_id, recipient_id, channel.id, bucket),
@@ -1040,8 +1143,8 @@ class NotificationService:
             retry_interval_seconds=rule.retry_interval_seconds if rule is not None else 0,
             severity=event.severity,
             asset_id=event.asset_id,
-            title=event.title,
-            body=event.body,
+            title=title,
+            body=body,
             url=event.url,
             next_attempt_at=deliver_at,
             created_at=now,
@@ -1329,6 +1432,8 @@ class NotificationService:
             ]
             if not recipients:
                 continue
+            locales = recipient_locales(self._session, recipients)
+            default_locale = notification_document(self._session).locale
             deliver_at = _window_start(rule, now)
             for event in events:
                 if self._monitoring.notification_suppressed(event.alert_id, now=now):
@@ -1337,8 +1442,7 @@ class NotificationService:
                     channel = channels.get(channel_id)
                     if channel is None or not channel.enabled:
                         continue
-                    targets = recipients if channel.kind == CHANNEL_INTERNAL else [None]
-                    for recipient_id in targets:
+                    for recipient_id in recipients:
                         if self._queue_row(
                             event,
                             rule,
@@ -1347,6 +1451,7 @@ class NotificationService:
                             bucket=1,
                             deliver_at=deliver_at,
                             now=now,
+                            texts=self._event_texts(event, recipient_id, locales, default_locale),
                         ):
                             created += 1
             self._session.flush()
@@ -1440,6 +1545,7 @@ def record_alert_event(
     title: str,
     body: str,
     url: str | None,
+    message: Mapping[str, Any] | None = None,
     acknowledged: bool = False,
     recovered: bool = False,
     occurred_at: datetime | None = None,
@@ -1459,6 +1565,7 @@ def record_alert_event(
         title=title,
         body=body,
         url=url,
+        message=message,
         acknowledged=acknowledged,
         recovered=recovered,
         occurred_at=occurred_at,

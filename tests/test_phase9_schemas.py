@@ -187,6 +187,7 @@ def test_report_request_defaults_are_safe_and_serialize_camel_case():
     assert request.templateId is None
     assert request.template is None
     assert request.labels is None
+    assert request.locale is None
 
     dumped = request.model_dump()
     assert set(dumped) == {
@@ -200,6 +201,7 @@ def test_report_request_defaults_are_safe_and_serialize_camel_case():
         "mode",
         "output",
         "name",
+        "locale",
         "labels",
     }
     assert set(dumped["filters"]) == {

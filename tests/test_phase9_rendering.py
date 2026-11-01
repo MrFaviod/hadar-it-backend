@@ -334,7 +334,7 @@ def test_composition_summary_is_a_real_count_chart_with_totals_and_facts():
     assert "Baja" in html and "2 (33%)" in html
     assert "Cámara" in html and "3 (50%)" in html
     assert "Router" in html
-    assert "Coste total: 1234.50" in html
+    assert "Coste total: 1.234" in html
     assert "Con datos técnicos: 2" in html
     assert 'class="summary-bar"' in html
     assert "placeholder" not in html.lower() and "fake" not in html.lower()

@@ -18,6 +18,7 @@ from huey.signals import SIGNAL_ERROR, SIGNAL_RETRYING
 
 from itsm.config import Settings, get_settings
 from itsm.database import check_readiness, create_engine_from_settings
+from itsm.i18n.documents import localized_message
 from itsm.logging import configure_logging, log_event
 from itsm.ops import quiesce
 from itsm.release_identity import enforce_startup
@@ -215,6 +216,14 @@ def _task_id(task: Any) -> str:
     return str(getattr(task, "id", task))
 
 
+def _operation_owner(session: Any, operation_id: str) -> str | None:
+    """The requester of an operation, used to render its completion message."""
+    from itsm.workflows.models import Operation
+
+    operation = session.get(Operation, operation_id)
+    return None if operation is None else operation.owner_id
+
+
 def register_operation_task(huey: Huey, settings: Settings):
     """Register the fixed business task; payload contains only a SQL locator."""
 
@@ -230,10 +239,19 @@ def register_operation_task(huey: Huey, settings: Settings):
             write_task_state(huey, task.id, TaskState.RUNNING)
             with create_session_factory(engine)() as session:
                 result = execute_job(session, settings, operation_id)
+                # The message is language-neutral in storage and rendered here,
+                # in the requester's own locale.
+                message = localized_message(
+                    session,
+                    "api.tasks.operation_completed",
+                    identity_id=_operation_owner(session, operation_id),
+                    params={"operation_id": operation_id},
+                )
                 return {
                     "state": "complete",
                     "operationId": operation_id,
                     "summary": result["summary"],
+                    "message": message,
                 }
         finally:
             engine.dispose()

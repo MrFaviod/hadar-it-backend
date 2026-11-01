@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Any
 
 from itsm.dashboard.service import DashboardService
+from itsm.i18n.documents import localized_message
 from itsm.identity.service import IdentityService, Principal, ValidationFailed
 from itsm.relationships.service import RelationshipService
 from itsm.search.service import SearchService
@@ -89,12 +90,20 @@ def operational_summary(
     site_id: Any = None,
 ) -> dict[str, Any]:
     """Delegate the bounded operational summary and keep its provenance intact."""
-    return DashboardService(session, identity, settings, source=source).summary(
+    summary = DashboardService(session, identity, settings, source=source).summary(
         principal,
         period=_text(period, "period", MAX_PERIOD),
         category=_optional_text(category, "category", MAX_LABEL),
         site_id=_optional_text(site_id, "siteId", MAX_LABEL),
     )
+    # A stable key plus its parameters; the text follows the requester's locale.
+    summary["message"] = localized_message(
+        session,
+        "api.operations.summary_ready",
+        identity_id=principal.actor_id,
+        params={"period": summary.get("period") or ""},
+    )
+    return summary
 
 
 def search_everything(

@@ -2065,7 +2065,17 @@ class MonitoringService:
             return False
         assets = self._asset_index([alert.asset_id])
         name = assets.get(alert.asset_id, (alert.labels.get("asset_name") or "", ""))[0]
-        title = f"{alert.alert_name} — {name or alert.asset_id}"[:160]
+        asset_label = name or alert.asset_id
+        title = f"{alert.alert_name} — {asset_label}"[:160]
+        if alert.summary:
+            body_key, body_params = "api.monitoring.alert.summary", {"summary": alert.summary}
+        elif alert.description:
+            body_key, body_params = (
+                "api.monitoring.alert.description",
+                {"description": alert.description},
+            )
+        else:
+            body_key, body_params = "api.monitoring.alert.severity", {"severity": alert.severity}
         body = (alert.summary or alert.description or f"Severity {alert.severity}")[:1000]
         url = (
             f"{self._settings.monitoring_public_url.rstrip('/')}/#/supervision/alerta/{alert.id}"
@@ -2080,6 +2090,13 @@ class MonitoringService:
             asset_id=alert.asset_id,
             title=title,
             body=body,
+            message={
+                "title": {
+                    "key": "api.monitoring.alert.title",
+                    "params": {"alert": alert.alert_name, "asset": asset_label},
+                },
+                "body": {"key": body_key, "params": body_params},
+            },
             url=url,
             acknowledged=acknowledged,
             recovered=recovered,

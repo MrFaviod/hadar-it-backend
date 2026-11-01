@@ -17,7 +17,7 @@ import sqlalchemy as sa
 from alembic import op
 
 revision = "0041_i18n_labels"
-down_revision = "0039_i18n_registry"
+down_revision = "0040_notification_i18n"
 branch_labels = None
 depends_on = None
 
