@@ -3,6 +3,9 @@
 Message syntax (D2): named ``{parameter}`` placeholders; plural forms separated
 by `` | `` in CLDR category order. The plural category always comes from Babel's
 ``Locale.plural_form``; this module only maps that category to a form index.
+
+Lookup goes through the versioned registry (D5) so an installed pack is visible
+to ``t()``; when no registry is configured the owner files remain the answer.
 """
 
 from __future__ import annotations
@@ -14,7 +17,13 @@ from functools import cache
 from babel import Locale
 from babel.core import UnknownLocaleError
 
-from itsm.i18n.catalog import DEFAULT_LOCALE, catalog_keys, load_catalog, resolve_installed_locale
+from itsm.i18n import registry
+from itsm.i18n.catalog import (
+    DEFAULT_LOCALE,
+    catalog_keys,
+    load_catalog,
+    resolve_installed_locale,
+)
 
 logger = logging.getLogger("itsm.i18n")
 
@@ -84,17 +93,25 @@ def fallback_tags(
     locale: str | None, default_locale: str | None = DEFAULT_LOCALE
 ) -> tuple[str, ...]:
     """D5 chain: locale (with parents) -> installation default -> Spanish."""
+    default = default_locale or DEFAULT_LOCALE
+    snapshot = registry.current_snapshot()
+    if snapshot is not None:
+        return snapshot.fallback(locale, default)
     tags: list[str] = []
-    for candidate in (locale, default_locale, DEFAULT_LOCALE):
-        installed = resolve_installed_locale(candidate)
-        if installed is not None and installed not in tags:
-            tags.append(installed)
+    for candidate in (locale, default, DEFAULT_LOCALE):
+        for tag in registry.tag_chain(candidate):
+            installed = resolve_installed_locale(tag)
+            if installed is not None and installed not in tags:
+                tags.append(installed)
     return tuple(tags)
 
 
 def message_for(
     key: str, locale: str | None, default_locale: str | None = DEFAULT_LOCALE
 ) -> tuple[str | None, str | None]:
+    hit = registry.lookup(key, locale, default_locale or DEFAULT_LOCALE)
+    if hit is not None:
+        return hit
     for tag in fallback_tags(locale, default_locale):
         catalog = load_catalog(tag)
         if catalog is not None and key in catalog:
@@ -136,8 +153,12 @@ def t(
 
 
 def resolve_messages(locale: str, default_locale: str | None = DEFAULT_LOCALE) -> dict[str, str]:
-    """The full core message set for one locale, fallback applied per key."""
+    """The full message set for one locale, fallback applied per key."""
     fallback = default_locale or DEFAULT_LOCALE
+    snapshot = registry.current_snapshot()
+    resolved = registry.resolve_installed(locale)
+    if snapshot is not None and resolved is not None:
+        return dict(snapshot.locale_view(resolved).messages)
     return {key: t(key, locale, default_locale=fallback) for key in sorted(catalog_keys())}
 
 

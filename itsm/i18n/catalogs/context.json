@@ -19,6 +19,7 @@
   "api.i18n.invalid_timezone": "422 when installation settings send an unknown IANA time zone.",
   "api.i18n.locale_count": "Plural example and translator tooling for the number of installed languages.",
   "api.i18n.text_unavailable": "Shown instead of a raw key when a catalog entry is missing.",
+  "api.i18n.unknown_doc_topic": "404 when an authenticated docs request has no localized topic for the requested locale chain.",
   "api.i18n.unknown_locale": "422/404 when a requested or configured language is not installed.",
   "api.validation.bool_parsing": "422 detail for a boolean field that cannot be parsed.",
   "api.validation.bool_type": "422 detail for a non-boolean value in a boolean field.",

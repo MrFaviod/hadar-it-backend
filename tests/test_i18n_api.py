@@ -420,3 +420,57 @@ def test_public_i18n_endpoints_stay_open_in_demo_mode(
     assert bundle.status_code == 200, bundle.text
     assert bundle.json()["messages"]["api.error.not_found"] == "Not found."
     assert settings_write.status_code == 401, settings_write.text
+
+
+def test_accept_language_honors_quality_values_and_exclusions() -> None:
+    """F1: q=0 excludes a tag and the highest q wins, ties in header order."""
+    from itsm.i18n.request import negotiate_accept_language
+
+    available = ("es", "en")
+
+    assert negotiate_accept_language("en;q=0", available) is None
+    assert negotiate_accept_language("es;q=0.1, en;q=0.9", available) == "en"
+    assert negotiate_accept_language("en;q=0.5, es;q=0.5", available) == "en"
+    assert negotiate_accept_language("es;q=0.3, en;q=0.9, es-PY;q=0.4", available) == "en"
+    assert negotiate_accept_language("*,en;q=0.2", available) == "en"
+
+
+def test_accept_language_exclusion_reaches_the_http_error_locale(env) -> None:
+    client, _ = env
+
+    response = client.get(
+        f"{API}/auth/me",
+        headers={"Accept-Language": "en;q=0"},
+    )
+
+    assert response.status_code == 401
+    assert response.json()["error"]["message"] == "Se requiere autenticación."
+
+
+def test_bundle_etag_and_fallback_change_with_the_default_locale(env) -> None:
+    """F2: the ETag covers the fallback chain, so a 304 never serves a stale list."""
+    client, _ = env
+    headers = auth_headers(client)
+
+    before = client.get(f"{API}/i18n/bundle", params={"locale": "es"})
+    assert before.status_code == 200, before.text
+    assert before.json()["fallback"] == ["es"]
+    etag = before.headers["etag"]
+
+    updated = client.put(
+        f"{API}/i18n/settings",
+        json={"defaultLocale": "en", "timezone": "America/Asuncion", "currency": "PYG"},
+        headers=headers,
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["revision"] > before.json()["revision"]
+    assert updated.json()["defaultLocale"] == "en"
+
+    revalidated = client.get(
+        f"{API}/i18n/bundle",
+        params={"locale": "es"},
+        headers={"If-None-Match": etag},
+    )
+    assert revalidated.status_code == 200, revalidated.text
+    assert revalidated.json()["fallback"] == ["es", "en"]
+    assert revalidated.headers["etag"] != etag

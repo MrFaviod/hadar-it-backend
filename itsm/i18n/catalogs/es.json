@@ -19,6 +19,7 @@
   "api.i18n.invalid_timezone": "La zona horaria {timezone} no es válida.",
   "api.i18n.locale_count": "{count} idioma instalado | {count} idiomas instalados",
   "api.i18n.text_unavailable": "Texto no disponible.",
+  "api.i18n.unknown_doc_topic": "No hay documentación para {topic} en {locale}.",
   "api.i18n.unknown_locale": "El idioma {locale} no está instalado.",
   "api.validation.bool_parsing": "Debe ser un valor booleano.",
   "api.validation.bool_type": "Debe ser un valor booleano.",

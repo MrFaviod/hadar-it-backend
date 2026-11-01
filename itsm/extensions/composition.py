@@ -22,6 +22,11 @@ def create_extension_services(
     from itsm.extensions.notifications import enqueue_extension_notice
     from itsm.extensions.validator import ContainerValidator, RemoteContainerValidator
 
+    # The host owns pack install/uninstall, so it is also where the versioned
+    # catalog overlay is bound to this application's session factory.
+    from itsm.i18n import registry
+
+    registry.configure(session_factory)
     host = ExtensionHostService(
         settings,
         session_factory,

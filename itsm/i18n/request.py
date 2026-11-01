@@ -13,31 +13,63 @@ from babel import Locale
 from fastapi import Request
 
 from itsm.config import Settings
-from itsm.i18n.catalog import CORE_LOCALES, DEFAULT_LOCALE, resolve_installed_locale
+from itsm.i18n.catalog import DEFAULT_LOCALE
+from itsm.i18n.registry import installed_tags, resolve_installed
 from itsm.i18n.settings import InstallationSettings, read_installation_settings
 
 logger = logging.getLogger("itsm.i18n")
 
 
-def negotiate_accept_language(
-    header: str | None, available: tuple[str, ...] = CORE_LOCALES
-) -> str | None:
-    """Match an ``Accept-Language`` header against installed locales via Babel."""
+def _quality(parameters: list[str]) -> float:
+    """The ``q`` weight of one range; an unparsable weight is excluded."""
+    for parameter in parameters:
+        name, _, value = parameter.partition("=")
+        if name.strip().lower() != "q":
+            continue
+        try:
+            return float(value.strip())
+        except ValueError:
+            return 0.0
+    return 1.0
+
+
+def negotiated_preferences(header: str | None) -> tuple[str, ...]:
+    """Ranges in preference order: highest ``q`` first, ties keep header order.
+
+    D8 delegates negotiation to Babel, but RFC 4647 attaches a quality weight to
+    every range: ``q=0`` means "not acceptable" and ``en;q=0.9`` must beat
+    ``es;q=0.1``. Babel's ``negotiate`` only sees an ordered list, so the header
+    is weighted here before the standard matcher runs.
+    """
     if not header:
-        return None
-    preferred: list[str] = []
-    for part in header.split(","):
-        tag = part.split(";")[0].strip().replace("-", "_")
+        return ()
+    weighted: list[tuple[float, int, str]] = []
+    for index, part in enumerate(header.split(",")):
+        pieces = part.split(";")
+        tag = pieces[0].strip().replace("-", "_")
         if not tag or tag == "*":
             continue
-        preferred.append(tag)
+        quality = _quality(pieces[1:])
+        if quality <= 0:
+            continue
+        weighted.append((quality, index, tag))
+    weighted.sort(key=lambda item: (-item[0], item[1]))
+    return tuple(tag for _quality, _index, tag in weighted)
+
+
+def negotiate_accept_language(
+    header: str | None, available: tuple[str, ...] | None = None
+) -> str | None:
+    """Match an ``Accept-Language`` header against installed locales via Babel."""
+    preferred = list(negotiated_preferences(header))
     if not preferred:
         return None
+    candidates = list(installed_tags() if available is None else available)
     try:
-        matched = Locale.negotiate(preferred, list(available), sep="_")
+        matched = Locale.negotiate(preferred, candidates, sep="_")
     except TypeError, ValueError:
         return None
-    return resolve_installed_locale(matched) if matched else None
+    return resolve_installed(matched) if matched else None
 
 
 def resolve_request_locale(request: Request) -> str:
@@ -66,9 +98,9 @@ def resolve_request_locale(request: Request) -> str:
             preference = None
 
     locale = (
-        resolve_installed_locale(preference)
+        resolve_installed(preference)
         or negotiate_accept_language(request.headers.get("accept-language"))
-        or resolve_installed_locale(installation.default_locale)
+        or resolve_installed(installation.default_locale)
         or DEFAULT_LOCALE
     )
     request.state.locale = locale
