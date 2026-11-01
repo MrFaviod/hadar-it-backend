@@ -20,6 +20,13 @@ from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from itsm.config import Settings
+from itsm.i18n.catalog import resolve_installed_locale
+from itsm.i18n.settings import (
+    InstallationSettingError,
+    InstallationSettings,
+    read_installation_settings,
+    validate_installation_settings,
+)
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.hashing import (
     burn_password_check,
@@ -61,7 +68,23 @@ AUDIT_RESOURCE_MAX = 200
 
 
 class IdentityError(Exception):
-    """Base class for domain errors translated by the API layer."""
+    """Base class for domain errors translated by the API layer.
+
+    ``key``/``params`` are optional: when present the API renders a localized
+    ``message`` from the catalog; when absent the English text stays the legacy
+    fallback for call sites that T4 has not converted yet.
+    """
+
+    def __init__(
+        self,
+        message: str = "",
+        *,
+        key: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.key = key
+        self.params = dict(params or {})
 
 
 class ValidationFailed(IdentityError):
@@ -79,23 +102,38 @@ class NotFound(IdentityError):
 class AuthenticationFailed(IdentityError):
     """Generic authentication failure; never reveals which check failed."""
 
-    def __init__(self, message: str = "invalid credentials") -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str = "invalid credentials",
+        *,
+        key: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, key=key, params=params)
 
 
 class AccountThrottled(IdentityError):
     """Too many failed logins in the configured window."""
 
     def __init__(self, retry_after_seconds: int) -> None:
-        super().__init__("too many login attempts; try again later")
+        super().__init__(
+            "too many login attempts; try again later",
+            key="api.auth.too_many_attempts",
+        )
         self.retry_after_seconds = retry_after_seconds
 
 
 class PermissionDenied(IdentityError):
     """Authorization denial; audited before it is raised."""
 
-    def __init__(self, message: str = "permission denied") -> None:
-        super().__init__(message)
+    def __init__(
+        self,
+        message: str = "permission denied",
+        *,
+        key: str | None = None,
+        params: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message, key=key, params=params)
 
 
 class BootstrapRefused(IdentityError):
@@ -113,6 +151,7 @@ class UserView:
     last_access: datetime | None
     person_id: str | None
     actor_kind: str
+    locale: str | None = None
 
 
 @dataclass(frozen=True)
@@ -171,6 +210,7 @@ class CurrentView:
     permissions: frozenset[str]
     csrf_token: str | None
     session_minutes: int
+    locale: str | None = None
 
 
 @dataclass(frozen=True)
@@ -237,6 +277,7 @@ class IdentityService:
             last_access=as_utc(identity.last_access_at) if identity.last_access_at else None,
             person_id=identity.person_id,
             actor_kind=identity.actor_kind,
+            locale=identity.locale,
         )
 
     def _role_view(self, role: IdentityRole) -> RoleView:
@@ -614,7 +655,7 @@ class IdentityService:
         )
         if invalid:
             self._record_login_failure(key, identity)
-            raise AuthenticationFailed()
+            raise AuthenticationFailed(key="api.auth.invalid_credentials")
 
         now = self._now()
         minutes = self.session_minutes()
@@ -713,7 +754,97 @@ class IdentityService:
             permissions=context.permissions,
             csrf_token=context.csrf_token,
             session_minutes=context.session_minutes,
+            locale=identity.locale,
         )
+
+    def locale_for_session(self, token: str | None) -> str | None:
+        """Read a session's stored locale without refreshing or committing it.
+
+        Used only to pick the response language; authentication and session
+        revalidation stay in :meth:`authenticate_session`.
+        """
+        if not token:
+            return None
+        row = self._session.execute(
+            select(IdentitySession).where(IdentitySession.token_digest == hash_token(token))
+        ).scalar_one_or_none()
+        if row is None or row.revoked_at is not None:
+            return None
+        if as_utc(row.expires_at) <= self._now():
+            return None
+        identity = self._session.get(Identity, row.identity_id)
+        if identity is None or not identity.active or identity.role_id is None:
+            return None
+        return identity.locale
+
+    def update_preferences(self, principal: Principal, *, locale: str | None) -> UserView:
+        """Change the caller's own language; nobody else's is reachable."""
+        identity = self._require_identity(principal.actor_id)
+        resolved: str | None = None
+        if locale is not None:
+            resolved = resolve_installed_locale(locale)
+            if resolved is None:
+                raise ValidationFailed(
+                    f"unknown locale: {locale}",
+                    key="api.i18n.unknown_locale",
+                    params={"locale": locale},
+                )
+        identity.locale = resolved
+        identity.updated_at = self._now()
+        self._audit(
+            actor_id=identity.id,
+            actor_kind=identity.actor_kind,
+            actor_username=identity.username,
+            action="identity.preferences_updated",
+            resource=f"identity:{identity.id}",
+            outcome="success",
+            execution_id=principal.execution_id,
+            authorization_ref=principal.authorization_ref,
+        )
+        self._session.commit()
+        return self._user_view(identity)
+
+    def installation_settings(self) -> InstallationSettings:
+        return read_installation_settings(self._session)
+
+    def update_installation_settings(
+        self,
+        principal: Principal,
+        *,
+        default_locale: str,
+        timezone: str,
+        currency: str,
+    ) -> InstallationSettings:
+        """Persist installation i18n defaults; ``system.configure`` is required."""
+        self.authorize(principal, "system.configure", resource="i18n:settings")
+        try:
+            validated = validate_installation_settings(
+                default_locale=default_locale, timezone=timezone, currency=currency
+            )
+        except InstallationSettingError as exc:
+            raise ValidationFailed(str(exc), key=exc.key, params=exc.params) from exc
+        row = self._session.get(IdentitySecuritySettings, 1)
+        if row is None:
+            row = IdentitySecuritySettings(
+                id=1, session_minutes=self._settings.auth_session_minutes_default
+            )
+            self._session.add(row)
+        row.default_locale = validated.default_locale
+        row.timezone = validated.timezone
+        row.currency = validated.currency
+        row.updated_at = self._now()
+        self._audit(
+            actor_id=principal.actor_id,
+            actor_kind=principal.kind,
+            actor_username=principal.username,
+            action="i18n.settings_updated",
+            resource="i18n:settings",
+            outcome="success",
+            execution_id=principal.execution_id,
+            authorization_ref=principal.authorization_ref,
+        )
+        self._session.commit()
+        return validated
 
     # ------------------------------------------------------- machine identity
     def authenticate_token(

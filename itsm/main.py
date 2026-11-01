@@ -50,6 +50,10 @@ from itsm.directory.api import create_directory_router
 from itsm.directory.media_api import create_directory_media_router
 from itsm.extensions.api import create_extension_router, install_extension_error_handlers
 from itsm.extensions.composition import create_extension_services
+from itsm.i18n import error_payload, t
+from itsm.i18n.api import create_i18n_router
+from itsm.i18n.catalog import catalog_keys
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import (
     authenticated_actor,
     create_identity_router,
@@ -83,6 +87,27 @@ from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
 from itsm.workflows.api import create_workflow_router
 
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{8,64}$"
+
+
+VALIDATION_FALLBACK_KEY = "api.validation.invalid"
+
+
+def _validation_key(error_type: str) -> str:
+    """Pydantic error type -> catalog key; unknown types use one generic key."""
+    key = f"api.validation.{error_type}"
+    return key if key in catalog_keys() else VALIDATION_FALLBACK_KEY
+
+
+def _validation_params(context: dict[str, Any] | None) -> dict[str, Any]:
+    """Pydantic ``ctx`` as JSON-safe parameters for the localized message."""
+    params: dict[str, Any] = {}
+    for name, value in (context or {}).items():
+        if isinstance(value, bool) or value is None or isinstance(value, (int, float, str)):
+            params[str(name)] = value
+        else:
+            params[str(name)] = str(value)
+    return params
+
 
 logger = logging.getLogger("itsm.api")
 
@@ -119,10 +144,6 @@ class TaskStatusResponse(BaseModel):
     result: dict[str, Any] | None
     error: str | None
     retries_remaining: int | None
-
-
-def error_payload(code: str, message: str) -> dict[str, dict[str, str]]:
-    return {"error": {"code": code, "message": message}}
 
 
 def _optional_services(settings: Settings) -> dict[str, str]:
@@ -438,17 +459,24 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     @app.exception_handler(RequestValidationError)
     async def on_validation_error(request: Request, exc: RequestValidationError) -> JSONResponse:
-        details = [
-            {
-                "field": ".".join(str(part) for part in error["loc"][1:]),
-                "message": error["msg"],
-            }
-            for error in exc.errors()
-        ]
+        locale = resolve_request_locale(request)
+        details = []
+        for error in exc.errors():
+            key = _validation_key(error["type"])
+            params = _validation_params(error.get("ctx"))
+            details.append(
+                {
+                    "field": ".".join(str(part) for part in error["loc"][1:]),
+                    "message": t(key, locale, **params),
+                    "key": key,
+                    "params": params,
+                }
+            )
+        top_key = "api.error.validation_error"
         return JSONResponse(
             status_code=422,
             content={
-                **error_payload("validation_error", "request validation failed"),
+                **error_payload("validation_error", t(top_key, locale), key=top_key, params={}),
                 "details": details,
             },
         )
@@ -456,15 +484,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     @app.exception_handler(StarletteHTTPException)
     async def on_http_error(request: Request, exc: StarletteHTTPException) -> JSONResponse:
         code = ERROR_STATUS_CODES.get(exc.status_code, "http_error")
-        message = exc.detail if isinstance(exc.detail, str) else "request failed"
+        locale = resolve_request_locale(request)
+        if isinstance(exc.detail, str) and exc.detail in catalog_keys():
+            # A domain site that already speaks keys; T4 converts the rest.
+            return JSONResponse(
+                status_code=exc.status_code,
+                content=error_payload(code, t(exc.detail, locale), key=exc.detail, params={}),
+            )
+        message = exc.detail if isinstance(exc.detail, str) else t("api.error.http_error", locale)
         return JSONResponse(status_code=exc.status_code, content=error_payload(code, message))
 
     @app.exception_handler(Exception)
     async def on_unexpected_error(request: Request, exc: Exception) -> JSONResponse:
         logger.exception("unhandled error while serving %s %s", request.method, request.url.path)
+        key = "api.error.internal_error"
         return JSONResponse(
             status_code=500,
-            content=error_payload("internal_error", "internal server error"),
+            content=error_payload(
+                "internal_error", t(key, resolve_request_locale(request)), key=key, params={}
+            ),
         )
 
     api = APIRouter(prefix=settings.api_prefix)
@@ -592,6 +630,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_ai_gateway_router())
     api.include_router(create_extension_router())
     api.include_router(create_system_router())
+    api.include_router(create_i18n_router())
     api.include_router(create_identity_router())
     app.include_router(api)
     app.mount(settings.api_prefix, mcp_app)

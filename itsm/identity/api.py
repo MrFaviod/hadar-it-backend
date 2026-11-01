@@ -16,6 +16,10 @@ from pydantic import BaseModel, ConfigDict, Field
 
 from itsm.demo.restrictions import DEMO_HIDDEN_PERMISSIONS, visitor_password_waiver
 from itsm.demo.state import is_demo
+from itsm.i18n.envelope import error_payload
+from itsm.i18n.messages import t
+from itsm.i18n.request import resolve_request_locale
+from itsm.i18n.settings import InstallationSettings
 from itsm.identity.service import (
     AccountThrottled,
     AuditView,
@@ -24,6 +28,7 @@ from itsm.identity.service import (
     BootstrapRefused,
     Conflict,
     CurrentView,
+    IdentityError,
     IdentityService,
     NotFound,
     PermissionDenied,
@@ -43,9 +48,18 @@ NO_STORE = {"Cache-Control": "no-store"}
 class AuthenticationRequired(Exception):
     """Raised when a request has no usable session or machine credential."""
 
+    key = "api.auth.authentication_required"
 
-def error_body(code: str, message: str) -> dict[str, dict[str, str]]:
-    return {"error": {"code": code, "message": message}}
+
+def error_body(
+    code: str,
+    message: str,
+    *,
+    key: str | None = None,
+    params: dict[str, object] | None = None,
+) -> dict[str, object]:
+    """The shared envelope; ``key``/``params`` are additive when localized."""
+    return error_payload(code, message, key=key, params=params)
 
 
 # ------------------------------------------------------------------ envelopes
@@ -68,6 +82,16 @@ class RoleDTO(BaseModel):
     builtIn: bool
 
 
+class PreferencesDTO(BaseModel):
+    locale: str | None
+
+
+class InstallationDTO(BaseModel):
+    defaultLocale: str
+    timezone: str
+    currency: str
+
+
 class SessionEnvelope(BaseModel):
     user: UserDTO
     permissions: list[str]
@@ -76,6 +100,12 @@ class SessionEnvelope(BaseModel):
     # Additive, server-derived installation identity. Legacy payloads that omit
     # it stay ordinary installations; a client can never set it.
     demoMode: bool = False
+    # Additive i18n contract (D11): effective locale, the caller's own
+    # preference (``None`` follows the installation) and the installation
+    # defaults every client must format numbers and dates with.
+    locale: str
+    preferences: PreferencesDTO
+    installation: InstallationDTO
 
 
 class StateDTO(BaseModel):
@@ -171,6 +201,14 @@ class SettingsRequest(BaseModel):
     sessionMinutes: int
 
 
+class PreferencesRequest(BaseModel):
+    """Only the caller's own locale; ``null`` follows the installation."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    locale: str | None = Field(default=None, max_length=35)
+
+
 def user_dto(view: UserView) -> UserDTO:
     return UserDTO(
         id=view.id,
@@ -194,7 +232,12 @@ def role_dto(view: RoleView) -> RoleDTO:
     )
 
 
-def session_envelope(view: CurrentView, *, demo_mode: bool = False) -> SessionEnvelope:
+def session_envelope(
+    view: CurrentView,
+    *,
+    installation: InstallationSettings,
+    demo_mode: bool = False,
+) -> SessionEnvelope:
     return SessionEnvelope(
         user=user_dto(view.user),
         permissions=sorted(
@@ -203,6 +246,13 @@ def session_envelope(view: CurrentView, *, demo_mode: bool = False) -> SessionEn
         csrfToken=view.csrf_token,
         sessionMinutes=view.session_minutes,
         demoMode=demo_mode,
+        locale=view.user.locale or installation.default_locale,
+        preferences=PreferencesDTO(locale=view.user.locale),
+        installation=InstallationDTO(
+            defaultLocale=installation.default_locale,
+            timezone=installation.timezone,
+            currency=installation.currency,
+        ),
     )
 
 
@@ -263,7 +313,7 @@ def _origin_allowed(request: Request) -> bool:
 
 def _require_origin(request: Request) -> None:
     if not _origin_allowed(request):
-        raise PermissionDenied("request origin is not allowed")
+        raise PermissionDenied("request origin is not allowed", key="api.auth.origin_not_allowed")
 
 
 def mutation_guard(
@@ -276,7 +326,7 @@ def mutation_guard(
     _require_origin(request)
     supplied = request.headers.get(CSRF_HEADER, "")
     if not supplied or not secrets.compare_digest(supplied, context.csrf_token):
-        raise PermissionDenied("csrf token is invalid")
+        raise PermissionDenied("csrf token is invalid", key="api.auth.csrf_invalid")
     return context
 
 
@@ -340,7 +390,11 @@ def create_identity_router() -> APIRouter:
     ) -> JSONResponse:
         _require_origin(request)
         grant = service.login(payload.username, payload.password)
-        body = session_envelope(service.me(grant), demo_mode=demo_mode)
+        body = session_envelope(
+            service.me(grant),
+            installation=service.installation_settings(),
+            demo_mode=demo_mode,
+        )
         response = JSONResponse(content=body.model_dump(mode="json"), headers=NO_STORE)
         set_session_cookie(request, response, grant.token, grant.session_minutes)
         return response
@@ -352,7 +406,27 @@ def create_identity_router() -> APIRouter:
         service: ServiceDependency,
         demo_mode: DemoModeDependency,
     ) -> JSONResponse:
-        body = session_envelope(service.me(context), demo_mode=demo_mode)
+        body = session_envelope(
+            service.me(context),
+            installation=service.installation_settings(),
+            demo_mode=demo_mode,
+        )
+        return JSONResponse(content=body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.patch("/auth/me/preferences")
+    def update_preferences(
+        payload: PreferencesRequest,
+        context: MutationDependency,
+        service: ServiceDependency,
+        demo_mode: DemoModeDependency,
+    ) -> JSONResponse:
+        """Only the caller's own locale changes; the session envelope comes back."""
+        service.update_preferences(context.principal, locale=payload.locale)
+        body = session_envelope(
+            service.me(context),
+            installation=service.installation_settings(),
+            demo_mode=demo_mode,
+        )
         return JSONResponse(content=body.model_dump(mode="json"), headers=NO_STORE)
 
     @router.post("/auth/logout")
@@ -483,45 +557,72 @@ def create_identity_router() -> APIRouter:
 
 
 def install_error_handlers(app: FastAPI) -> None:
-    """Translate identity domain errors into the shared error envelope."""
+    """Translate identity domain errors into the shared, localized envelope."""
 
     def json_error(
-        status_code: int, code: str, message: str, headers: dict[str, str] | None = None
+        request: Request,
+        status_code: int,
+        code: str,
+        message: str,
+        *,
+        key: str | None = None,
+        params: dict[str, object] | None = None,
+        headers: dict[str, str] | None = None,
     ) -> JSONResponse:
         return JSONResponse(
-            status_code=status_code, content=error_body(code, message), headers=headers
+            status_code=status_code,
+            content=error_body(code, message, key=key, params=params),
+            headers=headers,
         )
+
+    def localized(
+        request: Request, code: str, message: str, exc: IdentityError
+    ) -> tuple[str, str | None, dict[str, object] | None]:
+        """Localize only when the domain error carries a stable key."""
+        if exc.key is None:
+            return message, None, None
+        return t(exc.key, resolve_request_locale(request), **exc.params), exc.key, exc.params
 
     @app.exception_handler(ValidationFailed)
     async def on_validation(request: Request, exc: ValidationFailed) -> JSONResponse:
-        return json_error(422, "validation_error", str(exc))
+        message, key, params = localized(request, "validation_error", str(exc), exc)
+        return json_error(request, 422, "validation_error", message, key=key, params=params)
 
     @app.exception_handler(NotFound)
     async def on_not_found(request: Request, exc: NotFound) -> JSONResponse:
-        return json_error(404, "not_found", str(exc))
+        message, key, params = localized(request, "not_found", str(exc), exc)
+        return json_error(request, 404, "not_found", message, key=key, params=params)
 
     @app.exception_handler(Conflict)
     async def on_conflict(request: Request, exc: Conflict) -> JSONResponse:
-        return json_error(409, "conflict", str(exc))
+        message, key, params = localized(request, "conflict", str(exc), exc)
+        return json_error(request, 409, "conflict", message, key=key, params=params)
 
     @app.exception_handler(BootstrapRefused)
     async def on_bootstrap_refused(request: Request, exc: BootstrapRefused) -> JSONResponse:
-        return json_error(409, "conflict", str(exc))
+        message, key, params = localized(request, "conflict", str(exc), exc)
+        return json_error(request, 409, "conflict", message, key=key, params=params)
 
     @app.exception_handler(PermissionDenied)
     async def on_permission_denied(request: Request, exc: PermissionDenied) -> JSONResponse:
-        return json_error(403, "forbidden", str(exc))
+        message, key, params = localized(request, "forbidden", str(exc), exc)
+        return json_error(request, 403, "forbidden", message, key=key, params=params)
 
     @app.exception_handler(AuthenticationFailed)
     async def on_authentication_failed(request: Request, exc: AuthenticationFailed) -> JSONResponse:
-        return json_error(401, "unauthorized", str(exc))
+        message, key, params = localized(request, "unauthorized", str(exc), exc)
+        return json_error(request, 401, "unauthorized", message, key=key, params=params)
 
     @app.exception_handler(AccountThrottled)
     async def on_throttled(request: Request, exc: AccountThrottled) -> JSONResponse:
+        message, key, params = localized(request, "too_many_requests", str(exc), exc)
         return json_error(
+            request,
             429,
             "too_many_requests",
-            str(exc),
+            message,
+            key=key,
+            params=params,
             headers={"Retry-After": str(exc.retry_after_seconds)},
         )
 
@@ -529,7 +630,15 @@ def install_error_handlers(app: FastAPI) -> None:
     async def on_authentication_required(
         request: Request, exc: AuthenticationRequired
     ) -> JSONResponse:
-        response = json_error(401, "unauthorized", "authentication required")
+        key = exc.key
+        response = json_error(
+            request,
+            401,
+            "unauthorized",
+            t(key, resolve_request_locale(request)),
+            key=key,
+            params={},
+        )
         # A rejected machine credential says nothing about the browser session; only
         # a request that relied on the cookie may have that cookie cleared.
         if "authorization" not in request.headers:

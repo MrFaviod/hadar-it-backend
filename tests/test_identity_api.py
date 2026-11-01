@@ -138,7 +138,14 @@ def test_login_rejects_invalid_credentials_generically(env) -> None:
     )
 
     assert response.status_code == 401
-    assert response.json() == {"error": {"code": "unauthorized", "message": "invalid credentials"}}
+    assert response.json() == {
+        "error": {
+            "code": "unauthorized",
+            "key": "api.auth.invalid_credentials",
+            "params": {},
+            "message": "Credenciales inválidas.",
+        }
+    }
     assert "wrong-password-value" not in response.text
     assert client.cookies.get("itsm_session") is None
 

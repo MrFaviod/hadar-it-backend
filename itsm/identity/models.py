@@ -78,6 +78,8 @@ class Identity(IdentityBase):
     # Reserved machine grants additionally require this to stay ``superadmin``,
     # so a changed delegator cannot silently broaden a machine's authority.
     role_owner: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # Personal language preference; ``NULL`` means "follow the installation".
+    locale: Mapped[str | None] = mapped_column(String(35), nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
@@ -149,6 +151,11 @@ class IdentitySecuritySettings(IdentityBase):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     session_minutes: Mapped[int] = mapped_column(Integer, nullable=False, default=480)
+    # Installation i18n defaults. Columns, not seeded rows, so an untouched
+    # installation still has no settings row until an administrator saves one.
+    default_locale: Mapped[str] = mapped_column(String(35), nullable=False, default="es")
+    timezone: Mapped[str] = mapped_column(String(64), nullable=False, default="America/Asuncion")
+    currency: Mapped[str] = mapped_column(String(3), nullable=False, default="PYG")
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
