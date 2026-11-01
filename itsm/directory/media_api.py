@@ -98,7 +98,9 @@ def create_directory_media_router() -> APIRouter:
                 continue
             if len(data) + len(chunk) > MAX_PLAN_BYTES:
                 raise ValidationFailed(
-                    f"plan image must be at most {MAX_PLAN_BYTES // (1024 * 1024)} MiB"
+                    f"plan image must be at most {MAX_PLAN_BYTES // (1024 * 1024)} MiB",
+                    key="api.directory.plan_image_most_maximum_mib",
+                    params={"maximum": MAX_PLAN_BYTES // (1024 * 1024)},
                 )
             data.extend(chunk)
         try:

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 from fastapi.testclient import TestClient
 from itsm.config import Settings
+from itsm.i18n import t
 from sqlalchemy import text
 from tests.inventory_support import OPERATOR, READER, Catalog, prepare, sign_in_as
 
@@ -243,21 +244,21 @@ def test_invalid_payloads_and_unknown_ids_are_reported(
     assert missing.status_code == 404
     unknown_envelope = missing.json()
     assert set(unknown_envelope) == {"error"}
-    assert set(unknown_envelope["error"]) == {"code", "message"}
+    assert set(unknown_envelope["error"]) == {"code", "message", "key", "params"}
     assert rows(catalog, "directory_people") == 0
     assert rows(catalog, "directory_locations") == 0
 
 
 @pytest.mark.parametrize(
-    ("case", "message"),
+    ("case", "key"),
     [
-        ("location", "parentId must reference an active location"),
-        ("person_site", "siteId must reference an active site"),
-        ("person_department", "departmentId must reference an active department"),
+        ("location", "api.directory.parentid_reference_active_location"),
+        ("person_site", "api.directory.siteid_reference_active_site"),
+        ("person_department", "api.directory.departmentid_reference_active_department"),
     ],
 )
 def test_reactivation_against_an_inactive_reference_is_rejected(
-    signed_in_client: SignedInFactory, catalog: Catalog, case: str, message: str
+    signed_in_client: SignedInFactory, catalog: Catalog, case: str, key: str
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
     site = create_location(test_client, auth, level="site", name="Example Site")
@@ -293,7 +294,9 @@ def test_reactivation_against_an_inactive_reference_is_rejected(
 
     rejected = test_client.patch(target_path, json=reactivation, headers=auth)
     assert rejected.status_code == 422
-    assert rejected.json() == {"error": {"code": "validation_error", "message": message}}
+    error = rejected.json()["error"]
+    assert (error["code"], error["key"]) == ("validation_error", key)
+    assert error["message"] == t(key, "es")
 
     unchanged = test_client.get(target_path, headers=auth).json()
     if case == "location":

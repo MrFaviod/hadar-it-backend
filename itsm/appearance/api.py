@@ -121,21 +121,30 @@ def create_appearance_router() -> APIRouter:
     async def preview_import(request: Request, service: Service, context: Auth):
         content_type = request.headers.get("content-type", "").split(";")[0].strip().lower()
         if content_type not in ZIP_TYPES | {"", "application/octet-stream"}:
-            raise ValidationFailed("preview requires an application/zip body")
+            raise ValidationFailed(
+                "preview requires an application/zip body",
+                key="api.appearance.preview_requires_application_zip_body",
+            )
         length = request.headers.get("content-length")
         if length is not None:
             try:
                 declared = int(length)
             except ValueError:
-                raise ValidationFailed("content-length is invalid") from None
+                raise ValidationFailed(
+                    "content-length is invalid", key="api.appearance.content_length_invalid"
+                ) from None
             if declared > MAX_ZIP_BYTES:
-                raise ValidationFailed("ZIP must contain at most 24 MiB")
+                raise ValidationFailed(
+                    "ZIP must contain at most 24 MiB", key="api.appearance.zip_contain_most_24_mib"
+                )
         chunks: list[bytes] = []
         total = 0
         async for chunk in request.stream():
             total += len(chunk)
             if total > MAX_ZIP_BYTES:
-                raise ValidationFailed("ZIP must contain at most 24 MiB")
+                raise ValidationFailed(
+                    "ZIP must contain at most 24 MiB", key="api.appearance.zip_contain_most_24_mib"
+                )
             chunks.append(chunk)
         try:
             return service.preview_import(context.principal, b"".join(chunks))

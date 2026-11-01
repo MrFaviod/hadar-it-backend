@@ -121,7 +121,9 @@ class UsageEvidence:
     @classmethod
     def from_mapping(cls, evidence: Mapping[str, Any]) -> UsageEvidence:
         if not isinstance(evidence, Mapping):
-            raise ValidationFailed("usage evidence must be an object")
+            raise ValidationFailed(
+                "usage evidence must be an object", key="api.ai_usage.usage_evidence_object"
+            )
         aliases = {
             "totalTokens": "total_tokens",
             "total_tokens": "total_tokens",
@@ -152,9 +154,17 @@ class UsageEvidence:
         for key, value in evidence.items():
             target = aliases.get(key)
             if target is None:
-                raise ValidationFailed(f"unknown usage evidence field: {key}")
+                raise ValidationFailed(
+                    f"unknown usage evidence field: {key}",
+                    key="api.ai_usage.unknown_usage_evidence_field_key",
+                    params={"key": key},
+                )
             if target in values and values[target] != value:
-                raise ValidationFailed(f"conflicting usage evidence field: {target}")
+                raise ValidationFailed(
+                    f"conflicting usage evidence field: {target}",
+                    key="api.ai_usage.conflicting_usage_evidence_field_target",
+                    params={"target": target},
+                )
             values[target] = value
 
         for field in ("total_tokens", "input_tokens", "output_tokens"):
@@ -163,16 +173,28 @@ class UsageEvidence:
             _validate_token_count(values.get(field), field)
         precision = values.get("precision", "unavailable")
         if precision not in PRECISIONS:
-            raise ValidationFailed("precision must be measured, estimated or unavailable")
+            raise ValidationFailed(
+                "precision must be measured, estimated or unavailable",
+                key="api.ai_usage.precision_measured_estimated_unavailable",
+            )
         source = values.get("source", "none")
         if source not in SOURCES:
-            raise ValidationFailed("source must be provider, engine, estimate or none")
+            raise ValidationFailed(
+                "source must be provider, engine, estimate or none",
+                key="api.ai_usage.source_provider_engine_estimate_none",
+            )
         total_source = values.get("total_source")
         if total_source is not None and total_source not in ("provider", "derived"):
-            raise ValidationFailed("totalSource must be provider or derived")
+            raise ValidationFailed(
+                "totalSource must be provider or derived",
+                key="api.ai_usage.totalsource_provider_derived",
+            )
         method = values.get("estimation_method")
         if method is not None and (not isinstance(method, str) or not method.strip()):
-            raise ValidationFailed("estimation method must be a non-empty string")
+            raise ValidationFailed(
+                "estimation method must be a non-empty string",
+                key="api.ai_usage.estimation_method_non_empty_string",
+            )
         counts = tuple(
             values.get(field)
             for field in (
@@ -185,21 +207,40 @@ class UsageEvidence:
             )
         )
         if precision == "measured" and source not in {"provider", "engine"}:
-            raise ValidationFailed("measured evidence must come from a provider or engine")
+            raise ValidationFailed(
+                "measured evidence must come from a provider or engine",
+                key="api.ai_usage.measured_evidence_come_from_provider_engine",
+            )
         if precision == "estimated":
             if source != "estimate":
-                raise ValidationFailed("estimated evidence must use the estimate source")
+                raise ValidationFailed(
+                    "estimated evidence must use the estimate source",
+                    key="api.ai_usage.estimated_evidence_use_estimate_source",
+                )
             if not method:
-                raise ValidationFailed("estimated usage requires an estimation method")
+                raise ValidationFailed(
+                    "estimated usage requires an estimation method",
+                    key="api.ai_usage.estimated_usage_requires_estimation_method",
+                )
         if precision == "unavailable":
             if source == "estimate" or method is not None:
-                raise ValidationFailed("unavailable evidence cannot contain an estimate")
+                raise ValidationFailed(
+                    "unavailable evidence cannot contain an estimate",
+                    key="api.ai_usage.unavailable_evidence_cannot_contain_estimate",
+                )
             if any(count is not None for count in counts):
-                raise ValidationFailed("unavailable evidence must not carry token values")
+                raise ValidationFailed(
+                    "unavailable evidence must not carry token values",
+                    key="api.ai_usage.unavailable_evidence_not_carry_token_values",
+                )
         for flag_field in ("cache_included_in_input", "reasoning_included_in_output"):
             flag = values.get(flag_field)
             if flag is not None and not isinstance(flag, bool):
-                raise ValidationFailed(f"{flag_field} must be a boolean or null")
+                raise ValidationFailed(
+                    f"{flag_field} must be a boolean or null",
+                    key="api.ai_usage.flag_field_boolean_null",
+                    params={"flag_field": flag_field},
+                )
         return cls(**values)
 
     def total(self) -> int | None:
@@ -300,24 +341,39 @@ def _validate_token_count(value: Any, field: str) -> None:
     if value is None:
         return
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValidationFailed(f"{field} must be a non-negative integer or null")
+        raise ValidationFailed(
+            f"{field} must be a non-negative integer or null",
+            key="api.ai_usage.field_non_negative_integer_null",
+            params={"field": field},
+        )
 
 
 def _validate_limit(value: Any) -> int | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValidationFailed("daily limit must be a non-negative integer or null")
+        raise ValidationFailed(
+            "daily limit must be a non-negative integer or null",
+            key="api.ai_usage.daily_limit_non_negative_integer_null",
+        )
     return value
 
 
 def _validate_day(value: str, field: str) -> str:
     if not isinstance(value, str) or not _DAY_PATTERN.match(value):
-        raise ValidationFailed(f"{field} must be an ISO day (YYYY-MM-DD)")
+        raise ValidationFailed(
+            f"{field} must be an ISO day (YYYY-MM-DD)",
+            key="api.ai_usage.field_iso_day_yyyy_mm_dd",
+            params={"field": field},
+        )
     try:
         date.fromisoformat(value)
     except ValueError as exc:
-        raise ValidationFailed(f"{field} must be a valid ISO day") from exc
+        raise ValidationFailed(
+            f"{field} must be a valid ISO day",
+            key="api.ai_usage.field_valid_iso_day",
+            params={"field": field},
+        ) from exc
     return value
 
 
@@ -325,7 +381,11 @@ def _zone(name: str) -> ZoneInfo:
     try:
         return ZoneInfo(name)
     except (ZoneInfoNotFoundError, ValueError) as exc:
-        raise ValidationFailed(f"unknown IANA timezone: {name}") from exc
+        raise ValidationFailed(
+            f"unknown IANA timezone: {name}",
+            key="api.ai_usage.unknown_iana_timezone_name",
+            params={"name": name},
+        ) from exc
 
 
 def _as_utc(value: datetime) -> datetime:
@@ -523,7 +583,8 @@ class AiUsageService:
     def _require_admin(self, db: Session, principal: Any, resource: str) -> None:
         if principal.kind != HUMAN_ACTOR_KIND:
             raise PermissionDenied(
-                "AI usage administration requires a signed-in installation owner"
+                "AI usage administration requires a signed-in installation owner",
+                key="api.ai_usage.ai_usage_administration_requires_signed_in_installation_owner",
             )
         require_system_authority(db, self._settings, principal, PERMISSION, resource)
 
@@ -554,13 +615,19 @@ class AiUsageService:
                 policy.company_daily_limit = _validate_limit(company_daily_limit)
                 policy.company_configured = True
             if cancel_timezone_change and timezone is not UNSET:
-                raise ValidationFailed("timezone and cancelTimezoneChange cannot be combined")
+                raise ValidationFailed(
+                    "timezone and cancelTimezoneChange cannot be combined",
+                    key="api.ai_usage.timezone_canceltimezonechange_cannot_combined",
+                )
             if cancel_timezone_change:
                 policy.pending_timezone = None
                 policy.pending_effective_day = None
             elif timezone is not UNSET:
                 if not isinstance(timezone, str):
-                    raise ValidationFailed("timezone must be an IANA timezone name")
+                    raise ValidationFailed(
+                        "timezone must be an IANA timezone name",
+                        key="api.ai_usage.timezone_iana_timezone_name",
+                    )
                 target = _zone(timezone)
                 if target.key == policy.timezone:
                     policy.pending_timezone = None
@@ -599,9 +666,9 @@ class AiUsageService:
                 raise PersonalBudgetUnsupported()
             limit = _validate_limit(daily_limit)
             if not isinstance(user_id, str) or not user_id.strip():
-                raise ValidationFailed("user id is required")
+                raise ValidationFailed("user id is required", key="api.ai_usage.user_id_required")
             if db.get(Identity, user_id) is None:
-                raise ValidationFailed("unknown user")
+                raise ValidationFailed("unknown user", key="api.ai_usage.unknown_user")
             row = db.get(AiUsageQuotaOverride, f"{scope}:{user_id}")
             now = self._now_utc()
             if row is None:
@@ -650,13 +717,20 @@ class AiUsageService:
 
     def _validate_scope(self, scope: str) -> None:
         if scope not in (COMPANY, PERSONAL):
-            raise ValidationFailed("funding scope must be company or personal")
+            raise ValidationFailed(
+                "funding scope must be company or personal",
+                key="api.ai_usage.funding_scope_company_personal",
+            )
 
     def _inherit(self, field: str, parent_value: Any, value: Any) -> Any:
         if value is None:
             return parent_value
         if value != parent_value:
-            raise ValidationFailed(f"{field} does not match the parent reservation")
+            raise ValidationFailed(
+                f"{field} does not match the parent reservation",
+                key="api.ai_usage.field_does_not_match_parent_reservation",
+                params={"field": field},
+            )
         return value
 
     def reserve(
@@ -679,15 +753,26 @@ class AiUsageService:
             or not isinstance(reserved_tokens, int)
             or reserved_tokens < 1
         ):
-            raise ValidationFailed("reserved tokens must be a positive integer")
+            raise ValidationFailed(
+                "reserved tokens must be a positive integer",
+                key="api.ai_usage.reserved_tokens_positive_integer",
+            )
         if provider_scope is not None and provider_scope not in PROVIDER_SCOPES:
-            raise ValidationFailed("provider scope must be global or personal")
+            raise ValidationFailed(
+                "provider scope must be global or personal",
+                key="api.ai_usage.provider_scope_global_personal",
+            )
         if idempotency_key is not None and (
             not isinstance(idempotency_key, str) or not idempotency_key.strip()
         ):
-            raise ValidationFailed("idempotency key must be a non-empty string")
+            raise ValidationFailed(
+                "idempotency key must be a non-empty string",
+                key="api.ai_usage.idempotency_key_non_empty_string",
+            )
         if run_id is not None and (not isinstance(run_id, str) or not run_id.strip()):
-            raise ValidationFailed("run id must be a non-empty string")
+            raise ValidationFailed(
+                "run id must be a non-empty string", key="api.ai_usage.run_id_non_empty_string"
+            )
 
         with self._session() as db:
             policy = self._policy(db)
@@ -696,15 +781,24 @@ class AiUsageService:
             if parent_reservation_id is not None:
                 parent = db.get(AiUsageReservation, parent_reservation_id)
                 if parent is None:
-                    raise ValidationFailed("parent reservation not found")
+                    raise ValidationFailed(
+                        "parent reservation not found",
+                        key="api.ai_usage.parent_reservation_not_found",
+                    )
                 if actor_id is None:
                     actor_id = parent.actor_id
                 elif parent.actor_id != actor_id:
-                    raise ValidationFailed("parent reservation belongs to another actor")
+                    raise ValidationFailed(
+                        "parent reservation belongs to another actor",
+                        key="api.ai_usage.parent_reservation_belongs_another_actor",
+                    )
                 if funding is None:
                     funding = parent.funding
                 elif parent.funding != funding:
-                    raise ValidationFailed("funding does not match the parent reservation")
+                    raise ValidationFailed(
+                        "funding does not match the parent reservation",
+                        key="api.ai_usage.funding_does_not_match_parent_reservation",
+                    )
                 provider_id = self._inherit("provider", parent.provider_id, provider_id)
                 provider_scope = self._inherit(
                     "provider scope", parent.provider_scope, provider_scope
@@ -721,9 +815,9 @@ class AiUsageService:
                 )
 
             if not isinstance(actor_id, str) or not actor_id.strip():
-                raise ValidationFailed("actor id is required")
+                raise ValidationFailed("actor id is required", key="api.ai_usage.actor_id_required")
             if funding is None:
-                raise ValidationFailed("funding is required")
+                raise ValidationFailed("funding is required", key="api.ai_usage.funding_required")
             self._validate_scope(funding)
             limit_state = self._effective_limit(db, actor_id, funding)
 
@@ -738,7 +832,8 @@ class AiUsageService:
             if existing is not None:
                 if existing.funding != funding or existing.reserved_tokens != reserved_tokens:
                     raise ValidationFailed(
-                        "idempotency key was already used with different reservation terms"
+                        "idempotency key was already used with different reservation terms",
+                        key="api.ai_usage.idempotency_key_already_used_different_reservation_terms",
                     )
                 for label, provided, stored in (
                     ("provider", provider_id, existing.provider_id),
@@ -748,7 +843,9 @@ class AiUsageService:
                 ):
                     if provided is not None and provided != stored:
                         raise ValidationFailed(
-                            f"idempotency key was already used with a different {label}"
+                            f"idempotency key was already used with a different {label}",
+                            key="api.ai_usage.idempotency_key_already_used_different_label",
+                            params={"label": label},
                         )
                 db.commit()
                 balance = db.get(
@@ -918,10 +1015,14 @@ class AiUsageService:
     ) -> SettlementResult:
         if not trusted_no_upstream:
             raise ValidationFailed(
-                "release requires explicit trusted_no_upstream=True (never on timeout)"
+                "release requires explicit trusted_no_upstream=True (never on timeout)",
+                key="api.ai_usage.release_requires_explicit_trusted_no_upstream_true_never",
             )
         if not isinstance(reason, str) or not reason.strip():
-            raise ValidationFailed("release requires a non-empty reason")
+            raise ValidationFailed(
+                "release requires a non-empty reason",
+                key="api.ai_usage.release_requires_non_empty_reason",
+            )
         with self._session() as db:
             result = self._release_core(db, reservation_id, reason=reason, resolved_by=None)
             db.commit()
@@ -938,7 +1039,7 @@ class AiUsageService:
     ) -> SettlementResult:
         reservation = db.get(AiUsageReservation, reservation_id)
         if reservation is None:
-            raise ValidationFailed("unknown reservation")
+            raise ValidationFailed("unknown reservation", key="api.ai_usage.unknown_reservation")
         amount = evidence.resolved_total()
         if reservation.status in (SETTLED, RELEASED):
             receipt = self._receipt(db, reservation_id)
@@ -1033,9 +1134,12 @@ class AiUsageService:
     ) -> SettlementResult:
         reservation = db.get(AiUsageReservation, reservation_id)
         if reservation is None:
-            raise ValidationFailed("unknown reservation")
+            raise ValidationFailed("unknown reservation", key="api.ai_usage.unknown_reservation")
         if reservation.status == SETTLED:
-            raise ValidationFailed("a settled reservation cannot be released")
+            raise ValidationFailed(
+                "a settled reservation cannot be released",
+                key="api.ai_usage.settled_reservation_cannot_released",
+            )
         if reservation.status == RELEASED:
             receipt = self._receipt(db, reservation_id)
             db.commit()
@@ -1213,7 +1317,9 @@ class AiUsageService:
         limit: int = 100,
     ) -> list[dict[str, Any]]:
         if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= 500:
-            raise ValidationFailed("limit must be between 1 and 500")
+            raise ValidationFailed(
+                "limit must be between 1 and 500", key="api.ai_usage.limit_between_1_500"
+            )
         with self._session() as db:
             statement = select(AiUsageReservation).where(
                 AiUsageReservation.status.in_((PENDING, UNRESOLVED))
@@ -1275,14 +1381,21 @@ class AiUsageService:
         with self._session() as db:
             self._require_admin(db, principal, f"ai-usage:reservation:{reservation_id}:resolve")
             if outcome not in (SETTLED, RELEASED):
-                raise ValidationFailed("outcome must be settled or released")
+                raise ValidationFailed(
+                    "outcome must be settled or released",
+                    key="api.ai_usage.outcome_settled_released",
+                )
             parsed = UsageEvidence.from_mapping(evidence or {}) if outcome == SETTLED else None
             if outcome == SETTLED and (parsed is None or parsed.resolved_total() is None):
                 raise ValidationFailed(
-                    "settlement requires trustworthy total tokens, precision and source"
+                    "settlement requires trustworthy total tokens, precision and source",
+                    key="api.ai_usage.settlement_requires_trustworthy_total_tokens_precision_source",
                 )
             if outcome == RELEASED and (not reason or not reason.strip()):
-                raise ValidationFailed("release requires a non-empty reason")
+                raise ValidationFailed(
+                    "release requires a non-empty reason",
+                    key="api.ai_usage.release_requires_non_empty_reason",
+                )
             db.commit()
             if outcome == SETTLED:
                 assert parsed is not None
@@ -1313,7 +1426,7 @@ class AiUsageService:
 
     def me(self, actor_id: str) -> dict[str, Any]:
         if not isinstance(actor_id, str) or not actor_id.strip():
-            raise ValidationFailed("actor id is required")
+            raise ValidationFailed("actor id is required", key="api.ai_usage.actor_id_required")
         with self._session() as db:
             period = self._period(db)
             company_limit = self._effective_limit(db, actor_id, COMPANY)
@@ -1408,7 +1521,11 @@ class AiUsageService:
         groups = tuple(group_by) if group_by is not None else DEFAULT_GROUP_BY
         unknown = set(groups) - GROUPABLE
         if unknown:
-            raise ValidationFailed(f"unsupported report grouping: {', '.join(sorted(unknown))}")
+            raise ValidationFailed(
+                f"unsupported report grouping: {', '.join(sorted(unknown))}",
+                key="api.ai_usage.unsupported_report_grouping",
+                params={"groupings": ", ".join(sorted(unknown))},
+            )
         with self._session() as db:
             self._require_admin(db, principal, "ai-usage:report")
             period = self._period(db)

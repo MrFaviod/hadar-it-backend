@@ -22,6 +22,7 @@ from itsm.directory.media import (
     validate_plan,
 )
 from itsm.directory.media_api import create_directory_media_router
+from itsm.i18n import t
 from itsm.identity.api import create_identity_router, install_error_handlers
 from itsm.identity.service import ValidationFailed
 from PIL import Image
@@ -117,7 +118,9 @@ def test_plan_round_trip_publishes_only_opaque_metadata(
 
         missing = test_client.get(f"/api/v1/locations/{floor['id']}/plan/meta", headers=auth)
         assert missing.status_code == 404
-        assert missing.json() == {"error": {"code": "not_found", "message": "plan not found"}}
+        error = missing.json()["error"]
+        assert (error["code"], error["key"]) == ("not_found", "api.directory.plan_not_found")
+        assert error["message"] == t("api.directory.plan_not_found", "es")
 
         uploaded = test_client.put(
             f"/api/v1/locations/{floor['id']}/plan",
@@ -198,32 +201,47 @@ def test_rejected_uploads_leave_the_previous_plan_untouched(catalog: Catalog) ->
         cases = [
             (
                 b"<svg xmlns='http://www.w3.org/2000/svg'></svg>",
-                "plan image must be a PNG, JPEG or WebP file",
+                "api.directory.plan_image_png_jpeg_webp_file",
             ),
-            (b"GIF89a" + b"0" * 32, "plan image must be a PNG, JPEG or WebP file"),
-            (b"not an image", "plan image must be a PNG, JPEG or WebP file"),
-            (b"", "plan image is empty"),
+            (
+                b"GIF89a" + b"0" * 32,
+                "api.directory.plan_image_png_jpeg_webp_file",
+            ),
+            (b"not an image", "api.directory.plan_image_png_jpeg_webp_file"),
+            (b"", "api.directory.plan_image_empty"),
             (
                 b"\x89PNG\r\n\x1a\n" + b"\x00" * 8,
-                "plan image dimensions could not be read",
+                "api.directory.plan_image_dimensions_could_not_read",
             ),
         ]
-        for payload, message in cases:
+        for payload, key in cases:
             rejected = test_client.put(path, content=payload, headers=auth)
             assert rejected.status_code == 422, rejected.text
-            assert rejected.json() == {"error": {"code": "validation_error", "message": message}}
+            error = rejected.json()["error"]
+            assert (error["code"], error["key"]) == ("validation_error", key)
+            assert error["message"] == t(key, "es")
             assert test_client.get(path, headers=auth).content == original
 
         too_large = b"\x89PNG\r\n\x1a\n" + b"0" * (MAX_PLAN_BYTES - 7)
         rejected = test_client.put(path, content=too_large, headers=auth)
         assert rejected.status_code == 422
-        assert "at most 5 MiB" in rejected.json()["error"]["message"]
+        error = rejected.json()["error"]
+        assert (error["key"], error["params"]) == (
+            "api.directory.plan_image_most_maximum_mib",
+            {"maximum": 5},
+        )
+        assert error["message"] == t(error["key"], "es", **error["params"])
         assert test_client.get(path, headers=auth).content == original
 
         too_wide = png_bytes(MAX_PLAN_DIMENSION + 1, 1)
         rejected = test_client.put(path, content=too_wide, headers=auth)
         assert rejected.status_code == 422
-        assert "8192 pixels" in rejected.json()["error"]["message"]
+        error = rejected.json()["error"]
+        assert (error["key"], error["params"]) == (
+            "api.directory.plan_image_sides_most_maximum_pixels",
+            {"maximum": 8192},
+        )
+        assert error["message"] == t(error["key"], "es", **error["params"])
         assert test_client.get(path, headers=auth).content == original
 
 
@@ -238,9 +256,12 @@ def test_plan_resource_requires_a_floor_and_the_configuration_permission(
             f"/api/v1/locations/{site['id']}/plan", content=plan, headers=auth
         )
         assert not_floor.status_code == 422
-        assert not_floor.json()["error"]["message"] == (
-            "floor plans are only stored on a floor location"
+        error = not_floor.json()["error"]
+        assert (error["code"], error["key"]) == (
+            "validation_error",
+            "api.directory.floor_plans_only_stored_floor_location",
         )
+        assert error["message"] == t("api.directory.floor_plans_only_stored_floor_location", "es")
 
         unknown = "0f8c5f1e-0000-4000-8000-000000000000"
         assert test_client.get(f"/api/v1/locations/{unknown}/plan", headers=auth).status_code == 404

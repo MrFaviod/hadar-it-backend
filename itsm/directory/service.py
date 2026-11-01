@@ -411,14 +411,20 @@ class DirectoryService:
     def _row(self, model: Any, value: Any, label: str) -> Any:
         """Resolve a permanent id from the URL; a bad or missing id is a 404."""
         if not isinstance(value, str) or not value.strip():
-            raise NotFound(f"{label} not found")
+            raise NotFound(
+                f"{label} not found", key="api.directory.record_not_found", params={"field": label}
+            )
         try:
             key = str(UUID(value.strip()))
         except ValueError:
-            raise NotFound(f"{label} not found") from None
+            raise NotFound(
+                f"{label} not found", key="api.directory.record_not_found", params={"field": label}
+            ) from None
         row = self._session.get(model, key)
         if row is None:
-            raise NotFound(f"{label} not found")
+            raise NotFound(
+                f"{label} not found", key="api.directory.record_not_found", params={"field": label}
+            )
         return row
 
     def _department_reference(self, value: Any) -> str | None:
@@ -427,9 +433,15 @@ class DirectoryService:
         key = _uuid_text(value, "departmentId")
         department = self._session.get(DirectoryDepartment, key)
         if department is None:
-            raise ValidationFailed("departmentId must reference an existing department")
+            raise ValidationFailed(
+                "departmentId must reference an existing department",
+                key="api.directory.departmentid_reference_existing_department",
+            )
         if not department.active:
-            raise ValidationFailed("departmentId must reference an active department")
+            raise ValidationFailed(
+                "departmentId must reference an active department",
+                key="api.directory.departmentid_reference_active_department",
+            )
         return department.id
 
     def _site_reference(self, value: Any) -> str | None:
@@ -438,30 +450,55 @@ class DirectoryService:
         key = _uuid_text(value, "siteId")
         site = self._session.get(DirectoryLocation, key)
         if site is None:
-            raise ValidationFailed("siteId must reference an existing site")
+            raise ValidationFailed(
+                "siteId must reference an existing site",
+                key="api.directory.siteid_reference_existing_site",
+            )
         if site.level != "site":
-            raise ValidationFailed("siteId must reference a location of level site")
+            raise ValidationFailed(
+                "siteId must reference a location of level site",
+                key="api.directory.siteid_reference_location_level_site",
+            )
         if not site.active:
-            raise ValidationFailed("siteId must reference an active site")
+            raise ValidationFailed(
+                "siteId must reference an active site",
+                key="api.directory.siteid_reference_active_site",
+            )
         return site.id
 
     def _parent_reference(self, level: str, value: Any) -> str | None:
         expected = LEVEL_PARENT[level]
         if expected is None:
             if value is not None:
-                raise ValidationFailed("a site cannot have a parent location")
+                raise ValidationFailed(
+                    "a site cannot have a parent location",
+                    key="api.directory.site_cannot_parent_location",
+                )
             return None
         if value is None:
-            raise ValidationFailed(f"a {level} requires a parent {expected}")
+            raise ValidationFailed(
+                f"a {level} requires a parent {expected}",
+                key="api.directory.level_requires_parent_expected",
+                params={"level": level, "expected": expected},
+            )
         parent = self._session.get(DirectoryLocation, _uuid_text(value, "parentId"))
         if parent is None:
-            raise ValidationFailed(f"parentId must reference an existing {expected}")
+            raise ValidationFailed(
+                f"parentId must reference an existing {expected}",
+                key="api.directory.parentid_reference_existing_expected",
+                params={"expected": expected},
+            )
         if parent.level != expected:
             raise ValidationFailed(
-                f"the parent of a {level} must be a location of level {expected}"
+                f"the parent of a {level} must be a location of level {expected}",
+                key="api.directory.parent_level_location_level_expected",
+                params={"level": level, "expected": expected},
             )
         if not parent.active:
-            raise ValidationFailed("parentId must reference an active location")
+            raise ValidationFailed(
+                "parentId must reference an active location",
+                key="api.directory.parentid_reference_active_location",
+            )
         return parent.id
 
     # ---------------------------------------------------------- transactions
@@ -472,7 +509,10 @@ class DirectoryService:
         try:
             self._session.flush()
         except IntegrityError as exc:
-            raise Conflict("another directory record already uses that value") from exc
+            raise Conflict(
+                "another directory record already uses that value",
+                key="api.directory.another_directory_record_already_uses_value",
+            ) from exc
 
     def _record_event(
         self,
@@ -518,7 +558,10 @@ class DirectoryService:
                 changed_before[field] = before[field]
                 changed_after[field] = value
         if not changed_after:
-            raise ValidationFailed("patch does not change any field")
+            raise ValidationFailed(
+                "patch does not change any field",
+                key="api.directory.patch_does_not_change_any_field",
+            )
         return changed_before, changed_after
 
     @staticmethod
@@ -656,7 +699,9 @@ class DirectoryService:
             )
         if active is not None:
             if not isinstance(active, bool):
-                raise ValidationFailed("active must be a boolean")
+                raise ValidationFailed(
+                    "active must be a boolean", key="api.directory.active_boolean"
+                )
             filters.append(DirectoryDepartment.active.is_(active))
         total = int(
             self._session.execute(
@@ -785,7 +830,7 @@ class DirectoryService:
         """Canonical label for another module; never derived from legacy free text."""
         view = self.get_person(principal, person_id)
         if require_active and view.status != "active":
-            raise Conflict("person is not active")
+            raise Conflict("person is not active", key="api.directory.person_not_active")
         return view.label
 
     def list_people(
@@ -975,7 +1020,9 @@ class DirectoryService:
             filters.append(DirectoryLocation.parent_id == parent)
         if active is not None:
             if not isinstance(active, bool):
-                raise ValidationFailed("active must be a boolean")
+                raise ValidationFailed(
+                    "active must be a boolean", key="api.directory.active_boolean"
+                )
             filters.append(DirectoryLocation.active.is_(active))
         total = int(
             self._session.execute(
@@ -1011,13 +1058,21 @@ class DirectoryService:
             or isinstance(depth, bool)
             or not 1 <= depth <= MAX_TREE_DEPTH
         ):
-            raise ValidationFailed(f"depth must be between 1 and {MAX_TREE_DEPTH}")
+            raise ValidationFailed(
+                f"depth must be between 1 and {MAX_TREE_DEPTH}",
+                key="api.directory.depth_range",
+                params={"maximum": MAX_TREE_DEPTH},
+            )
         if (
             not isinstance(max_nodes, int)
             or isinstance(max_nodes, bool)
             or not 1 <= max_nodes <= MAX_TREE_NODES
         ):
-            raise ValidationFailed(f"maxNodes must be between 1 and {MAX_TREE_NODES}")
+            raise ValidationFailed(
+                f"maxNodes must be between 1 and {MAX_TREE_NODES}",
+                key="api.directory.max_nodes_range",
+                params={"maximum": MAX_TREE_NODES},
+            )
 
         roots: tuple[DirectoryLocation, ...]
         if root_id is not None:
@@ -1091,7 +1146,11 @@ class DirectoryService:
     ) -> DirectoryHistoryPage:
         """Bounded append-only event history of one directory record."""
         if entity not in ENTITIES:
-            raise ValidationFailed(f"entity must be one of {', '.join(ENTITIES)}")
+            raise ValidationFailed(
+                f"entity must be one of {', '.join(ENTITIES)}",
+                key="api.directory.entity_allowed",
+                params={"allowed": ", ".join(ENTITIES)},
+            )
         permission = "assets.view" if entity == "location" else "people.view"
         self._identity.authorize(principal, permission, resource=f"{entity}:{entity_id}")
         _page_bounds(limit, offset, maximum=HISTORY_LIMIT)
@@ -1129,20 +1188,36 @@ class DirectoryService:
     # ------------------------------------------------------------- validation
     def _prepare_department_create(self, values: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("department payload must be an object")
+            raise ValidationFailed(
+                "department payload must be an object",
+                key="api.directory.department_payload_object",
+            )
         unknown = sorted(set(values) - {"name"})
         if unknown:
-            raise ValidationFailed(f"unsupported department fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported department fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_department_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         return {"name": _text(values.get("name"), "name", DEPARTMENT_NAME_MAX, required=True)}
 
     def _prepare_department_changes(self, changes: Any) -> dict[str, Any]:
         if not isinstance(changes, Mapping):
-            raise ValidationFailed("department patch must be an object")
+            raise ValidationFailed(
+                "department patch must be an object", key="api.directory.department_patch_object"
+            )
         unknown = sorted(set(changes) - set(DEPARTMENT_CHANGE_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported department fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported department fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_department_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         if not changes:
-            raise ValidationFailed("patch requires at least one field")
+            raise ValidationFailed(
+                "patch requires at least one field",
+                key="api.directory.patch_requires_least_one_field",
+            )
         prepared: dict[str, Any] = {}
         if "name" in changes:
             prepared["name"] = _text(changes["name"], "name", DEPARTMENT_NAME_MAX, required=True)
@@ -1152,10 +1227,16 @@ class DirectoryService:
 
     def _prepare_person_create(self, values: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("person payload must be an object")
+            raise ValidationFailed(
+                "person payload must be an object", key="api.directory.person_payload_object"
+            )
         unknown = sorted(set(values) - set(PERSON_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported person fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported person fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_person_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         return {
             "name": _text(values.get("name"), "name", PERSON_NAME_MAX, required=True),
             "job_title": _text(values.get("job_title"), "jobTitle", PERSON_JOB_TITLE_MAX),
@@ -1168,12 +1249,21 @@ class DirectoryService:
 
     def _prepare_person_changes(self, person: DirectoryPerson, changes: Any) -> dict[str, Any]:
         if not isinstance(changes, Mapping):
-            raise ValidationFailed("person patch must be an object")
+            raise ValidationFailed(
+                "person patch must be an object", key="api.directory.person_patch_object"
+            )
         unknown = sorted(set(changes) - set(PERSON_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported person fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported person fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_person_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         if not changes:
-            raise ValidationFailed("patch requires at least one field")
+            raise ValidationFailed(
+                "patch requires at least one field",
+                key="api.directory.patch_requires_least_one_field",
+            )
         prepared: dict[str, Any] = {}
         if "name" in changes:
             prepared["name"] = _text(changes["name"], "name", PERSON_NAME_MAX, required=True)
@@ -1200,10 +1290,16 @@ class DirectoryService:
 
     def _prepare_location_create(self, values: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("location payload must be an object")
+            raise ValidationFailed(
+                "location payload must be an object", key="api.directory.location_payload_object"
+            )
         unknown = sorted(set(values) - set(LOCATION_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported location fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported location fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_location_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         level = _level(values.get("level"))
         name = _text(values.get("name"), "name", LOCATION_NAME_MAX, required=True)
         coordinates = _new_coordinates(level, values)
@@ -1225,12 +1321,21 @@ class DirectoryService:
         self, location: DirectoryLocation, changes: Any
     ) -> dict[str, Any]:
         if not isinstance(changes, Mapping):
-            raise ValidationFailed("location patch must be an object")
+            raise ValidationFailed(
+                "location patch must be an object", key="api.directory.location_patch_object"
+            )
         unknown = sorted(set(changes) - set(LOCATION_CHANGE_FIELDS))
         if unknown:
-            raise ValidationFailed(f"unsupported location fields: {', '.join(unknown)}")
+            raise ValidationFailed(
+                f"unsupported location fields: {', '.join(unknown)}",
+                key="api.directory.unsupported_location_fields",
+                params={"fields": ", ".join(unknown)},
+            )
         if not changes:
-            raise ValidationFailed("patch requires at least one field")
+            raise ValidationFailed(
+                "patch requires at least one field",
+                key="api.directory.patch_requires_least_one_field",
+            )
         prepared: dict[str, Any] = {}
         if "parent_id" in changes:
             parent_id = self._parent_reference(location.level, changes["parent_id"])
@@ -1265,7 +1370,10 @@ class DirectoryService:
         if exclude_id is not None:
             statement = statement.where(DirectoryDepartment.id != exclude_id)
         if self._session.execute(statement).first() is not None:
-            raise Conflict("department name is already in use")
+            raise Conflict(
+                "department name is already in use",
+                key="api.directory.department_name_already_in_use",
+            )
 
     def _assert_department_unused(self, department_id: str) -> None:
         active_people = int(
@@ -1277,7 +1385,10 @@ class DirectoryService:
             ).scalar_one()
         )
         if active_people:
-            raise Conflict("department still has active people")
+            raise Conflict(
+                "department still has active people",
+                key="api.directory.department_still_active_people",
+            )
 
     def _assert_location_name_free(
         self, parent_id: str | None, name_key: str, *, exclude_id: str | None = None
@@ -1291,7 +1402,10 @@ class DirectoryService:
         if exclude_id is not None:
             statement = statement.where(DirectoryLocation.id != exclude_id)
         if self._session.execute(statement).first() is not None:
-            raise Conflict("a sibling location already uses that name")
+            raise Conflict(
+                "a sibling location already uses that name",
+                key="api.directory.sibling_location_already_uses_name",
+            )
 
     def _assert_location_unused(self, location_id: str) -> None:
         active_children = int(
@@ -1315,11 +1429,17 @@ class DirectoryService:
             or active_people
             or self._active_assets(self._location_assets(location_id))
         ):
-            raise Conflict("location still has active children, people or assets")
+            raise Conflict(
+                "location still has active children, people or assets",
+                key="api.directory.location_still_active_children_people_assets",
+            )
 
     def _assert_person_unused(self, person_id: str) -> None:
         if self._active_assets(self._person_assets(person_id)):
-            raise Conflict("person still has active assigned assets")
+            raise Conflict(
+                "person still has active assigned assets",
+                key="api.directory.person_still_active_assigned_assets",
+            )
 
     def _location_assets(self, location_id: str) -> Any:
         """Condition counting unarchived assets bound to a site or a location id."""
@@ -1349,35 +1469,55 @@ class DirectoryService:
             if current is None:
                 return
             if current in seen:
-                raise Conflict("a location cannot move into its own subtree")
+                raise Conflict(
+                    "a location cannot move into its own subtree",
+                    key="api.directory.location_cannot_move_into_own_subtree",
+                )
             seen.add(current)
             row = self._session.get(DirectoryLocation, current)
             if row is None:
                 return
             current = row.parent_id
-        raise Conflict("location hierarchy is deeper than the supported depth")
+        raise Conflict(
+            "location hierarchy is deeper than the supported depth",
+            key="api.directory.location_hierarchy_deeper_than_supported_depth",
+        )
 
 
 def _text(value: Any, field: str, limit: int, *, required: bool = False) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required", key="api.validation.field_required", params={"field": field}
+            )
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text", key="api.validation.field_text", params={"field": field}
+        )
     normalized = value.strip()
     if not normalized:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required", key="api.validation.field_required", params={"field": field}
+            )
         return None
     if len(normalized) > limit:
-        raise ValidationFailed(f"{field} must be at most {limit} characters")
+        raise ValidationFailed(
+            f"{field} must be at most {limit} characters",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": limit},
+        )
     return normalized
 
 
 def _boolean(value: Any, field: str) -> bool:
     if not isinstance(value, bool):
-        raise ValidationFailed(f"{field} must be a boolean")
+        raise ValidationFailed(
+            f"{field} must be a boolean",
+            key="api.validation.field_boolean",
+            params={"field": field},
+        )
     return value
 
 
@@ -1391,11 +1531,15 @@ def _escape_like(value: str) -> str:
 
 def _uuid_text(value: Any, field: str) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be a UUID")
+        raise ValidationFailed(
+            f"{field} must be a UUID", key="api.validation.field_uuid", params={"field": field}
+        )
     try:
         return str(UUID(value.strip()))
     except ValueError:
-        raise ValidationFailed(f"{field} must be a UUID") from None
+        raise ValidationFailed(
+            f"{field} must be a UUID", key="api.validation.field_uuid", params={"field": field}
+        ) from None
 
 
 def _optional_uuid(value: Any, field: str) -> str | None:
@@ -1406,22 +1550,36 @@ def _optional_uuid(value: Any, field: str) -> str | None:
 
 def _page_bounds(limit: Any, offset: Any, *, maximum: int = MAX_LIMIT) -> None:
     if not isinstance(limit, int) or isinstance(limit, bool) or not 1 <= limit <= maximum:
-        raise ValidationFailed(f"limit must be between 1 and {maximum}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {maximum}",
+            key="api.validation.limit_range",
+            params={"maximum": maximum},
+        )
     if not isinstance(offset, int) or isinstance(offset, bool) or offset < 0:
-        raise ValidationFailed("offset must be zero or greater")
+        raise ValidationFailed(
+            "offset must be zero or greater", key="api.validation.offset_non_negative"
+        )
 
 
 def _person_status(value: Any) -> str:
     if value is None:
         return DEFAULT_PERSON_STATUS
     if not isinstance(value, str) or value.strip().lower() not in PERSON_STATUSES:
-        raise ValidationFailed(f"status must be one of {', '.join(PERSON_STATUSES)}")
+        raise ValidationFailed(
+            f"status must be one of {', '.join(PERSON_STATUSES)}",
+            key="api.directory.status_allowed",
+            params={"allowed": ", ".join(PERSON_STATUSES)},
+        )
     return value.strip().lower()
 
 
 def _level(value: Any) -> str:
     if not isinstance(value, str) or value.strip().lower() not in LEVELS:
-        raise ValidationFailed(f"level must be one of {', '.join(LEVELS)}")
+        raise ValidationFailed(
+            f"level must be one of {', '.join(LEVELS)}",
+            key="api.directory.level_allowed",
+            params={"allowed": ", ".join(LEVELS)},
+        )
     return value.strip().lower()
 
 
@@ -1430,7 +1588,9 @@ def _email(value: Any) -> str | None:
     if normalized is None:
         return None
     if "@" not in normalized or any(character.isspace() for character in normalized):
-        raise ValidationFailed("contactEmail must be an email address")
+        raise ValidationFailed(
+            "contactEmail must be an email address", key="api.directory.contactemail_email_address"
+        )
     return normalized
 
 
@@ -1444,7 +1604,9 @@ def _phone(value: Any) -> str | None:
     if not _PHONE_PATTERN.match(normalized) or not any(
         character.isdigit() for character in normalized
     ):
-        raise ValidationFailed("contactPhone must be a phone number")
+        raise ValidationFailed(
+            "contactPhone must be a phone number", key="api.directory.contactphone_phone_number"
+        )
     return normalized
 
 
@@ -1452,18 +1614,32 @@ def _coordinate(value: Any, field: str, bound: Decimal) -> Decimal | None:
     if value is None:
         return None
     if isinstance(value, bool) or not isinstance(value, (int, float, Decimal)):
-        raise ValidationFailed(f"{field} must be a number")
+        raise ValidationFailed(
+            f"{field} must be a number", key="api.validation.field_number", params={"field": field}
+        )
     try:
         number = Decimal(str(value))
     except InvalidOperation:
-        raise ValidationFailed(f"{field} must be a number") from None
+        raise ValidationFailed(
+            f"{field} must be a number", key="api.validation.field_number", params={"field": field}
+        ) from None
     if not number.is_finite():
-        raise ValidationFailed(f"{field} must be finite")
+        raise ValidationFailed(
+            f"{field} must be finite", key="api.directory.field_finite", params={"field": field}
+        )
     if abs(number) > bound:
-        raise ValidationFailed(f"{field} must be between -{bound} and {bound}")
+        raise ValidationFailed(
+            f"{field} must be between -{bound} and {bound}",
+            key="api.directory.coordinate_range",
+            params={"field": field, "bound": bound, "bound_2": bound},
+        )
     exponent = number.as_tuple().exponent
     if isinstance(exponent, int) and -exponent > COORDINATE_MAX_DECIMALS:
-        raise ValidationFailed(f"{field} supports at most {COORDINATE_MAX_DECIMALS} decimal places")
+        raise ValidationFailed(
+            f"{field} supports at most {COORDINATE_MAX_DECIMALS} decimal places",
+            key="api.directory.field_supports_most_decimals_decimal_places",
+            params={"field": field, "decimals": COORDINATE_MAX_DECIMALS},
+        )
     return number
 
 
@@ -1484,10 +1660,16 @@ def _new_coordinates(level: str, values: Mapping[str, Any]) -> dict[str, str | N
     longitude = _coordinate(values.get("longitude"), "longitude", LONGITUDE_BOUND)
     if level != "site":
         if latitude is not None or longitude is not None:
-            raise ValidationFailed("geographic coordinates are only allowed on a site")
+            raise ValidationFailed(
+                "geographic coordinates are only allowed on a site",
+                key="api.directory.geographic_coordinates_only_allowed_site",
+            )
         return {"latitude": None, "longitude": None}
     if (latitude is None) != (longitude is None):
-        raise ValidationFailed("latitude and longitude must be provided together")
+        raise ValidationFailed(
+            "latitude and longitude must be provided together",
+            key="api.directory.latitude_longitude_provided_together",
+        )
     return {"latitude": _stored_value(latitude), "longitude": _stored_value(longitude)}
 
 
@@ -1497,7 +1679,10 @@ def _merged_coordinates(
     if "latitude" not in changes and "longitude" not in changes:
         return {}
     if location.level != "site":
-        raise ValidationFailed("geographic coordinates are only allowed on a site")
+        raise ValidationFailed(
+            "geographic coordinates are only allowed on a site",
+            key="api.directory.geographic_coordinates_only_allowed_site",
+        )
     latitude = (
         _coordinate(changes["latitude"], "latitude", LATITUDE_BOUND)
         if "latitude" in changes
@@ -1509,7 +1694,10 @@ def _merged_coordinates(
         else _current_coordinate(location.longitude)
     )
     if (latitude is None) != (longitude is None):
-        raise ValidationFailed("latitude and longitude must be provided together")
+        raise ValidationFailed(
+            "latitude and longitude must be provided together",
+            key="api.directory.latitude_longitude_provided_together",
+        )
     return {"latitude": _stored_value(latitude), "longitude": _stored_value(longitude)}
 
 
@@ -1518,13 +1706,21 @@ def _plan_reference(value: Any, field: str, limit: int) -> str | None:
     if normalized is None:
         return None
     if any(marker in normalized for marker in ("/", "\\", "..", "://")):
-        raise ValidationFailed(f"{field} must be an opaque plan identifier, not a path or URL")
+        raise ValidationFailed(
+            f"{field} must be an opaque plan identifier, not a path or URL",
+            key="api.directory.field_opaque_plan_identifier_not_path_url",
+            params={"field": field},
+        )
     return normalized
 
 
 def _source(value: Any) -> str:
     if value not in SOURCES:
-        raise ValidationFailed(f"source must be one of {', '.join(SOURCES)}")
+        raise ValidationFailed(
+            f"source must be one of {', '.join(SOURCES)}",
+            key="api.directory.source_allowed",
+            params={"allowed": ", ".join(SOURCES)},
+        )
     return value
 
 
@@ -1532,9 +1728,13 @@ def _effective_at(value: Any) -> datetime | None:
     if value is None:
         return None
     if not isinstance(value, datetime):
-        raise ValidationFailed("effectiveAt must be a timestamp")
+        raise ValidationFailed(
+            "effectiveAt must be a timestamp", key="api.directory.effectiveat_timestamp"
+        )
     if value.tzinfo is None:
-        raise ValidationFailed("effectiveAt must include a timezone")
+        raise ValidationFailed(
+            "effectiveAt must include a timezone", key="api.directory.effectiveat_include_timezone"
+        )
     return as_utc(value)
 
 

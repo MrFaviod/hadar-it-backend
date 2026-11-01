@@ -141,27 +141,41 @@ def _text(
 ) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required", key="api.validation.field_required", params={"field": field}
+            )
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be text")
+        raise ValidationFailed(
+            f"{field} must be text", key="api.validation.field_text", params={"field": field}
+        )
     text = value.strip()
     if not text:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required", key="api.validation.field_required", params={"field": field}
+            )
         return None
     if len(text) > max_length:
-        raise ValidationFailed(f"{field} must be at most {max_length} characters")
+        raise ValidationFailed(
+            f"{field} must be at most {max_length} characters",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": max_length},
+        )
     return text
 
 
 def _uuid_text(value: Any, field: str) -> str:
     if not isinstance(value, str) or not 1 <= len(value) <= 36:
-        raise ValidationFailed(f"{field} must be a UUID")
+        raise ValidationFailed(
+            f"{field} must be a UUID", key="api.validation.field_uuid", params={"field": field}
+        )
     try:
         return str(UUID(value))
     except ValueError:
-        raise ValidationFailed(f"{field} must be a UUID") from None
+        raise ValidationFailed(
+            f"{field} must be a UUID", key="api.validation.field_uuid", params={"field": field}
+        ) from None
 
 
 def _optional_uuid_text(value: Any, field: str) -> str | None:
@@ -174,7 +188,11 @@ def _enum(value: Any, field: str, allowed: tuple[str, ...], default: str) -> str
     if value is None:
         return default
     if value not in allowed:
-        raise ValidationFailed(f"{field} must be one of " + ", ".join(allowed))
+        raise ValidationFailed(
+            f"{field} must be one of " + ", ".join(allowed),
+            key="api.interventions.field_allowed",
+            params={"field": field, "allowed": ", ".join(allowed)},
+        )
     return value
 
 
@@ -184,11 +202,19 @@ def _date_value(value: Any, field: str) -> date:
     if isinstance(value, date):
         return value
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be an ISO date")
+        raise ValidationFailed(
+            f"{field} must be an ISO date",
+            key="api.interventions.field_iso_date",
+            params={"field": field},
+        )
     try:
         return date.fromisoformat(value)
     except ValueError:
-        raise ValidationFailed(f"{field} must be an ISO date (YYYY-MM-DD)") from None
+        raise ValidationFailed(
+            f"{field} must be an ISO date (YYYY-MM-DD)",
+            key="api.interventions.field_iso_date_yyyy_mm_dd",
+            params={"field": field},
+        ) from None
 
 
 def _date_arg(value: Any, field: str) -> date | None:
@@ -199,9 +225,15 @@ def _date_arg(value: Any, field: str) -> date | None:
 
 def _bounded_page(limit: Any, offset: Any) -> tuple[int, int]:
     if isinstance(limit, bool) or not isinstance(limit, int) or not 1 <= limit <= MAX_LIMIT:
-        raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {MAX_LIMIT}",
+            key="api.validation.limit_range",
+            params={"maximum": MAX_LIMIT},
+        )
     if isinstance(offset, bool) or not isinstance(offset, int) or offset < 0:
-        raise ValidationFailed("offset must be zero or greater")
+        raise ValidationFailed(
+            "offset must be zero or greater", key="api.validation.offset_non_negative"
+        )
     return limit, offset
 
 
@@ -210,16 +242,32 @@ def _money(value: Any, field: str) -> Decimal | None:
     if value is None:
         return None
     if isinstance(value, (bool, float)):
-        raise ValidationFailed(f"{field} must be a decimal string")
+        raise ValidationFailed(
+            f"{field} must be a decimal string",
+            key="api.interventions.field_decimal_string",
+            params={"field": field},
+        )
     try:
         parsed = Decimal(value) if isinstance(value, Decimal) else Decimal(str(value).strip())
     except InvalidOperation, ValueError:
-        raise ValidationFailed(f"{field} must be a decimal amount") from None
+        raise ValidationFailed(
+            f"{field} must be a decimal amount",
+            key="api.interventions.field_decimal_amount",
+            params={"field": field},
+        ) from None
     if not parsed.is_finite() or parsed < 0 or parsed > COST_LIMIT:
-        raise ValidationFailed(f"{field} must be a nonnegative decimal below {COST_LIMIT}")
+        raise ValidationFailed(
+            f"{field} must be a nonnegative decimal below {COST_LIMIT}",
+            key="api.interventions.field_nonnegative_decimal_below_maximum",
+            params={"field": field, "maximum": COST_LIMIT},
+        )
     quantized = parsed.quantize(COST_QUANTUM)
     if quantized != parsed:
-        raise ValidationFailed(f"{field} must have at most two decimals")
+        raise ValidationFailed(
+            f"{field} must have at most two decimals",
+            key="api.interventions.field_most_two_decimals",
+            params={"field": field},
+        )
     return quantized
 
 
@@ -233,16 +281,26 @@ def _parts(value: Any) -> list[dict[str, Any]]:
     if value is None:
         return []
     if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-        raise ValidationFailed("parts must be a list")
+        raise ValidationFailed("parts must be a list", key="api.interventions.parts_list")
     if len(value) > PARTS_MAX:
-        raise ValidationFailed(f"parts must contain at most {PARTS_MAX} entries")
+        raise ValidationFailed(
+            f"parts must contain at most {PARTS_MAX} entries",
+            key="api.interventions.parts_contain_most_maximum_entries",
+            params={"maximum": PARTS_MAX},
+        )
     prepared: list[dict[str, Any]] = []
     for item in value:
         if not isinstance(item, Mapping):
-            raise ValidationFailed("each part must be an object with name and quantity")
+            raise ValidationFailed(
+                "each part must be an object with name and quantity",
+                key="api.interventions.each_part_object_name_quantity",
+            )
         unknown = set(item) - {"name", "quantity", "unitCost"}
         if unknown:
-            raise ValidationFailed("each part accepts only name, quantity and unitCost")
+            raise ValidationFailed(
+                "each part accepts only name, quantity and unitCost",
+                key="api.interventions.each_part_accepts_only_name_quantity_unitcost",
+            )
         name = _text(item.get("name"), "part name", max_length=PART_NAME_MAX, required=True)
         quantity = item.get("quantity")
         if (
@@ -250,7 +308,11 @@ def _parts(value: Any) -> list[dict[str, Any]]:
             or not isinstance(quantity, int)
             or not 1 <= quantity <= QUANTITY_MAX
         ):
-            raise ValidationFailed(f"part quantity must be an integer from 1 to {QUANTITY_MAX}")
+            raise ValidationFailed(
+                f"part quantity must be an integer from 1 to {QUANTITY_MAX}",
+                key="api.interventions.part_quantity_integer_from_1_maximum",
+                params={"maximum": QUANTITY_MAX},
+            )
         entry: dict[str, Any] = {"name": name, "quantity": quantity}
         unit_cost = _money(item.get("unitCost"), "part unitCost")
         if unit_cost is not None:
@@ -589,9 +651,17 @@ class InterventionService:
         person_id = _uuid_text(value, field)
         row = self._session.get(DirectoryPerson, person_id)
         if row is None:
-            raise ValidationFailed(f"{field} does not reference a directory person")
+            raise ValidationFailed(
+                f"{field} does not reference a directory person",
+                key="api.interventions.field_does_not_reference_directory_person",
+                params={"field": field},
+            )
         if row.status != "active":
-            raise ValidationFailed(f"{field} must reference an active directory person")
+            raise ValidationFailed(
+                f"{field} must reference an active directory person",
+                key="api.interventions.field_reference_active_directory_person",
+                params={"field": field},
+            )
         return row
 
     def _person_names(self, person_ids: Sequence[str]) -> dict[str, str]:
@@ -607,28 +677,36 @@ class InterventionService:
         identifier = _uuid_text(intervention_id, "intervention id")
         row = self._session.get(Intervention, identifier)
         if row is None:
-            raise NotFound("intervention not found")
+            raise NotFound("intervention not found", key="api.interventions.intervention_not_found")
         return row
 
     def _incident(self, incident_id: Any) -> Incident:
         identifier = _uuid_text(incident_id, "incident id")
         row = self._session.get(Incident, identifier)
         if row is None:
-            raise NotFound("incident not found")
+            raise NotFound("incident not found", key="api.interventions.incident_not_found")
         return row
 
     def _attachments(self, asset_id: str, value: Any) -> tuple[Attachment, ...]:
         if value is None:
             return ()
         if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-            raise ValidationFailed("attachmentIds must be a list")
+            raise ValidationFailed(
+                "attachmentIds must be a list", key="api.interventions.attachmentids_list"
+            )
         if len(value) > ATTACHMENTS_MAX:
-            raise ValidationFailed(f"attachmentIds must contain at most {ATTACHMENTS_MAX} entries")
+            raise ValidationFailed(
+                f"attachmentIds must contain at most {ATTACHMENTS_MAX} entries",
+                key="api.interventions.attachmentids_contain_most_maximum_entries",
+                params={"maximum": ATTACHMENTS_MAX},
+            )
         ordered: list[str] = []
         for item in value:
             identifier = _uuid_text(item, "attachmentIds must contain attachment UUIDs")
             if identifier in ordered:
-                raise ValidationFailed("attachmentIds must be unique")
+                raise ValidationFailed(
+                    "attachmentIds must be unique", key="api.interventions.attachmentids_unique"
+                )
             ordered.append(identifier)
         if not ordered:
             return ()
@@ -642,7 +720,8 @@ class InterventionService:
         by_id = {row.id: row for row in rows}
         if len(by_id) != len(ordered):
             raise ValidationFailed(
-                "attachmentIds must reference existing attachments of the intervention asset"
+                "attachmentIds must reference existing attachments of the intervention asset",
+                key="api.interventions.attachmentids_reference_existing_attachments_intervention_asset",
             )
         return tuple(by_id[identifier] for identifier in ordered)
 
@@ -650,16 +729,28 @@ class InterventionService:
         if value is None:
             return []
         if isinstance(value, (str, bytes)) or not isinstance(value, Sequence):
-            raise ValidationFailed("affectedAssetIds must be a list")
+            raise ValidationFailed(
+                "affectedAssetIds must be a list", key="api.interventions.affectedassetids_list"
+            )
         if len(value) > AFFECTED_MAX:
-            raise ValidationFailed(f"affectedAssetIds must contain at most {AFFECTED_MAX} entries")
+            raise ValidationFailed(
+                f"affectedAssetIds must contain at most {AFFECTED_MAX} entries",
+                key="api.interventions.affectedassetids_contain_most_maximum_entries",
+                params={"maximum": AFFECTED_MAX},
+            )
         ordered: list[str] = []
         for item in value:
             identifier = _uuid_text(item, "affectedAssetIds must contain asset UUIDs")
             if identifier in ordered:
-                raise ValidationFailed("affectedAssetIds must be unique")
+                raise ValidationFailed(
+                    "affectedAssetIds must be unique",
+                    key="api.interventions.affectedassetids_unique",
+                )
             if identifier == primary_id:
-                raise ValidationFailed("the primary asset cannot also be an affected asset")
+                raise ValidationFailed(
+                    "the primary asset cannot also be an affected asset",
+                    key="api.interventions.primary_asset_cannot_also_affected_asset",
+                )
             self._asset(identifier)
             ordered.append(identifier)
         return ordered
@@ -670,9 +761,15 @@ class InterventionService:
         identifier = _uuid_text(value, "incidentId")
         row = self._session.get(Incident, identifier)
         if row is None:
-            raise ValidationFailed("incidentId does not reference an existing incident")
+            raise ValidationFailed(
+                "incidentId does not reference an existing incident",
+                key="api.interventions.incidentid_does_not_reference_existing_incident",
+            )
         if row.status == "closed":
-            raise ValidationFailed("incidentId references a closed incident")
+            raise ValidationFailed(
+                "incidentId references a closed incident",
+                key="api.interventions.incidentid_references_closed_incident",
+            )
         return row
 
     # --------------------------------------------------------------- builders
@@ -963,7 +1060,9 @@ class InterventionService:
         if end is not None:
             conditions.append(Intervention.occurred_on <= end)
         if start is not None and end is not None and start > end:
-            raise ValidationFailed("from must not be after to")
+            raise ValidationFailed(
+                "from must not be after to", key="api.interventions.from_not_after"
+            )
         return conditions
 
     def list(
@@ -1129,10 +1228,17 @@ class InterventionService:
     ) -> InterventionView:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:interventions")
         if not isinstance(values, Mapping):
-            raise ValidationFailed("intervention changes must be an object")
+            raise ValidationFailed(
+                "intervention changes must be an object",
+                key="api.interventions.intervention_changes_object",
+            )
         unknown = set(values) - _INTERVENTION_UPDATE_KEYS
         if unknown:
-            raise ValidationFailed("unsupported intervention fields: " + ", ".join(sorted(unknown)))
+            raise ValidationFailed(
+                "unsupported intervention fields: " + ", ".join(sorted(unknown)),
+                key="api.interventions.unsupported_intervention_fields",
+                params={"fields": ", ".join(sorted(unknown))},
+            )
         row = self._intervention(intervention_id)
         asset = self._asset(row.asset_id)
         previous_status = row.status
@@ -1203,7 +1309,11 @@ class InterventionService:
             new_status = _enum(values["status"], "status", INTERVENTION_STATUSES, row.status)
             if new_status != row.status:
                 if new_status not in INTERVENTION_TRANSITIONS.get(row.status, frozenset()):
-                    raise Conflict(f"cannot move an intervention from {row.status} to {new_status}")
+                    raise Conflict(
+                        f"cannot move an intervention from {row.status} to {new_status}",
+                        key="api.interventions.cannot_move_intervention_from_status_new_status",
+                        params={"status": row.status, "new_status": new_status},
+                    )
                 changes["status"] = {"old": row.status, "new": new_status}
                 row.status = new_status
         if not changes:
@@ -1244,10 +1354,17 @@ class InterventionService:
 
     def _prepare_create(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("intervention values must be an object")
+            raise ValidationFailed(
+                "intervention values must be an object",
+                key="api.interventions.intervention_values_object",
+            )
         unknown = set(values) - _INTERVENTION_CREATE_KEYS
         if unknown:
-            raise ValidationFailed("unsupported intervention fields: " + ", ".join(sorted(unknown)))
+            raise ValidationFailed(
+                "unsupported intervention fields: " + ", ".join(sorted(unknown)),
+                key="api.interventions.unsupported_intervention_fields",
+                params={"fields": ", ".join(sorted(unknown))},
+            )
         asset = self._asset(values.get("assetId"))
         technician: DirectoryPerson | None = None
         if values.get("technicianPersonId") is not None:
@@ -1257,7 +1374,10 @@ class InterventionService:
         if plan_id is not None:
             plan = self._maintenance.get_plan(principal, plan_id)
             if plan.asset_id != asset.id:
-                raise ValidationFailed("planId must belong to the intervention asset")
+                raise ValidationFailed(
+                    "planId must belong to the intervention asset",
+                    key="api.interventions.planid_belong_intervention_asset",
+                )
             self._plan_validator(principal, plan_id)
         occurred_on = (
             _date_value(values["occurredOn"], "occurredOn")
@@ -1373,7 +1493,9 @@ class InterventionService:
         conditions = []
         if active is not None:
             if not isinstance(active, bool):
-                raise ValidationFailed("active must be a boolean")
+                raise ValidationFailed(
+                    "active must be a boolean", key="api.interventions.active_boolean"
+                )
             conditions.append(
                 Incident.status.in_(ACTIVE_INCIDENT_STATUSES)
                 if active
@@ -1418,7 +1540,9 @@ class InterventionService:
         if end is not None:
             conditions.append(Incident.opened_on <= end)
         if start is not None and end is not None and start > end:
-            raise ValidationFailed("from must not be after to")
+            raise ValidationFailed(
+                "from must not be after to", key="api.interventions.from_not_after"
+            )
         statement = statement.where(*conditions)
         total = int(
             self._session.execute(
@@ -1521,7 +1645,10 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status == "closed":
-            raise Conflict("a closed incident cannot change its affected assets")
+            raise Conflict(
+                "a closed incident cannot change its affected assets",
+                key="api.interventions.closed_incident_cannot_change_affected_assets",
+            )
         new_ids = self._affected(affected_asset_ids, row.primary_asset_id)
         old_ids = self._affected_ids(row.id)
         if new_ids == old_ids:
@@ -1569,7 +1696,11 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status != "open":
-            raise Conflict(f"cannot acknowledge an incident in {row.status}")
+            raise Conflict(
+                f"cannot acknowledge an incident in {row.status}",
+                key="api.interventions.cannot_acknowledge_incident_in_status",
+                params={"status": row.status},
+            )
         return self._transition(
             principal,
             row,
@@ -1586,7 +1717,11 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status != "in_progress":
-            raise Conflict(f"cannot resolve an incident in {row.status}")
+            raise Conflict(
+                f"cannot resolve an incident in {row.status}",
+                key="api.interventions.cannot_resolve_incident_in_status",
+                params={"status": row.status},
+            )
         return self._transition(
             principal,
             row,
@@ -1604,7 +1739,11 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status != "resolved":
-            raise Conflict(f"cannot close an incident in {row.status}")
+            raise Conflict(
+                f"cannot close an incident in {row.status}",
+                key="api.interventions.cannot_close_incident_in_status",
+                params={"status": row.status},
+            )
         return self._transition(
             principal,
             row,
@@ -1622,7 +1761,10 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status not in ACTIVE_INCIDENT_STATUSES:
-            raise Conflict("only an active incident can prepare a resolution")
+            raise Conflict(
+                "only an active incident can prepare a resolution",
+                key="api.interventions.only_active_incident_can_prepare_resolution",
+            )
         token = secrets.token_urlsafe(TOKEN_BYTES)
         status = row.status
         self._touch(row)
@@ -1671,18 +1813,27 @@ class InterventionService:
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         row = self._incident(incident_id)
         if row.status not in ACTIVE_INCIDENT_STATUSES:
-            raise Conflict("only an active incident can confirm a resolution")
+            raise Conflict(
+                "only an active incident can confirm a resolution",
+                key="api.interventions.only_active_incident_can_confirm_resolution",
+            )
         if not isinstance(token, str) or not token or len(token) > 200:
-            raise ValidationFailed("token is required")
+            raise ValidationFailed("token is required", key="api.interventions.token_required")
         stored = row.resolution_token
         if (
             stored is None
             or row.resolution_revision is None
             or int(row.resolution_revision) != int(row.revision)
         ):
-            raise Conflict("resolution token is stale; prepare the resolution again")
+            raise Conflict(
+                "resolution token is stale; prepare the resolution again",
+                key="api.interventions.resolution_token_stale_prepare_resolution_again",
+            )
         if not hmac.compare_digest(_token_digest(token), stored):
-            raise Conflict("resolution token is invalid or stale; prepare the resolution again")
+            raise Conflict(
+                "resolution token is invalid or stale; prepare the resolution again",
+                key="api.interventions.resolution_token_invalid_stale_prepare_resolution_again",
+            )
         previous = row.status
         row.status = "resolved"
         row.resolved_at = utcnow()
@@ -1731,7 +1882,7 @@ class InterventionService:
             ).scalar_one()
         )
         if total == 0 and self._session.get(Asset, identifier) is None:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.interventions.asset_not_found")
         rows = self._session.execute(
             select(AssetHistory)
             .where(
@@ -1755,10 +1906,16 @@ class InterventionService:
     # ------------------------------------------------------------------ shared
     def _prepare_incident(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("incident values must be an object")
+            raise ValidationFailed(
+                "incident values must be an object", key="api.interventions.incident_values_object"
+            )
         unknown = set(values) - _INCIDENT_CREATE_KEYS
         if unknown:
-            raise ValidationFailed("unsupported incident fields: " + ", ".join(sorted(unknown)))
+            raise ValidationFailed(
+                "unsupported incident fields: " + ", ".join(sorted(unknown)),
+                key="api.interventions.unsupported_incident_fields",
+                params={"fields": ", ".join(sorted(unknown))},
+            )
         primary = self._asset(values.get("primaryAssetId"))
         description = _text(
             values.get("description"), "description", max_length=DESCRIPTION_MAX, required=True

@@ -86,12 +86,16 @@ def create_workflow_router():
         try:
             parsed = json.loads(options)
         except ValueError, TypeError:
-            raise ValidationFailed("invalid import options JSON") from None
+            raise ValidationFailed(
+                "invalid import options JSON", key="api.workflows.invalid_import_options_json"
+            ) from None
         service._auth(context.principal)
         data = bytearray()
         async for chunk in request.stream():
             if len(data) + len(chunk) > MAX_BYTES:
-                raise ValidationFailed("import exceeds 10 MiB")
+                raise ValidationFailed(
+                    "import exceeds 10 MiB", key="api.workflows.import_exceeds_10_mib"
+                )
             data.extend(chunk)
         return service.analyze(context.principal, bytes(data), filename, parsed)
 

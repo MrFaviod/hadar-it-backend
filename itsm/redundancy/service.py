@@ -151,16 +151,23 @@ class RedundancyGroupPage:
 # ------------------------------------------------------------------ validation
 def _mode(value: Any) -> str:
     if not isinstance(value, str) or value not in MODES:
-        raise ValidationFailed("mode must be active_active or active_passive")
+        raise ValidationFailed(
+            "mode must be active_active or active_passive",
+            key="api.redundancy.mode_active_active_active_passive",
+        )
     return value
 
 
 def _name(value: Any) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed("name must be text")
+        raise ValidationFailed("name must be text", key="api.redundancy.name_text")
     normalized = value.strip()
     if not 1 <= len(normalized) <= NAME_MAX:
-        raise ValidationFailed(f"name must be between 1 and {NAME_MAX} characters")
+        raise ValidationFailed(
+            f"name must be between 1 and {NAME_MAX} characters",
+            key="api.redundancy.name_between_1_maximum_characters",
+            params={"maximum": NAME_MAX},
+        )
     return normalized
 
 
@@ -168,49 +175,74 @@ def _description(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("description must be text")
+        raise ValidationFailed("description must be text", key="api.redundancy.description_text")
     normalized = value.strip()
     if not normalized:
         return None
     if len(normalized) > DESCRIPTION_MAX:
-        raise ValidationFailed(f"description must be at most {DESCRIPTION_MAX} characters")
+        raise ValidationFailed(
+            f"description must be at most {DESCRIPTION_MAX} characters",
+            key="api.redundancy.description_most_maximum_characters",
+            params={"maximum": DESCRIPTION_MAX},
+        )
     return normalized
 
 
 def _active(value: Any) -> bool:
     if not isinstance(value, bool):
-        raise ValidationFailed("active must be a boolean")
+        raise ValidationFailed("active must be a boolean", key="api.redundancy.active_boolean")
     return value
 
 
 def _share(value: Any) -> str:
     """Return the canonical decimal string of a finite 0..100 share."""
     if value is None or isinstance(value, bool):
-        raise ValidationFailed("every active/active member needs a numeric traffic share")
+        raise ValidationFailed(
+            "every active/active member needs a numeric traffic share",
+            key="api.redundancy.every_active_active_member_needs_numeric_traffic_share",
+        )
     try:
         number = Decimal(str(value).strip())
     except InvalidOperation, ValueError, AttributeError:
-        raise ValidationFailed("traffic share must be a decimal number") from None
+        raise ValidationFailed(
+            "traffic share must be a decimal number",
+            key="api.redundancy.traffic_share_decimal_number",
+        ) from None
     if not number.is_finite():
-        raise ValidationFailed("traffic share must be finite")
+        raise ValidationFailed(
+            "traffic share must be finite", key="api.redundancy.traffic_share_finite"
+        )
     if number < 0 or number > 100:
-        raise ValidationFailed("traffic share must be between 0 and 100")
+        raise ValidationFailed(
+            "traffic share must be between 0 and 100",
+            key="api.redundancy.traffic_share_between_0_100",
+        )
     if -number.as_tuple().exponent > SHARE_MAX_DECIMALS:
-        raise ValidationFailed("traffic share allows at most two decimals")
+        raise ValidationFailed(
+            "traffic share allows at most two decimals",
+            key="api.redundancy.traffic_share_allows_most_two_decimals",
+        )
     return format(number.normalize(), "f")
 
 
 def _limit(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValidationFailed("limit must be an integer")
+        raise ValidationFailed("limit must be an integer", key="api.redundancy.limit_integer")
     if not 1 <= value <= MAX_LIMIT:
-        raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {MAX_LIMIT}",
+            key="api.validation.limit_range",
+            params={"maximum": MAX_LIMIT},
+        )
     return value
 
 
 def _offset(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
-        raise ValidationFailed("offset must be a non-negative integer")
+        raise ValidationFailed(
+            "offset must be a non-negative integer",
+            key="api.redundancy.offset_non_negative_integer",
+        )
     return value
 
 
@@ -218,12 +250,16 @@ def _query(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed("query must be text")
+        raise ValidationFailed("query must be text", key="api.redundancy.query_text")
     normalized = value.strip()
     if not normalized:
         return None
     if len(normalized) > QUERY_MAX:
-        raise ValidationFailed(f"query must be at most {QUERY_MAX} characters")
+        raise ValidationFailed(
+            f"query must be at most {QUERY_MAX} characters",
+            key="api.redundancy.query_most_maximum_characters",
+            params={"maximum": QUERY_MAX},
+        )
     return normalized
 
 
@@ -233,32 +269,46 @@ def _escape_like(value: str) -> str:
 
 def _asset_id(value: Any) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed("assetId must be a UUID")
+        raise ValidationFailed("assetId must be a UUID", key="api.redundancy.assetid_uuid")
     try:
         UUID(value)
     except ValueError:
-        raise NotFound("asset not found") from None
+        raise NotFound("asset not found", key="api.redundancy.asset_not_found") from None
     return value
 
 
 def _specs(value: Any) -> list[dict[str, Any]]:
     """Normalize an explicit member list; every entry keeps its raw role/share."""
     if isinstance(value, (str, bytes, Mapping)) or not isinstance(value, Sequence):
-        raise ValidationFailed("members must be a list of member objects")
+        raise ValidationFailed(
+            "members must be a list of member objects",
+            key="api.redundancy.members_list_member_objects",
+        )
     entries = list(value)
     if len(entries) > MAX_MEMBERS:
-        raise ValidationFailed(f"a redundancy group accepts at most {MAX_MEMBERS} members")
+        raise ValidationFailed(
+            f"a redundancy group accepts at most {MAX_MEMBERS} members",
+            key="api.redundancy.redundancy_group_accepts_most_maximum_members",
+            params={"maximum": MAX_MEMBERS},
+        )
     seen: set[str] = set()
     normalized: list[dict[str, Any]] = []
     for entry in entries:
         if not isinstance(entry, Mapping):
-            raise ValidationFailed("every member must be an object")
+            raise ValidationFailed(
+                "every member must be an object", key="api.redundancy.every_member_object"
+            )
         unknown = set(entry) - {"asset_id", "role", "share"}
         if unknown:
-            raise ValidationFailed("member fields are assetId, role and share")
+            raise ValidationFailed(
+                "member fields are assetId, role and share",
+                key="api.redundancy.member_fields_assetid_role_share",
+            )
         asset_id = _asset_id(entry.get("asset_id"))
         if asset_id in seen:
-            raise ValidationFailed("duplicate member asset")
+            raise ValidationFailed(
+                "duplicate member asset", key="api.redundancy.duplicate_member_asset"
+            )
         seen.add(asset_id)
         normalized.append(
             {"asset_id": asset_id, "role": entry.get("role"), "share": entry.get("share")}
@@ -281,34 +331,61 @@ def _resolve_specs(
         share = spec.get("share")
         if mode == "active_active":
             if role is not None:
-                raise ValidationFailed("active/active members do not take a role")
+                raise ValidationFailed(
+                    "active/active members do not take a role",
+                    key="api.redundancy.active_active_members_do_not_take_role",
+                )
             resolved.append({"asset_id": spec["asset_id"], "role": None, "share": _share(share)})
             continue
         if share is not None:
-            raise ValidationFailed("active/passive members do not take a traffic share")
+            raise ValidationFailed(
+                "active/passive members do not take a traffic share",
+                key="api.redundancy.active_passive_members_do_not_take_traffic_share",
+            )
         if role not in ROLES:
-            raise ValidationFailed("active/passive members need role primary or backup")
+            raise ValidationFailed(
+                "active/passive members need role primary or backup",
+                key="api.redundancy.active_passive_members_need_role_primary_backup",
+            )
         roles.append(role)
         resolved.append({"asset_id": spec["asset_id"], "role": role, "share": None})
 
     complete = len(resolved) >= 2
     if complete and mode == "active_passive":
         if roles.count("primary") != 1:
-            raise ValidationFailed("an active/passive group needs exactly one primary")
+            raise ValidationFailed(
+                "an active/passive group needs exactly one primary",
+                key="api.redundancy.active_passive_group_needs_exactly_one_primary",
+            )
         if roles.count("backup") < 1:
-            raise ValidationFailed("an active/passive group needs at least one backup")
+            raise ValidationFailed(
+                "an active/passive group needs at least one backup",
+                key="api.redundancy.active_passive_group_needs_least_one_backup",
+            )
     if mode == "active_passive" and roles.count("primary") > 1:
-        raise ValidationFailed("an active/passive group needs exactly one primary")
+        raise ValidationFailed(
+            "an active/passive group needs exactly one primary",
+            key="api.redundancy.active_passive_group_needs_exactly_one_primary",
+        )
     if complete and mode == "active_active":
         total = sum(Decimal(spec["share"]) for spec in resolved)
         if total != Decimal("100"):
-            raise ValidationFailed("active/active traffic shares must total exactly 100")
+            raise ValidationFailed(
+                "active/active traffic shares must total exactly 100",
+                key="api.redundancy.active_active_traffic_shares_total_exactly_100",
+            )
     if active:
         if len(resolved) < 2:
-            raise ValidationFailed("an active redundancy group needs at least two members")
+            raise ValidationFailed(
+                "an active redundancy group needs at least two members",
+                key="api.redundancy.active_redundancy_group_needs_least_two_members",
+            )
         archived_ids = [spec["asset_id"] for spec in resolved if archived[spec["asset_id"]]]
         if archived_ids:
-            raise Conflict("an active redundancy group cannot include archived assets")
+            raise Conflict(
+                "an active redundancy group cannot include archived assets",
+                key="api.redundancy.active_redundancy_group_cannot_include_archived_assets",
+            )
     return resolved
 
 
@@ -364,14 +441,18 @@ class RedundancyService:
     # ------------------------------------------------------------------- views
     def _group(self, group_id: Any) -> RedundancyGroup:
         if not isinstance(group_id, str):
-            raise ValidationFailed("group id is required")
+            raise ValidationFailed("group id is required", key="api.redundancy.group_id_required")
         try:
             UUID(group_id)
         except ValueError:
-            raise NotFound("redundancy group not found") from None
+            raise NotFound(
+                "redundancy group not found", key="api.redundancy.redundancy_group_not_found"
+            ) from None
         row = self._session.get(RedundancyGroup, group_id)
         if row is None:
-            raise NotFound("redundancy group not found")
+            raise NotFound(
+                "redundancy group not found", key="api.redundancy.redundancy_group_not_found"
+            )
         return row
 
     def _rows(self, group_id: str) -> list[RedundancyGroupMember]:
@@ -391,7 +472,7 @@ class RedundancyService:
         found = {asset.id: asset for asset in rows}
         missing = [asset_id for asset_id in ids if asset_id not in found]
         if missing:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.redundancy.asset_not_found")
         return found
 
     def _hosts(self, asset_ids: Iterable[str]) -> dict[str, str]:
@@ -485,7 +566,7 @@ class RedundancyService:
         bounded_offset = _offset(offset)
         text = _query(query)
         if active is not None and not isinstance(active, bool):
-            raise ValidationFailed("active must be a boolean")
+            raise ValidationFailed("active must be a boolean", key="api.redundancy.active_boolean")
         checked_mode = None if mode is None else _mode(mode)
 
         filters = []
@@ -596,7 +677,10 @@ class RedundancyService:
         checked_effective = _effective_at(effective_at)
         specs = _specs(members)
         if len(specs) < 2:
-            raise ValidationFailed("a redundancy group needs at least two members")
+            raise ValidationFailed(
+                "a redundancy group needs at least two members",
+                key="api.redundancy.redundancy_group_needs_least_two_members",
+            )
 
         facts = self._facts([spec["asset_id"] for spec in specs])
         group_id = str(uuid4())
@@ -690,7 +774,10 @@ class RedundancyService:
         new_mode = group.mode if mode is UNSET else _mode(mode)
         new_active = bool(group.active) if active is UNSET else _active(active)
         if mode is not UNSET and new_mode != group.mode and specs is None:
-            raise ValidationFailed("changing mode requires the complete member list")
+            raise ValidationFailed(
+                "changing mode requires the complete member list",
+                key="api.redundancy.changing_mode_requires_complete_member_list",
+            )
         if specs is None:
             specs = [
                 {"asset_id": row.asset_id, "role": row.role, "share": row.share} for row in current
@@ -797,7 +884,10 @@ class RedundancyService:
         facts = self._facts([row.asset_id for row in current])
         self._authorize(principal, list(facts), group.id)
         if not group.active:
-            raise Conflict("redundancy group is already inactive")
+            raise Conflict(
+                "redundancy group is already inactive",
+                key="api.redundancy.redundancy_group_already_inactive",
+            )
         checked_reason = _reason(reason, required=False)
         checked_notes = _notes(notes)
         checked_effective = _effective_at(effective_at)
@@ -838,7 +928,10 @@ class RedundancyService:
             self._session.flush()
         except IntegrityError:
             self._session.rollback()
-            raise Conflict("redundancy group conflicts with stored data") from None
+            raise Conflict(
+                "redundancy group conflicts with stored data",
+                key="api.redundancy.redundancy_group_conflicts_stored_data",
+            ) from None
 
 
 __all__ = [

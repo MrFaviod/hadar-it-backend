@@ -38,18 +38,23 @@ def _options(options: Any) -> dict[str, Any]:
     key is checked here rather than inside the row loop.
     """
     if not isinstance(options, dict):
-        raise ValidationFailed("import options must be an object")
+        raise ValidationFailed(
+            "import options must be an object", key="api.workflows.import_options_object"
+        )
     values = dict(options)
     header = values.get("headerRow", 1)
     if type(header) is not int or not 1 <= header <= 100:
-        raise ValidationFailed("headerRow must be 1-100")
+        raise ValidationFailed("headerRow must be 1-100", key="api.workflows.headerrow_1_100")
     mapping = values.get("mapping", {})
     if (
         not isinstance(mapping, dict)
         or len(mapping) > MAX_COLUMNS
         or not all(isinstance(k, str) and isinstance(v, str) for k, v in mapping.items())
     ):
-        raise ValidationFailed("mapping must map column labels to field names")
+        raise ValidationFailed(
+            "mapping must map column labels to field names",
+            key="api.workflows.mapping_map_column_labels_field_names",
+        )
     selected = values.get("selectedSheets")
     if selected is not None and (
         not isinstance(selected, list)
@@ -57,7 +62,10 @@ def _options(options: Any) -> dict[str, Any]:
         or any(not isinstance(name, str) or not name for name in selected)
         or len(set(selected)) != len(selected)
     ):
-        raise ValidationFailed("selectedSheets must list 1-20 unique sheet names")
+        raise ValidationFailed(
+            "selectedSheets must list 1-20 unique sheet names",
+            key="api.workflows.selectedsheets_list_1_20_unique_sheet_names",
+        )
     for key in SHEET_OPTIONS:
         entries = values.get(key)
         if entries is None:
@@ -67,7 +75,11 @@ def _options(options: Any) -> dict[str, Any]:
             or len(entries) > MAX_SHEETS
             or any(not isinstance(name, str) or not name for name in entries)
         ):
-            raise ValidationFailed(f"{key} must map at most 20 sheet names")
+            raise ValidationFailed(
+                f"{key} must map at most 20 sheet names",
+                key="api.workflows.options_map_most_20_sheet_names",
+                params={"options": key},
+            )
     # An empty per-sheet map means "no override"; an empty target means "ignore
     # this column", matching how the global mapping already works.
     for entry in (values.get("sheetMappings") or {}).values():
@@ -76,27 +88,46 @@ def _options(options: Any) -> dict[str, Any]:
             or len(entry) > MAX_COLUMNS
             or not all(isinstance(k, str) and k and isinstance(v, str) for k, v in entry.items())
         ):
-            raise ValidationFailed("sheetMappings must map each sheet to header targets")
+            raise ValidationFailed(
+                "sheetMappings must map each sheet to header targets",
+                key="api.workflows.sheetmappings_map_each_sheet_header_targets",
+            )
     for entry in (values.get("sheetSites") or {}).values():
         target = entry if isinstance(entry, dict) else {"site": entry}
         if len(target) != 1 or next(iter(target)) not in {"site", "site_id"}:
-            raise ValidationFailed("sheetSites accepts a label or one site/site_id target")
+            raise ValidationFailed(
+                "sheetSites accepts a label or one site/site_id target",
+                key="api.workflows.sheetsites_accepts_label_one_site_site_id_target",
+            )
         label = next(iter(target.values()))
         if not isinstance(label, str) or not label.strip() or len(label) > 100:
-            raise ValidationFailed("sheetSites accepts a label or one site/site_id target")
+            raise ValidationFailed(
+                "sheetSites accepts a label or one site/site_id target",
+                key="api.workflows.sheetsites_accepts_label_one_site_site_id_target",
+            )
     for entry in (values.get("sheetCategories") or {}).values():
         if not isinstance(entry, str) or not entry.strip() or len(entry) > 100:
-            raise ValidationFailed("sheetCategories must map each sheet to a category")
+            raise ValidationFailed(
+                "sheetCategories must map each sheet to a category",
+                key="api.workflows.sheetcategories_map_each_sheet_category",
+            )
     date_format = values.get("dateFormat")
     date_fields = values.get("dateFields")
     if date_format is not None:
         if date_format not in DATE_FORMATS:
-            raise ValidationFailed("dateFormat must be one of %d/%m/%Y, %m/%d/%Y, %Y-%m-%d")
+            raise ValidationFailed(
+                "dateFormat must be one of %d/%m/%Y, %m/%d/%Y, %Y-%m-%d",
+                key="api.workflows.dateformat_one_d_m_y_m_d_y",
+            )
         if date_fields is None:
-            raise ValidationFailed("dateFormat requires dateFields")
+            raise ValidationFailed(
+                "dateFormat requires dateFields", key="api.workflows.dateformat_requires_datefields"
+            )
     if date_fields is not None:
         if date_format is None:
-            raise ValidationFailed("dateFields requires dateFormat")
+            raise ValidationFailed(
+                "dateFields requires dateFormat", key="api.workflows.datefields_requires_dateformat"
+            )
         if (
             not isinstance(date_fields, list)
             or not 1 <= len(date_fields) <= MAX_COLUMNS
@@ -108,9 +139,14 @@ def _options(options: Any) -> dict[str, Any]:
                 for field in date_fields
             )
         ):
-            raise ValidationFailed("dateFields must list technical.* date fields")
+            raise ValidationFailed(
+                "dateFields must list technical.* date fields",
+                key="api.workflows.datefields_list_technical_date_fields",
+            )
     if values.get("inspectOnly") is not None and type(values["inspectOnly"]) is not bool:
-        raise ValidationFailed("inspectOnly must be a boolean")
+        raise ValidationFailed(
+            "inspectOnly must be a boolean", key="api.workflows.inspectonly_boolean"
+        )
     return values
 
 
@@ -124,11 +160,18 @@ def _sheet_options(options: dict[str, Any], names: list[str]) -> dict[str, Any]:
     available = set(names)
     for name in options.get("selectedSheets") or ():
         if name not in available:
-            raise ValidationFailed("selectedSheets names an unknown sheet")
+            raise ValidationFailed(
+                "selectedSheets names an unknown sheet",
+                key="api.workflows.selectedsheets_names_unknown_sheet",
+            )
     for key in SHEET_OPTIONS:
         for name in options.get(key) or {}:
             if name not in available:
-                raise ValidationFailed(f"{key} names an unknown sheet")
+                raise ValidationFailed(
+                    f"{key} names an unknown sheet",
+                    key="api.workflows.key_names_unknown_sheet",
+                    params={"key": key},
+                )
     return options
 
 
@@ -136,18 +179,26 @@ def _sheet_options(options: dict[str, Any], names: list[str]) -> dict[str, Any]:
 def _sheets(data: bytes, filename: str, options: dict[str, Any]) -> Iterator[list[tuple[str, Any]]]:
     """Decode one bounded workbooks worth of sheet row iterators."""
     if not data or len(data) > MAX_BYTES:
-        raise ValidationFailed("import must contain 1-10485760 bytes")
+        raise ValidationFailed(
+            "import must contain 1-10485760 bytes",
+            key="api.workflows.import_contain_1_10485760_bytes",
+        )
     suffix = filename.lower().rsplit(".", 1)[-1]
     workbook = None
     try:
         if suffix == "csv":
             encoding = options.get("encoding", "utf-8-sig")
             if encoding not in {"utf-8", "utf-8-sig", "cp1252", "latin-1"}:
-                raise ValidationFailed("unsupported encoding")
+                raise ValidationFailed(
+                    "unsupported encoding", key="api.workflows.unsupported_encoding"
+                )
             try:
                 text = data.decode(encoding)
             except UnicodeError:
-                raise ValidationFailed("file does not match selected encoding") from None
+                raise ValidationFailed(
+                    "file does not match selected encoding",
+                    key="api.workflows.file_does_not_match_selected_encoding",
+                ) from None
             delimiter = options.get("delimiter")
             if delimiter is None:
                 try:
@@ -155,7 +206,9 @@ def _sheets(data: bytes, filename: str, options: dict[str, Any]) -> Iterator[lis
                 except csv.Error:
                     delimiter = ","
             if delimiter not in {",", ";", "\t", "|"}:
-                raise ValidationFailed("unsupported delimiter")
+                raise ValidationFailed(
+                    "unsupported delimiter", key="api.workflows.unsupported_delimiter"
+                )
             yield [("CSV", csv.reader(StringIO(text), delimiter=delimiter))]
         elif suffix == "xlsx":
             try:
@@ -166,23 +219,38 @@ def _sheets(data: bytes, filename: str, options: dict[str, Any]) -> Iterator[lis
                         or sum(i.file_size for i in infos) > 50 * 1024 * 1024
                         or any(i.file_size > 20 * 1024 * 1024 for i in infos)
                     ):
-                        raise ValidationFailed("workbook expanded size exceeds limits")
+                        raise ValidationFailed(
+                            "workbook expanded size exceeds limits",
+                            key="api.workflows.workbook_expanded_size_exceeds_limits",
+                        )
                     if any(i.filename.endswith("vbaProject.bin") for i in infos):
-                        raise ValidationFailed("macro workbooks are not supported")
+                        raise ValidationFailed(
+                            "macro workbooks are not supported",
+                            key="api.workflows.macro_workbooks_not_supported",
+                        )
                 from openpyxl import load_workbook
 
                 workbook = load_workbook(
                     BytesIO(data), read_only=True, data_only=False, keep_links=False
                 )
                 if len(workbook.worksheets) > MAX_SHEETS:
-                    raise ValidationFailed("workbook exceeds 20 sheets")
+                    raise ValidationFailed(
+                        "workbook exceeds 20 sheets", key="api.workflows.workbook_exceeds_20_sheets"
+                    )
                 yield [(s.title, s.iter_rows(values_only=True)) for s in workbook.worksheets]
             except BadZipFile, KeyError, ValueError, OSError:
-                raise ValidationFailed("invalid XLSX workbook") from None
+                raise ValidationFailed(
+                    "invalid XLSX workbook", key="api.workflows.invalid_xlsx_workbook"
+                ) from None
         else:
-            raise ValidationFailed("only CSV and XLSX imports are supported")
+            raise ValidationFailed(
+                "only CSV and XLSX imports are supported",
+                key="api.workflows.only_csv_xlsx_imports_supported",
+            )
     except (csv.Error, UnicodeError) as exc:
-        raise ValidationFailed("invalid tabular file") from exc
+        raise ValidationFailed(
+            "invalid tabular file", key="api.workflows.invalid_tabular_file"
+        ) from exc
     finally:
         if workbook is not None:
             workbook.close()
@@ -218,7 +286,10 @@ def _labels(cells: tuple[Any, ...]) -> list[str]:
     labels = [str(cell or "").strip() for cell in cells]
     nonempty = [label for label in labels if label]
     if len(set(nonempty)) != len(nonempty):
-        raise ValidationFailed("duplicate column headers require correction")
+        raise ValidationFailed(
+            "duplicate column headers require correction",
+            key="api.workflows.duplicate_column_headers_require_correction",
+        )
     return labels
 
 
@@ -241,7 +312,9 @@ def parse(data: bytes, filename: str, options: dict[str, Any]) -> list[dict[str,
             mapping = {**resolved.get("mapping", {}), **sheet_mappings.get(sheet, {})}
             for index, cells in enumerate(rows, 1):
                 if len(cells) > MAX_COLUMNS:
-                    raise ValidationFailed("sheet exceeds 100 columns")
+                    raise ValidationFailed(
+                        "sheet exceeds 100 columns", key="api.workflows.sheet_exceeds_100_columns"
+                    )
                 if index < resolved.get("headerRow", 1):
                     continue
                 if labels is None:
@@ -250,7 +323,10 @@ def parse(data: bytes, filename: str, options: dict[str, Any]) -> list[dict[str,
                 if not any(cell is not None and str(cell).strip() for cell in cells):
                     continue
                 if len(output) >= MAX_ROWS:
-                    raise ValidationFailed("import exceeds 5000 data rows")
+                    raise ValidationFailed(
+                        "import exceeds 5000 data rows",
+                        key="api.workflows.import_exceeds_5000_data_rows",
+                    )
                 values, errors, technical = {}, [], {}
                 for label, cell in zip(labels, cells, strict=False):
                     field = mapping.get(label, label)
@@ -330,7 +406,9 @@ def inspect_file(data: bytes, filename: str, options: dict[str, Any]) -> dict[st
             has_more = False
             for index, cells in enumerate(rows, 1):
                 if len(cells) > MAX_COLUMNS:
-                    raise ValidationFailed("sheet exceeds 100 columns")
+                    raise ValidationFailed(
+                        "sheet exceeds 100 columns", key="api.workflows.sheet_exceeds_100_columns"
+                    )
                 if index < resolved.get("headerRow", 1):
                     continue
                 if not columns:

@@ -106,7 +106,9 @@ def enqueue(
     elif state in DISPATCHABLE_STATES:
         job_id = ""
     else:
-        raise Conflict("operation is not ready to enqueue")
+        raise Conflict(
+            "operation is not ready to enqueue", key="api.workflows.operation_not_ready_enqueue"
+        )
     job_id = job_id or str(uuid4())
     payload = {
         **operation.payload,
@@ -115,7 +117,10 @@ def enqueue(
     }
     if not _claim(service, operation_id, state, job_id, payload):
         service._session.rollback()
-        raise Conflict("operation state changed; retry the request")
+        raise Conflict(
+            "operation state changed; retry the request",
+            key="api.workflows.operation_state_changed_retry_request",
+        )
     service._session.commit()
     try:
         queue.submit_operation(operation_id, job_id)
@@ -128,7 +133,10 @@ def enqueue(
 def _stored_executor(operation: Operation) -> dict[str, Any]:
     executor = operation.payload.get("executor")
     if not isinstance(executor, dict) or not isinstance(executor.get("actorId"), str):
-        raise PermissionDenied("operation has no stored executor authority")
+        raise PermissionDenied(
+            "operation has no stored executor authority",
+            key="api.workflows.operation_no_stored_executor_authority",
+        )
     return executor
 
 
@@ -142,7 +150,9 @@ def _assert_executor_authority(session: Any, principal: Any, executor: dict[str,
             or grant.revoked_at is not None
             or as_utc(grant.expires_at) <= utcnow()
         ):
-            raise PermissionDenied("job session is no longer active")
+            raise PermissionDenied(
+                "job session is no longer active", key="api.workflows.job_session_no_longer_active"
+            )
     elif principal.kind != "human":
         credential = session.scalar(
             select(IdentityCredential).where(
@@ -152,7 +162,10 @@ def _assert_executor_authority(session: Any, principal: Any, executor: dict[str,
             )
         )
         if credential is None:
-            raise PermissionDenied("job credential is no longer active")
+            raise PermissionDenied(
+                "job credential is no longer active",
+                key="api.workflows.job_credential_no_longer_active",
+            )
 
 
 def _mark_failed(session: Any, operation_id: str) -> None:
@@ -169,7 +182,9 @@ def execute_job(session: Any, settings: Any, operation_id: str) -> dict[str, Any
     """Run one queued operation with the authority captured at enqueue time."""
     operation = session.get(Operation, operation_id)
     if operation is None:
-        raise PermissionDenied("operation is not available")
+        raise PermissionDenied(
+            "operation is not available", key="api.workflows.operation_not_available"
+        )
     executor = _stored_executor(operation)
     try:
         identity = IdentityService(session, settings)

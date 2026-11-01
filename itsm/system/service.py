@@ -323,16 +323,28 @@ class SystemService:
     ) -> dict[str, Any]:
         deployment = payload.get("deployment")
         if not isinstance(deployment, Mapping):
-            raise ValidationFailed("deployment preferences are required")
+            raise ValidationFailed(
+                "deployment preferences are required",
+                key="api.system.deployment_preferences_required",
+            )
         unknown = set(deployment) - {"classification", "maintenanceWindow"}
         if unknown:
-            raise ValidationFailed("unsupported deployment preference")
+            raise ValidationFailed(
+                "unsupported deployment preference",
+                key="api.system.unsupported_deployment_preference",
+            )
         classification = deployment.get("classification")
         if classification is not None and classification not in CLASSIFICATIONS:
-            raise ValidationFailed("deployment classification is not supported")
+            raise ValidationFailed(
+                "deployment classification is not supported",
+                key="api.system.deployment_classification_not_supported",
+            )
         window = deployment.get("maintenanceWindow")
         if window is not None and window not in MAINTENANCE_WINDOWS:
-            raise ValidationFailed("maintenance window is not supported")
+            raise ValidationFailed(
+                "maintenance window is not supported",
+                key="api.system.maintenance_window_not_supported",
+            )
         with self._session_factory() as session:
             self._authorize(session, principal, "system.configure", "system:configuration")
             row = session.get(SystemPreference, 1)
@@ -374,11 +386,15 @@ class SystemService:
 
     def set_provider(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         if set(payload) - {"provider", "model"}:
-            raise ValidationFailed("unsupported provider field")
+            raise ValidationFailed(
+                "unsupported provider field", key="api.system.unsupported_provider_field"
+            )
         try:
             provider, model = validate_selection(payload.get("provider"), payload.get("model"))
         except ProviderSelectionError as exc:
-            raise ValidationFailed(str(exc)) from None
+            raise ValidationFailed(
+                str(exc), key="api.system.provider_selection_invalid", params={"reason": str(exc)}
+            ) from None
         with self._session_factory() as session:
             self._authorize(session, principal, "system.providers", "system:providers")
             row = session.get(SystemProviderSettings, 1)
@@ -410,9 +426,12 @@ class SystemService:
         self, principal: Principal, module_id: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         if not isinstance(module_id, str) or not module_id or len(module_id) > 120:
-            raise ValidationFailed("module id is invalid")
+            raise ValidationFailed("module id is invalid", key="api.system.module_id_invalid")
         if set(payload) != {"enabled"} or not isinstance(payload.get("enabled"), bool):
-            raise ValidationFailed("module payload must contain only a boolean enabled")
+            raise ValidationFailed(
+                "module payload must contain only a boolean enabled",
+                key="api.system.module_payload_contain_only_boolean_enabled",
+            )
         with self._session_factory() as session:
             self._authorize(session, principal, "system.modules", "system:modules")
         result = self._integration_service().set_module(
@@ -431,7 +450,9 @@ class SystemService:
     def operation(self, principal: Principal, action: str) -> dict[str, Any]:
         permission = OPERATION_PERMISSIONS.get(action)
         if action not in ACTION_NAMES or permission is None:
-            raise ValidationFailed("unknown system operation")
+            raise ValidationFailed(
+                "unknown system operation", key="api.system.unknown_system_operation"
+            )
         with self._session_factory() as session:
             self._authorize(session, principal, permission, f"system:operation:{action}")
         outcome: ExecutorOutcome = self._executor_client().execute(action)

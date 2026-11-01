@@ -356,20 +356,23 @@ class IdentityService:
     # ----------------------------------------------------- validation helpers
     def _normalize_username(self, username: str) -> str:
         if not isinstance(username, str):
-            raise ValidationFailed("username is required")
+            raise ValidationFailed("username is required", key="api.identity.username_required")
         normalized = username.strip().lower()
         if not USERNAME_PATTERN.match(normalized):
             raise ValidationFailed(
-                "username must be 3-64 characters using a-z, 0-9, dot, underscore or hyphen"
+                "username must be 3-64 characters using a-z, 0-9, dot, underscore or hyphen",
+                key="api.identity.username_3_64_characters_using_z_0_9",
             )
         return normalized
 
     def _normalize_name(self, name: str) -> str:
         if not isinstance(name, str):
-            raise ValidationFailed("name is required")
+            raise ValidationFailed("name is required", key="api.identity.name_required")
         normalized = name.strip()
         if not 1 <= len(normalized) <= 120:
-            raise ValidationFailed("name must be 1-120 characters")
+            raise ValidationFailed(
+                "name must be 1-120 characters", key="api.identity.name_1_120_characters"
+            )
         return normalized
 
     def _normalize_email(self, email: str | None) -> str | None:
@@ -379,7 +382,7 @@ class IdentityService:
         if not normalized:
             return None
         if len(normalized) > 254 or "@" not in normalized or any(ch.isspace() for ch in normalized):
-            raise ValidationFailed("email is not valid")
+            raise ValidationFailed("email is not valid", key="api.identity.email_not_valid")
         return normalized
 
     def _normalize_person_id(self, person_id: str | None) -> str | None:
@@ -389,7 +392,10 @@ class IdentityService:
         if not normalized:
             return None
         if len(normalized) > 64:
-            raise ValidationFailed("person_id must be at most 64 characters")
+            raise ValidationFailed(
+                "person_id must be at most 64 characters",
+                key="api.identity.person_id_most_64_characters",
+            )
         return normalized
 
     def _validate_password(self, password: str) -> str:
@@ -401,7 +407,11 @@ class IdentityService:
         minimum = self._settings.auth_password_min_length
         maximum = self._settings.auth_password_max_length
         if not isinstance(password, str) or not minimum <= len(password) <= maximum:
-            raise ValidationFailed(f"password must be {minimum}-{maximum} characters")
+            raise ValidationFailed(
+                f"password must be {minimum}-{maximum} characters",
+                key="api.identity.password_minimum_maximum_characters",
+                params={"minimum": minimum, "maximum": maximum},
+            )
         return password
 
     def _enforce_session_cap(self, now: datetime) -> None:
@@ -426,23 +436,31 @@ class IdentityService:
 
     def _validate_actor_kind(self, actor_kind: str) -> str:
         if actor_kind not in ACTOR_KINDS:
-            raise ValidationFailed("actor_kind is not supported")
+            raise ValidationFailed(
+                "actor_kind is not supported", key="api.identity.actor_kind_not_supported"
+            )
         return actor_kind
 
     def _validate_permissions(self, permissions: Iterable[str]) -> tuple[str, ...]:
         if isinstance(permissions, str):
-            raise ValidationFailed("permissions must be a list of permission codes")
+            raise ValidationFailed(
+                "permissions must be a list of permission codes",
+                key="api.identity.permissions_list_permission_codes",
+            )
         cleaned: set[str] = set()
         for code in permissions:
             if not isinstance(code, str) or not is_known_permission(code, self._session):
-                raise ValidationFailed("permissions contain an unknown code")
+                raise ValidationFailed(
+                    "permissions contain an unknown code",
+                    key="api.identity.permissions_contain_unknown_code",
+                )
             cleaned.add(code)
         return tuple(sorted(cleaned))
 
     def _load_role(self, role_id: str | None) -> IdentityRole:
         role = None if not role_id else self._session.get(IdentityRole, role_id)
         if role is None:
-            raise ValidationFailed("role_id is unknown")
+            raise ValidationFailed("role_id is unknown", key="api.identity.role_id_unknown")
         return role
 
     def _identity_by_username(self, username: str) -> Identity | None:
@@ -453,7 +471,7 @@ class IdentityService:
     def _require_identity(self, identity_id: str) -> Identity:
         identity = self._session.get(Identity, identity_id)
         if identity is None:
-            raise NotFound("identity not found")
+            raise NotFound("identity not found", key="api.identity.identity_not_found")
         return identity
 
     # ---------------------------------------------------------- authorization
@@ -538,7 +556,11 @@ class IdentityService:
             authorization_ref=principal.authorization_ref,
         )
         self._session.commit()
-        raise PermissionDenied("your permissions do not cover: " + ", ".join(sorted(missing)))
+        raise PermissionDenied(
+            "your permissions do not cover: " + ", ".join(sorted(missing)),
+            key="api.identity.permissions_do_not_cover",
+            params={"permissions": ", ".join(sorted(missing))},
+        )
 
     def authorize(
         self,
@@ -552,8 +574,10 @@ class IdentityService:
         target = resource or permission
         identity = self._session.get(Identity, principal.actor_id)
         allowed = False
-        if identity is not None and identity.active and is_known_permission(
-            permission, self._session
+        if (
+            identity is not None
+            and identity.active
+            and is_known_permission(permission, self._session)
         ):
             allowed = permission in self._effective_permissions(identity, principal.scopes)
             if (
@@ -579,7 +603,7 @@ class IdentityService:
                 )
             if commit_denial:
                 self._session.commit()
-            raise PermissionDenied()
+            raise PermissionDenied(key="api.identity.permission_denied")
 
     def _principal(self, identity: Identity, *, session_id: str | None = None) -> Principal:
         return Principal(
@@ -703,18 +727,26 @@ class IdentityService:
     def authenticate_session(self, token: str | None) -> AuthContext:
         """Resolve and revalidate a cookie session; called on every request."""
         if not token:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
         row = self._session.execute(
             select(IdentitySession).where(IdentitySession.token_digest == hash_token(token))
         ).scalar_one_or_none()
         if row is None:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
         now = self._now()
         if row.revoked_at is not None or as_utc(row.expires_at) <= now:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
         identity = self._session.get(Identity, row.identity_id)
         if identity is None or not identity.active or identity.role_id is None:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
 
         permissions = self._effective_permissions(identity, frozenset())
         row.last_access_at = now
@@ -856,7 +888,9 @@ class IdentityService:
     ) -> AuthContext:
         """Machine bearer authentication using a stored token digest."""
         if not token:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
         credential = self._session.execute(
             select(IdentityCredential).where(
                 IdentityCredential.token_digest == hash_token(token),
@@ -864,14 +898,18 @@ class IdentityService:
             )
         ).scalar_one_or_none()
         if credential is None:
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
         identity = self._session.get(Identity, credential.identity_id)
         if (
             identity is None
             or not identity.active
             or identity.actor_kind not in MACHINE_ACTOR_KINDS
         ):
-            raise AuthenticationFailed("authentication required")
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
 
         now = self._now()
         identity.last_access_at = now
@@ -905,7 +943,9 @@ class IdentityService:
         """Resolve a principal for tool callers (Pydantic AI, FastMCP, CLI)."""
         identity = self._session.get(Identity, identity_id)
         if identity is None or not identity.active:
-            raise PermissionDenied("identity is not available")
+            raise PermissionDenied(
+                "identity is not available", key="api.identity.identity_not_available"
+            )
         return Principal(
             actor_id=identity.id,
             kind=identity.actor_kind,
@@ -925,11 +965,18 @@ class IdentityService:
         normalized = self._normalize_username(username)
         identity = self._identity_by_username(normalized)
         if identity is None:
-            raise NotFound(f"machine identity {normalized} not found")
+            raise NotFound(
+                f"machine identity {normalized} not found",
+                key="api.identity.machine_identity_normalized_not_found",
+                params={"normalized": normalized},
+            )
         if identity.actor_kind not in MACHINE_ACTOR_KINDS:
-            raise ValidationFailed("credentials are issued only to machine identities")
+            raise ValidationFailed(
+                "credentials are issued only to machine identities",
+                key="api.identity.credentials_issued_only_machine_identities",
+            )
         if not identity.active:
-            raise Conflict("identity is inactive")
+            raise Conflict("identity is inactive", key="api.identity.identity_inactive")
         token = MACHINE_TOKEN_PREFIX + secrets.token_urlsafe(32)
         credential_id = str(uuid4())
         self._session.add(
@@ -954,9 +1001,16 @@ class IdentityService:
         normalized = self._normalize_username(username)
         identity = self._identity_by_username(normalized)
         if identity is None:
-            raise NotFound(f"machine identity {normalized} not found")
+            raise NotFound(
+                f"machine identity {normalized} not found",
+                key="api.identity.machine_identity_normalized_not_found",
+                params={"normalized": normalized},
+            )
         if identity.actor_kind not in MACHINE_ACTOR_KINDS:
-            raise ValidationFailed("credentials belong only to machine identities")
+            raise ValidationFailed(
+                "credentials belong only to machine identities",
+                key="api.identity.credentials_belong_only_machine_identities",
+            )
         now = self._now()
         rows = self._session.execute(
             select(IdentityCredential).where(
@@ -992,12 +1046,15 @@ class IdentityService:
             select(func.count(Identity.id)).where(Identity.actor_kind == HUMAN_ACTOR_KIND)
         ).scalar_one()
         if int(humans):
-            raise BootstrapRefused("the installation already has a human identity")
+            raise BootstrapRefused(
+                "the installation already has a human identity",
+                key="api.identity.installation_already_human_identity",
+            )
         normalized = self._normalize_username(username)
         display_name = self._normalize_name(name)
         self._validate_password(password)
         if self._identity_by_username(normalized) is not None:
-            raise Conflict("username is already in use")
+            raise Conflict("username is already in use", key="api.identity.username_already_in_use")
         now = self._now()
         identity = Identity(
             id=str(uuid4()),
@@ -1037,11 +1094,16 @@ class IdentityService:
         normalized = self._normalize_username(username)
         target = self._identity_by_username(normalized)
         if target is None:
-            raise NotFound("identity not found")
+            raise NotFound("identity not found", key="api.identity.identity_not_found")
         if target.actor_kind != HUMAN_ACTOR_KIND:
-            raise ValidationFailed("only human identities can own the installation")
+            raise ValidationFailed(
+                "only human identities can own the installation",
+                key="api.identity.only_human_identities_can_own_installation",
+            )
         if not target.active:
-            raise ValidationFailed("the identity is not active")
+            raise ValidationFailed(
+                "the identity is not active", key="api.identity.identity_not_active"
+            )
         active_owners = self._session.execute(
             select(func.count(Identity.id)).where(
                 Identity.actor_kind == HUMAN_ACTOR_KIND,
@@ -1050,7 +1112,10 @@ class IdentityService:
             )
         ).scalar_one()
         if int(active_owners):
-            raise BootstrapRefused("the installation already has an active superadministrator")
+            raise BootstrapRefused(
+                "the installation already has an active superadministrator",
+                key="api.identity.installation_already_active_superadministrator",
+            )
         target.role_id = ROLE_SUPERADMIN
         target.updated_at = self._now()
         self._revoke_sessions(target.id)
@@ -1090,16 +1155,25 @@ class IdentityService:
             )
         ).scalar_one()
         if not int(owners):
-            raise BootstrapRefused("bootstrap a human superadministrator first")
+            raise BootstrapRefused(
+                "bootstrap a human superadministrator first",
+                key="api.identity.bootstrap_human_superadministrator_first",
+            )
         if actor_kind not in MACHINE_ACTOR_KINDS:
-            raise ValidationFailed("actor_kind must be a machine actor kind")
+            raise ValidationFailed(
+                "actor_kind must be a machine actor kind",
+                key="api.identity.actor_kind_machine_actor_kind",
+            )
         role = self._load_role(role_id)
         self._check_machine_role(actor_kind, role.id)
         delegated_by_id = None
         if delegated_by is not None:
             delegator = self._identity_by_username(self._normalize_username(delegated_by))
             if delegator is None:
-                raise ValidationFailed("delegated-by identity is unknown")
+                raise ValidationFailed(
+                    "delegated-by identity is unknown",
+                    key="api.identity.delegated_identity_unknown",
+                )
             delegated_by_id = delegator.id
         delegated_by_id, role_owner = self._role_assignment(
             actor_kind=actor_kind, role=role, delegated_by_id=delegated_by_id
@@ -1107,7 +1181,7 @@ class IdentityService:
         normalized = self._normalize_username(username)
         display_name = self._normalize_name(name)
         if self._identity_by_username(normalized) is not None:
-            raise Conflict("username is already in use")
+            raise Conflict("username is already in use", key="api.identity.username_already_in_use")
         now = self._now()
         identity = Identity(
             id=str(uuid4()),
@@ -1158,7 +1232,10 @@ class IdentityService:
         """
         role = self._session.get(IdentityRole, ROLE_SUPERADMIN)
         if role is None:
-            raise Conflict("built-in roles are missing; run the database migrations first")
+            raise Conflict(
+                "built-in roles are missing; run the database migrations first",
+                key="api.identity.built_in_roles_missing_run_database_migrations_first",
+            )
         self._session.execute(
             update(IdentityRole)
             .where(IdentityRole.id == ROLE_SUPERADMIN)
@@ -1177,19 +1254,29 @@ class IdentityService:
             )
         ).scalar_one()
         if int(remaining) == 0:
-            raise Conflict("at least one active superadministrator is required")
+            raise Conflict(
+                "at least one active superadministrator is required",
+                key="api.identity.least_one_active_superadministrator_required",
+            )
 
     def _check_machine_role(self, actor_kind: str, role_id: str | None) -> None:
         if actor_kind in MACHINE_ACTOR_KINDS and role_id in (ROLE_ADMIN, ROLE_SUPERADMIN):
-            raise ValidationFailed("machine identities cannot use an administrator role")
+            raise ValidationFailed(
+                "machine identities cannot use an administrator role",
+                key="api.identity.machine_identities_cannot_use_administrator_role",
+            )
 
     def _delegator(self, delegated_by_id: str, *, require_superadmin: bool) -> Identity:
         delegator = self._session.get(Identity, delegated_by_id)
         if delegator is None or delegator.actor_kind != HUMAN_ACTOR_KIND or not delegator.active:
-            raise ValidationFailed("delegation requires an active human identity")
+            raise ValidationFailed(
+                "delegation requires an active human identity",
+                key="api.identity.delegation_requires_active_human_identity",
+            )
         if require_superadmin and delegator.role_id != ROLE_SUPERADMIN:
             raise ValidationFailed(
-                "reserved permissions require delegation by an active superadministrator"
+                "reserved permissions require delegation by an active superadministrator",
+                key="api.identity.reserved_permissions_require_delegation_active_superadministrator",
             )
         return delegator
 
@@ -1210,17 +1297,24 @@ class IdentityService:
         permissions = PolicyEngine.load(self._session).permissions(role.id)
         if actor_kind == HUMAN_ACTOR_KIND:
             if role.id != ROLE_SUPERADMIN and permissions & SYSTEM_PERMISSIONS:
-                raise ValidationFailed("system permissions are reserved to the installation owner")
+                raise ValidationFailed(
+                    "system permissions are reserved to the installation owner",
+                    key="api.identity.system_permissions_reserved_installation_owner",
+                )
             if delegated_by_id is not None:
                 self._delegator(delegated_by_id, require_superadmin=False)
             return delegated_by_id, None
         if role.id in (ROLE_ADMIN, ROLE_SUPERADMIN):
-            raise ValidationFailed("machine identities cannot use an administrator role")
+            raise ValidationFailed(
+                "machine identities cannot use an administrator role",
+                key="api.identity.machine_identities_cannot_use_administrator_role",
+            )
         reserved = bool(permissions & SYSTEM_PERMISSIONS)
         if not delegated_by_id:
             if reserved:
                 raise ValidationFailed(
-                    "reserved permissions require delegation by an active superadministrator"
+                    "reserved permissions require delegation by an active superadministrator",
+                    key="api.identity.reserved_permissions_require_delegation_active_superadministrator",
                 )
             return None, None
         delegator = self._delegator(delegated_by_id, require_superadmin=reserved)
@@ -1258,14 +1352,20 @@ class IdentityService:
             actor_kind=kind, role=role, delegated_by_id=delegated_by_id
         )
         if kind in MACHINE_ACTOR_KINDS and password:
-            raise ValidationFailed("machine identities do not use passwords")
+            raise ValidationFailed(
+                "machine identities do not use passwords",
+                key="api.identity.machine_identities_do_not_use_passwords",
+            )
         password_hash = None
         if kind == HUMAN_ACTOR_KIND:
             if not password:
-                raise ValidationFailed("a password is required for human identities")
+                raise ValidationFailed(
+                    "a password is required for human identities",
+                    key="api.identity.password_required_human_identities",
+                )
             password_hash = hash_password(self._validate_password(password))
         if self._identity_by_username(normalized) is not None:
-            raise Conflict("username is already in use")
+            raise Conflict("username is already in use", key="api.identity.username_already_in_use")
 
         now = self._now()
         identity = Identity(
@@ -1325,7 +1425,9 @@ class IdentityService:
         )
         if role_id is not None and role_id != target.role_id:
             if target.id == principal.actor_id:
-                raise PermissionDenied("you cannot change your own role")
+                raise PermissionDenied(
+                    "you cannot change your own role", key="api.identity.cannot_change_own_role"
+                )
             new_role = self._load_role(role_id)
             self._check_machine_role(target.actor_kind, new_role.id)
             if (
@@ -1335,7 +1437,9 @@ class IdentityService:
             ):
                 self._assert_not_last_superadmin(target)
         if actor_kind is not None and actor_kind != target.actor_kind:
-            raise ValidationFailed("actor_kind cannot be changed")
+            raise ValidationFailed(
+                "actor_kind cannot be changed", key="api.identity.actor_kind_cannot_changed"
+            )
         if (
             active is False
             and target.active
@@ -1360,7 +1464,9 @@ class IdentityService:
             normalized = self._normalize_username(username)
             if normalized != target.username:
                 if self._identity_by_username(normalized) is not None:
-                    raise Conflict("username is already in use")
+                    raise Conflict(
+                        "username is already in use", key="api.identity.username_already_in_use"
+                    )
                 target.username = normalized
         if name is not None:
             target.name = self._normalize_name(name)
@@ -1376,7 +1482,10 @@ class IdentityService:
             revoke = revoke or not target.active
         if password is not None:
             if target.actor_kind != HUMAN_ACTOR_KIND:
-                raise ValidationFailed("machine identities do not use passwords")
+                raise ValidationFailed(
+                    "machine identities do not use passwords",
+                    key="api.identity.machine_identities_do_not_use_passwords",
+                )
             target.password_hash = hash_password(self._validate_password(password))
             revoke = True
         target.updated_at = self._now()
@@ -1443,7 +1552,9 @@ class IdentityService:
         if self._session.execute(
             select(func.count(IdentityRole.id)).where(IdentityRole.name == display_name)
         ).scalar_one():
-            raise Conflict("a role with that name already exists")
+            raise Conflict(
+                "a role with that name already exists", key="api.identity.role_name_already_exists"
+            )
         role = IdentityRole(
             id=f"role-{uuid4().hex[:12]}",
             name=display_name,
@@ -1482,11 +1593,16 @@ class IdentityService:
         self.authorize(principal, "roles.manage", resource=f"identity-role:{role_id}")
         role = self._session.get(IdentityRole, role_id)
         if role is None:
-            raise NotFound("role not found")
+            raise NotFound("role not found", key="api.identity.role_not_found")
         if role.built_in:
-            raise Conflict("built-in roles cannot be modified")
+            raise Conflict(
+                "built-in roles cannot be modified",
+                key="api.identity.built_in_roles_cannot_modified",
+            )
         if permissions is not None and role.id == principal.role_id:
-            raise PermissionDenied("you cannot change your own role")
+            raise PermissionDenied(
+                "you cannot change your own role", key="api.identity.cannot_change_own_role"
+            )
         self._assert_permission_ceiling(
             principal,
             action="identity.role_updated",
@@ -1500,7 +1616,10 @@ class IdentityService:
                 if self._session.execute(
                     select(func.count(IdentityRole.id)).where(IdentityRole.name == display_name)
                 ).scalar_one():
-                    raise Conflict("a role with that name already exists")
+                    raise Conflict(
+                        "a role with that name already exists",
+                        key="api.identity.role_name_already_exists",
+                    )
                 role.name = display_name
         if permissions is not None:
             codes = self._validate_permissions(permissions)
@@ -1533,7 +1652,9 @@ class IdentityService:
             SESSION_MINUTES_MIN <= session_minutes <= SESSION_MINUTES_MAX
         ):
             raise ValidationFailed(
-                f"sessionMinutes must be {SESSION_MINUTES_MIN}-{SESSION_MINUTES_MAX}"
+                f"sessionMinutes must be {SESSION_MINUTES_MIN}-{SESSION_MINUTES_MAX}",
+                key="api.identity.sessionminutes_minimum_maximum",
+                params={"minimum": SESSION_MINUTES_MIN, "maximum": SESSION_MINUTES_MAX},
             )
         row = self._session.get(IdentitySecuritySettings, 1)
         if row is None:
@@ -1616,7 +1737,10 @@ class IdentityService:
         and cannot be core codes.  The caller owns the transaction.
         """
         if role_id != ROLE_SUPERADMIN:
-            raise PermissionDenied("extension grants belong to the Superadmin role only")
+            raise PermissionDenied(
+                "extension grants belong to the Superadmin role only",
+                key="api.identity.extension_grants_belong_superadmin_role_only",
+            )
         identity = self._session.get(Identity, principal.actor_id)
         if (
             identity is None
@@ -1625,12 +1749,16 @@ class IdentityService:
             or identity.role_id != ROLE_SUPERADMIN
         ):
             raise PermissionDenied(
-                "installation grants require a persisted human Superadmin"
+                "installation grants require a persisted human Superadmin",
+                key="api.identity.installation_grants_require_persisted_human_superadmin",
             )
         codes = self._validate_permissions(permissions)
         for code in codes:
             if code in PERMISSION_CATALOG or not code.startswith("ext_"):
-                raise PermissionDenied("installation grants are limited to extension codes")
+                raise PermissionDenied(
+                    "installation grants are limited to extension codes",
+                    key="api.identity.installation_grants_limited_extension_codes",
+                )
         existing = {
             f"{resource}.{operation}"
             for resource, operation in self._session.execute(

@@ -26,22 +26,33 @@ REFERENCE_STATES: Final[tuple[str, ...]] = ("active", "archived", "missing")
 
 def _entity_type(value: object) -> str:
     if not isinstance(value, str) or value not in REFERENCE_ENTITY_TYPES:
-        raise ValidationFailed("entity_type must be asset or incident")
+        raise ValidationFailed(
+            "entity_type must be asset or incident", key="api.events.entity_type_asset_incident"
+        )
     return value
 
 
 def _identifiers(values: object) -> list[str]:
     if isinstance(values, (str, bytes)) or not isinstance(values, Sequence):
-        raise ValidationFailed("ids must be a list of permanent identifiers")
+        raise ValidationFailed(
+            "ids must be a list of permanent identifiers",
+            key="api.events.ids_list_permanent_identifiers",
+        )
     if len(values) > MAX_REFERENCE_IDS:
-        raise ValidationFailed(f"at most {MAX_REFERENCE_IDS} ids may be resolved at once")
+        raise ValidationFailed(
+            f"at most {MAX_REFERENCE_IDS} ids may be resolved at once",
+            key="api.events.most_maximum_ids_may_resolved_once",
+            params={"maximum": MAX_REFERENCE_IDS},
+        )
     ordered: list[str] = []
     for value in values:
         if not isinstance(value, str):
-            raise ValidationFailed("ids must contain strings")
+            raise ValidationFailed("ids must contain strings", key="api.events.ids_contain_strings")
         identifier = value.strip()
         if not identifier or len(identifier) > 36:
-            raise ValidationFailed("ids must be 1-36 characters")
+            raise ValidationFailed(
+                "ids must be 1-36 characters", key="api.events.ids_1_36_characters"
+            )
         if identifier not in ordered:
             ordered.append(identifier)
     return ordered

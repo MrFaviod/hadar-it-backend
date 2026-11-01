@@ -28,7 +28,9 @@ class WarrantyService:
     def set_preferences(self, principal, days):
         self.identity.authorize(principal, "config.general", resource="warranties:preferences")
         if type(days) is not int or not 1 <= days <= 365:
-            raise ValidationFailed("expiringDays must be 1-365")
+            raise ValidationFailed(
+                "expiringDays must be 1-365", key="api.workflows.expiringdays_1_365"
+            )
         row = self._session.get(WarrantyPreference, "expiring")
         if row is None:
             self._session.add(WarrantyPreference(key="expiring", days=days))
@@ -58,7 +60,7 @@ class WarrantyService:
         self.inventory.get(principal, asset_id)
         row = self._session.get(Warranty, asset_id)
         if row is None:
-            raise NotFound("warranty not found")
+            raise NotFound("warranty not found", key="api.workflows.warranty_not_found")
         return self._view(row, self.preferences(principal)["expiringDays"])
 
     def list(self, principal, *, coverage=None, offset=0, limit=100):
@@ -70,7 +72,9 @@ class WarrantyService:
             or type(limit) is not int
             or not 1 <= limit <= 100
         ):
-            raise ValidationFailed("invalid warranty query")
+            raise ValidationFailed(
+                "invalid warranty query", key="api.workflows.invalid_warranty_query"
+            )
         days = self.preferences(principal)["expiringDays"]
         # The portable JSON payload is projected in bounded pages. Stop when
         # enough matching rows exist; never materialize all warranties.
@@ -101,14 +105,22 @@ class WarrantyService:
             "notes",
         }
         if not isinstance(values, dict) or set(values) - allowed:
-            raise ValidationFailed("unsupported warranty fields")
+            raise ValidationFailed(
+                "unsupported warranty fields", key="api.workflows.unsupported_warranty_fields"
+            )
         payload = dict(values)
         for key, maximum in (("supplier", 160), ("notes", 2000)):
             value = payload.get(key)
             if value is not None and (not isinstance(value, str) or len(value) > maximum):
-                raise ValidationFailed(f"{key} is too long or is not text")
+                raise ValidationFailed(
+                    f"{key} is too long or is not text",
+                    key="api.workflows.key_too_long_not_text",
+                    params={"key": key},
+                )
         if payload.get("status", "active") not in {"active", "cancelled", "claimed", "unknown"}:
-            raise ValidationFailed("unsupported warranty status")
+            raise ValidationFailed(
+                "unsupported warranty status", key="api.workflows.unsupported_warranty_status"
+            )
         payload.setdefault("status", "active")
         dates = {}
         for key in ("purchaseDate", "expiresOn"):
@@ -119,22 +131,34 @@ class WarrantyService:
                         raise ValueError()
                     dates[key] = date.fromisoformat(value)
                 except ValueError, TypeError:
-                    raise ValidationFailed(f"invalid {key}") from None
+                    raise ValidationFailed(
+                        f"invalid {key}", key="api.workflows.invalid_key", params={"key": key}
+                    ) from None
         months = payload.get("durationMonths")
         if months is not None:
             if type(months) is not int or not 1 <= months <= 1200:
-                raise ValidationFailed("durationMonths must be 1-1200")
+                raise ValidationFailed(
+                    "durationMonths must be 1-1200", key="api.workflows.durationmonths_1_1200"
+                )
             if "purchaseDate" not in dates:
-                raise ValidationFailed("durationMonths requires purchaseDate")
+                raise ValidationFailed(
+                    "durationMonths requires purchaseDate",
+                    key="api.workflows.durationmonths_requires_purchasedate",
+                )
             purchase = dates["purchaseDate"]
             total = purchase.year * 12 + purchase.month - 1 + months
             year, month = divmod(total, 12)
             month += 1
             if year > 9999:
-                raise ValidationFailed("warranty expiry exceeds supported date range")
+                raise ValidationFailed(
+                    "warranty expiry exceeds supported date range",
+                    key="api.workflows.warranty_expiry_exceeds_supported_date_range",
+                )
             calculated = date(year, month, min(purchase.day, calendar.monthrange(year, month)[1]))
             if "expiresOn" in dates and dates["expiresOn"] != calculated:
-                raise ValidationFailed("duration and expiry conflict")
+                raise ValidationFailed(
+                    "duration and expiry conflict", key="api.workflows.duration_expiry_conflict"
+                )
             dates["expiresOn"] = calculated
             payload["expiresOn"] = calculated.isoformat()
         if (
@@ -142,14 +166,19 @@ class WarrantyService:
             and dates.get("purchaseDate")
             and dates["expiresOn"] < dates["purchaseDate"]
         ):
-            raise ValidationFailed("expiry cannot precede purchase")
+            raise ValidationFailed(
+                "expiry cannot precede purchase", key="api.workflows.expiry_cannot_precede_purchase"
+            )
         receipt_id = payload.get("receiptId")
         if receipt_id:
             if not isinstance(receipt_id, str) or len(receipt_id) != 36:
-                raise ValidationFailed("invalid receiptId")
+                raise ValidationFailed("invalid receiptId", key="api.workflows.invalid_receiptid")
             receipt = self._session.get(Attachment, receipt_id)
             if receipt is None or receipt.asset_id != asset_id or receipt.deleted_at is not None:
-                raise ValidationFailed("receipt must be an accessible attachment of this asset")
+                raise ValidationFailed(
+                    "receipt must be an accessible attachment of this asset",
+                    key="api.workflows.receipt_accessible_attachment_asset",
+                )
         row = self._session.get(Warranty, asset_id)
         previous = row.payload if row else None
         if row is None:
@@ -176,7 +205,7 @@ class WarrantyService:
         asset = self.inventory._asset(asset_id)
         row = self._session.get(Warranty, asset_id)
         if row is None:
-            raise NotFound("warranty not found")
+            raise NotFound("warranty not found", key="api.workflows.warranty_not_found")
         self.inventory._record_history(
             principal,
             asset,

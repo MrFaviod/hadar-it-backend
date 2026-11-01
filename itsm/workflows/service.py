@@ -64,20 +64,33 @@ def export_options(options: Any) -> dict[str, Any]:
     if options is None:
         return dict(EXPORT_DEFAULTS)
     if not isinstance(options, dict):
-        raise ValidationFailed("export options must be an object")
+        raise ValidationFailed(
+            "export options must be an object", key="api.workflows.export_options_object"
+        )
     unknown = set(options) - set(EXPORT_DEFAULTS)
     if unknown:
-        raise ValidationFailed("unsupported export options: " + ", ".join(sorted(unknown)))
+        raise ValidationFailed(
+            "unsupported export options: " + ", ".join(sorted(unknown)),
+            key="api.workflows.unsupported_export_options",
+            params={"options": ", ".join(sorted(unknown))},
+        )
     resolved = dict(EXPORT_DEFAULTS)
     if "separator" in options:
         name = options["separator"]
         if not isinstance(name, str) or name not in EXPORT_SEPARATORS:
-            raise ValidationFailed("separator must be comma, semicolon, tab or pipe")
+            raise ValidationFailed(
+                "separator must be comma, semicolon, tab or pipe",
+                key="api.workflows.separator_comma_semicolon_tab_pipe",
+            )
         resolved["separator"] = EXPORT_SEPARATORS[name]
     for flag in EXPORT_FLAGS:
         if flag in options:
             if type(options[flag]) is not bool:
-                raise ValidationFailed(f"{flag} must be a boolean")
+                raise ValidationFailed(
+                    f"{flag} must be a boolean",
+                    key="api.workflows.flag_boolean",
+                    params={"flag": flag},
+                )
             resolved[flag] = options[flag]
     return resolved
 
@@ -110,7 +123,9 @@ def compact_operation(value: Any, limit: int = 20) -> Any:
     tells the caller to page through ``get_inventory_operation``.
     """
     if type(limit) is not int or not 1 <= limit <= 100:
-        raise ValidationFailed("compact limit must be 1-100")
+        raise ValidationFailed(
+            "compact limit must be 1-100", key="api.workflows.compact_limit_1_100"
+        )
     if not isinstance(value, dict):
         return value
     result = dict(value)
@@ -175,7 +190,7 @@ class WorkflowService:
         self._auth(principal, permission)
         row = self._session.get(Operation, operation_id)
         if row is None:
-            raise NotFound("operation not found")
+            raise NotFound("operation not found", key="api.workflows.operation_not_found")
         # Human approval can be shared with authorized machines; UUID is a
         # locator, never authorization. All operations require current scope.
         return row
@@ -197,7 +212,9 @@ class WorkflowService:
             or type(limit) is not int
             or not 1 <= limit <= 5000
         ):
-            raise ValidationFailed("invalid operation page")
+            raise ValidationFailed(
+                "invalid operation page", key="api.workflows.invalid_operation_page"
+            )
         rows = self._rows(row.id)
         summary = {"created": 0, "modified": 0, "omitted": 0, "failed": 0}
         for item in rows:
@@ -251,10 +268,12 @@ class WorkflowService:
             or not isinstance(options, dict)
             or len(json.dumps(options)) > 20000
         ):
-            raise ValidationFailed("invalid import profile")
+            raise ValidationFailed(
+                "invalid import profile", key="api.workflows.invalid_import_profile"
+            )
         row = self._session.get(ImportProfile, profile_id) if profile_id else None
         if profile_id and row is None:
-            raise NotFound("profile not found")
+            raise NotFound("profile not found", key="api.workflows.profile_not_found")
         if row is None:
             row = ImportProfile(id=str(uuid4()), name=name.strip(), options=options)
             self._session.add(row)
@@ -269,7 +288,7 @@ class WorkflowService:
         self._auth(principal)
         row = self._session.get(ImportProfile, profile_id)
         if row is None:
-            raise NotFound("profile not found")
+            raise NotFound("profile not found", key="api.workflows.profile_not_found")
         self._session.delete(row)
         self.identity.record_operation(
             principal,
@@ -281,7 +300,9 @@ class WorkflowService:
         self._auth(principal)
         # JSON callers may send any decoded value; only an object is a contract.
         if options is not None and not isinstance(options, dict):
-            raise ValidationFailed("import options must be an object")
+            raise ValidationFailed(
+                "import options must be an object", key="api.workflows.import_options_object"
+            )
         options = dict(options or {})
         if options.get("profileId"):
             profile = next(
@@ -289,7 +310,7 @@ class WorkflowService:
                 None,
             )
             if profile is None:
-                raise NotFound("profile not found")
+                raise NotFound("profile not found", key="api.workflows.profile_not_found")
             options = {**profile["options"], **options}
         if wants_inspection(options):
             return inspect_file(data, filename, options)
@@ -298,7 +319,10 @@ class WorkflowService:
         if not isinstance(match_fields, list) or any(
             f not in {"quick_code", "serial", "ip"} for f in match_fields
         ):
-            raise ValidationFailed("matchFields supports quick_code, serial, ip")
+            raise ValidationFailed(
+                "matchFields supports quick_code, serial, ip",
+                key="api.workflows.matchfields_supports_quick_code_serial_ip",
+            )
         for row in rows:
             values = row["values"]
             permanent_id = values.pop("id", None)
@@ -358,7 +382,10 @@ class WorkflowService:
                 or len(asset_ids) > LIMIT
                 or any(not isinstance(i, str) for i in asset_ids)
             ):
-                raise ValidationFailed("select 1-5000 permanent asset IDs")
+                raise ValidationFailed(
+                    "select 1-5000 permanent asset IDs",
+                    key="api.workflows.select_1_5000_permanent_asset_ids",
+                )
             return list(dict.fromkeys(asset_ids))
         filters = filters or {}
         if not filters or set(filters) - {
@@ -370,16 +397,25 @@ class WorkflowService:
             "responsible_person_id",
             "archived",
         }:
-            raise ValidationFailed("explicit selection or supported nonempty filters required")
+            raise ValidationFailed(
+                "explicit selection or supported nonempty filters required",
+                key="api.workflows.explicit_selection_supported_nonempty_filters_required",
+            )
         if "all" in filters and filters["all"] is not True:
-            raise ValidationFailed('the "all" filter accepts only true')
+            raise ValidationFailed(
+                'the "all" filter accepts only true',
+                key="api.workflows.all_filter_accepts_only_true",
+            )
         query = select(Asset.id)
         for field, value in filters.items():
             if field == "all":
                 continue
             if field == "archived":
                 if type(value) is not bool:
-                    raise ValidationFailed("archived filter must be boolean")
+                    raise ValidationFailed(
+                        "archived filter must be boolean",
+                        key="api.workflows.archived_filter_boolean",
+                    )
                 query = query.where(
                     Asset.archived_at.is_not(None) if value else Asset.archived_at.is_(None)
                 )
@@ -387,7 +423,10 @@ class WorkflowService:
                 query = query.where(getattr(Asset, field) == value)
         ids = list(self._session.scalars(query.order_by(Asset.id).limit(LIMIT + 1)))
         if len(ids) > LIMIT:
-            raise ValidationFailed("selection exceeds 5000 assets; narrow filters")
+            raise ValidationFailed(
+                "selection exceeds 5000 assets; narrow filters",
+                key="api.workflows.selection_exceeds_5000_assets_narrow_filters",
+            )
         return ids
 
     def preview(
@@ -395,9 +434,14 @@ class WorkflowService:
     ):
         self._auth(principal)
         if action not in {"update", "archive", "transfer", "assign", "return"}:
-            raise ValidationFailed("unsupported bulk action")
+            raise ValidationFailed(
+                "unsupported bulk action", key="api.workflows.unsupported_bulk_action"
+            )
         if not isinstance(changes, dict) or len(json.dumps(changes)) > 20000:
-            raise ValidationFailed("changes must be an explicit bounded object")
+            raise ValidationFailed(
+                "changes must be an explicit bounded object",
+                key="api.workflows.changes_explicit_bounded_object",
+            )
         changes = {ALIASES.get(k, k): v for k, v in changes.items()}
         ids = self._select(principal, asset_ids, filters)
         rows = []
@@ -428,14 +472,21 @@ class WorkflowService:
     def resolve(self, principal, operation_id, index, action, asset_id=None, values=None):
         operation = self._operation(principal, operation_id, "assets.edit")
         if operation.state not in {"preview", "approved"}:
-            raise Conflict("only unapplied previews can be resolved")
+            raise Conflict(
+                "only unapplied previews can be resolved",
+                key="api.workflows.only_unapplied_previews_can_resolved",
+            )
         row = self._session.get(OperationRow, (operation.id, index))
         if row is None or action not in {"skip", "create", "update"}:
-            raise ValidationFailed("invalid row resolution")
+            raise ValidationFailed(
+                "invalid row resolution", key="api.workflows.invalid_row_resolution"
+            )
         payload = dict(row.payload)
         if values is not None:
             if not isinstance(values, dict) or set(values) - set(ASSET_FIELDS):
-                raise ValidationFailed("unsupported row values")
+                raise ValidationFailed(
+                    "unsupported row values", key="api.workflows.unsupported_row_values"
+                )
             payload["values"] = values
         asset = self.inventory._asset(asset_id) if action == "update" else None
         if action != "skip":
@@ -476,18 +527,30 @@ class WorkflowService:
     def approve(self, principal, operation_id):
         operation = self._operation(principal, operation_id, "assets.edit")
         if principal.kind != "human":
-            raise PermissionDenied("only an authorized human can approve a fixed preview")
+            raise PermissionDenied(
+                "only an authorized human can approve a fixed preview",
+                key="api.workflows.only_authorized_human_can_approve_fixed_preview",
+            )
         if operation.state not in {"preview", "approved"}:
-            raise Conflict("operation is already applying or completed")
+            raise Conflict(
+                "operation is already applying or completed",
+                key="api.workflows.operation_already_applying_completed",
+            )
         rows = self._rows(operation.id)
         self._row_permissions(principal, rows)
         if any(r.payload["classification"] in {"possible_duplicate", "error"} for r in rows):
-            raise Conflict("resolve or skip conflicts before approval")
+            raise Conflict(
+                "resolve or skip conflicts before approval",
+                key="api.workflows.resolve_skip_conflicts_before_approval",
+            )
         for row in rows:
             if row.payload.get("assetId") and row.payload.get("action") != "skip":
                 asset = self.inventory._asset(row.payload["assetId"])
                 if version(asset) != row.payload["version"]:
-                    raise Conflict("preview is stale; prepare a new preview")
+                    raise Conflict(
+                        "preview is stale; prepare a new preview",
+                        key="api.workflows.preview_stale_prepare_new_preview",
+                    )
         operation.approver_id, operation.state = principal.actor_id, "approved"
         self.identity.record_operation(
             principal, action="inventory.operation_approved", resource=f"operation:{operation.id}"
@@ -496,10 +559,15 @@ class WorkflowService:
 
     def _approval(self, operation, principal, permissions=None):
         if not operation.approver_id:
-            raise Conflict("human approval of the exact preview is required")
+            raise Conflict(
+                "human approval of the exact preview is required",
+                key="api.workflows.human_approval_exact_preview_required",
+            )
         stored = self._session.get(Identity, operation.approver_id)
         if stored is None or stored.actor_kind != "human":
-            raise PermissionDenied("approval is no longer valid")
+            raise PermissionDenied(
+                "approval is no longer valid", key="api.workflows.approval_no_longer_valid"
+            )
         approver = self.identity._principal(stored)
         if permissions is None:
             permissions = self._required_permissions(self._rows(operation.id))
@@ -573,7 +641,10 @@ class WorkflowService:
         else:
             asset = inventory._asset(payload["assetId"])
             if version(asset) != payload["version"]:
-                raise Conflict("asset changed since preview; prepare a new preview")
+                raise Conflict(
+                    "asset changed since preview; prepare a new preview",
+                    key="api.workflows.asset_changed_since_preview_prepare_new_preview",
+                )
             if action == "archive":
                 inventory.archive(principal, asset.id, reason=payload.get("reason"))
             elif action == "transfer":
@@ -601,7 +672,9 @@ class WorkflowService:
         ids = self._select(principal, asset_ids, filters)
         fields = list(dict.fromkeys(["id", *(fields or DEFAULT_EXPORT_FIELDS)]))
         if any(f not in {"id", *ASSET_FIELDS} for f in fields):
-            raise ValidationFailed("unsupported export field")
+            raise ValidationFailed(
+                "unsupported export field", key="api.workflows.unsupported_export_field"
+            )
         table = [
             [_cell(getattr(self.inventory._asset(asset_id), field, None)) for field in fields]
             for asset_id in ids

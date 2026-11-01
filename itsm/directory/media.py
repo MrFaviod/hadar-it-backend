@@ -149,37 +149,65 @@ def image_dimensions(data: bytes, content_type: str) -> tuple[int, int] | None:
 def validate_plan(data: object) -> PlanImage:
     """Validate one plan upload before any storage write."""
     if not isinstance(data, bytes | bytearray | memoryview):
-        raise ValidationFailed("plan must be binary image data")
+        raise ValidationFailed(
+            "plan must be binary image data", key="api.directory.plan_binary_image_data"
+        )
     payload = bytes(data)
     if not payload:
-        raise ValidationFailed("plan image is empty")
+        raise ValidationFailed("plan image is empty", key="api.directory.plan_image_empty")
     if len(payload) > MAX_PLAN_BYTES:
-        raise ValidationFailed(f"plan image must be at most {MAX_PLAN_BYTES // (1024 * 1024)} MiB")
+        raise ValidationFailed(
+            f"plan image must be at most {MAX_PLAN_BYTES // (1024 * 1024)} MiB",
+            key="api.directory.plan_image_most_maximum_mib",
+            params={"maximum": MAX_PLAN_BYTES // (1024 * 1024)},
+        )
     content_type = detect_image_type(payload)
     if content_type not in PLAN_CONTENT_TYPES:
-        raise ValidationFailed("plan image must be a PNG, JPEG or WebP file")
+        raise ValidationFailed(
+            "plan image must be a PNG, JPEG or WebP file",
+            key="api.directory.plan_image_png_jpeg_webp_file",
+        )
     dimensions = image_dimensions(payload, content_type)
     if dimensions is None:
-        raise ValidationFailed("plan image dimensions could not be read")
+        raise ValidationFailed(
+            "plan image dimensions could not be read",
+            key="api.directory.plan_image_dimensions_could_not_read",
+        )
     width, height = dimensions
     if width < 1 or height < 1:
-        raise ValidationFailed("plan image dimensions are invalid")
+        raise ValidationFailed(
+            "plan image dimensions are invalid", key="api.directory.plan_image_dimensions_invalid"
+        )
     if width > MAX_PLAN_DIMENSION or height > MAX_PLAN_DIMENSION:
-        raise ValidationFailed(f"plan image sides must be at most {MAX_PLAN_DIMENSION} pixels")
+        raise ValidationFailed(
+            f"plan image sides must be at most {MAX_PLAN_DIMENSION} pixels",
+            key="api.directory.plan_image_sides_most_maximum_pixels",
+            params={"maximum": MAX_PLAN_DIMENSION},
+        )
     if width * height > MAX_PLAN_PIXELS:
-        raise ValidationFailed("plan image has too many pixels")
+        raise ValidationFailed(
+            "plan image has too many pixels", key="api.directory.plan_image_too_many_pixels"
+        )
     try:
         with Image.open(io.BytesIO(payload)) as image:
             if (
                 image.format
                 != {"image/png": "PNG", "image/jpeg": "JPEG", "image/webp": "WEBP"}[content_type]
             ):
-                raise ValidationFailed("plan image content does not match its type")
+                raise ValidationFailed(
+                    "plan image content does not match its type",
+                    key="api.directory.plan_image_content_does_not_match_type",
+                )
             if getattr(image, "n_frames", 1) != 1:
-                raise ValidationFailed("plan image must contain one frame")
+                raise ValidationFailed(
+                    "plan image must contain one frame",
+                    key="api.directory.plan_image_contain_one_frame",
+                )
             image.load()
     except UnidentifiedImageError, OSError, ValueError, Image.DecompressionBombError:
-        raise ValidationFailed("plan image is not a valid image") from None
+        raise ValidationFailed(
+            "plan image is not a valid image", key="api.directory.plan_image_not_valid_image"
+        ) from None
     return PlanImage(content_type=content_type, data=payload, width=width, height=height)
 
 
@@ -235,7 +263,10 @@ class DirectoryMediaService:
     def _location(self, principal: Principal, location_id: str, *, write: bool):
         view = self._directory.get_location(principal, location_id)
         if view.level != "floor":
-            raise ValidationFailed("floor plans are only stored on a floor location")
+            raise ValidationFailed(
+                "floor plans are only stored on a floor location",
+                key="api.directory.floor_plans_only_stored_floor_location",
+            )
         if write:
             self._identity.authorize(principal, "config.sites", resource=f"location:{view.id}")
         return view
@@ -256,7 +287,7 @@ class DirectoryMediaService:
         self._location(principal, location_id, write=False)
         image = self._stored_image(self._key(location_id))
         if image is None:
-            raise NotFound("plan not found")
+            raise NotFound("plan not found", key="api.directory.plan_not_found")
         return image
 
     def meta(self, principal: Principal, location_id: str) -> PlanView:
@@ -264,7 +295,7 @@ class DirectoryMediaService:
         view = self._location(principal, location_id, write=False)
         image = self._stored_image(self._key(location_id))
         if image is None:
-            raise NotFound("plan not found")
+            raise NotFound("plan not found", key="api.directory.plan_not_found")
         return PlanView(
             location_id=location_id,
             plan_ref=view.plan_ref,
@@ -285,7 +316,10 @@ class DirectoryMediaService:
         page = f"{image.width}x{image.height}"
         if len(page) > PLAN_PAGE_MAX:
             self._replace_raw(key, previous)
-            raise ValidationFailed("plan dimensions do not fit the plan page field")
+            raise ValidationFailed(
+                "plan dimensions do not fit the plan page field",
+                key="api.directory.plan_dimensions_do_not_fit_plan_page_field",
+            )
         marker = plan_reference(location_id, key)
         try:
             if view.plan_ref != marker or view.plan_page != page:

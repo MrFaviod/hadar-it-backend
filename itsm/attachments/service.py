@@ -51,7 +51,10 @@ def _display_name(filename: str) -> str:
         or any(c in filename for c in "/\\")
         or any(ord(c) < 32 or ord(c) == 127 for c in filename)
     ):
-        raise ValidationFailed("filename must be a plain display name of 1-180 characters")
+        raise ValidationFailed(
+            "filename must be a plain display name of 1-180 characters",
+            key="api.attachments.filename_plain_display_name_1_180_characters",
+        )
     return filename
 
 
@@ -68,7 +71,9 @@ def _sniff(filename: str, data: bytes) -> str | None:
         try:
             text = data.decode("utf-8-sig")
         except UnicodeError:
-            raise ValidationFailed("text documents must use UTF-8") from None
+            raise ValidationFailed(
+                "text documents must use UTF-8", key="api.attachments.text_documents_use_utf_8"
+            ) from None
         if not re.search(r"[\x00-\x08\x0b\x0c\x0e-\x1f]", text):
             return "text/plain; charset=utf-8" if suffix == ".txt" else "text/csv; charset=utf-8"
     return None
@@ -77,15 +82,28 @@ def _sniff(filename: str, data: bytes) -> str | None:
 def validate_document(filename: str, category: str, data: bytes, maximum: int) -> str:
     _display_name(filename)
     if category not in {"photo", "receipt", "manual", "document"}:
-        raise ValidationFailed("category must be photo, receipt, manual or document")
+        raise ValidationFailed(
+            "category must be photo, receipt, manual or document",
+            key="api.attachments.category_photo_receipt_manual_document",
+        )
     if not isinstance(data, bytes) or not data or len(data) > maximum:
-        raise ValidationFailed(f"file must contain 1-{maximum} bytes")
+        raise ValidationFailed(
+            f"file must contain 1-{maximum} bytes",
+            key="api.attachments.file_contain_1_maximum_bytes",
+            params={"maximum": maximum},
+        )
     media_type = _sniff(filename, data)
     if media_type is not None:
         return media_type
     if category == "photo":
-        raise ValidationFailed("photo requires a PNG, JPEG, GIF or WebP file")
-    raise ValidationFailed("unsupported document type or file content")
+        raise ValidationFailed(
+            "photo requires a PNG, JPEG, GIF or WebP file",
+            key="api.attachments.photo_requires_png_jpeg_gif_webp_file",
+        )
+    raise ValidationFailed(
+        "unsupported document type or file content",
+        key="api.attachments.unsupported_document_type_file_content",
+    )
 
 
 def validate_chat_attachment(filename: str, data: bytes, maximum: int) -> tuple[str, str]:
@@ -97,10 +115,17 @@ def validate_chat_attachment(filename: str, data: bytes, maximum: int) -> tuple[
 
     _display_name(filename)
     if not isinstance(data, bytes) or not data or len(data) > maximum:
-        raise ValidationFailed(f"file must contain 1-{maximum} bytes")
+        raise ValidationFailed(
+            f"file must contain 1-{maximum} bytes",
+            key="api.attachments.file_contain_1_maximum_bytes",
+            params={"maximum": maximum},
+        )
     media_type = _sniff(filename, data)
     if media_type is None:
-        raise ValidationFailed("unsupported chat attachment type or file content")
+        raise ValidationFailed(
+            "unsupported chat attachment type or file content",
+            key="api.attachments.unsupported_chat_attachment_type_file_content",
+        )
     if media_type.startswith("image/"):
         return media_type, CHAT_IMAGE_KIND
     if media_type.startswith("text/"):
@@ -133,7 +158,7 @@ class AttachmentService:
     def _row(self, asset_id: str, attachment_id: str, *, deleted=False):
         row = self._session.get(Attachment, attachment_id)
         if row is None or row.asset_id != asset_id or (row.deleted_at is not None and not deleted):
-            raise NotFound("attachment not found")
+            raise NotFound("attachment not found", key="api.attachments.attachment_not_found")
         return row
 
     def _payload(self, row: Attachment) -> dict[str, Any]:
@@ -162,7 +187,10 @@ class AttachmentService:
             or not isinstance(offset, int)
             or offset < 0
         ):
-            raise ValidationFailed("limit must be 1-100 and offset nonnegative")
+            raise ValidationFailed(
+                "limit must be 1-100 and offset nonnegative",
+                key="api.attachments.limit_1_100_offset_nonnegative",
+            )
         rows = self._session.scalars(
             select(Attachment)
             .where(Attachment.asset_id == asset_id, Attachment.deleted_at.is_(None))
@@ -236,10 +264,10 @@ class AttachmentService:
         """
 
         if not isinstance(attachment_id, str) or not attachment_id:
-            raise NotFound("attachment not found")
+            raise NotFound("attachment not found", key="api.attachments.attachment_not_found")
         row = self._session.get(Attachment, attachment_id)
         if row is None or row.deleted_at is not None:
-            raise NotFound("attachment not found")
+            raise NotFound("attachment not found", key="api.attachments.attachment_not_found")
         self._authorize(principal, row.asset_id, "assets.view")
         return self._payload(row), self._bytes(row)
 
@@ -260,7 +288,10 @@ class AttachmentService:
 
         warranty = self._session.get(Warranty, asset_id)
         if warranty is not None and warranty.payload.get("receiptId") == row.id:
-            raise Conflict("attachment is referenced by the individual warranty")
+            raise Conflict(
+                "attachment is referenced by the individual warranty",
+                key="api.attachments.attachment_referenced_individual_warranty",
+            )
         from itsm.interventions.models import InterventionAttachment
 
         if self._session.scalar(
@@ -268,7 +299,10 @@ class AttachmentService:
             .where(InterventionAttachment.attachment_id == row.id)
             .limit(1)
         ):
-            raise Conflict("attachment is referenced by a technical intervention")
+            raise Conflict(
+                "attachment is referenced by a technical intervention",
+                key="api.attachments.attachment_referenced_technical_intervention",
+            )
         if row.deleted_at is None:
             row.deleted_at = utcnow().replace(tzinfo=None)
             self._inventory._record_history(

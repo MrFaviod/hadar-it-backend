@@ -77,4 +77,7 @@ def require_system_authority(
         resource=resource[:200],
         outcome="denied",
     )
-    raise PermissionDenied("system operations are reserved to the installation owner")
+    raise PermissionDenied(
+        "system operations are reserved to the installation owner",
+        key="api.system.system_operations_reserved_installation_owner",
+    )

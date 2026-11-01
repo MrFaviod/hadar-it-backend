@@ -100,9 +100,17 @@ def _bounded_int(value: Any, field: str, *, low: int, high: int, default: int) -
     if value is None:
         return default
     if isinstance(value, bool) or not isinstance(value, int):
-        raise ValidationFailed(f"{field} must be an integer")
+        raise ValidationFailed(
+            f"{field} must be an integer",
+            key="api.validation.field_integer",
+            params={"field": field},
+        )
     if value < low or value > high:
-        raise ValidationFailed(f"{field} must be between {low} and {high}")
+        raise ValidationFailed(
+            f"{field} must be between {low} and {high}",
+            key="api.search.field_between_low_high",
+            params={"field": field, "low": low, "high": high},
+        )
     return value
 
 
@@ -150,7 +158,7 @@ class SearchService:
     def authorize_index_admin(self, principal: Principal) -> None:
         """Require the same configuration privilege the other admin surfaces use."""
         if self._identity is None:
-            raise PermissionDenied()
+            raise PermissionDenied(key="api.search.permission_denied")
         self._identity.authorize(principal, "config.general", resource="search:index")
 
     # ------------------------------------------------------------------ search
@@ -163,10 +171,14 @@ class SearchService:
         offset: int = 0,
     ) -> SearchPage:
         if not isinstance(query, str) or not query.strip():
-            raise ValidationFailed("q is required")
+            raise ValidationFailed("q is required", key="api.search.q_required")
         query = " ".join(query.split())
         if len(query) > MAX_QUERY_LENGTH:
-            raise ValidationFailed(f"q must be at most {MAX_QUERY_LENGTH} characters")
+            raise ValidationFailed(
+                f"q must be at most {MAX_QUERY_LENGTH} characters",
+                key="api.search.q_most_maximum_characters",
+                params={"maximum": MAX_QUERY_LENGTH},
+            )
         limit = _bounded_int(limit, "limit", low=1, high=MAX_LIMIT, default=DEFAULT_LIMIT)
         offset = _bounded_int(offset, "offset", low=0, high=MAX_OFFSET, default=0)
         requested = self._kinds(kinds)
@@ -262,7 +274,11 @@ class SearchService:
             return list(TYPES)
         unknown = sorted(set(values) - set(TYPES))
         if unknown:
-            raise ValidationFailed("unsupported search kinds: " + ", ".join(unknown))
+            raise ValidationFailed(
+                "unsupported search kinds: " + ", ".join(unknown),
+                key="api.search.unsupported_search_kinds",
+                params={"kinds": ", ".join(unknown)},
+            )
         return list(dict.fromkeys(values))
 
     # -------------------------------------------------------------- rehydrate

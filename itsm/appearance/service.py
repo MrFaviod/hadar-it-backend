@@ -158,7 +158,9 @@ class AppearanceService:
             try:
                 parsed = PresetPayload.model_validate(dict(payload))
             except Exception:
-                raise ValidationFailed("appearance preset is invalid") from None
+                raise ValidationFailed(
+                    "appearance preset is invalid", key="api.appearance.appearance_preset_invalid"
+                ) from None
         document = parsed.model_dump()
         document["id"] = preset_id
         document["version"] = 1
@@ -228,12 +230,24 @@ class AppearanceService:
             if reference.startswith(resource_prefix):
                 resource_id = reference[len(resource_prefix) :]
                 if RESOURCE_ID.fullmatch(resource_id) is None:
-                    raise ValidationFailed(f"{key} references an unknown appearance resource")
+                    raise ValidationFailed(
+                        f"{key} references an unknown appearance resource",
+                        key="api.appearance.key_references_unknown_appearance_resource",
+                        params={"key": key},
+                    )
                 row = session.get(AppearanceResource, resource_id)
                 if row is None:
-                    raise ValidationFailed(f"{key} references an unknown appearance resource")
+                    raise ValidationFailed(
+                        f"{key} references an unknown appearance resource",
+                        key="api.appearance.key_references_unknown_appearance_resource",
+                        params={"key": key},
+                    )
                 if row.content_type not in package.ALLOWED_TYPES[key]:
-                    raise ValidationFailed(f"{key} does not accept the {row.content_type} type")
+                    raise ValidationFailed(
+                        f"{key} does not accept the {row.content_type} type",
+                        key="api.appearance.key_does_not_accept_content_type",
+                        params={"key": key, "content_type": row.content_type},
+                    )
                 output[key] = self._resource_url(resource_id)
                 continue
             if reference in LEGACY_ASSET_PATHS:
@@ -243,19 +257,29 @@ class AppearanceService:
             if reference.startswith(asset_prefix):
                 asset_key = reference[len(asset_prefix) :]
                 if asset_key not in BUILTIN_ASSETS:
-                    raise ValidationFailed(f"{key} references an unknown built-in graphic")
+                    raise ValidationFailed(
+                        f"{key} references an unknown built-in graphic",
+                        key="api.appearance.key_references_unknown_built_in_graphic",
+                        params={"key": key},
+                    )
                 output[key] = self._asset_url(asset_key)
                 continue
             if reference.lower().startswith("data:"):
                 parsed = package.parse_data_url(reference)
                 if parsed is None:  # pragma: no cover - guarded by the prefix check
-                    raise ValidationFailed(f"{key} graphic is invalid")
+                    raise ValidationFailed(
+                        f"{key} graphic is invalid",
+                        key="api.appearance.key_graphic_invalid",
+                        params={"key": key},
+                    )
                 content_type, data = parsed
                 content_type, _, _ = package.validate_resource(key, content_type, data)
                 pending.append((key, content_type, data))
                 continue
             raise ValidationFailed(
-                f"{key} must be an uploaded image, a stored appearance resource or empty"
+                f"{key} must be an uploaded image, a stored appearance resource or empty",
+                key="api.appearance.key_uploaded_image_stored_appearance_resource_empty",
+                params={"key": key},
             )
 
         created: list[str] = []
@@ -333,7 +357,10 @@ class AppearanceService:
             except IntegrityError:
                 session.rollback()
                 self._discard(created)
-                raise Conflict("an appearance preset with that name already exists") from None
+                raise Conflict(
+                    "an appearance preset with that name already exists",
+                    key="api.appearance.appearance_preset_name_already_exists",
+                ) from None
             except BaseException:
                 session.rollback()
                 self._discard(created)
@@ -349,12 +376,17 @@ class AppearanceService:
         self, principal: Principal, preset_id: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         if preset_id in BUILTIN_IDS:
-            raise Conflict("built-in appearance presets are immutable")
+            raise Conflict(
+                "built-in appearance presets are immutable",
+                key="api.appearance.built_in_appearance_presets_immutable",
+            )
         with self._session() as session:
             identity = self._authorize(session, principal)
             row = session.get(AppearancePreset, preset_id)
             if row is None:
-                raise NotFound("appearance preset not found")
+                raise NotFound(
+                    "appearance preset not found", key="api.appearance.appearance_preset_not_found"
+                )
             document = self._normalize_document(payload, preset_id)
             if document["name"] != row.name:
                 duplicate = session.execute(
@@ -366,7 +398,10 @@ class AppearanceService:
                 if duplicate is not None or document["name"] in {
                     preset["name"] for preset in self._builtins().values()
                 }:
-                    raise Conflict("an appearance preset with that name already exists")
+                    raise Conflict(
+                        "an appearance preset with that name already exists",
+                        key="api.appearance.appearance_preset_name_already_exists",
+                    )
             branding, created = self._materialize_branding(session, document["branding"], principal)
             document["branding"] = branding
             try:
@@ -375,7 +410,10 @@ class AppearanceService:
             except IntegrityError:
                 session.rollback()
                 self._discard(created)
-                raise Conflict("an appearance preset with that name already exists") from None
+                raise Conflict(
+                    "an appearance preset with that name already exists",
+                    key="api.appearance.appearance_preset_name_already_exists",
+                ) from None
             except BaseException:
                 session.rollback()
                 self._discard(created)
@@ -390,15 +428,23 @@ class AppearanceService:
 
     def delete_preset(self, principal: Principal, preset_id: str) -> None:
         if preset_id in BUILTIN_IDS:
-            raise Conflict("built-in appearance presets are immutable")
+            raise Conflict(
+                "built-in appearance presets are immutable",
+                key="api.appearance.built_in_appearance_presets_immutable",
+            )
         with self._session() as session:
             identity = self._authorize(session, principal)
             row = session.get(AppearancePreset, preset_id)
             if row is None:
-                raise NotFound("appearance preset not found")
+                raise NotFound(
+                    "appearance preset not found", key="api.appearance.appearance_preset_not_found"
+                )
             state = self._state(session)
             if state is not None and state.active_id == preset_id:
-                raise Conflict("the active appearance preset cannot be deleted")
+                raise Conflict(
+                    "the active appearance preset cannot be deleted",
+                    key="api.appearance.active_appearance_preset_cannot_deleted",
+                )
             session.delete(row)
             session.commit()
             self._gc(session)
@@ -418,7 +464,10 @@ class AppearanceService:
             else:
                 row = session.get(AppearancePreset, preset_id)
                 if row is None:
-                    raise NotFound("appearance preset not found")
+                    raise NotFound(
+                        "appearance preset not found",
+                        key="api.appearance.appearance_preset_not_found",
+                    )
                 document = deepcopy(row.document)
             self._replace_active(session, document, preset_id, principal)
             if row is not None and row.staged:
@@ -448,7 +497,10 @@ class AppearanceService:
             identity = self._authorize(session, principal)
             state = self._state(session)
             if state is None or not isinstance(state.previous, dict) or state.previous_id is None:
-                raise Conflict("there is no previous appearance preset to revert to")
+                raise Conflict(
+                    "there is no previous appearance preset to revert to",
+                    key="api.appearance.there_no_previous_appearance_preset_revert",
+                )
             current_document = deepcopy(state.active)
             current_id = state.active_id
             state.active = deepcopy(state.previous)
@@ -569,7 +621,10 @@ class AppearanceService:
         try:
             request = ImportRequest.model_validate(dict(payload))
         except Exception:
-            raise ValidationFailed("appearance import request is invalid") from None
+            raise ValidationFailed(
+                "appearance import request is invalid",
+                key="api.appearance.appearance_import_request_invalid",
+            ) from None
         with self._session() as session:
             identity = self._authorize(session, principal)
             builtins = self._builtins()
@@ -577,7 +632,10 @@ class AppearanceService:
             source = request.preset
             if request.policy == "replace":
                 if source.name in {preset["name"] for preset in builtins.values()}:
-                    raise Conflict("built-in appearance presets are immutable")
+                    raise Conflict(
+                        "built-in appearance presets are immutable",
+                        key="api.appearance.built_in_appearance_presets_immutable",
+                    )
                 existing = session.execute(
                     select(AppearancePreset).where(AppearancePreset.name == source.name)
                 ).scalar_one_or_none()
@@ -593,7 +651,10 @@ class AppearanceService:
             except IntegrityError:
                 session.rollback()
                 self._discard(created)
-                raise Conflict("an appearance preset with that name already exists") from None
+                raise Conflict(
+                    "an appearance preset with that name already exists",
+                    key="api.appearance.appearance_preset_name_already_exists",
+                ) from None
             except BaseException:
                 session.rollback()
                 self._discard(created)
@@ -615,7 +676,10 @@ class AppearanceService:
             else:
                 row = session.get(AppearancePreset, preset_id)
                 if row is None:
-                    raise NotFound("appearance preset not found")
+                    raise NotFound(
+                        "appearance preset not found",
+                        key="api.appearance.appearance_preset_not_found",
+                    )
                 document = deepcopy(row.document)
 
             def resolve(key: str, reference: str) -> tuple[str, bytes] | None:
@@ -658,17 +722,24 @@ class AppearanceService:
 
     def resource(self, resource_id: str) -> tuple[str, bytes]:
         if RESOURCE_ID.fullmatch(resource_id) is None:
-            raise NotFound("appearance resource not found")
+            raise NotFound(
+                "appearance resource not found", key="api.appearance.appearance_resource_not_found"
+            )
         with self._session() as session:
             row = session.get(AppearanceResource, resource_id)
             if row is None:
-                raise NotFound("appearance resource not found")
+                raise NotFound(
+                    "appearance resource not found",
+                    key="api.appearance.appearance_resource_not_found",
+                )
             return row.content_type, self._read_blob(row)
 
     def builtin_asset(self, key: str) -> tuple[str, bytes]:
         asset = BUILTIN_ASSETS.get(key)
         if asset is None:
-            raise NotFound("appearance asset not found")
+            raise NotFound(
+                "appearance asset not found", key="api.appearance.appearance_asset_not_found"
+            )
         return asset
 
     # ------------------------------------------------------------- retention

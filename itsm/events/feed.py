@@ -112,32 +112,55 @@ class ConsumerStatus:
 
 def _consumer_id(value: Any) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed("consumer must be a string")
+        raise ValidationFailed("consumer must be a string", key="api.events.consumer_string")
     identifier = value.strip()
     if not identifier or len(identifier) > MAX_CONSUMER_ID:
-        raise ValidationFailed(f"consumer must be 1-{MAX_CONSUMER_ID} characters")
+        raise ValidationFailed(
+            f"consumer must be 1-{MAX_CONSUMER_ID} characters",
+            key="api.events.consumer_1_maximum_characters",
+            params={"maximum": MAX_CONSUMER_ID},
+        )
     return identifier
 
 
 def _positive_int(value: Any, field: str, maximum: int) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise ValidationFailed(f"{field} must be an integer")
+        raise ValidationFailed(
+            f"{field} must be an integer",
+            key="api.validation.field_integer",
+            params={"field": field},
+        )
     if not 1 <= value <= maximum:
-        raise ValidationFailed(f"{field} must be between 1 and {maximum}")
+        raise ValidationFailed(
+            f"{field} must be between 1 and {maximum}",
+            key="api.events.field_between_1_maximum",
+            params={"field": field, "maximum": maximum},
+        )
     return value
 
 
 def _sequence(value: Any, field: str) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise ValidationFailed(f"{field} must be an integer")
+        raise ValidationFailed(
+            f"{field} must be an integer",
+            key="api.validation.field_integer",
+            params={"field": field},
+        )
     if value < 0:
-        raise ValidationFailed(f"{field} must be zero or greater")
+        raise ValidationFailed(
+            f"{field} must be zero or greater",
+            key="api.events.field_zero_greater",
+            params={"field": field},
+        )
     return value
 
 
 def _failure_code(value: Any) -> str:
     if not isinstance(value, str) or value not in FAILURE_CODES:
-        raise ValidationFailed("failure code is not a recognized delivery outcome")
+        raise ValidationFailed(
+            "failure code is not a recognized delivery outcome",
+            key="api.events.failure_code_not_recognized_delivery_outcome",
+        )
     return value
 
 
@@ -311,7 +334,9 @@ class EntityEventFeed:
         operator floor. Nothing unacknowledged is ever deleted.
         """
         if not isinstance(older_than, datetime):
-            raise ValidationFailed("older_than must be a timestamp")
+            raise ValidationFailed(
+                "older_than must be a timestamp", key="api.events.older_than_timestamp"
+            )
         cutoff = older_than
         floor = (
             None

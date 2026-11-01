@@ -148,11 +148,15 @@ def template_id(category: str, maintenance_type: str) -> str:
 def add_months(value: date, months: int) -> date:
     """Calendar-month recurrence with an explicit end-of-month clamp."""
     if not isinstance(value, date) or isinstance(value, datetime):
-        raise ValidationFailed("date is required")
+        raise ValidationFailed("date is required", key="api.maintenance.date_required")
     if not isinstance(months, int) or isinstance(months, bool):
-        raise ValidationFailed("months must be an integer")
+        raise ValidationFailed("months must be an integer", key="api.maintenance.months_integer")
     if not 1 <= months <= MAX_INTERVAL_MONTHS:
-        raise ValidationFailed(f"months must be between 1 and {MAX_INTERVAL_MONTHS}")
+        raise ValidationFailed(
+            f"months must be between 1 and {MAX_INTERVAL_MONTHS}",
+            key="api.maintenance.months_between_1_maximum",
+            params={"maximum": MAX_INTERVAL_MONTHS},
+        )
     total = value.year * 12 + (value.month - 1) + months
     year, month_index = divmod(total, 12)
     month = month_index + 1
@@ -160,7 +164,9 @@ def add_months(value: date, months: int) -> date:
         last_day = calendar.monthrange(year, month)[1]
         return date(year, month, min(value.day, last_day))
     except ValueError:
-        raise ValidationFailed("resulting date is out of range") from None
+        raise ValidationFailed(
+            "resulting date is out of range", key="api.maintenance.resulting_date_out_range"
+        ) from None
 
 
 def _iso_date(value: date | None) -> str | None:
@@ -173,25 +179,38 @@ def _iso_datetime(value: datetime | None) -> str | None:
 
 def _checked_date(value: Any, label: str) -> date:
     if not isinstance(value, date) or isinstance(value, datetime):
-        raise ValidationFailed(f"{label} must be an ISO date")
+        raise ValidationFailed(
+            f"{label} must be an ISO date",
+            key="api.maintenance.field_iso_date",
+            params={"field": label},
+        )
     return value
 
 
 def _checked_interval(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool):
-        raise ValidationFailed("intervalMonths must be an integer")
+        raise ValidationFailed(
+            "intervalMonths must be an integer", key="api.maintenance.intervalmonths_integer"
+        )
     if not 1 <= value <= MAX_INTERVAL_MONTHS:
-        raise ValidationFailed(f"intervalMonths must be between 1 and {MAX_INTERVAL_MONTHS}")
+        raise ValidationFailed(
+            f"intervalMonths must be between 1 and {MAX_INTERVAL_MONTHS}",
+            key="api.maintenance.intervalmonths_between_1_maximum",
+            params={"maximum": MAX_INTERVAL_MONTHS},
+        )
     return value
 
 
 def _checked_type(value: Any) -> str:
     if not isinstance(value, str):
-        raise ValidationFailed("maintenanceType must be text")
+        raise ValidationFailed(
+            "maintenanceType must be text", key="api.maintenance.maintenancetype_text"
+        )
     normalized = value.strip().lower()
     if not _TYPE_PATTERN.fullmatch(normalized):
         raise ValidationFailed(
-            "maintenanceType must be 2-32 lowercase letters, digits or underscores"
+            "maintenanceType must be 2-32 lowercase letters, digits or underscores",
+            key="api.maintenance.maintenancetype_2_32_lowercase_letters_digits_underscores",
         )
     return normalized
 
@@ -200,45 +219,71 @@ def _checked_tasks(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
     if isinstance(value, str) or not isinstance(value, Iterable):
-        raise ValidationFailed("tasks must be a list of text")
+        raise ValidationFailed(
+            "tasks must be a list of text", key="api.maintenance.tasks_list_text"
+        )
     items: list[str] = []
     for raw in value:
         if not isinstance(raw, str):
-            raise ValidationFailed("tasks must contain text")
+            raise ValidationFailed(
+                "tasks must contain text", key="api.maintenance.tasks_contain_text"
+            )
         task = raw.strip()
         if not task or len(task) > MAX_TASK_LENGTH:
-            raise ValidationFailed(f"task must be 1-{MAX_TASK_LENGTH} characters")
+            raise ValidationFailed(
+                f"task must be 1-{MAX_TASK_LENGTH} characters",
+                key="api.maintenance.task_1_maximum_characters",
+                params={"maximum": MAX_TASK_LENGTH},
+            )
         if task not in items:
             items.append(task)
     if len(items) > MAX_TASKS:
-        raise ValidationFailed(f"tasks must have at most {MAX_TASKS} entries")
+        raise ValidationFailed(
+            f"tasks must have at most {MAX_TASKS} entries",
+            key="api.maintenance.tasks_most_maximum_entries",
+            params={"maximum": MAX_TASKS},
+        )
     return tuple(items)
 
 
 def _checked_uuid(value: Any, label: str) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValidationFailed(f"{label} is required")
+        raise ValidationFailed(
+            f"{label} is required", key="api.validation.field_required", params={"field": label}
+        )
     try:
         return str(UUID(value.strip()))
     except ValueError:
-        raise ValidationFailed(f"{label} must be a UUID") from None
+        raise ValidationFailed(
+            f"{label} must be a UUID", key="api.validation.field_uuid", params={"field": label}
+        ) from None
 
 
 def _checked_bool(value: Any, label: str) -> bool:
     if not isinstance(value, bool):
-        raise ValidationFailed(f"{label} must be a boolean")
+        raise ValidationFailed(
+            f"{label} must be a boolean",
+            key="api.validation.field_boolean",
+            params={"field": label},
+        )
     return value
 
 
 def _checked_limit(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or not 1 <= value <= MAX_LIMIT:
-        raise ValidationFailed(f"limit must be between 1 and {MAX_LIMIT}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {MAX_LIMIT}",
+            key="api.validation.limit_range",
+            params={"maximum": MAX_LIMIT},
+        )
     return value
 
 
 def _checked_offset(value: Any) -> int:
     if not isinstance(value, int) or isinstance(value, bool) or value < 0:
-        raise ValidationFailed("offset must be zero or greater")
+        raise ValidationFailed(
+            "offset must be zero or greater", key="api.validation.offset_non_negative"
+        )
     return value
 
 
@@ -250,10 +295,13 @@ def _checked_optional_date(value: Any, label: str) -> date | None:
 
 def _normalized_category(value: Any) -> str:
     if not isinstance(value, str) or not value.strip():
-        raise ValidationFailed("category is required")
+        raise ValidationFailed("category is required", key="api.maintenance.category_required")
     text = value.strip()
     if len(text) > 64:
-        raise ValidationFailed("category must have at most 64 characters")
+        raise ValidationFailed(
+            "category must have at most 64 characters",
+            key="api.maintenance.category_most_64_characters",
+        )
     return text
 
 
@@ -532,7 +580,10 @@ class MaintenanceService:
         if not required:
             row = self._session.get(DirectoryPerson, checked)
             if row is None:
-                raise NotFound("responsible person not found")
+                raise NotFound(
+                    "responsible person not found",
+                    key="api.maintenance.responsible_person_not_found",
+                )
             return row.id, row.name
         label = DirectoryService(self._session, self._settings).person_label(principal, checked)
         return checked, label
@@ -541,9 +592,9 @@ class MaintenanceService:
         checked = _checked_uuid(asset_id, "assetId")
         asset = self._session.get(Asset, checked)
         if asset is None:
-            raise NotFound("asset not found")
+            raise NotFound("asset not found", key="api.maintenance.asset_not_found")
         if require_active and asset.archived_at is not None:
-            raise Conflict("asset is archived")
+            raise Conflict("asset is archived", key="api.maintenance.asset_archived")
         return asset
 
     def _plan_key(self, plan_id_value: Any) -> str:
@@ -670,7 +721,9 @@ class MaintenanceService:
         if row is not None:
             asset = self._session.get(Asset, row.asset_id)
             if asset is None:
-                raise NotFound("maintenance plan not found")
+                raise NotFound(
+                    "maintenance plan not found", key="api.maintenance.maintenance_plan_not_found"
+                )
             return self._row_effective(row), asset
         templates, catalog = self._template_maps()
         statement = select(Asset)
@@ -680,7 +733,9 @@ class MaintenanceService:
             effective = self._virtual_effective(asset, DEFAULT_TYPE, templates, catalog)
             if effective is not None and effective.id == checked:
                 return effective, asset
-        raise NotFound("maintenance plan not found")
+        raise NotFound(
+            "maintenance plan not found", key="api.maintenance.maintenance_plan_not_found"
+        )
 
     def _record_history(
         self,
@@ -752,7 +807,9 @@ class MaintenanceService:
         catalog = self._catalog_categories()
         key = self._category_key(_normalized_category(category), catalog)
         if key is None:
-            raise ValidationFailed("unknown asset category")
+            raise ValidationFailed(
+                "unknown asset category", key="api.maintenance.unknown_asset_category"
+            )
         checked_type = _checked_type(maintenance_type)
         checked_interval = _checked_interval(interval_months)
         checked_tasks = _checked_tasks(tasks)
@@ -762,7 +819,10 @@ class MaintenanceService:
         if self._session.get(MaintenanceTemplate, checked_id) is not None or (
             checked_type == DEFAULT_TYPE
         ):
-            raise Conflict("template already exists; update it instead")
+            raise Conflict(
+                "template already exists; update it instead",
+                key="api.maintenance.template_already_exists_update_instead",
+            )
         row = MaintenanceTemplate(
             id=checked_id,
             category=key,
@@ -810,7 +870,10 @@ class MaintenanceService:
                 None,
             )
             if record is None:
-                raise NotFound("maintenance template not found")
+                raise NotFound(
+                    "maintenance template not found",
+                    key="api.maintenance.maintenance_template_not_found",
+                )
         interval_value: Any = _UNSET
         if interval_months is not _UNSET:
             interval_value = _checked_interval(interval_months)
@@ -862,8 +925,14 @@ class MaintenanceService:
         if row is None:
             catalog = self._catalog_categories()
             if any(template_id(item["id"], DEFAULT_TYPE) == checked_id for item in catalog):
-                raise Conflict("a preconfigured default cannot be deleted; edit it instead")
-            raise NotFound("maintenance template not found")
+                raise Conflict(
+                    "a preconfigured default cannot be deleted; edit it instead",
+                    key="api.maintenance.preconfigured_default_cannot_deleted_edit_instead",
+                )
+            raise NotFound(
+                "maintenance template not found",
+                key="api.maintenance.maintenance_template_not_found",
+            )
         self._session.delete(row)
         self._session.flush()
         self._identity.record_operation(
@@ -938,17 +1007,29 @@ class MaintenanceService:
         """Read effective plans with bounded filters and pagination; never writes."""
         self._identity.authorize(principal, "assets.view", resource="inventory:assets")
         if state is not None and state not in PLAN_STATES:
-            raise ValidationFailed("state must be pending, upcoming or overdue")
+            raise ValidationFailed(
+                "state must be pending, upcoming or overdue",
+                key="api.maintenance.state_pending_upcoming_overdue",
+            )
         if status is not None and status not in PLAN_STATUSES:
-            raise ValidationFailed("status must be active, postponed or cancelled")
+            raise ValidationFailed(
+                "status must be active, postponed or cancelled",
+                key="api.maintenance.status_active_postponed_cancelled",
+            )
         if (
             not isinstance(upcoming_days, int)
             or isinstance(upcoming_days, bool)
             or not (0 <= upcoming_days <= MAX_UPCOMING_DAYS)
         ):
-            raise ValidationFailed(f"upcomingDays must be between 0 and {MAX_UPCOMING_DAYS}")
+            raise ValidationFailed(
+                f"upcomingDays must be between 0 and {MAX_UPCOMING_DAYS}",
+                key="api.maintenance.upcomingdays_between_0_maximum",
+                params={"maximum": MAX_UPCOMING_DAYS},
+            )
         if not isinstance(archived, bool):
-            raise ValidationFailed("archived must be a boolean")
+            raise ValidationFailed(
+                "archived must be a boolean", key="api.maintenance.archived_boolean"
+            )
         limit_value = _checked_limit(limit)
         offset_value = _checked_offset(offset)
         if maintenance_type is not None:
@@ -960,13 +1041,18 @@ class MaintenanceService:
         completed_from_value = _checked_optional_date(completed_from, "completedFrom")
         completed_to_value = _checked_optional_date(completed_to, "completedTo")
         if due_from_value and due_to_value and due_from_value > due_to_value:
-            raise ValidationFailed("dueFrom cannot be after dueTo")
+            raise ValidationFailed(
+                "dueFrom cannot be after dueTo", key="api.maintenance.duefrom_cannot_after_dueto"
+            )
         if (
             completed_from_value
             and completed_to_value
             and completed_from_value > completed_to_value
         ):
-            raise ValidationFailed("completedFrom cannot be after completedTo")
+            raise ValidationFailed(
+                "completedFrom cannot be after completedTo",
+                key="api.maintenance.completedfrom_cannot_after_completedto",
+            )
 
         templates, catalog = self._template_maps()
         statement = select(Asset).where(
@@ -991,7 +1077,9 @@ class MaintenanceService:
             statement = statement.where(func.lower(Asset.category).in_(candidates))
         if site is not None:
             if not isinstance(site, str) or not site.strip():
-                raise ValidationFailed("site must be non-empty text")
+                raise ValidationFailed(
+                    "site must be non-empty text", key="api.maintenance.site_non_empty_text"
+                )
             statement = statement.where(func.lower(Asset.site) == site.strip().casefold())
         if site_id is not None:
             statement = statement.where(Asset.site_id == site_id)
@@ -1080,11 +1168,17 @@ class MaintenanceService:
         template = self._template_for(asset.category, checked_type, templates, catalog)
         existing = self._session.get(MaintenancePlan, plan_id(asset.id, checked_type))
         if existing is not None:
-            raise Conflict("a plan for this asset and maintenance type already exists")
+            raise Conflict(
+                "a plan for this asset and maintenance type already exists",
+                key="api.maintenance.plan_asset_maintenance_type_already_exists",
+            )
 
         if interval_months is _UNSET:
             if template is None:
-                raise ValidationFailed("intervalMonths is required when no template exists")
+                raise ValidationFailed(
+                    "intervalMonths is required when no template exists",
+                    key="api.maintenance.intervalmonths_required_when_no_template_exists",
+                )
             interval_value = template.interval_months
         else:
             interval_value = _checked_interval(interval_months)
@@ -1227,18 +1321,27 @@ class MaintenanceService:
         notes: Any,
     ) -> MaintenancePlanView:
         if effective.status == STATUS_CANCELLED:
-            raise Conflict("a cancelled plan cannot be completed")
+            raise Conflict(
+                "a cancelled plan cannot be completed",
+                key="api.maintenance.cancelled_plan_cannot_completed",
+            )
         today = _today()
         completed_value = (
             today if completed_on is None else _checked_date(completed_on, "completedOn")
         )
         if completed_value > today:
-            raise ValidationFailed("completedOn cannot be in the future")
+            raise ValidationFailed(
+                "completedOn cannot be in the future",
+                key="api.maintenance.completedon_cannot_in_future",
+            )
         if (
             effective.last_completed_on is not None
             and completed_value <= effective.last_completed_on
         ):
-            raise Conflict("completedOn must be after the last completion")
+            raise Conflict(
+                "completedOn must be after the last completion",
+                key="api.maintenance.completedon_after_last_completion",
+            )
         row = self._ensure_row(effective)
         old_status = row.status
         old_last = row.last_completed_on
@@ -1320,7 +1423,10 @@ class MaintenanceService:
         effective, asset = self._resolve(plan_id_value)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if effective.status == STATUS_CANCELLED:
-            raise Conflict("a cancelled plan cannot be postponed")
+            raise Conflict(
+                "a cancelled plan cannot be postponed",
+                key="api.maintenance.cancelled_plan_cannot_postponed",
+            )
         due_value = _checked_date(due_on, "dueOn")
         row = self._ensure_row(effective)
         old_status = row.status
@@ -1360,7 +1466,10 @@ class MaintenanceService:
         effective, asset = self._resolve(plan_id_value)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
         if effective.status == STATUS_CANCELLED:
-            raise Conflict("a cancelled plan cannot be cancelled again")
+            raise Conflict(
+                "a cancelled plan cannot be cancelled again",
+                key="api.maintenance.cancelled_plan_cannot_cancelled_again",
+            )
         row = self._ensure_row(effective)
         old_status = row.status
         old_due = row.due_on
@@ -1411,7 +1520,11 @@ class MaintenanceService:
             or isinstance(horizon_days, bool)
             or not (0 <= horizon_days <= MAX_UPCOMING_DAYS)
         ):
-            raise ValidationFailed(f"horizon_days must be between 0 and {MAX_UPCOMING_DAYS}")
+            raise ValidationFailed(
+                f"horizon_days must be between 0 and {MAX_UPCOMING_DAYS}",
+                key="api.maintenance.horizon_days_between_0_maximum",
+                params={"maximum": MAX_UPCOMING_DAYS},
+            )
         limit_value = _checked_limit(limit)
         offset_value = _checked_offset(offset)
         templates, catalog = self._template_maps()
