@@ -47,6 +47,7 @@ MIGRATION_REFERENCE_TABLES: frozenset[str] = frozenset(
         "ai_usage_quota_policy",
         "identity_role_policies",
         "identity_roles",
+        "i18n_registry_state",
         "identity_security_settings",
         "inventory_catalog",
         "inventory_code_sequences",
