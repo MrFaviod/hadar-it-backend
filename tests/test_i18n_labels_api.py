@@ -347,6 +347,28 @@ def test_fixed_state_ids_gain_localized_labels_without_changing_ids(
     assert plan.json()["status"] == "active"
     assert plan.json()["statusLabel"] == t("api.maintenance.status.active", "es")
 
+    english_intervention = client.get(
+        f"{API}/interventions/{intervention.json()['id']}", headers=headers(auth, "en")
+    )
+    assert english_intervention.status_code == 200, english_intervention.text
+    assert english_intervention.json()["type"] == "corrective"
+    assert english_intervention.json()["typeLabel"] == t("api.interventions.type.corrective", "en")
+    assert english_intervention.json()["statusLabel"] == t("api.interventions.state.open", "en")
+
+    english_incident = client.get(
+        f"{API}/incidents/{incident.json()['id']}", headers=headers(auth, "en")
+    )
+    assert english_incident.status_code == 200, english_incident.text
+    assert english_incident.json()["priorityLabel"] == t("api.interventions.priority.normal", "en")
+    assert english_incident.json()["statusLabel"] == t("api.interventions.state.open", "en")
+
+    english_plan = client.get(
+        f"{API}/maintenance/plans/{plan.json()['id']}", headers=headers(auth, "en")
+    )
+    assert english_plan.status_code == 200, english_plan.text
+    assert english_plan.json()["status"] == "active"
+    assert english_plan.json()["statusLabel"] == t("api.maintenance.status.active", "en")
+
 
 def test_fixed_state_catalog_keys_cover_both_core_locales() -> None:
     for state in ("in_use", "in_storage", "maintenance", "retired"):

@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Body, Depends, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import AuthContext, IdentityService
 from itsm.maintenance.service import (
@@ -89,6 +90,7 @@ def get_maintenance_service(request: Request) -> Iterator[MaintenanceService]:
             request.app.state.settings,
             identity=identity,
             source="rest",
+            locale=resolve_request_locale(request),
         )
     finally:
         session.close()

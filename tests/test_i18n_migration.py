@@ -28,9 +28,16 @@ def test_i18n_preferences_migration_upgrades_and_downgrades(
         settings, "identity_security_settings"
     )
 
-    # Two steps: the registry revision sits on top of the preference columns.
+    # Later i18n revisions sit on top; step back to the revision before 0038.
     downgrade = run_cli(
-        ["-m", "alembic", "-c", str(BACKEND_ROOT / "alembic.ini"), "downgrade", "-2"],
+        [
+            "-m",
+            "alembic",
+            "-c",
+            str(BACKEND_ROOT / "alembic.ini"),
+            "downgrade",
+            "0037_ext_core_call_principal",
+        ],
         settings,
     )
     assert downgrade.returncode == 0, downgrade.stderr

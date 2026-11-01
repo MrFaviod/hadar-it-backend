@@ -9,6 +9,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, Query, Request
 from pydantic import BaseModel, ConfigDict, Field
 
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.interventions.service import (
     AFFECTED_MAX,
@@ -92,7 +93,9 @@ class ResolutionConfirmInput(Input):
 
 def get_intervention_service(request: Request):
     with request.app.state.session_factory() as session:
-        yield InterventionService(session, request.app.state.settings)
+        yield InterventionService(
+            session, request.app.state.settings, locale=resolve_request_locale(request)
+        )
 
 
 Service = Annotated[InterventionService, Depends(get_intervention_service)]

@@ -140,7 +140,7 @@ def test_a_failed_sqlite_revision_rolls_back_its_ddl(
     tables, revision = sqlite_state(settings.database_url)
     assert "probe_partial" not in tables
     assert "itsm_infrastructure" in tables
-    assert revision == "0039_i18n_registry"
+    assert revision == "0041_i18n_labels"
 
 
 def test_a_successful_sqlite_revision_commits_its_ddl(
@@ -194,7 +194,7 @@ def test_business_routes_are_refused_while_migrations_are_pending(
     assert ready.status_code == 503
     assert ready.json()["checks"]["migrations"] == "pending"
 
-    set_recorded_revision(settings.database_url, "0039_i18n_registry")
+    set_recorded_revision(settings.database_url, "0041_i18n_labels")
 
     served = test_client.get("/api/v1/assets")
     assert served.status_code in {401, 403}
