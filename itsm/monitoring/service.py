@@ -106,24 +106,51 @@ def _iso(value: datetime | None) -> str | None:
 def _text(value: Any, field: str, *, max_length: int, required: bool = False) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required",
+                key="api.validation.field_required",
+                params={"field": field},
+            )
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field} must be a string")
+        raise ValidationFailed(
+            f"{field} must be a string", key="api.validation.field_text", params={"field": field}
+        )
     cleaned = value.strip()
     if required and not cleaned:
-        raise ValidationFailed(f"{field} is required")
+        raise ValidationFailed(
+            f"{field} is required",
+            key="api.validation.field_required",
+            params={"field": field},
+        )
     if len(cleaned) > max_length:
-        raise ValidationFailed(f"{field} must be at most {max_length} characters")
+        raise ValidationFailed(
+            f"{field} must be at most {max_length} characters",
+            key="api.validation.field_max_length",
+            params={"field": field, "limit": max_length},
+        )
     if any(ord(character) < 32 for character in cleaned):
-        raise ValidationFailed(f"{field} contains control characters")
+        raise ValidationFailed(
+            f"{field} contains control characters",
+            key="api.monitoring.field_control_characters",
+            params={"field": field},
+        )
     return cleaned or None
 
 
 def _uuid(value: Any, field: str) -> str:
     if not isinstance(value, str) or not _UUID.fullmatch(value.strip()):
-        raise ValidationFailed(f"{field} must be a UUID")
+        raise ValidationFailed(
+            f"{field} must be a UUID", key="api.validation.field_uuid", params={"field": field}
+        )
     return str(UUID(value.strip()))
+
+
+def _missing(field: str) -> NotFound:
+    """One localized not-found error for a monitoring resource label."""
+    return NotFound(
+        f"{field} not found", key="api.monitoring.record_not_found", params={"field": field}
+    )
 
 
 def _bounded(limit: Any, offset: Any) -> tuple[int, int]:
@@ -131,11 +158,19 @@ def _bounded(limit: Any, offset: Any) -> tuple[int, int]:
         bounded_limit = int(limit)
         bounded_offset = int(offset)
     except (TypeError, ValueError) as exc:
-        raise ValidationFailed("limit and offset must be integers") from exc
+        raise ValidationFailed(
+            "limit and offset must be integers", key="api.monitoring.paging_integers"
+        ) from exc
     if not 1 <= bounded_limit <= rules.MAX_LIMIT:
-        raise ValidationFailed(f"limit must be between 1 and {rules.MAX_LIMIT}")
+        raise ValidationFailed(
+            f"limit must be between 1 and {rules.MAX_LIMIT}",
+            key="api.validation.limit_range",
+            params={"maximum": rules.MAX_LIMIT},
+        )
     if bounded_offset < 0:
-        raise ValidationFailed("offset must be zero or greater")
+        raise ValidationFailed(
+            "offset must be zero or greater", key="api.validation.offset_non_negative"
+        )
     return bounded_limit, bounded_offset
 
 
@@ -146,11 +181,23 @@ def _datetime_arg(value: Any, field: str) -> datetime:
         try:
             parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
         except ValueError as exc:
-            raise ValidationFailed(f"{field} must be an ISO-8601 datetime") from exc
+            raise ValidationFailed(
+                f"{field} must be an ISO-8601 datetime",
+                key="api.monitoring.field_iso_datetime",
+                params={"field": field},
+            ) from exc
     else:
-        raise ValidationFailed(f"{field} must be an ISO-8601 datetime")
+        raise ValidationFailed(
+            f"{field} must be an ISO-8601 datetime",
+            key="api.monitoring.field_iso_datetime",
+            params={"field": field},
+        )
     if parsed.tzinfo is None:
-        raise ValidationFailed(f"{field} must include a timezone")
+        raise ValidationFailed(
+            f"{field} must include a timezone",
+            key="api.monitoring.field_timezone_required",
+            params={"field": field},
+        )
     return as_utc(parsed)
 
 
@@ -171,10 +218,18 @@ def _severity(value: Any) -> str:
 def _slug(value: Any, field: str, *, required: bool = False) -> str | None:
     if value is None:
         if required:
-            raise ValidationFailed(f"{field} is required")
+            raise ValidationFailed(
+                f"{field} is required",
+                key="api.validation.field_required",
+                params={"field": field},
+            )
         return None
     if not isinstance(value, str) or not rules.SLUG_PATTERN.fullmatch(value.strip()):
-        raise ValidationFailed(f"{field} must be 1-64 letters, digits, dots, dashes or underscores")
+        raise ValidationFailed(
+            f"{field} must be 1-64 letters, digits, dots, dashes or underscores",
+            key="api.monitoring.field_slug",
+            params={"field": field},
+        )
     return value.strip()
 
 
@@ -184,9 +239,13 @@ def _host_port(value: str) -> tuple[str | None, int | None, str]:
         parts = urlsplit(f"//{value}")
         port = parts.port
     except ValueError as exc:
-        raise ValidationFailed("target has an invalid port") from exc
+        raise ValidationFailed(
+            "target has an invalid port", key="api.monitoring.target_invalid_port"
+        ) from exc
     if parts.username is not None or parts.password is not None:
-        raise ValidationFailed("target must not carry credentials")
+        raise ValidationFailed(
+            "target must not carry credentials", key="api.monitoring.target_credentials"
+        )
     host = parts.hostname
     path = parts.path.rstrip("/")
     return host, port, path
@@ -197,13 +256,17 @@ def _validate_target(value: Any, check_type: str | None) -> str | None:
     if target is None:
         return None
     if any(character.isspace() for character in target):
-        raise ValidationFailed("target must not contain whitespace")
+        raise ValidationFailed(
+            "target must not contain whitespace", key="api.monitoring.target_whitespace"
+        )
     if check_type == "http":
         try:
             parts = urlsplit(target)
             port = parts.port
         except ValueError as exc:
-            raise ValidationFailed("target must be a valid http(s) URL") from exc
+            raise ValidationFailed(
+                "target must be a valid http(s) URL", key="api.monitoring.target_invalid_url"
+            ) from exc
         if (
             parts.scheme not in {"http", "https"}
             or not parts.hostname
@@ -212,17 +275,30 @@ def _validate_target(value: Any, check_type: str | None) -> str | None:
             or parts.fragment
             or (port is not None and not 1 <= port <= 65535)
         ):
-            raise ValidationFailed("target must be an http(s) URL without credentials or fragment")
+            raise ValidationFailed(
+                "target must be an http(s) URL without credentials or fragment",
+                key="api.monitoring.target_url_restricted",
+            )
         return target
     if "://" in target or "/" in target or "?" in target or "#" in target:
-        raise ValidationFailed("target must be a host or host:port")
+        raise ValidationFailed(
+            "target must be a host or host:port", key="api.monitoring.target_host_shape"
+        )
     host, port, path = _host_port(target)
     if not host or path:
-        raise ValidationFailed("target must be a host or host:port")
+        raise ValidationFailed(
+            "target must be a host or host:port", key="api.monitoring.target_host_shape"
+        )
     if port is not None and not 1 <= port <= 65535:
-        raise ValidationFailed("target port must be between 1 and 65535")
+        raise ValidationFailed(
+            "target port must be between 1 and 65535", key="api.monitoring.target_port_range"
+        )
     if check_type in {"node", "windows", "tcp"} and port is None:
-        raise ValidationFailed(f"target for {check_type} checks must include a port")
+        raise ValidationFailed(
+            f"target for {check_type} checks must include a port",
+            key="api.monitoring.target_port_required",
+            params={"check_type": str(check_type)},
+        )
     return target
 
 
@@ -239,16 +315,25 @@ def _validate_thresholds(value: Any, check_type: str | None) -> dict[str, dict[s
     if value is None:
         return {}
     if not isinstance(value, Mapping) or len(value) > len(rules.METRIC_CATALOG):
-        raise ValidationFailed("thresholds must be an object with bounded metric keys")
+        raise ValidationFailed(
+            "thresholds must be an object with bounded metric keys",
+            key="api.monitoring.thresholds_object",
+        )
     allowed = set(rules.CHECK_METRICS.get(check_type or "", ()))
     cleaned: dict[str, dict[str, float]] = {}
     for metric, bounds in value.items():
         if metric not in allowed:
             raise ValidationFailed(
-                f"threshold metric '{metric}' is not available for this check type"
+                f"threshold metric '{metric}' is not available for this check type",
+                key="api.monitoring.threshold_metric_unavailable",
+                params={"metric": str(metric)},
             )
         if not isinstance(bounds, Mapping) or not bounds or set(bounds) - {"warning", "critical"}:
-            raise ValidationFailed(f"thresholds for '{metric}' must use warning and/or critical")
+            raise ValidationFailed(
+                f"thresholds for '{metric}' must use warning and/or critical",
+                key="api.monitoring.threshold_severity_fields",
+                params={"metric": str(metric)},
+            )
         low, high = _threshold_bounds(metric)
         entry: dict[str, float] = {}
         for severity in ("warning", "critical"):
@@ -256,27 +341,48 @@ def _validate_thresholds(value: Any, check_type: str | None) -> dict[str, dict[s
                 continue
             raw = bounds[severity]
             if isinstance(raw, bool) or not isinstance(raw, (int, float)):
-                raise ValidationFailed(f"{metric}.{severity} must be a number")
+                raise ValidationFailed(
+                    f"{metric}.{severity} must be a number",
+                    key="api.monitoring.threshold_number",
+                    params={"metric": str(metric), "severity": severity},
+                )
             number = float(raw)
             if not math.isfinite(number) or not low < number <= high:
                 raise ValidationFailed(
-                    f"{metric}.{severity} must be greater than {low} and at most {high}"
+                    f"{metric}.{severity} must be greater than {low} and at most {high}",
+                    key="api.monitoring.threshold_number_range",
+                    params={
+                        "metric": str(metric),
+                        "severity": severity,
+                        "low": low,
+                        "high": high,
+                    },
                 )
             entry[severity] = round(number, 4)
         if "warning" in entry and "critical" in entry and entry["warning"] >= entry["critical"]:
-            raise ValidationFailed(f"{metric}.warning must be lower than {metric}.critical")
+            raise ValidationFailed(
+                f"{metric}.warning must be lower than {metric}.critical",
+                key="api.monitoring.threshold_warning_critical",
+                params={"metric": str(metric)},
+            )
         cleaned[metric] = entry
     return cleaned
 
 
 def _validate_metrics(value: Any, check_type: str | None) -> list[str]:
     if not isinstance(value, list) or len(value) > len(rules.METRIC_CATALOG):
-        raise ValidationFailed("metrics must be a bounded list")
+        raise ValidationFailed(
+            "metrics must be a bounded list", key="api.monitoring.metrics_bounded"
+        )
     allowed = rules.CHECK_METRICS.get(check_type or "", ())
     requested: list[str] = []
     for metric in value:
         if not isinstance(metric, str) or metric not in allowed:
-            raise ValidationFailed(f"metric '{metric}' is not available for this check type")
+            raise ValidationFailed(
+                f"metric '{metric}' is not available for this check type",
+                key="api.monitoring.metric_unavailable",
+                params={"metric": str(metric)},
+            )
         if metric not in requested:
             requested.append(metric)
     return [metric for metric in allowed if metric in requested]
@@ -286,13 +392,18 @@ def _validate_check_type(value: Any) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str) or value not in rules.CHECK_TYPES:
-        raise ValidationFailed("checkType is not a supported check type")
+        raise ValidationFailed(
+            "checkType is not a supported check type", key="api.monitoring.check_type_unsupported"
+        )
     return value
 
 
 def _validate_interval(value: Any) -> int:
     if isinstance(value, bool) or not isinstance(value, int) or value not in rules.INTERVAL_PRESETS:
-        raise ValidationFailed("intervalSeconds must be one of 30, 60, 300 or 900")
+        raise ValidationFailed(
+            "intervalSeconds must be one of 30, 60, 300 or 900",
+            key="api.monitoring.interval_preset",
+        )
     return value
 
 
@@ -302,7 +413,10 @@ def _validate_minimum_duration(value: Any) -> int:
         or not isinstance(value, int)
         or value not in rules.MINIMUM_DURATION_PRESETS
     ):
-        raise ValidationFailed("minimumDurationSeconds must be one of 0, 60, 300 or 900")
+        raise ValidationFailed(
+            "minimumDurationSeconds must be one of 0, 60, 300 or 900",
+            key="api.monitoring.minimum_duration_preset",
+        )
     return value
 
 
@@ -356,21 +470,21 @@ class MonitoringService:
         key = _uuid(asset_id, "assetId")
         asset = self._session.get(Asset, key)
         if asset is None:
-            raise NotFound("asset not found")
+            raise _missing("asset")
         return asset
 
     def _exporter(self, exporter_id: Any) -> MonitorExporter:
         key = _uuid(exporter_id, "exporterId")
         row = self._session.get(MonitorExporter, key)
         if row is None:
-            raise NotFound("exporter not found")
+            raise _missing("exporter")
         return row
 
     def _alert(self, alert_id: Any) -> MonitoringAlert:
         key = _uuid(alert_id, "alertId")
         row = self._session.get(MonitoringAlert, key)
         if row is None:
-            raise NotFound("alert not found")
+            raise _missing("alert")
         return row
 
     def _event(self, alert: MonitoringAlert, event_key: str) -> bool:
@@ -577,20 +691,35 @@ class MonitoringService:
         self, category: str, values: Mapping[str, Any], current: dict[str, Any]
     ) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("profile values must be an object")
+            raise ValidationFailed(
+                "profile values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "profile"},
+            )
         unknown = set(values) - set(PROFILE_KEYS)
         if unknown:
-            raise ValidationFailed(f"unsupported profile field: {sorted(unknown)[0]}")
+            raise ValidationFailed(
+                f"unsupported profile field: {sorted(unknown)[0]}",
+                key="api.monitoring.unsupported_field",
+                params={"field": str(sorted(unknown)[0])},
+            )
         candidate = dict(current)
         if "enabled" in values:
             if not isinstance(values["enabled"], bool):
-                raise ValidationFailed("enabled must be a boolean")
+                raise ValidationFailed(
+                    "enabled must be a boolean",
+                    key="api.validation.field_boolean",
+                    params={"field": "enabled"},
+                )
             candidate["enabled"] = values["enabled"]
         if "checkType" in values:
             candidate["checkType"] = _validate_check_type(values["checkType"])
         check_type = candidate.get("checkType")
         if candidate.get("enabled") and check_type is None:
-            raise ValidationFailed("checkType is required when monitoring is enabled")
+            raise ValidationFailed(
+                "checkType is required when monitoring is enabled",
+                key="api.monitoring.check_type_required_enabled",
+            )
         if "intervalSeconds" in values:
             candidate["intervalSeconds"] = _validate_interval(values["intervalSeconds"])
         if "minimumDurationSeconds" in values:
@@ -621,7 +750,11 @@ class MonitoringService:
             exporter = self._session.get(MonitorExporter, exporter_id)
             expected = rules.EXPORTER_FOR_CHECK.get(check_type or "")
             if exporter is not None and expected and exporter.kind != expected:
-                raise ValidationFailed(f"exporter kind must be {expected} for {check_type} checks")
+                raise ValidationFailed(
+                    f"exporter kind must be {expected} for {check_type} checks",
+                    key="api.monitoring.exporter_kind_mismatch",
+                    params={"expected": str(expected), "check_type": str(check_type)},
+                )
         return candidate
 
     def update_profile(
@@ -658,10 +791,18 @@ class MonitoringService:
         self._identity.authorize(principal, "assets.edit", resource="monitoring:assets")
         asset = self._asset(asset_id)
         if not isinstance(values, Mapping):
-            raise ValidationFailed("asset monitoring values must be an object")
+            raise ValidationFailed(
+                "asset monitoring values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "asset monitoring"},
+            )
         unknown = set(values) - set(CONFIG_KEYS)
         if unknown:
-            raise ValidationFailed(f"unsupported monitoring field: {sorted(unknown)[0]}")
+            raise ValidationFailed(
+                f"unsupported monitoring field: {sorted(unknown)[0]}",
+                key="api.monitoring.unsupported_field",
+                params={"field": str(sorted(unknown)[0])},
+            )
         effective = self._effective(asset)
         candidate = dict(effective)
         for key in CONFIG_KEYS:
@@ -672,11 +813,16 @@ class MonitoringService:
             and values["enabled"] is not None
             and not isinstance(values["enabled"], bool)
         ):
-            raise ValidationFailed("enabled must be a boolean or null")
+            raise ValidationFailed(
+                "enabled must be a boolean or null", key="api.monitoring.enabled_boolean_or_null"
+            )
         candidate["checkType"] = _validate_check_type(candidate.get("checkType"))
         check_type = candidate.get("checkType")
         if candidate.get("enabled") and check_type is None:
-            raise ValidationFailed("checkType is required when monitoring is enabled")
+            raise ValidationFailed(
+                "checkType is required when monitoring is enabled",
+                key="api.monitoring.check_type_required_enabled",
+            )
         candidate["intervalSeconds"] = _validate_interval(
             candidate.get("intervalSeconds", rules.DEFAULT_INTERVAL)
         )
@@ -692,7 +838,11 @@ class MonitoringService:
             exporter = self._exporter(exporter_id)
             expected = rules.EXPORTER_FOR_CHECK.get(check_type or "")
             if expected and exporter.kind != expected:
-                raise ValidationFailed(f"exporter kind must be {expected} for {check_type} checks")
+                raise ValidationFailed(
+                    f"exporter kind must be {expected} for {check_type} checks",
+                    key="api.monitoring.exporter_kind_mismatch",
+                    params={"expected": str(expected), "check_type": str(check_type)},
+                )
         candidate["target"] = _validate_target(candidate.get("target"), check_type)
         candidate["snmpModule"] = _slug(candidate.get("snmpModule"), "snmpModule")
         candidate["snmpAuthRef"] = _slug(candidate.get("snmpAuthRef"), "snmpAuthRef")
@@ -751,27 +901,46 @@ class MonitoringService:
     def save_exporter(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         self._identity.authorize(principal, "config.integrations", resource="monitoring:exporters")
         if not isinstance(values, Mapping):
-            raise ValidationFailed("exporter values must be an object")
+            raise ValidationFailed(
+                "exporter values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "exporter"},
+            )
         unknown = set(values) - set(EXPORTER_KEYS)
         if unknown:
-            raise ValidationFailed(f"unsupported exporter field: {sorted(unknown)[0]}")
+            raise ValidationFailed(
+                f"unsupported exporter field: {sorted(unknown)[0]}",
+                key="api.monitoring.unsupported_field",
+                params={"field": str(sorted(unknown)[0])},
+            )
         name = _text(values.get("name"), "name", max_length=64, required=True)
         kind = values.get("kind")
         if kind not in rules.EXPORTER_KINDS:
-            raise ValidationFailed("kind must be blackbox, snmp, node or windows")
+            raise ValidationFailed(
+                "kind must be blackbox, snmp, node or windows",
+                key="api.monitoring.exporter_kind_allowed",
+            )
         module = _slug(values.get("module"), "module", required=True)
         address = None
         if values.get("address") is not None:
             address = _text(values["address"], "address", max_length=200)
             if address is not None:
                 if "://" in address:
-                    raise ValidationFailed("address must be host:port")
+                    raise ValidationFailed(
+                        "address must be host:port", key="api.monitoring.exporter_address_shape"
+                    )
                 host, port, path = _host_port(address)
                 if not host or path or port is None:
-                    raise ValidationFailed("address must be host:port")
+                    raise ValidationFailed(
+                        "address must be host:port", key="api.monitoring.exporter_address_shape"
+                    )
         enabled = values.get("enabled", True)
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         row = None
         if values.get("id") is not None:
             row = self._exporter(values["id"])
@@ -786,7 +955,10 @@ class MonitoringService:
             )
         )
         if duplicate is not None:
-            raise Conflict("an exporter with that name already exists")
+            raise Conflict(
+                "an exporter with that name already exists",
+                key="api.monitoring.exporter_name_conflict",
+            )
         now = self._now()
         if row is None:
             row = MonitorExporter(id=str(uuid4()), created_at=now, updated_at=now)
@@ -912,7 +1084,9 @@ class MonitoringService:
         """
         self._identity.authorize(principal, "assets.view", resource="monitoring:dashboard")
         if period not in rules.PERIOD_PRESETS:
-            raise ValidationFailed("period must be one of 24h, 7d or 30d")
+            raise ValidationFailed(
+                "period must be one of 24h, 7d or 30d", key="api.monitoring.period_allowed"
+            )
         filters = [Asset.archived_at.is_(None)]
         if category is not None:
             cleaned_category = _text(category, "category", max_length=64)
@@ -1068,7 +1242,9 @@ class MonitoringService:
         self._identity.authorize(principal, "assets.view", resource="monitoring:devices")
         bounded_limit, bounded_offset = _bounded(limit, offset)
         if period not in rules.PERIOD_PRESETS:
-            raise ValidationFailed("period must be 24h, 7d or 30d")
+            raise ValidationFailed(
+                "period must be 24h, 7d or 30d", key="api.monitoring.period_allowed"
+            )
         statement = select(Asset)
         conditions = []
         if category:
@@ -1161,7 +1337,9 @@ class MonitoringService:
     ) -> dict[str, Any]:
         self._identity.authorize(principal, "assets.view", resource="monitoring:devices")
         if period not in rules.PERIOD_PRESETS:
-            raise ValidationFailed("period must be 24h, 7d or 30d")
+            raise ValidationFailed(
+                "period must be 24h, 7d or 30d", key="api.monitoring.period_allowed"
+            )
         asset = self._asset(asset_id)
         config = self._effective(asset)
         now = self._now()
@@ -1464,7 +1642,10 @@ class MonitoringService:
         conditions = []
         if state is not None:
             if state not in rules.ALERT_STATES:
-                raise ValidationFailed("state must be pending, firing or resolved")
+                raise ValidationFailed(
+                    "state must be pending, firing or resolved",
+                    key="api.monitoring.alert_state_allowed",
+                )
             conditions.append(MonitoringAlert.state == state)
         if asset_id is not None:
             conditions.append(MonitoringAlert.asset_id == _uuid(asset_id, "assetId"))
@@ -1578,23 +1759,38 @@ class MonitoringService:
     def silence(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         self._identity.authorize(principal, "assets.edit", resource="monitoring:silences")
         if not isinstance(values, Mapping):
-            raise ValidationFailed("silence values must be an object")
+            raise ValidationFailed(
+                "silence values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "silence"},
+            )
         unknown = set(values) - set(SILENCE_KEYS)
         if unknown:
-            raise ValidationFailed(f"unsupported silence field: {sorted(unknown)[0]}")
+            raise ValidationFailed(
+                f"unsupported silence field: {sorted(unknown)[0]}",
+                key="api.monitoring.unsupported_field",
+                params={"field": str(sorted(unknown)[0])},
+            )
         alert_id = values.get("alertId")
         asset_id = values.get("assetId")
         if bool(alert_id) == bool(asset_id):
-            raise ValidationFailed("a silence targets exactly one alert or asset")
+            raise ValidationFailed(
+                "a silence targets exactly one alert or asset",
+                key="api.monitoring.silence_single_target",
+            )
         alert = self._alert(alert_id) if alert_id else None
         asset = self._asset(asset_id) if asset_id else None
         comment = _text(values.get("comment"), "comment", max_length=200, required=True)
         ends_at = _datetime_arg(values.get("endsAt"), "endsAt")
         now = self._now()
         if ends_at <= now:
-            raise ValidationFailed("endsAt must be in the future")
+            raise ValidationFailed(
+                "endsAt must be in the future", key="api.monitoring.silence_end_future"
+            )
         if ends_at > now + timedelta(seconds=rules.MAX_SILENCE_SECONDS):
-            raise ValidationFailed("endsAt must be within 30 days")
+            raise ValidationFailed(
+                "endsAt must be within 30 days", key="api.monitoring.silence_end_window"
+            )
         if alert is not None:
             asset_id = alert.asset_id
         native_id = None
@@ -1749,10 +1945,18 @@ class MonitoringService:
         window_id: str | None,
     ) -> dict[str, Any]:
         if not isinstance(values, Mapping):
-            raise ValidationFailed("window values must be an object")
+            raise ValidationFailed(
+                "window values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "window"},
+            )
         unknown = set(values) - set(WINDOW_KEYS)
         if unknown:
-            raise ValidationFailed(f"unsupported window field: {sorted(unknown)[0]}")
+            raise ValidationFailed(
+                f"unsupported window field: {sorted(unknown)[0]}",
+                key="api.monitoring.unsupported_field",
+                params={"field": str(sorted(unknown)[0])},
+            )
         name = (
             _text(values.get("name"), "name", max_length=120, required=True)
             if "name" in values or current is None
@@ -1764,7 +1968,9 @@ class MonitoringService:
         if asset_ids is None:
             asset_ids = []
         if not isinstance(asset_ids, list) or len(asset_ids) > 50:
-            raise ValidationFailed("assetIds must be a bounded list")
+            raise ValidationFailed(
+                "assetIds must be a bounded list", key="api.monitoring.window_asset_ids_bounded"
+            )
         clean_assets: list[str] = []
         for asset_id in asset_ids:
             key = _uuid(asset_id, "assetIds")
@@ -1777,31 +1983,56 @@ class MonitoringService:
         if days is None:
             days = []
         if not isinstance(days, list) or len(days) > 7:
-            raise ValidationFailed("daysOfWeek must be a bounded list")
+            raise ValidationFailed(
+                "daysOfWeek must be a bounded list", key="api.monitoring.window_days_bounded"
+            )
         clean_days: list[int] = []
         for day in days:
             if isinstance(day, bool) or not isinstance(day, int) or not 0 <= day <= 6:
-                raise ValidationFailed("daysOfWeek values must be between 0 and 6")
+                raise ValidationFailed(
+                    "daysOfWeek values must be between 0 and 6",
+                    key="api.monitoring.window_day_range",
+                )
             if day not in clean_days:
                 clean_days.append(day)
         start_time = values.get("startTime", current.start_time if current else None)
         end_time = values.get("endTime", current.end_time if current else None)
         if not isinstance(start_time, str) or not _TIME.fullmatch(start_time):
-            raise ValidationFailed("startTime must use HH:MM")
+            raise ValidationFailed(
+                "startTime must use HH:MM",
+                key="api.monitoring.window_time_shape",
+                params={"field": "startTime"},
+            )
         if not isinstance(end_time, str) or not _TIME.fullmatch(end_time):
-            raise ValidationFailed("endTime must use HH:MM")
+            raise ValidationFailed(
+                "endTime must use HH:MM",
+                key="api.monitoring.window_time_shape",
+                params={"field": "endTime"},
+            )
         if start_time == end_time:
-            raise ValidationFailed("endTime must differ from startTime")
+            raise ValidationFailed(
+                "endTime must differ from startTime", key="api.monitoring.window_times_differ"
+            )
         timezone_name = values.get("timezone", current.timezone if current else None)
         if not isinstance(timezone_name, str) or len(timezone_name) > 64:
-            raise ValidationFailed("timezone must be an IANA timezone name")
+            raise ValidationFailed(
+                "timezone must be an IANA timezone name",
+                key="api.monitoring.window_timezone_invalid",
+            )
         try:
             ZoneInfo(timezone_name)
         except (ZoneInfoNotFoundError, ValueError) as exc:
-            raise ValidationFailed("timezone must be an IANA timezone name") from exc
+            raise ValidationFailed(
+                "timezone must be an IANA timezone name",
+                key="api.monitoring.window_timezone_invalid",
+            ) from exc
         enabled = values.get("enabled", current.enabled if current else True)
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         return {
             "id": window_id,
             "name": name,
@@ -1816,14 +2047,18 @@ class MonitoringService:
     def save_window(self, principal: Principal, values: Mapping[str, Any]) -> dict[str, Any]:
         self._identity.authorize(principal, "assets.edit", resource="monitoring:windows")
         if not isinstance(values, Mapping):
-            raise ValidationFailed("window values must be an object")
+            raise ValidationFailed(
+                "window values must be an object",
+                key="api.monitoring.values_object",
+                params={"entity": "window"},
+            )
         window_id = values.get("id")
         current = None
         if window_id is not None:
             key = _uuid(window_id, "id")
             current = self._session.get(MaintenanceWindow, key)
             if current is None:
-                raise NotFound("maintenance window not found")
+                raise _missing("maintenance window")
         clean = self._window_values(
             values, current=current, window_id=current.id if current else None
         )
@@ -1986,13 +2221,19 @@ class MonitoringService:
             incident_id = _uuid(incident_id, "incidentId")
             incident = self._session.get(Incident, incident_id)
             if incident is None:
-                raise NotFound("incident not found")
+                raise _missing("incident")
             if alert.incident_id == incident_id:
                 return self.get_alert(principal, alert.id)
             if alert.incident_id is not None:
-                raise Conflict("alert is already linked to another incident")
+                raise Conflict(
+                    "alert is already linked to another incident",
+                    key="api.monitoring.alert_already_linked",
+                )
             if incident.status == "closed":
-                raise Conflict("cannot link an alert to a closed incident")
+                raise Conflict(
+                    "cannot link an alert to a closed incident",
+                    key="api.monitoring.alert_incident_closed",
+                )
         alert.incident_id = incident_id
         alert.updated_at = self._now()
         event_key = f"{alert.id}:incident:{incident_id}"
@@ -2111,7 +2352,10 @@ class MonitoringService:
         known = set(self._session.scalars(select(Asset.id).where(Asset.id.in_(keys))))
         missing = [key for key in keys if key not in known]
         if missing:
-            raise ValidationFailed("alert references an asset that is not in inventory")
+            raise ValidationFailed(
+                "alert references an asset that is not in inventory",
+                key="api.monitoring.alert_asset_not_inventory",
+            )
 
     @staticmethod
     def _normalize_alert_item(
@@ -2342,9 +2586,14 @@ class MonitoringService:
         group_key: str | None = None,
     ) -> dict[str, int]:
         if not items:
-            raise ValidationFailed("the payload contains no alerts")
+            raise ValidationFailed(
+                "the payload contains no alerts", key="api.monitoring.payload_no_alerts"
+            )
         if len(items) > rules.MAX_ALERTS_PER_INGEST:
-            raise ValidationFailed("the payload exceeds the bounded alert count")
+            raise ValidationFailed(
+                "the payload exceeds the bounded alert count",
+                key="api.monitoring.payload_too_many_alerts",
+            )
         self._known_assets([item["asset_id"] for item in items])
         stats = {
             "received": len(items),
@@ -2365,29 +2614,49 @@ class MonitoringService:
     ) -> dict[str, int]:
         """Idempotent Alertmanager v4 webhook ingestion; validates all assets first."""
         if not isinstance(payload, Mapping):
-            raise ValidationFailed("alertmanager payload must be an object")
+            raise ValidationFailed(
+                "alertmanager payload must be an object",
+                key="api.monitoring.alertmanager_payload_object",
+            )
         if str(payload.get("version")) != "4":
-            raise ValidationFailed("unsupported alertmanager payload version")
+            raise ValidationFailed(
+                "unsupported alertmanager payload version",
+                key="api.monitoring.alertmanager_payload_version",
+            )
         raw_alerts = payload.get("alerts")
         if (
             not isinstance(raw_alerts, list)
             or not 1 <= len(raw_alerts) <= rules.MAX_ALERTS_PER_INGEST
         ):
-            raise ValidationFailed("alerts must be a bounded non-empty list")
+            raise ValidationFailed(
+                "alerts must be a bounded non-empty list", key="api.monitoring.alerts_bounded"
+            )
         group_key = payload.get("groupKey")
         if group_key is not None and (not isinstance(group_key, str) or len(group_key) > 256):
-            raise ValidationFailed("groupKey must be at most 256 characters")
+            raise ValidationFailed(
+                "groupKey must be at most 256 characters",
+                key="api.validation.field_max_length",
+                params={"field": "groupKey", "limit": 256},
+            )
         items: list[dict[str, Any]] = []
         for raw in raw_alerts:
             if not isinstance(raw, Mapping):
-                raise ValidationFailed("each alert must be an object")
+                raise ValidationFailed(
+                    "each alert must be an object", key="api.monitoring.alert_entry_object"
+                )
             labels = raw.get("labels")
             annotations = raw.get("annotations") or {}
             if not isinstance(labels, Mapping) or not isinstance(annotations, Mapping):
-                raise ValidationFailed("alert labels and annotations must be objects")
+                raise ValidationFailed(
+                    "alert labels and annotations must be objects",
+                    key="api.monitoring.alert_labels_object",
+                )
             status = raw.get("status")
             if status not in {"firing", "resolved"}:
-                raise ValidationFailed("alert status must be firing or resolved")
+                raise ValidationFailed(
+                    "alert status must be firing or resolved",
+                    key="api.monitoring.alert_status_allowed",
+                )
             items.append(
                 self._normalize_alert_item(
                     labels,
@@ -2407,7 +2676,9 @@ class MonitoringService:
     def discovery(self, check_type: str) -> list[dict[str, Any]]:
         """Prometheus HTTP SD entries; computed in memory, never materialized."""
         if check_type not in rules.CHECK_TYPES:
-            raise ValidationFailed("unsupported check_type")
+            raise ValidationFailed(
+                "unsupported check_type", key="api.monitoring.check_type_unsupported"
+            )
         assets = list(
             self._session.scalars(
                 select(Asset).order_by(Asset.quick_code).limit(rules.MAX_SD_ASSETS)

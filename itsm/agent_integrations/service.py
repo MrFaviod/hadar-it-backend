@@ -234,20 +234,44 @@ def _label(value: Any, *, limit: int = 200) -> str | None:
 def _http_url(value: Any, field_name: str) -> str:
     text = _clean(value, 2048)
     if text is None:
-        raise ValidationFailed(f"{field_name} is required")
+        raise ValidationFailed(
+            f"{field_name} is required",
+            key="api.validation.field_required",
+            params={"field": field_name},
+        )
     if any(char in text for char in (" ", "\\")) or any(ord(char) < 32 for char in text):
-        raise ValidationFailed(f"{field_name} must be a valid http(s) URL")
+        raise ValidationFailed(
+            f"{field_name} must be a valid http(s) URL",
+            key="api.agent_integrations.url_invalid",
+            params={"field": field_name},
+        )
     parts = urlsplit(text)
     if parts.scheme not in {"http", "https"} or not parts.hostname:
-        raise ValidationFailed(f"{field_name} must be a valid http(s) URL")
+        raise ValidationFailed(
+            f"{field_name} must be a valid http(s) URL",
+            key="api.agent_integrations.url_invalid",
+            params={"field": field_name},
+        )
     if parts.username or parts.password:
-        raise ValidationFailed(f"{field_name} must not include credentials")
+        raise ValidationFailed(
+            f"{field_name} must not include credentials",
+            key="api.agent_integrations.url_credentials",
+            params={"field": field_name},
+        )
     if parts.query or parts.fragment:
-        raise ValidationFailed(f"{field_name} must not include a query or fragment")
+        raise ValidationFailed(
+            f"{field_name} must not include a query or fragment",
+            key="api.agent_integrations.url_query",
+            params={"field": field_name},
+        )
     try:
         _ = parts.port
     except ValueError:
-        raise ValidationFailed(f"{field_name} must use a valid port") from None
+        raise ValidationFailed(
+            f"{field_name} must use a valid port",
+            key="api.agent_integrations.url_port",
+            params={"field": field_name},
+        ) from None
     return text.rstrip("/")
 
 
@@ -261,7 +285,11 @@ def _provider_values(
     if "name" in payload:
         name = _label(payload["name"], limit=120)
         if name is None:
-            raise ValidationFailed("provider name is required")
+            raise ValidationFailed(
+                "provider name is required",
+                key="api.validation.field_required",
+                params={"field": "name"},
+            )
         values["name"] = name
     if "baseUrl" in payload:
         try:
@@ -269,25 +297,42 @@ def _provider_values(
                 payload["baseUrl"], scope=scope, policy=policy
             )
         except ProviderEndpointError as exc:
-            raise ValidationFailed(str(exc)) from None
+            raise ValidationFailed(
+                str(exc),
+                key="api.agent_integrations.provider_endpoint_invalid",
+                params={"reason": str(exc)},
+            ) from None
     if "models" in payload:
         raw = payload["models"]
         if not isinstance(raw, list):
-            raise ValidationFailed("models must be a list")
+            raise ValidationFailed(
+                "models must be a list", key="api.agent_integrations.models_list"
+            )
         models: list[str] = []
         for item in raw:
             model = _label(item, limit=200)
             if model is None:
-                raise ValidationFailed("provider models must be non-empty identifiers")
+                raise ValidationFailed(
+                    "provider models must be non-empty identifiers",
+                    key="api.agent_integrations.models_identifiers",
+                )
             if model not in models:
                 models.append(model)
         if len(models) > _MAX_PROVIDER_MODELS:
-            raise ValidationFailed("provider models exceed the configured limit")
+            raise ValidationFailed(
+                "provider models exceed the configured limit",
+                key="api.agent_integrations.models_limit",
+                params={"limit": _MAX_PROVIDER_MODELS},
+            )
         values["models"] = models
     if "enabled" in payload:
         enabled = payload["enabled"]
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         values["enabled"] = enabled
     return values
 
@@ -298,7 +343,10 @@ def _model_selection_value(payload: Mapping[str, Any], *, current: str) -> str:
         return current
     value = payload["modelSelection"]
     if value not in _MODEL_SELECTIONS:
-        raise ValidationFailed("modelSelection must be auto or manual")
+        raise ValidationFailed(
+            "modelSelection must be auto or manual",
+            key="api.agent_integrations.model_selection_allowed",
+        )
     return str(value)
 
 
@@ -310,25 +358,42 @@ def _capability_values(payload: Mapping[str, Any]) -> dict[str, dict[str, bool |
     if raw is None:
         return {}
     if not isinstance(raw, Mapping):
-        raise ValidationFailed("modelCapabilities must be an object")
+        raise ValidationFailed(
+            "modelCapabilities must be an object", key="api.agent_integrations.capabilities_object"
+        )
     marks: dict[str, dict[str, bool | None]] = {}
     for key, value in raw.items():
         model_id = _label(key, limit=200)
         if model_id is None:
-            raise ValidationFailed("modelCapabilities keys must be model identifiers")
+            raise ValidationFailed(
+                "modelCapabilities keys must be model identifiers",
+                key="api.agent_integrations.capabilities_keys",
+            )
         if not isinstance(value, Mapping):
-            raise ValidationFailed("modelCapabilities entries must be objects")
+            raise ValidationFailed(
+                "modelCapabilities entries must be objects",
+                key="api.agent_integrations.capabilities_entries",
+            )
         if set(value) - set(_MODEL_CAPABILITY_FIELDS):
-            raise ValidationFailed("modelCapabilities entries accept image and file only")
+            raise ValidationFailed(
+                "modelCapabilities entries accept image and file only",
+                key="api.agent_integrations.capabilities_fields",
+            )
         entry: dict[str, bool | None] = {}
         for capability in _MODEL_CAPABILITY_FIELDS:
             flag = value.get(capability)
             if flag is not None and not isinstance(flag, bool):
-                raise ValidationFailed("modelCapabilities marks must be booleans or null")
+                raise ValidationFailed(
+                    "modelCapabilities marks must be booleans or null",
+                    key="api.agent_integrations.capabilities_marks",
+                )
             entry[capability] = flag
         marks[model_id] = entry
     if len(marks) > _MAX_DISCOVERED_MODELS:
-        raise ValidationFailed("modelCapabilities exceed the configured limit")
+        raise ValidationFailed(
+            "modelCapabilities exceed the configured limit",
+            key="api.agent_integrations.capabilities_limit",
+        )
     return marks
 
 
@@ -340,24 +405,44 @@ def _provider_api_key(payload: Mapping[str, Any]) -> str | None:
     if callable(unwrap):
         api_key = unwrap()
     if not isinstance(api_key, str):
-        raise ValidationFailed("apiKey must be text")
+        raise ValidationFailed(
+            "apiKey must be text",
+            key="api.validation.field_text",
+            params={"field": "apiKey"},
+        )
     key = api_key.strip()
     if not key:
-        raise ValidationFailed("apiKey must not be empty")
+        raise ValidationFailed(
+            "apiKey must not be empty", key="api.agent_integrations.api_key_empty"
+        )
     if len(key) > 2048 or any(ord(char) < 32 for char in key):
-        raise ValidationFailed("apiKey is not a valid credential")
+        raise ValidationFailed(
+            "apiKey is not a valid credential", key="api.agent_integrations.api_key_invalid"
+        )
     return key
 
 
 def _absolute_path(value: Any, field_name: str) -> str:
     text = _clean(value, 1024)
     if text is None:
-        raise ValidationFailed(f"{field_name} is required")
+        raise ValidationFailed(
+            f"{field_name} is required",
+            key="api.validation.field_required",
+            params={"field": field_name},
+        )
     if any(ord(char) < 32 for char in text):
-        raise ValidationFailed(f"{field_name} must be an absolute path")
+        raise ValidationFailed(
+            f"{field_name} must be an absolute path",
+            key="api.agent_integrations.path_absolute",
+            params={"field": field_name},
+        )
     windows = re.match(r"^[A-Za-z]:[\\/]", text)
     if not text.startswith("/") and windows is None:
-        raise ValidationFailed(f"{field_name} must be an absolute path")
+        raise ValidationFailed(
+            f"{field_name} must be an absolute path",
+            key="api.agent_integrations.path_absolute",
+            params={"field": field_name},
+        )
     return text
 
 
@@ -365,12 +450,20 @@ def _optional_text(value: Any, field_name: str, limit: int) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field_name} must be text")
+        raise ValidationFailed(
+            f"{field_name} must be text",
+            key="api.validation.field_text",
+            params={"field": field_name},
+        )
     text = _clean(value, limit)
     if text is None:
         return None
     if any(ord(char) < 32 for char in text):
-        raise ValidationFailed(f"{field_name} must not contain control characters")
+        raise ValidationFailed(
+            f"{field_name} must not contain control characters",
+            key="api.agent_integrations.field_control_characters",
+            params={"field": field_name},
+        )
     return text
 
 
@@ -378,11 +471,19 @@ def _uuid_text(value: Any, field_name: str) -> str | None:
     if value is None:
         return None
     if not isinstance(value, str):
-        raise ValidationFailed(f"{field_name} must be a UUID")
+        raise ValidationFailed(
+            f"{field_name} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field_name},
+        )
     try:
         UUID(value)
     except ValueError:
-        raise ValidationFailed(f"{field_name} must be a UUID") from None
+        raise ValidationFailed(
+            f"{field_name} must be a UUID",
+            key="api.validation.field_uuid",
+            params={"field": field_name},
+        ) from None
     return value
 
 
@@ -556,7 +657,10 @@ class AgentIntegrationService:
 
     def _require_human(self, principal: Principal) -> None:
         if principal.kind != HUMAN_ACTOR_KIND:
-            raise ValidationFailed("the conversational agent is available to signed-in people")
+            raise ValidationFailed(
+                "the conversational agent is available to signed-in people",
+                key="api.agent_integrations.human_only",
+            )
 
     def _privileged_human(self, db: Session, principal: Principal) -> bool:
         """Reload the persisted active role; request data never selects it."""
@@ -564,7 +668,10 @@ class AgentIntegrationService:
 
     def _require_external_role(self, db: Session, principal: Principal) -> None:
         if not self._privileged_human(db, principal):
-            raise PermissionDenied("external agent engines require administrator permissions")
+            raise PermissionDenied(
+                "external agent engines require administrator permissions",
+                key="api.agent_integrations.external_role_required",
+            )
 
     def _external_instance(self, db: Session, instance_id: str | None) -> bool:
         if instance_id is None:
@@ -593,14 +700,21 @@ class AgentIntegrationService:
 
         identity = IdentityService(db, self._settings)
         if human_only and principal.kind != HUMAN_ACTOR_KIND:
-            raise PermissionDenied("installation changes require a signed-in installation owner")
+            raise PermissionDenied(
+                "installation changes require a signed-in installation owner",
+                key="api.agent_integrations.installation_owner_required",
+            )
         require_system_authority(db, self._settings, principal, permission, resource)
         return identity
 
     def _instance(self, db: Session, instance_id: str) -> AgentInstance:
         row = db.get(AgentInstance, instance_id)
         if row is None:
-            raise NotFound("agent instance not found")
+            raise NotFound(
+                "agent instance not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "agent instance"},
+            )
         return row
 
     @staticmethod
@@ -738,7 +852,10 @@ class AgentIntegrationService:
         discovered = {entry["id"].casefold() for entry in self._discovered_entries(row)}
         reported = [model for model in self._provider_models(row) if model.casefold() in discovered]
         if len(reported) != len(self._provider_models(row)):
-            raise ValidationFailed("the provider does not report the selected models")
+            raise ValidationFailed(
+                "the provider does not report the selected models",
+                key="api.agent_integrations.provider_models_missing",
+            )
 
     async def _probe_models(self, base_url: str, credential: str, scope: str) -> ProviderProbe:
         """Discover models through the same guarded transport as a chat turn."""
@@ -761,7 +878,11 @@ class AgentIntegrationService:
             return self._snapshot(instance), None
         provider = db.get(AgentProvider, instance_id)
         if provider is None or not self._provider_visible(provider, principal):
-            raise NotFound("agent instance not found")
+            raise NotFound(
+                "agent instance not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "agent instance"},
+            )
         return self._provider_snapshot(provider), provider
 
     def _provider_dto(self, row: AgentProvider) -> dict[str, Any]:
@@ -790,12 +911,19 @@ class AgentIntegrationService:
     def _provider_row(self, db: Session, provider_id: str) -> AgentProvider:
         row = db.get(AgentProvider, provider_id)
         if row is None:
-            raise NotFound("provider not found")
+            raise NotFound(
+                "provider not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "provider"},
+            )
         return row
 
     def _require_personal_provider(self, db: Session, principal: Principal) -> IdentityService:
         if principal.kind != HUMAN_ACTOR_KIND:
-            raise PermissionDenied("personal providers require a signed-in person")
+            raise PermissionDenied(
+                "personal providers require a signed-in person",
+                key="api.agent_integrations.personal_provider_person_required",
+            )
         identity = IdentityService(db, self._settings)
         identity.authorize(principal, PERSONAL_PROVIDER_PERMISSION, resource="agent:providers")
         return identity
@@ -833,7 +961,10 @@ class AgentIntegrationService:
     def _validate_provider_model(self, row: AgentProvider, model: str) -> str:
         value = _label(model, limit=200)
         if value is None or value not in self._provider_models(row):
-            raise ValidationFailed("the selected model is not configured on this provider")
+            raise ValidationFailed(
+                "the selected model is not configured on this provider",
+                key="api.agent_integrations.model_not_configured",
+            )
         return value
 
     def _provider_selection(
@@ -877,9 +1008,15 @@ class AgentIntegrationService:
             return bound
         selected = db.get(AgentProvider, provider_id)
         if selected is None or not self._provider_visible(selected, principal):
-            raise NotFound("provider not found")
+            raise NotFound(
+                "provider not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "provider"},
+            )
         if not selected.enabled:
-            raise ValidationFailed("the selected provider is disabled")
+            raise ValidationFailed(
+                "the selected provider is disabled", key="api.agent_integrations.provider_disabled"
+            )
         if selected.scope == "personal":
             self._require_personal_provider(db, principal)
         return selected
@@ -1135,11 +1272,18 @@ class AgentIntegrationService:
     async def _validate_model(self, row: InstanceSnapshot, model: Any) -> str:
         value = _label(model, limit=200)
         if value is None:
-            raise ValidationFailed("model is required")
+            raise ValidationFailed(
+                "model is required",
+                key="api.validation.field_required",
+                params={"field": "model"},
+            )
         info = await self._discover(row)
         available = {item["id"] for item in info["models"]}
         if value not in available:
-            raise ValidationFailed("the selected model is not available on this instance")
+            raise ValidationFailed(
+                "the selected model is not available on this instance",
+                key="api.agent_integrations.model_unavailable",
+            )
         return value
 
     # ------------------------------------------------------------------- history
@@ -1274,10 +1418,18 @@ class AgentIntegrationService:
         self._require_human(principal)
         instance_id = _label(payload.get("instanceId"), limit=36)
         if instance_id is None:
-            raise ValidationFailed("instanceId is required")
+            raise ValidationFailed(
+                "instanceId is required",
+                key="api.validation.field_required",
+                params={"field": "instanceId"},
+            )
         model = payload.get("model")
         if model is not None and _label(model, limit=200) is None:
-            raise ValidationFailed("model must be text")
+            raise ValidationFailed(
+                "model must be text",
+                key="api.validation.field_text",
+                params={"field": "model"},
+            )
         with self._session() as db:
             self._ensure_builtin(db)
             row = db.get(AgentInstance, instance_id)
@@ -1285,13 +1437,21 @@ class AgentIntegrationService:
             if row is None:
                 provider = db.get(AgentProvider, instance_id)
                 if provider is None or not self._provider_visible(provider, principal):
-                    raise ValidationFailed("unknown instance")
+                    raise ValidationFailed(
+                        "unknown instance", key="api.agent_integrations.instance_unknown"
+                    )
                 if not provider.enabled:
-                    raise ValidationFailed("the selected instance is disabled")
+                    raise ValidationFailed(
+                        "the selected instance is disabled",
+                        key="api.agent_integrations.instance_disabled",
+                    )
                 snapshot = self._provider_snapshot(provider)
             else:
                 if not row.enabled:
-                    raise ValidationFailed("the selected instance is disabled")
+                    raise ValidationFailed(
+                        "the selected instance is disabled",
+                        key="api.agent_integrations.instance_disabled",
+                    )
                 if row.engine in EXTERNAL_ENGINES:
                     self._require_external_role(db, principal)
                 snapshot = self._snapshot(row)
@@ -1301,7 +1461,10 @@ class AgentIntegrationService:
                 if provider is not None:
                     value = self._validate_provider_model(provider, model)
                 elif model != self._settings.agent_model:
-                    raise ValidationFailed("the built-in instance uses the server-configured model")
+                    raise ValidationFailed(
+                        "the built-in instance uses the server-configured model",
+                        key="api.agent_integrations.pydantic_model_fixed",
+                    )
                 else:
                     value = str(model)
             else:
@@ -1350,7 +1513,9 @@ class AgentIntegrationService:
         self._require_human(principal)
         scope = payload.get("scope")
         if scope not in PROVIDER_SCOPES:
-            raise ValidationFailed("scope must be global or personal")
+            raise ValidationFailed(
+                "scope must be global or personal", key="api.agent_integrations.scope_allowed"
+            )
         api_key = _provider_api_key(payload)
         # A request that still sends only the historical ``models`` list keeps the
         # manual behavior it meant before discovery existed; a request without a
@@ -1366,9 +1531,17 @@ class AgentIntegrationService:
                 self._require_personal_provider(db, principal)
             values = _provider_values(payload, scope=scope, policy=self._provider_policy(scope))
             if "name" not in values:
-                raise ValidationFailed("provider name is required")
+                raise ValidationFailed(
+                    "provider name is required",
+                    key="api.validation.field_required",
+                    params={"field": "name"},
+                )
             if "base_url" not in values:
-                raise ValidationFailed("provider base URL is required")
+                raise ValidationFailed(
+                    "provider base URL is required",
+                    key="api.validation.field_required",
+                    params={"field": "baseUrl"},
+                )
             values.setdefault("models", [])
             values.setdefault("enabled", True)
             ciphertext = self._seal_credential(api_key) if api_key else None
@@ -1413,13 +1586,20 @@ class AgentIntegrationService:
             row = self._provider_row(db, provider_id)
             if row.scope == "personal":
                 if row.owner_id != principal.actor_id:
-                    raise NotFound("provider not found")
+                    raise NotFound(
+                        "provider not found",
+                        key="api.agent_integrations.record_not_found",
+                        params={"field": "provider"},
+                    )
                 self._require_personal_provider(db, principal)
             else:
                 self._require_admin(db, principal, "agent:providers", human_only=True)
             requested_scope = payload.get("scope")
             if requested_scope is not None and requested_scope != row.scope:
-                raise ValidationFailed("provider scope cannot be changed")
+                raise ValidationFailed(
+                    "provider scope cannot be changed",
+                    key="api.agent_integrations.provider_scope_fixed",
+                )
             values = _provider_values(
                 payload, scope=row.scope, policy=self._provider_policy(row.scope)
             )
@@ -1465,7 +1645,11 @@ class AgentIntegrationService:
             row = self._provider_row(db, provider_id)
             if row.scope == "personal":
                 if row.owner_id != principal.actor_id:
-                    raise NotFound("provider not found")
+                    raise NotFound(
+                        "provider not found",
+                        key="api.agent_integrations.record_not_found",
+                        params={"field": "provider"},
+                    )
                 self._require_personal_provider(db, principal)
             else:
                 self._require_admin(db, principal, "agent:providers", human_only=True)
@@ -1483,7 +1667,11 @@ class AgentIntegrationService:
         with self._session() as db:
             row = self._provider_row(db, provider_id)
             if not self._provider_visible(row, principal):
-                raise NotFound("provider not found")
+                raise NotFound(
+                    "provider not found",
+                    key="api.agent_integrations.record_not_found",
+                    params={"field": "provider"},
+                )
             if row.scope == "personal":
                 self._require_personal_provider(db, principal)
             else:
@@ -1558,12 +1746,20 @@ class AgentIntegrationService:
         if "name" in payload or existing is None:
             name = _label(payload.get("name"), limit=120)
             if name is None:
-                raise ValidationFailed("name is required")
+                raise ValidationFailed(
+                    "name is required",
+                    key="api.validation.field_required",
+                    params={"field": "name"},
+                )
             values["name"] = name
         if "enabled" in payload:
             enabled = payload.get("enabled")
             if not isinstance(enabled, bool):
-                raise ValidationFailed("enabled must be a boolean")
+                raise ValidationFailed(
+                    "enabled must be a boolean",
+                    key="api.validation.field_boolean",
+                    params={"field": "enabled"},
+                )
             values["enabled"] = enabled
         if "defaultModel" in payload:
             values["default_model"] = _optional_text(
@@ -1581,14 +1777,20 @@ class AgentIntegrationService:
                 values[stored] = payload[public]
         mode = values.get("quota_mode", getattr(existing, "quota_mode", "direct"))
         if mode not in {"direct", "managed"}:
-            raise ValidationFailed("quotaMode must be managed or direct")
+            raise ValidationFailed(
+                "quotaMode must be managed or direct",
+                key="api.agent_integrations.quota_mode_allowed",
+            )
         if mode == "managed":
             provider_id = values.get(
                 "managed_provider_id", getattr(existing, "managed_provider_id", None)
             )
             provider = db.get(AgentProvider, provider_id) if provider_id else None
             if provider is None or provider.scope != "global" or not provider.enabled:
-                raise ValidationFailed("managedProviderId must select an enabled global provider")
+                raise ValidationFailed(
+                    "managedProviderId must select an enabled global provider",
+                    key="api.agent_integrations.managed_provider_enabled",
+                )
             model = values.get("default_model", getattr(existing, "default_model", None))
             self._validate_provider_model(provider, model)
             bound = values.get(
@@ -1599,7 +1801,10 @@ class AgentIntegrationService:
                 or not isinstance(bound, int)
                 or not 1 <= bound <= 100_000_000
             ):
-                raise ValidationFailed("managedContextTokens must be a positive input bound")
+                raise ValidationFailed(
+                    "managedContextTokens must be a positive input bound",
+                    key="api.agent_integrations.managed_context_bound",
+                )
         if engine == PYDANTIC_ENGINE:
             forbidden = {
                 "baseUrl",
@@ -1611,7 +1816,8 @@ class AgentIntegrationService:
             }
             if forbidden & set(payload):
                 raise ValidationFailed(
-                    "the built-in instance does not accept engine connection fields"
+                    "the built-in instance does not accept engine connection fields",
+                    key="api.agent_integrations.pydantic_engine_fields",
                 )
             return values
 
@@ -1621,10 +1827,16 @@ class AgentIntegrationService:
             reference = _optional_text(payload.get("secretRef"), "secretRef", 128)
             if reference is not None:
                 if not SECRET_REF_PATTERN.fullmatch(reference):
-                    raise ValidationFailed("secretRef must be an environment variable name")
+                    raise ValidationFailed(
+                        "secretRef must be an environment variable name",
+                        key="api.agent_integrations.secret_ref_shape",
+                        params={"field": "secretRef"},
+                    )
                 if not os.environ.get(reference):
                     raise ValidationFailed(
-                        f"secretRef {reference} does not resolve to a configured secret"
+                        f"secretRef {reference} does not resolve to a configured secret",
+                        key="api.agent_integrations.secret_ref_unresolved",
+                        params={"reference": reference},
                     )
             values["secret_ref"] = reference
         if "username" in payload:
@@ -1646,14 +1858,19 @@ class AgentIntegrationService:
                     machine = identity.resolve_actor(str(identity_id))
                 except PermissionDenied:
                     raise ValidationFailed(
-                        "integrationIdentityId must be an active machine identity"
+                        "integrationIdentityId must be an active machine identity",
+                        key="api.agent_integrations.integration_identity_machine",
                     ) from None
                 if machine.kind not in MACHINE_ACTOR_KINDS:
                     raise ValidationFailed(
-                        "integrationIdentityId must be an active machine identity"
+                        "integrationIdentityId must be an active machine identity",
+                        key="api.agent_integrations.integration_identity_machine",
                     )
                 if machine.role_id in (ROLE_ADMIN, ROLE_SUPERADMIN):
-                    raise ValidationFailed("machine identities cannot use an administrator role")
+                    raise ValidationFailed(
+                        "machine identities cannot use an administrator role",
+                        key="api.agent_integrations.machine_admin_role",
+                    )
                 values["integration_identity_id"] = identity_id
         return values
 
@@ -1662,7 +1879,10 @@ class AgentIntegrationService:
             identity = self._require_admin(db, principal, "agent:integrations", human_only=True)
             engine = _label(payload.get("engine"), limit=32)
             if engine not in EXTERNAL_ENGINES:
-                raise ValidationFailed("engine must be one of: hermes, opencode")
+                raise ValidationFailed(
+                    "engine must be one of: hermes, opencode",
+                    key="api.agent_integrations.engine_allowed",
+                )
             values = self._instance_values(db, identity, payload, engine=engine)
             row = AgentInstance(id=str(uuid4()), engine=engine, **values)
             db.add(row)
@@ -1678,10 +1898,17 @@ class AgentIntegrationService:
             row = self._instance(db, instance_id)
             requested = payload.get("engine")
             if requested is not None and requested != row.engine:
-                raise ValidationFailed("an instance engine cannot be changed")
+                raise ValidationFailed(
+                    "an instance engine cannot be changed",
+                    key="api.agent_integrations.instance_engine_fixed",
+                )
             values = self._instance_values(db, identity, payload, engine=row.engine, existing=row)
             if row.engine != PYDANTIC_ENGINE and not values.get("base_url", row.base_url):
-                raise ValidationFailed("baseUrl is required")
+                raise ValidationFailed(
+                    "baseUrl is required",
+                    key="api.validation.field_required",
+                    params={"field": "baseUrl"},
+                )
             for key, value in values.items():
                 setattr(row, key, value)
             row.updated_at = utcnow()
@@ -1699,24 +1926,35 @@ class AgentIntegrationService:
             if instance_id is None:
                 instance_id = None
             elif _label(instance_id, limit=36) is None:
-                raise ValidationFailed("instanceId is required")
+                raise ValidationFailed(
+                    "instanceId is required",
+                    key="api.validation.field_required",
+                    params={"field": "instanceId"},
+                )
             model = payload.get("model")
             if instance_id is not None:
                 row = self._instance(db, str(instance_id))
                 if not row.enabled:
-                    raise ValidationFailed("the selected instance is disabled")
+                    raise ValidationFailed(
+                        "the selected instance is disabled",
+                        key="api.agent_integrations.instance_disabled",
+                    )
                 snapshot = self._snapshot(row)
                 if model is not None:
                     if snapshot.engine == PYDANTIC_ENGINE:
                         if model != self._settings.agent_model:
                             raise ValidationFailed(
-                                "the built-in instance uses the server-configured model"
+                                "the built-in instance uses the server-configured model",
+                                key="api.agent_integrations.pydantic_model_fixed",
                             )
                     else:
                         model = await self._validate_model(snapshot, model)
                 instance_id = row.id
             elif model is not None:
-                raise ValidationFailed("model requires an instanceId")
+                raise ValidationFailed(
+                    "model requires an instanceId",
+                    key="api.agent_integrations.model_instance_required",
+                )
             preference = db.get(AgentInstallationPreference, INSTALLATION_PREFERENCE_ID)
             if preference is None:
                 preference = AgentInstallationPreference(id=INSTALLATION_PREFERENCE_ID)
@@ -1731,7 +1969,11 @@ class AgentIntegrationService:
     def _owned(self, db: Session, principal: Principal, session_id: str) -> AgentSession:
         row = db.get(AgentSession, session_id)
         if row is None or row.owner_id != principal.actor_id:
-            raise NotFound("agent session not found")
+            raise NotFound(
+                "agent session not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "agent session"},
+            )
         return row
 
     def _session_dto(self, row: AgentSession) -> dict[str, Any]:
@@ -1784,23 +2026,45 @@ class AgentIntegrationService:
         if context is None:
             return []
         if not isinstance(context, list):
-            raise ValidationFailed("context must be a list of messages")
+            raise ValidationFailed(
+                "context must be a list of messages", key="api.agent_integrations.context_list"
+            )
         if len(context) > self._settings.agent_session_max_context_messages:
-            raise ValidationFailed("context has too many messages")
+            raise ValidationFailed(
+                "context has too many messages",
+                key="api.agent_integrations.context_too_many",
+                params={"limit": self._settings.agent_session_max_context_messages},
+            )
         messages: list[dict[str, str]] = []
         for item in context:
             if not isinstance(item, Mapping):
-                raise ValidationFailed("context messages must be objects")
+                raise ValidationFailed(
+                    "context messages must be objects",
+                    key="api.agent_integrations.context_entry_object",
+                )
             if set(item) - {"role", "content"}:
-                raise ValidationFailed("context messages accept only role and content")
+                raise ValidationFailed(
+                    "context messages accept only role and content",
+                    key="api.agent_integrations.context_fields",
+                )
             role = item.get("role")
             if role not in {"user", "assistant"}:
-                raise ValidationFailed("context role must be user or assistant")
+                raise ValidationFailed(
+                    "context role must be user or assistant",
+                    key="api.agent_integrations.context_role_allowed",
+                )
             content = item.get("content")
             if not isinstance(content, str) or not content.strip():
-                raise ValidationFailed("context content is required")
+                raise ValidationFailed(
+                    "context content is required",
+                    key="api.agent_integrations.context_content_required",
+                )
             if len(content) > 8000:
-                raise ValidationFailed("context content is too long")
+                raise ValidationFailed(
+                    "context content is too long",
+                    key="api.agent_integrations.context_content_too_long",
+                    params={"limit": self._settings.agent_session_max_context_messages},
+                )
             messages.append({"role": role, "content": content})
         return messages
 
@@ -1874,7 +2138,10 @@ class AgentIntegrationService:
         if row.engine == PYDANTIC_ENGINE:
             return
         if not self._profile_verified(db, row):
-            raise Conflict("the integration profile has not been verified by the installer")
+            raise Conflict(
+                "the integration profile has not been verified by the installer",
+                key="api.agent_integrations.profile_not_verified",
+            )
 
     def _assert_binding_ceiling(
         self,
@@ -1884,7 +2151,10 @@ class AgentIntegrationService:
         row: AgentInstance,
     ) -> None:
         if not row.integration_identity_id:
-            raise Conflict("the instance is not bound to an integration identity")
+            raise Conflict(
+                "the instance is not bound to an integration identity",
+                key="api.agent_integrations.instance_not_bound",
+            )
         installation = self._verified_installation(db, row)
         if installation is None:
             # The profile gate below reports the missing verified installation.
@@ -1893,20 +2163,28 @@ class AgentIntegrationService:
         secret_ref = mcp.get("secretRef") if isinstance(mcp, Mapping) else None
         token = os.environ.get(secret_ref) if isinstance(secret_ref, str) else None
         if not token:
-            raise PermissionDenied("the integration credential is not available")
+            raise PermissionDenied(
+                "the integration credential is not available",
+                key="api.agent_integrations.credential_unavailable",
+            )
         try:
             context = identity.authenticate_token(token)
         except AuthenticationFailed:
-            raise PermissionDenied("the integration credential is not valid") from None
+            raise PermissionDenied(
+                "the integration credential is not valid",
+                key="api.agent_integrations.credential_invalid",
+            ) from None
         if context.principal.actor_id != row.integration_identity_id:
             raise PermissionDenied(
-                "the integration credential does not belong to the bound identity"
+                "the integration credential does not belong to the bound identity",
+                key="api.agent_integrations.credential_identity_mismatch",
             )
         human_permissions = identity._persisted_permissions(principal)
         machine_permissions = context.permissions
         if machine_permissions - human_permissions:
             raise PermissionDenied(
-                "the integration identity has permissions this person does not hold"
+                "the integration identity has permissions this person does not hold",
+                key="api.agent_integrations.credential_permission_exceeded",
             )
 
     def _session_capabilities(self, engine: str, info: Mapping[str, Any] | None) -> dict[str, bool]:
@@ -1928,10 +2206,18 @@ class AgentIntegrationService:
         self._require_human(principal)
         instance_id = _label(payload.get("instanceId"), limit=36)
         if instance_id is None:
-            raise ValidationFailed("instanceId is required")
+            raise ValidationFailed(
+                "instanceId is required",
+                key="api.validation.field_required",
+                params={"field": "instanceId"},
+            )
         model = _label(payload.get("model"), limit=200)
         if model is None:
-            raise ValidationFailed("model is required")
+            raise ValidationFailed(
+                "model is required",
+                key="api.validation.field_required",
+                params={"field": "model"},
+            )
         provider_id = _label(payload.get("providerId"), limit=36)
         asset_id = _uuid_text(payload.get("assetId"), "assetId")
         context = self._context_messages(payload.get("context"))
@@ -1941,7 +2227,10 @@ class AgentIntegrationService:
             self._ensure_builtin(db)
             snapshot, provider = self._resolve_instance(db, principal, instance_id)
             if not snapshot.enabled:
-                raise ValidationFailed("the selected instance is disabled")
+                raise ValidationFailed(
+                    "the selected instance is disabled",
+                    key="api.agent_integrations.instance_disabled",
+                )
             if snapshot.engine != PYDANTIC_ENGINE:
                 self._require_external_role(db, principal)
                 instance = self._instance(db, instance_id)
@@ -1950,12 +2239,18 @@ class AgentIntegrationService:
                 self._require_verified_profile(db, instance)
                 if provider_id is not None:
                     if snapshot.quota_mode != "managed":
-                        raise ValidationFailed("direct engines cannot select a provider")
+                        raise ValidationFailed(
+                            "direct engines cannot select a provider",
+                            key="api.agent_integrations.direct_provider_forbidden",
+                        )
                     selected_provider = self._managed_provider(db, principal, instance, provider_id)
                     model = self._validate_provider_model(selected_provider, model)
             else:
                 if provider_id is not None:
-                    raise ValidationFailed("providerId is only supported by managed engines")
+                    raise ValidationFailed(
+                        "providerId is only supported by managed engines",
+                        key="api.agent_integrations.provider_id_managed_only",
+                    )
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
                     self._validate_provider_model(provider, model)
@@ -1966,7 +2261,8 @@ class AgentIntegrationService:
                         raise IntegrationUnavailable("agent model is not configured")
                     if model != self._settings.agent_model:
                         raise ValidationFailed(
-                            "the built-in instance uses the server-configured model"
+                            "the built-in instance uses the server-configured model",
+                            key="api.agent_integrations.pydantic_model_fixed",
                         )
         capabilities: dict[str, bool] = self._session_capabilities(snapshot.engine, None)
         external_session_id: str | None = None
@@ -1974,7 +2270,10 @@ class AgentIntegrationService:
             info = await self._discover(snapshot)
             available = {item["id"] for item in info["models"]}
             if model not in available:
-                raise ValidationFailed("the selected model is not available on this instance")
+                raise ValidationFailed(
+                    "the selected model is not available on this instance",
+                    key="api.agent_integrations.model_unavailable",
+                )
             capabilities = self._session_capabilities(snapshot.engine, info)
             engine = self._build_engine(snapshot)
             try:
@@ -1994,22 +2293,34 @@ class AgentIntegrationService:
         with self._session() as db:
             current, current_provider = self._resolve_instance(db, principal, instance_id)
             if not current.enabled:
-                raise Conflict("the selected instance changed while starting the session")
+                raise Conflict(
+                    "the selected instance changed while starting the session",
+                    key="api.agent_integrations.instance_changed",
+                )
             if current.engine != PYDANTIC_ENGINE:
                 self._require_external_role(db, principal)
             if provider is not None and current_provider is None:
-                raise Conflict("the selected provider changed while starting the session")
+                raise Conflict(
+                    "the selected provider changed while starting the session",
+                    key="api.agent_integrations.provider_changed",
+                )
             if provider is not None and provider.scope == "personal":
                 self._require_personal_provider(db, principal)
             if selected_provider is not None:
                 current_instance = self._instance(db, instance_id)
                 if current_instance.quota_mode != "managed":
-                    raise Conflict("the selected instance changed while starting the session")
+                    raise Conflict(
+                        "the selected instance changed while starting the session",
+                        key="api.agent_integrations.instance_changed",
+                    )
                 current_selected = self._managed_provider(
                     db, principal, current_instance, provider_id
                 )
                 if current_selected.id != selected_provider.id:
-                    raise Conflict("the selected provider changed while starting the session")
+                    raise Conflict(
+                        "the selected provider changed while starting the session",
+                        key="api.agent_integrations.provider_changed",
+                    )
             row = AgentSession(
                 id=str(uuid4()),
                 owner_id=principal.actor_id,
@@ -2050,13 +2361,19 @@ class AgentIntegrationService:
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
-                raise Conflict("a response is already running in this session")
+                raise Conflict(
+                    "a response is already running in this session",
+                    key="api.agent_integrations.response_running",
+                )
             original_updated_at = row.updated_at
             current_model = row.model
             target_id = instance_id or row.instance_id
             snapshot, provider = self._resolve_instance(db, principal, target_id)
             if not snapshot.enabled:
-                raise ValidationFailed("the selected instance is disabled")
+                raise ValidationFailed(
+                    "the selected instance is disabled",
+                    key="api.agent_integrations.instance_disabled",
+                )
             if snapshot.engine != PYDANTIC_ENGINE:
                 self._require_external_role(db, principal)
                 instance = self._instance(db, target_id)
@@ -2082,20 +2399,32 @@ class AgentIntegrationService:
                     elif configured:
                         value = configured[0]
                     else:
-                        raise ValidationFailed("the selected provider has no configured models")
+                        raise ValidationFailed(
+                            "the selected provider has no configured models",
+                            key="api.agent_integrations.provider_no_models",
+                        )
                     final_provider_id = chosen_provider_id
                 elif provider_supplied:
-                    raise ValidationFailed("direct engines cannot select a provider")
+                    raise ValidationFailed(
+                        "direct engines cannot select a provider",
+                        key="api.agent_integrations.direct_provider_forbidden",
+                    )
             else:
                 if provider_supplied:
-                    raise ValidationFailed("providerId is only supported by managed engines")
+                    raise ValidationFailed(
+                        "providerId is only supported by managed engines",
+                        key="api.agent_integrations.provider_id_managed_only",
+                    )
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
                     configured = self._provider_models(provider)
                     if requested_model is not None:
                         value = self._validate_provider_model(provider, requested_model)
                     elif not configured:
-                        raise ValidationFailed("the selected provider has no configured models")
+                        raise ValidationFailed(
+                            "the selected provider has no configured models",
+                            key="api.agent_integrations.provider_no_models",
+                        )
                     else:
                         value = current_model if current_model in configured else configured[0]
                     if provider.scope == "personal":
@@ -2106,7 +2435,8 @@ class AgentIntegrationService:
                         and requested_model != self._settings.agent_model
                     ):
                         raise ValidationFailed(
-                            "the built-in instance uses the server-configured model"
+                            "the built-in instance uses the server-configured model",
+                            key="api.agent_integrations.pydantic_model_fixed",
                         )
                     value = self._settings.agent_model
                     if value is None:
@@ -2114,7 +2444,10 @@ class AgentIntegrationService:
         capabilities = self._session_capabilities(snapshot.engine, None)
         if snapshot.engine != PYDANTIC_ENGINE:
             if not capabilities.get("model_switch", True):
-                raise Conflict("the selected engine does not support changing models")
+                raise Conflict(
+                    "the selected engine does not support changing models",
+                    key="api.agent_integrations.engine_model_change_unsupported",
+                )
             if snapshot.quota_mode == "managed":
                 # Managed runs never touch the shared instance; the gateway owns the models.
                 capabilities = dict(row.capabilities or {})
@@ -2131,17 +2464,29 @@ class AgentIntegrationService:
                 elif model_ids:
                     value = model_ids[0]
                 else:
-                    raise ValidationFailed("the selected instance exposes no models")
+                    raise ValidationFailed(
+                        "the selected instance exposes no models",
+                        key="api.agent_integrations.instance_no_models",
+                    )
                 if value not in available:
-                    raise ValidationFailed("the selected model is not available on this instance")
+                    raise ValidationFailed(
+                        "the selected model is not available on this instance",
+                        key="api.agent_integrations.model_unavailable",
+                    )
                 capabilities = self._session_capabilities(snapshot.engine, info)
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
-                raise Conflict("a response is already running in this session")
+                raise Conflict(
+                    "a response is already running in this session",
+                    key="api.agent_integrations.response_running",
+                )
             target, provider = self._resolve_instance(db, principal, target_id)
             if not target.enabled:
-                raise Conflict("the selected instance changed while switching engines")
+                raise Conflict(
+                    "the selected instance changed while switching engines",
+                    key="api.agent_integrations.instance_changed_engine",
+                )
             if target.engine != PYDANTIC_ENGINE:
                 self._require_external_role(db, principal)
                 instance = self._instance(db, target_id)
@@ -2153,7 +2498,10 @@ class AgentIntegrationService:
                         db, principal, instance, final_provider_id
                     )
                     if current_selected.id != selected_provider.id:
-                        raise Conflict("the selected provider changed while switching engines")
+                        raise Conflict(
+                            "the selected provider changed while switching engines",
+                            key="api.agent_integrations.provider_changed",
+                        )
             else:
                 self._require_pydantic_available(db, principal)
                 if provider is not None:
@@ -2161,7 +2509,10 @@ class AgentIntegrationService:
                     if provider.scope == "personal":
                         self._require_personal_provider(db, principal)
                 elif value != self._settings.agent_model:
-                    raise Conflict("the built-in instance uses the server-configured model")
+                    raise Conflict(
+                        "the built-in instance uses the server-configured model",
+                        key="api.agent_integrations.pydantic_model_fixed",
+                    )
             values: dict[str, Any] = {
                 "model": value,
                 "provider_id": final_provider_id,
@@ -2195,7 +2546,10 @@ class AgentIntegrationService:
             )
             db.commit()
             if claimed.rowcount != 1:
-                raise Conflict("the session changed while switching engines")
+                raise Conflict(
+                    "the session changed while switching engines",
+                    key="api.agent_integrations.session_changed_engine",
+                )
             row = self._owned(db, principal, session_id)
             db.refresh(row)
             return self._session_dto(row)
@@ -2348,10 +2702,15 @@ class AgentIntegrationService:
         chat_ids = bounded_attachment_ids(attachment_ids)
         stored_ids = bounded_attachment_ids(asset_attachment_ids)
         if not text.strip() and not chat_ids and not stored_ids:
-            raise ValidationFailed("message or at least one attachment is required")
+            raise ValidationFailed(
+                "message or at least one attachment is required",
+                key="api.agent_integrations.message_required",
+            )
         if len(text) > self._settings.agent_message_max_length:
             raise ValidationFailed(
-                f"message must be at most {self._settings.agent_message_max_length} characters"
+                f"message must be at most {self._settings.agent_message_max_length} characters",
+                key="api.validation.field_max_length",
+                params={"field": "message", "limit": self._settings.agent_message_max_length},
             )
         asset_id = _uuid_text(asset_id, "assetId")
         now = utcnow()
@@ -2359,7 +2718,10 @@ class AgentIntegrationService:
             row = self._owned(db, principal, session_id)
             instance, provider = self._resolve_instance(db, principal, row.instance_id)
             if not instance.enabled:
-                raise Conflict("the selected instance is disabled")
+                raise Conflict(
+                    "the selected instance is disabled",
+                    key="api.agent_integrations.instance_disabled",
+                )
             provider_selection: ProviderModelSelection | None = None
             if instance.engine != PYDANTIC_ENGINE:
                 self._require_external_role(db, principal)
@@ -2369,7 +2731,8 @@ class AgentIntegrationService:
                 self._require_verified_profile(db, instance_row)
                 if instance.quota_mode == "direct" and not instance.direct_company_exception:
                     raise PermissionDenied(
-                        "company-funded direct engines require an explicit quota exception"
+                        "company-funded direct engines require an explicit quota exception",
+                        key="api.agent_integrations.direct_quota_exception",
                     )
                 if instance.quota_mode == "managed":
                     provider = self._managed_provider(db, principal, instance_row, row.provider_id)
@@ -2389,7 +2752,10 @@ class AgentIntegrationService:
             run_id = str(uuid4())
             self._recover_stale(db, now)
             if row.status == "running":
-                raise Conflict("a response is already running in this session")
+                raise Conflict(
+                    "a response is already running in this session",
+                    key="api.agent_integrations.response_running",
+                )
             from itsm.agents.quota import reserve_run
 
             turn_provider_id = provider.id if provider is not None else None
@@ -2438,7 +2804,10 @@ class AgentIntegrationService:
             if claimed.rowcount != 1:
                 db.rollback()
                 quota.finish_without_dispatch()
-                raise Conflict("the session changed while starting the turn")
+                raise Conflict(
+                    "the session changed while starting the turn",
+                    key="api.agent_integrations.session_changed_turn",
+                )
             db.add(
                 AgentRun(
                     id=run_id,
@@ -2639,7 +3008,10 @@ class AgentIntegrationService:
         with self._session() as db:
             row = self._owned(db, principal, session_id)
             if row.status == "running":
-                raise Conflict("a response is still running in this session")
+                raise Conflict(
+                    "a response is still running in this session",
+                    key="api.agent_integrations.response_still_running",
+                )
             ChatAttachmentService(db, self._settings).delete_for_session(principal, session_id)
             db.delete(row)
             db.commit()
@@ -3051,12 +3423,22 @@ class AgentIntegrationService:
 
     def _target(self, payload: Mapping[str, Any], *, engine: str | None = None) -> Any:
         if not isinstance(payload, Mapping):
-            raise ValidationFailed("target is required")
+            raise ValidationFailed(
+                "target is required",
+                key="api.validation.field_required",
+                params={"field": "target"},
+            )
         target_engine = _label(payload.get("engine"), limit=32)
         if target_engine not in INSTALLABLE_ENGINES:
-            raise ValidationFailed("target engine must be one of: hermes, opencode")
+            raise ValidationFailed(
+                "target engine must be one of: hermes, opencode",
+                key="api.agent_integrations.target_engine_allowed",
+            )
         if engine is not None and target_engine != engine:
-            raise ValidationFailed("target engine must match the instance engine")
+            raise ValidationFailed(
+                "target engine must match the instance engine",
+                key="api.agent_integrations.target_engine_mismatch",
+            )
         path = _absolute_path(payload.get("path"), "target.path")
         profile = _optional_text(payload.get("profile"), "target.profile", 200)
         version = _optional_text(payload.get("version"), "target.version", 64)
@@ -3073,36 +3455,66 @@ class AgentIntegrationService:
     def _target_remote(self, payload: Mapping[str, Any]) -> bool:
         remote = payload.get("remote", False)
         if not isinstance(remote, bool):
-            raise ValidationFailed("target.remote must be a boolean")
+            raise ValidationFailed(
+                "target.remote must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "target.remote"},
+            )
         return remote
 
     def _mcp(self, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
-            raise ValidationFailed("mcp is required")
+            raise ValidationFailed(
+                "mcp is required",
+                key="api.validation.field_required",
+                params={"field": "mcp"},
+            )
         url = _http_url(payload.get("url"), "mcp.url")
         reference = _label(payload.get("secretRef"), limit=128)
         if reference is None:
-            raise ValidationFailed("mcp.secretRef is required")
+            raise ValidationFailed(
+                "mcp.secretRef is required",
+                key="api.validation.field_required",
+                params={"field": "mcp.secretRef"},
+            )
         if not SECRET_REF_PATTERN.fullmatch(reference):
-            raise ValidationFailed("mcp.secretRef must be an environment variable name")
+            raise ValidationFailed(
+                "mcp.secretRef must be an environment variable name",
+                key="api.agent_integrations.secret_ref_shape",
+                params={"field": "mcp.secretRef"},
+            )
         identity_id = _uuid_text(payload.get("identityId"), "mcp.identityId")
         if identity_id is None:
-            raise ValidationFailed("mcp.identityId is required")
+            raise ValidationFailed(
+                "mcp.identityId is required",
+                key="api.validation.field_required",
+                params={"field": "mcp.identityId"},
+            )
         return {"url": url, "secretRef": reference, "identityId": identity_id}
 
     def _skills(self, payload: Any) -> list[str]:
         if payload is None:
             return []
         if not isinstance(payload, list) or any(not isinstance(item, str) for item in payload):
-            raise ValidationFailed("skills must be a list of names")
+            raise ValidationFailed(
+                "skills must be a list of names", key="api.agent_integrations.skills_list"
+            )
         names = list(dict.fromkeys(item.strip() for item in payload if item.strip()))
         if len(names) > 50:
-            raise ValidationFailed("too many skills selected")
+            raise ValidationFailed(
+                "too many skills selected",
+                key="api.agent_integrations.skills_limit",
+                params={"limit": 50},
+            )
         catalog = self._catalog_instance()
         available = {item["name"] for item in catalog.list_skills()}
         unknown = [name for name in names if name not in available]
         if unknown:
-            raise ValidationFailed("unknown or disabled skills: " + ", ".join(sorted(unknown)))
+            raise ValidationFailed(
+                "unknown or disabled skills: " + ", ".join(sorted(unknown)),
+                key="api.agent_integrations.skills_unknown",
+                params={"names": ", ".join(sorted(unknown))},
+            )
         return names
 
     async def detect_target(
@@ -3151,22 +3563,39 @@ class AgentIntegrationService:
     async def install(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         operation = _label(payload.get("operation"), limit=16) or "install"
         if operation not in OPERATIONS:
-            raise ValidationFailed("operation is not supported")
+            raise ValidationFailed(
+                "operation is not supported", key="api.agent_integrations.operation_unsupported"
+            )
         with self._session() as db:
             self._require_admin(db, principal, "agent:integrations", human_only=True)
             instance = self._instance(db, str(payload.get("instanceId") or ""))
             if instance.engine not in INSTALLABLE_ENGINES:
-                raise ValidationFailed("the built-in instance has no external installation")
+                raise ValidationFailed(
+                    "the built-in instance has no external installation",
+                    key="api.agent_integrations.pydantic_no_installation",
+                )
             if not instance.enabled:
-                raise Conflict("the selected instance is disabled")
+                raise Conflict(
+                    "the selected instance is disabled",
+                    key="api.agent_integrations.instance_disabled",
+                )
             target = self._target(payload.get("target"), engine=instance.engine)
             if instance.directory is not None and target.path != instance.directory:
-                raise ValidationFailed("target.path must match the configured instance directory")
+                raise ValidationFailed(
+                    "target.path must match the configured instance directory",
+                    key="api.agent_integrations.target_path_mismatch",
+                )
             if instance.profile != target.profile:
-                raise ValidationFailed("target.profile must match the configured instance profile")
+                raise ValidationFailed(
+                    "target.profile must match the configured instance profile",
+                    key="api.agent_integrations.target_profile_mismatch",
+                )
             existing = self._installation_row(db, instance.id, target)
             if operation != "install" and existing is None:
-                raise ValidationFailed("the installation does not exist yet")
+                raise ValidationFailed(
+                    "the installation does not exist yet",
+                    key="api.agent_integrations.installation_absent",
+                )
             stored = dict(existing.receipt or {}) if existing is not None else {}
             if payload.get("mcp") is not None:
                 mcp = self._mcp(payload.get("mcp"))
@@ -3178,20 +3607,28 @@ class AgentIntegrationService:
                 }
                 mcp = self._mcp(mcp)
             else:
-                raise ValidationFailed("mcp is required for the first installation")
+                raise ValidationFailed(
+                    "mcp is required for the first installation",
+                    key="api.agent_integrations.mcp_first_installation",
+                )
             if (
                 instance.integration_identity_id
                 and mcp["identityId"] != instance.integration_identity_id
             ):
                 raise ValidationFailed(
-                    "the MCP identity must match the instance integration identity"
+                    "the MCP identity must match the instance integration identity",
+                    key="api.agent_integrations.mcp_identity_mismatch",
                 )
             if not instance.integration_identity_id:
                 raise ValidationFailed(
-                    "the instance must be bound to an integration identity first"
+                    "the instance must be bound to an integration identity first",
+                    key="api.agent_integrations.instance_binding_required",
                 )
             if not os.environ.get(mcp["secretRef"]):
-                raise ValidationFailed("mcp.secretRef does not resolve to a configured secret")
+                raise ValidationFailed(
+                    "mcp.secretRef does not resolve to a configured secret",
+                    key="api.agent_integrations.mcp_secret_unresolved",
+                )
             if payload.get("skills") is not None:
                 skills = self._skills(payload.get("skills"))
             elif existing is not None:
@@ -3199,7 +3636,10 @@ class AgentIntegrationService:
                     (stored.get("binding") or {}).get("skills") or stored.get("skills")
                 )
             else:
-                raise ValidationFailed("skills are required for the first installation")
+                raise ValidationFailed(
+                    "skills are required for the first installation",
+                    key="api.agent_integrations.skills_first_installation",
+                )
             instance_snapshot = self._snapshot(instance)
         installer = self._installer_instance()
         remote_mode = self._remote_mode(payload)
@@ -3257,7 +3697,9 @@ class AgentIntegrationService:
     def _remote_mode(self, payload: Mapping[str, Any]) -> bool:
         mode = payload.get("mode", "local")
         if mode not in {"local", "remote"}:
-            raise ValidationFailed("mode must be local or remote")
+            raise ValidationFailed(
+                "mode must be local or remote", key="api.agent_integrations.mode_allowed"
+            )
         return mode == "remote"
 
     async def _export_request(
@@ -3421,20 +3863,32 @@ class AgentIntegrationService:
         instance_id = _label(payload.get("instanceId"), limit=36)
         receipt = payload.get("receipt")
         if not isinstance(receipt, Mapping):
-            raise ValidationFailed("receipt must be an object")
+            raise ValidationFailed(
+                "receipt must be an object", key="api.agent_integrations.receipt_object"
+            )
         receipt = dict(receipt)
         try:
             encoded = json.dumps(receipt)
         except TypeError, ValueError:
-            raise ValidationFailed("receipt must be JSON data") from None
+            raise ValidationFailed(
+                "receipt must be JSON data", key="api.agent_integrations.receipt_json"
+            ) from None
         if len(encoded) > 512_000:
-            raise ValidationFailed("receipt is too large")
+            raise ValidationFailed(
+                "receipt is too large",
+                key="api.agent_integrations.receipt_too_large",
+                params={"limit": 512000},
+            )
         with self._session() as db:
             self._require_admin(db, principal, "agent:integrations", human_only=True)
             if installation_id is not None:
                 row = db.get(AgentInstallation, installation_id)
                 if row is None:
-                    raise NotFound("installation not found")
+                    raise NotFound(
+                        "installation not found",
+                        key="api.agent_integrations.record_not_found",
+                        params={"field": "installation"},
+                    )
             elif instance_id is not None:
                 candidates = list(
                     db.execute(
@@ -3452,20 +3906,35 @@ class AgentIntegrationService:
                     None,
                 )
                 if row is None:
-                    raise NotFound("the instance has no exported installation request")
+                    raise NotFound(
+                        "the instance has no exported installation request",
+                        key="api.agent_integrations.installation_request_absent",
+                    )
             else:
-                raise ValidationFailed("installationId or instanceId is required")
+                raise ValidationFailed(
+                    "installationId or instanceId is required",
+                    key="api.agent_integrations.installation_reference_required",
+                )
             if instance_id is not None and row.instance_id != instance_id:
-                raise ValidationFailed("the installation belongs to another instance")
+                raise ValidationFailed(
+                    "the installation belongs to another instance",
+                    key="api.agent_integrations.installation_instance_mismatch",
+                )
             instance = self._instance(db, row.instance_id)
             stored = dict(row.receipt or {})
             request = stored.get("request")
             stored_mcp = stored.get("mcp")
             if not isinstance(request, Mapping) or not isinstance(stored_mcp, Mapping):
-                raise ValidationFailed("the installation has no exported request")
+                raise ValidationFailed(
+                    "the installation has no exported request",
+                    key="api.agent_integrations.installation_request_missing",
+                )
             mcp = self._mcp(stored_mcp)
             if instance.integration_identity_id != mcp["identityId"]:
-                raise Conflict("the installation identity is no longer bound")
+                raise Conflict(
+                    "the installation identity is no longer bound",
+                    key="api.agent_integrations.installation_identity_unbound",
+                )
             target = self._target(
                 {
                     "engine": row.engine,
@@ -3483,7 +3952,10 @@ class AgentIntegrationService:
                 or (receipt.get("binding") or {}).get("requestDigest")
             )
             if expected_digest and provided_digest and provided_digest != expected_digest:
-                raise ValidationFailed("the receipt belongs to a different request")
+                raise ValidationFailed(
+                    "the receipt belongs to a different request",
+                    key="api.agent_integrations.receipt_request_mismatch",
+                )
             for key, expected in (
                 ("engine", row.engine),
                 ("profile", row.profile),
@@ -3491,7 +3963,11 @@ class AgentIntegrationService:
                 ("identityId", mcp["identityId"]),
             ):
                 if receipt.get(key) not in (None, expected):
-                    raise ValidationFailed(f"receipt {key} does not match the installation")
+                    raise ValidationFailed(
+                        f"receipt {key} does not match the installation",
+                        key="api.agent_integrations.receipt_key_mismatch",
+                        params={"key": key},
+                    )
             from itsm.agent_integrations.installer import validate_receipt
 
             instance_snapshot = self._snapshot(instance)
@@ -3501,7 +3977,10 @@ class AgentIntegrationService:
             except TimeoutError:
                 raise IntegrationUnavailable("receipt validation timed out") from None
             if not _validated(validation):
-                raise ValidationFailed("the receipt does not match the exported request")
+                raise ValidationFailed(
+                    "the receipt does not match the exported request",
+                    key="api.agent_integrations.receipt_mismatch",
+                )
             connection = await self._verify_connection(mcp)
             connection_ok = bool(connection.get("verified"))
             sanitized = _sanitize_receipt(receipt, os.environ.get(mcp["secretRef"]))
@@ -3955,11 +4434,18 @@ class AgentIntegrationService:
             self._require_admin(db, principal, "agent:integrations", human_only=True)
             row = db.get(AgentInstallation, installation_id)
             if row is None:
-                raise NotFound("installation not found")
+                raise NotFound(
+                    "installation not found",
+                    key="api.agent_integrations.record_not_found",
+                    params={"field": "installation"},
+                )
             receipt = dict(row.receipt or {})
             request = receipt.get("request")
             if not isinstance(request, Mapping):
-                raise Conflict("the installation has no exported remote request")
+                raise Conflict(
+                    "the installation has no exported remote request",
+                    key="api.agent_integrations.installation_remote_request_missing",
+                )
             return {
                 "request": dict(request),
                 "requestDigest": receipt.get("requestDigest"),
@@ -4000,7 +4486,11 @@ class AgentIntegrationService:
     ) -> dict[str, Any]:
         enabled = payload.get("enabled")
         if not isinstance(enabled, bool):
-            raise ValidationFailed("enabled must be a boolean")
+            raise ValidationFailed(
+                "enabled must be a boolean",
+                key="api.validation.field_boolean",
+                params={"field": "enabled"},
+            )
         with self._session() as db:
             self._require_admin(db, principal, "agent:catalog", permission="system.modules")
         catalog = self._catalog_instance()
@@ -4014,10 +4504,17 @@ class AgentIntegrationService:
                 "StopIteration",
                 "LookupError",
             }:
-                raise NotFound("module not found") from None
+                raise NotFound(
+                    "module not found",
+                    key="api.agent_integrations.record_not_found",
+                    params={"field": "module"},
+                ) from None
             raise
         if module.get("official") and not enabled:
-            raise Conflict("the official ITSM module cannot be disabled")
+            raise Conflict(
+                "the official ITSM module cannot be disabled",
+                key="api.agent_integrations.module_official_locked",
+            )
         with self._session() as db:
             row = db.get(AgentModuleState, module_id)
             if row is None:

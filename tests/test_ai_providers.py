@@ -30,6 +30,7 @@ from itsm.agent_integrations.providers import (
 from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.runtime import AgentRuntime, AgentUsage, ChatReply, ChatRequest
 from itsm.config import parse_personal_private_endpoints
+from itsm.i18n import t
 from itsm.main import create_app
 from pydantic_ai.messages import ModelResponse, TextPart
 from pydantic_ai.models.function import FunctionModel
@@ -882,7 +883,9 @@ def test_provider_scope_cannot_change_on_patch(provider_env: Any) -> None:
         headers=headers,
     )
     assert changed.status_code == 422, changed.text
-    assert changed.json()["error"]["message"] == "provider scope cannot be changed"
+    error = changed.json()["error"]
+    assert error["key"] == "api.agent_integrations.provider_scope_fixed"
+    assert error["message"] == t(error["key"], "es", **error["params"])
 
     renamed = client.patch(
         f"{API}/agent/providers/{provider_id}",
@@ -992,7 +995,9 @@ def test_instance_only_patch_rejects_provider_without_models(provider_env: Any) 
         headers=admin,
     )
     assert rejected.status_code == 422, rejected.text
-    assert rejected.json()["error"]["message"] == "the selected provider has no configured models"
+    error = rejected.json()["error"]
+    assert error["key"] == "api.agent_integrations.provider_no_models"
+    assert error["message"] == t(error["key"], "es", **error["params"])
     with catalog.session() as db:
         row = db.get(AgentSession, session.json()["id"])
         assert row is not None

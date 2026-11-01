@@ -110,12 +110,17 @@ def bounded_attachment_ids(value: Any) -> list[str]:
         return []
     if not isinstance(value, (list, tuple)) or len(value) > MAX_MESSAGE_ATTACHMENTS:
         raise ValidationFailed(
-            f"at most {MAX_MESSAGE_ATTACHMENTS} attachments are allowed per message"
+            f"at most {MAX_MESSAGE_ATTACHMENTS} attachments are allowed per message",
+            key="api.agent_integrations.message_attachments_limit",
+            params={"limit": MAX_MESSAGE_ATTACHMENTS},
         )
     seen: list[str] = []
     for item in value:
         if not isinstance(item, str) or not 1 <= len(item) <= 64:
-            raise ValidationFailed("attachment ids must be identifiers")
+            raise ValidationFailed(
+                "attachment ids must be identifiers",
+                key="api.agent_integrations.attachment_ids_invalid",
+            )
         if item not in seen:
             seen.append(item)
     return seen
@@ -150,13 +155,21 @@ class ChatAttachmentService:
     def _owned_session(self, principal: Principal, session_id: str) -> AgentSession:
         row = self._session.get(AgentSession, session_id)
         if row is None or row.owner_id != principal.actor_id:
-            raise NotFound("agent session not found")
+            raise NotFound(
+                "agent session not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "agent session"},
+            )
         return row
 
     def _row(self, principal: Principal, session_id: str, attachment_id: str) -> ChatAttachment:
         row = self._session.get(ChatAttachment, attachment_id)
         if row is None or row.session_id != session_id or row.owner_id != principal.actor_id:
-            raise NotFound("attachment not found")
+            raise NotFound(
+                "attachment not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "attachment"},
+            )
         return row
 
     @staticmethod
@@ -181,7 +194,9 @@ class ChatAttachmentService:
         )
         if int(stored or 0) >= MAX_SESSION_ATTACHMENTS:
             raise ValidationFailed(
-                f"a conversation accepts at most {MAX_SESSION_ATTACHMENTS} attachments"
+                f"a conversation accepts at most {MAX_SESSION_ATTACHMENTS} attachments",
+                key="api.agent_integrations.session_attachments_limit",
+                params={"limit": MAX_SESSION_ATTACHMENTS},
             )
         row = ChatAttachment(
             id=str(uuid4()),
@@ -265,7 +280,11 @@ class ChatAttachmentService:
             .order_by(ChatAttachment.created_at, ChatAttachment.id)
         ).all()
         if len(rows) != len(wanted):
-            raise NotFound("attachment not found")
+            raise NotFound(
+                "attachment not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "attachment"},
+            )
         return [self._read(row) for row in rows]
 
     def by_ids(
@@ -286,7 +305,11 @@ class ChatAttachmentService:
             .order_by(ChatAttachment.created_at, ChatAttachment.id)
         ).all()
         if len(rows) != len(wanted):
-            raise NotFound("attachment not found")
+            raise NotFound(
+                "attachment not found",
+                key="api.agent_integrations.record_not_found",
+                params={"field": "attachment"},
+            )
         return list(rows)
 
     def _read(self, row: ChatAttachment) -> ChatAttachmentInput:
@@ -309,7 +332,9 @@ def check_message_bytes(items: Iterable[ChatAttachmentInput]) -> None:
     total = sum(len(item.data) for item in items)
     if total > MAX_CHAT_MESSAGE_BYTES:
         raise ValidationFailed(
-            f"attachments must contain at most {MAX_CHAT_MESSAGE_BYTES} bytes per message"
+            f"attachments must contain at most {MAX_CHAT_MESSAGE_BYTES} bytes per message",
+            key="api.agent_integrations.message_bytes_limit",
+            params={"limit": MAX_CHAT_MESSAGE_BYTES},
         )
 
 

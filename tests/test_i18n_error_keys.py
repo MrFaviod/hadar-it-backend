@@ -63,18 +63,18 @@ GROUP_A = frozenset(
         "operations",
         "relationships",
         "reports",
+        "monitoring",
+        "notifications",
+        "agent_integrations",
+        "agents",
+        "mcp",
     }
 )
 
 #: T4b modules: pending conversion. This set may only shrink.
 PENDING = frozenset(
     {
-        "agent_integrations",
-        "agents",
         "extensions",
-        "mcp",
-        "monitoring",
-        "notifications",
     }
 )
 
@@ -328,6 +328,28 @@ CASES = [
         422,
         "api.dashboard.period_allowed",
         {"allowed": "24h, 7d, 30d"},
+        "monitoring",
+        "GET",
+        "/monitoring/alerts/00000000-0000-0000-0000-000000000000",
+        404,
+        "api.monitoring.record_not_found",
+        {"field": "alert"},
+    ),
+    (
+        "notifications",
+        "POST",
+        "/notifications/inbox/00000000000000000000000000000000/read",
+        404,
+        "api.notifications.record_not_found",
+        {"field": "notification"},
+    ),
+    (
+        "agent_integrations",
+        "GET",
+        "/agent/sessions/00000000-0000-0000-0000-000000000000",
+        404,
+        "api.agent_integrations.record_not_found",
+        {"field": "agent session"},
     ),
 ]
 
