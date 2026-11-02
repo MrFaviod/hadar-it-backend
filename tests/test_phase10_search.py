@@ -347,7 +347,7 @@ def test_sql_groups_entities_with_stable_keys_and_targets(settings_factory: Any)
     assert section["target"]["kind"] == "section"
     assert section["target"]["route"]["name"] == "inventory"
 
-    exact = _search(catalog, admin, "SITE-DEMO-001")
+    exact = _search(catalog, admin, "SW-SN-001")
     assert exact["items"][0]["key"] == f"asset:{asset_id}"
 
     scoped = _search(catalog, admin, "aruba", kinds=["person"])
@@ -384,10 +384,10 @@ def test_engine_hits_rehydrate_and_drop_stale_archived_and_deleted(
         asset_id = _asset(catalog)
         other_id = _asset(
             catalog,
-            quick_code="SITE-DEMO-002",
+            quick_code="SW-SN-002",
             name="Switch Aruba Respaldo",
             serial="AR2930F002",
-            ip="192.0.2.10",
+            ip="192.168.50.12",
         )
         with catalog.session() as session:
             result = execute_sync(session, catalog.settings)

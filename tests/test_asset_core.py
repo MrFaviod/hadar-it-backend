@@ -253,7 +253,7 @@ def test_archive_keeps_status_assignment_and_location_and_restore_clears_it(
     assert archived.status == "maintenance"
     assert archived.responsible == "Matriz NOC"
     assert archived.location == "Rack 2"
-    assert archived.site == "Example Site"
+    assert archived.site == "Sede Norte"
 
     with inventory(catalog) as assets:
         assert assets.search(catalog.admin(), archived=False).total == 0

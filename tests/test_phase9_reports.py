@@ -82,7 +82,7 @@ def test_inventory_preview_uses_filters_and_real_summary(catalog: Catalog) -> No
             quick_code="SW-RED-001",
             name="Switch rojo A",
             category="Red",
-            site="Example Site",
+            site="Sede Norte",
             cost="1000.00",
         ),
     )
@@ -116,7 +116,7 @@ def test_inventory_preview_uses_filters_and_real_summary(catalog: Catalog) -> No
     assert preview["summary"]["total"] == 2
     assert preview["summary"]["cost"] == "1900.50"
     assert preview["summary"]["byCategory"] == {"Red": 2}
-    assert preview["summary"]["bySite"] == {"Example Site": 1, "Centro": 1}
+    assert preview["summary"]["bySite"] == {"Sede Norte": 1, "Centro": 1}
     assert preview["template"]["id"] == "inventory-list"
     assert isinstance(preview["html"], str) and preview["html"]
 
@@ -484,7 +484,7 @@ def test_settings_defaults_save_and_logo_authorization(catalog: Catalog) -> None
     payload = {
         "baseUrl": "https://itam.example.com/",
         "branding": {
-            "name": "example-org",
+            "name": "Acme",
             "primary": "#123456",
             "accent": "#654321",
             "header": "Cabecera",
@@ -494,7 +494,7 @@ def test_settings_defaults_save_and_logo_authorization(catalog: Catalog) -> None
         "labelDefaults": {"formatId": "a4-21"},
     }
     saved = service.save_settings(admin, payload)
-    assert saved["branding"]["name"] == "example-org"
+    assert saved["branding"]["name"] == "Acme"
     assert saved["labelDefaults"]["formatId"] == "a4-21"
     assert (
         "Cabecera"
@@ -516,7 +516,7 @@ def test_settings_defaults_save_and_logo_authorization(catalog: Catalog) -> None
         service.save_settings(reader, payload)
     with catalog.session() as session:
         stored = session.get(ReportSettings, 1)
-        assert stored is not None and stored.data["branding"]["name"] == "example-org"
+        assert stored is not None and stored.data["branding"]["name"] == "Acme"
 
 
 def test_reports_deny_readers_without_assets_view(catalog: Catalog) -> None:

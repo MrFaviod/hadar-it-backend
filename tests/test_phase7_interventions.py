@@ -161,7 +161,7 @@ def plan_state(plan: dict[str, Any]) -> dict[str, Any]:
 
 def test_intervention_persists_rich_and_minimal_records_with_asset_history(api: Api):
     technician = person(api.client, api.auth, "Técnico Uno")
-    rich = asset(api.client, api.auth, "INT-RICH", category="Red", site="Example Site")
+    rich = asset(api.client, api.auth, "INT-RICH", category="Red", site="Sede Norte")
     attachment = upload(api.client, api.auth, rich["id"], PDF).json()
 
     response = add_intervention(
@@ -272,9 +272,9 @@ def test_incident_minimal_creation_multi_asset_links_and_interventions(api: Api)
         responsiblePersonId=responsible["id"],
         responsible=responsible["name"],
         category="Red",
-        site="Example Site",
+        site="Sede Norte",
     )
-    first = asset(api.client, api.auth, "INC-O1", category="Red", site="Example Site")
+    first = asset(api.client, api.auth, "INC-O1", category="Red", site="Sede Norte")
     second = asset(api.client, api.auth, "INC-O2", category="Blue", site="Matriz")
 
     response = add_incident(
@@ -628,7 +628,7 @@ def test_intervention_update_progresses_state_and_unlinks_reference_only(api: Ap
 def test_queries_filters_pagination_active_incidents_and_optional_costs(api: Api):
     first_person = person(api.client, api.auth, "Técnico Uno")
     second_person = person(api.client, api.auth, "Técnico Dos")
-    red = asset(api.client, api.auth, "Q-RED", category="Red", site="Example Site")
+    red = asset(api.client, api.auth, "Q-RED", category="Red", site="Sede Norte")
     blue = asset(api.client, api.auth, "Q-BLUE", category="Blue", site="Matriz")
     responsible = person(api.client, api.auth, "Responsable Dos")
 

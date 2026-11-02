@@ -383,9 +383,9 @@ def test_corrective_asset_changes_never_reset_the_preventive_cycle(catalog: Cata
 
 def test_queries_filter_state_category_site_period_and_paginate(catalog: Catalog) -> None:
     today = utcnow().date()
-    overdue = create_asset(catalog, "CAM-060", category="camaras", site="Example Site")
+    overdue = create_asset(catalog, "CAM-060", category="camaras", site="Sede Norte")
     upcoming = create_asset(catalog, "CAM-061", category="camaras", site="Central")
-    other = create_asset(catalog, "SW-062", category="switches", site="Example Site")
+    other = create_asset(catalog, "SW-062", category="switches", site="Sede Norte")
     cancelled_asset = create_asset(catalog, "CAM-063", category="camaras", site="Central")
 
     create_plan(
@@ -420,7 +420,7 @@ def test_queries_filter_state_category_site_period_and_paginate(catalog: Catalog
     assert list_plans(catalog, state="pending").total == 3
     assert list_plans(catalog, status="cancelled").total == 1
     assert list_plans(catalog, category="camaras").total == 3
-    assert list_plans(catalog, site="Example Site").total == 2
+    assert list_plans(catalog, site="Sede Norte").total == 2
     assert (
         list_plans(catalog, due_from=today, due_to=today.fromordinal(today.toordinal() + 30)).total
         == 1

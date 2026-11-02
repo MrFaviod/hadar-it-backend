@@ -133,7 +133,7 @@ def test_labels_document_title_and_fields_are_localized(catalog: Catalog) -> Non
     assert '<html lang="en">' in english
     assert "Labels ·" in english
     assert "LBL-I18N" in english
-    assert "Site: Example Site" in english
+    assert "Site: Sede Norte" in english
     assert "Sitio:" not in english
 
 

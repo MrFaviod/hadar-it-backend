@@ -5,8 +5,15 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
-.env
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Local-only records and material that is never published.
+AGENTS.md
+odd/
+docs/reviews/
+.worktrees/
+.publish/
+.env*

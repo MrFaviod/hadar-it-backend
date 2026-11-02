@@ -154,7 +154,7 @@ def test_operator_can_manage_people_but_not_departments_or_sites(
     )
     assert (
         operator.post(
-            "/api/v1/locations", json={"level": "site", "name": "Example Site"}, headers=auth
+            "/api/v1/locations", json={"level": "site", "name": "Sede Norte"}, headers=auth
         ).status_code
         == 403
     )
@@ -165,7 +165,7 @@ def test_location_hierarchy_and_tree_endpoint_are_bounded(
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
 
-    site = create_location(test_client, auth, level="site", name="Example Site")
+    site = create_location(test_client, auth, level="site", name="Sede Norte")
     assert set(site) == {
         "id",
         "level",
@@ -261,7 +261,7 @@ def test_reactivation_against_an_inactive_reference_is_rejected(
     signed_in_client: SignedInFactory, catalog: Catalog, case: str, key: str
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
-    site = create_location(test_client, auth, level="site", name="Example Site")
+    site = create_location(test_client, auth, level="site", name="Sede Norte")
     department = test_client.post("/api/v1/departments", json={"name": "Redes"}, headers=auth)
     assert department.status_code == 201
     department_id = department.json()["id"]
@@ -342,10 +342,10 @@ def test_department_and_location_writes_need_delete_free_configuration_permissio
     active = test_client.get("/api/v1/departments", headers=auth)
     assert active.json()["total"] == 1
 
-    site = create_location(test_client, auth, level="site", name="Example Site")
+    site = create_location(test_client, auth, level="site", name="Sede Norte")
     located = test_client.patch(
         f"/api/v1/locations/{site['id']}",
-        json={"latitude": -25.2867, "longitude": -57.3333, "planRef": "SITE-DEMO"},
+        json={"latitude": -25.2867, "longitude": -57.3333, "planRef": "PLANO-SN"},
         headers=auth,
     )
     assert located.status_code == 200

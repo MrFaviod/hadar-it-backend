@@ -177,10 +177,10 @@ def test_sheet_mapping_rejects_a_non_string_target():
 
 
 def test_sheet_site_applies_a_legacy_label_to_that_sheet_only():
-    rows = parse(two_sites(), "assets.xlsx", {"sheetSites": {"Sede A": "Example Site"}})
+    rows = parse(two_sites(), "assets.xlsx", {"sheetSites": {"Sede A": "Sede Norte"}})
 
     by_sheet = {row["sheet"]: row["values"] for row in rows}
-    assert by_sheet["Sede A"] == {"Nombre": "Switch A", "site": "Example Site"}
+    assert by_sheet["Sede A"] == {"Nombre": "Switch A", "site": "Sede Norte"}
     assert by_sheet["Sede B"] == {"Nombre": "Switch B"}
 
 
@@ -207,7 +207,7 @@ def test_a_row_site_column_wins_over_the_sheet_site():
     rows = parse(
         data,
         "assets.xlsx",
-        {"mapping": {"Sede": "site"}, "sheetSites": {"Sede A": "Example Site"}},
+        {"mapping": {"Sede": "site"}, "sheetSites": {"Sede A": "Sede Norte"}},
     )
 
     assert rows[0]["values"]["site"] == "Rack 2"

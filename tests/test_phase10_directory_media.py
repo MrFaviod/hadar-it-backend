@@ -101,7 +101,7 @@ def create_location(test_client: TestClient, auth: dict[str, str], **values: Any
 
 
 def create_floor(test_client: TestClient, auth: dict[str, str]) -> dict[str, Any]:
-    site = create_location(test_client, auth, level="site", name="Example Site")
+    site = create_location(test_client, auth, level="site", name="Sede Norte")
     building = create_location(
         test_client, auth, level="building", name="Edificio A", parentId=site["id"]
     )
@@ -250,7 +250,7 @@ def test_plan_resource_requires_a_floor_and_the_configuration_permission(
 ) -> None:
     with media_client(catalog) as test_client:
         auth = admin_auth(test_client, catalog)
-        site = create_location(test_client, auth, level="site", name="Example Site")
+        site = create_location(test_client, auth, level="site", name="Sede Norte")
         plan = png_bytes(10, 10)
         not_floor = test_client.put(
             f"/api/v1/locations/{site['id']}/plan", content=plan, headers=auth

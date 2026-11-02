@@ -121,15 +121,15 @@ def prepare(settings_factory: Any, **overrides: Any) -> Catalog:
 def asset_values(**overrides: Any) -> dict[str, Any]:
     """A complete valid asset payload; tests override only the fields under test."""
     values: dict[str, Any] = {
-        "quick_code": "SITE-DEMO-001",
+        "quick_code": "SW-SN-001",
         "name": "Switch Aruba 2930F",
         "category": "Red",
         "type": "Switch",
         "brand": "Aruba",
         "model": "2930F-24G",
         "serial": "AR2930F001",
-        "ip": "192.0.2.10",
-        "site": "Example Site",
+        "ip": "192.168.50.11",
+        "site": "Sede Norte",
         "location": "Rack 2",
         "responsible": "Matriz NOC",
         "status": "in_use",

@@ -38,11 +38,11 @@ def test_create_assigns_permanent_uuid_and_generated_quick_code(catalog: Catalog
 def test_create_preserves_explicit_quick_code_and_status(catalog: Catalog) -> None:
     with catalog.session() as session:
         created = service(catalog, session).create(
-            catalog.admin(), asset_values(quick_code="SITE-DEMO-001", status="in_storage")
+            catalog.admin(), asset_values(quick_code="sw-sn-001", status="in_storage")
         )
-    assert created.quick_code == "SITE-DEMO-001"
+    assert created.quick_code == "sw-sn-001"
     assert created.status == "in_storage"
-    assert created.site == "Example Site"
+    assert created.site == "Sede Norte"
 
 
 def test_quick_code_collision_is_case_insensitive_and_advances_the_suffix(
@@ -50,15 +50,15 @@ def test_quick_code_collision_is_case_insensitive_and_advances_the_suffix(
 ) -> None:
     with catalog.session() as session:
         first = service(catalog, session).create(
-            catalog.admin(), asset_values(quick_code="SITE-DEMO-001")
+            catalog.admin(), asset_values(quick_code="SW-SN-001")
         )
 
     with catalog.session() as session:
         second = service(catalog, session).create(
-            catalog.admin(), asset_values(quick_code="SITE-DEMO-001")
+            catalog.admin(), asset_values(quick_code="sw-sn-001")
         )
 
-    assert second.quick_code == "SITE-DEMO-002"
+    assert second.quick_code == "sw-sn-002"
     assert second.id != first.id
     assert catalog.asset_count() == 2
 
@@ -69,14 +69,14 @@ def test_update_changes_quick_code_and_keeps_the_same_id(catalog: Catalog) -> No
 
     with catalog.session() as session:
         updated = service(catalog, session).update(
-            catalog.admin(), created.id, {"quick_code": "SITE-DEMO-999", "responsible": "Soporte"}
+            catalog.admin(), created.id, {"quick_code": "SW-SN-999", "responsible": "Soporte"}
         )
         repeated = service(catalog, session).update(
-            catalog.admin(), created.id, {"quick_code": "SITE-DEMO-999"}
+            catalog.admin(), created.id, {"quick_code": "SW-SN-999"}
         )
 
     assert updated.id == created.id == repeated.id
-    assert updated.quick_code == "SITE-DEMO-999"
+    assert updated.quick_code == "SW-SN-999"
     assert updated.responsible == "Soporte"
 
 
@@ -123,10 +123,10 @@ def test_reader_can_search_but_cannot_create(catalog: Catalog) -> None:
     with catalog.session() as session:
         page = service(catalog, session).search(reader, query="Aruba")
     assert page.total == 1
-    assert page.items[0].quick_code == "SITE-DEMO-001"
+    assert page.items[0].quick_code == "SW-SN-001"
 
     with pytest.raises(PermissionDenied), catalog.session() as session:
-        service(catalog, session).create(reader, asset_values(quick_code="SITE-DEMO-002"))
+        service(catalog, session).create(reader, asset_values(quick_code="SW-SN-002"))
 
     assert catalog.asset_count() == 1
 
@@ -160,7 +160,7 @@ def test_responsible_changes_require_the_assign_permission(catalog: Catalog) -> 
 
     with pytest.raises(PermissionDenied), catalog.session() as session:
         service(catalog, session).create(
-            editor, asset_values(quick_code="SITE-DEMO-002", responsible="Otro")
+            editor, asset_values(quick_code="SW-SN-002", responsible="Otro")
         )
 
 
@@ -256,7 +256,7 @@ def test_search_filters_paginates_and_escapes_wildcards(catalog: Catalog) -> Non
         inventory = service(catalog, session)
         inventory.create(
             catalog.admin(),
-            asset_values(quick_code="NET-1", name="Switch 100% backup", site="Example Site"),
+            asset_values(quick_code="NET-1", name="Switch 100% backup", site="Sede Norte"),
         )
         inventory.create(
             catalog.admin(),
@@ -273,7 +273,7 @@ def test_search_filters_paginates_and_escapes_wildcards(catalog: Catalog) -> Non
             asset_values(
                 quick_code="PC-1",
                 name="Notebook Dell",
-                site="Example Site",
+                site="Sede Norte",
                 category="Computo",
                 status="in_use",
             ),
@@ -286,9 +286,9 @@ def test_search_filters_paginates_and_escapes_wildcards(catalog: Catalog) -> Non
         assert inventory.search(catalog.admin(), query="_").total == 0
         assert inventory.search(catalog.admin(), query="' OR 1=1 --").total == 0
         assert inventory.search(catalog.admin(), category="red").total == 2
-        assert inventory.search(catalog.admin(), site="Example Site").total == 2
+        assert inventory.search(catalog.admin(), site="Sede Norte").total == 2
         assert inventory.search(catalog.admin(), status="maintenance").total == 1
-        page = inventory.search(catalog.admin(), site="Example Site", limit=1, offset=1)
+        page = inventory.search(catalog.admin(), site="Sede Norte", limit=1, offset=1)
     assert page.total == 2
     assert len(page.items) == 1
     assert page.limit == 1

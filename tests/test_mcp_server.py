@@ -170,19 +170,19 @@ def test_mcp_create_is_visible_through_rest_with_the_same_id(mcp: McpServer) -> 
         "create_asset",
         {
             "name": "Switch Aruba 2930F",
-            "quick_code": "SITE-DEMO-001",
+            "quick_code": "MCP-SN-001",
             "category": "Red",
-            "site": "Example Site",
+            "site": "Sede Norte",
             "status": "in_use",
         },
     )
     payload = created.structured_content
-    assert payload["quickCode"] == "SITE-DEMO-001"
+    assert payload["quickCode"] == "MCP-SN-001"
 
     fetched = rest_get(mcp, token, f"/api/v1/assets/{payload['id']}")
     assert fetched.status_code == 200
     assert fetched.json()["id"] == payload["id"]
-    assert fetched.json()["quickCode"] == "SITE-DEMO-001"
+    assert fetched.json()["quickCode"] == "MCP-SN-001"
 
 
 def test_mcp_update_keeps_id_and_repeat_is_stable(mcp: McpServer) -> None:
@@ -240,14 +240,14 @@ def test_mcp_batch_is_bounded_atomic_and_compact(mcp: McpServer) -> None:
         "batch_update_assets",
         {
             "updates": [
-                {"asset_id": first.structured_content["id"], "site": "Example Site"},
-                {"asset_id": second.structured_content["id"], "site": "Example Site"},
+                {"asset_id": first.structured_content["id"], "site": "Sede Norte"},
+                {"asset_id": second.structured_content["id"], "site": "Sede Norte"},
             ]
         },
     )
-    assert {item["site"] for item in updated.structured_content["updated"]} == {"Example Site"}
+    assert {item["site"] for item in updated.structured_content["updated"]} == {"Sede Norte"}
 
-    search = call_tool(mcp, token, "search_assets", {"site": "Example Site"})
+    search = call_tool(mcp, token, "search_assets", {"site": "Sede Norte"})
     assert search.structured_content["total"] == 2
     assert set(search.structured_content["items"][0]) == {
         "id",
@@ -276,7 +276,7 @@ def test_mcp_batch_is_bounded_atomic_and_compact(mcp: McpServer) -> None:
         )
     assert (
         rest_get(mcp, token, f"/api/v1/assets/{first.structured_content['id']}").json()["site"]
-        == "Example Site"
+        == "Sede Norte"
     )
 
 

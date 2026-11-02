@@ -79,7 +79,7 @@ def test_rest_agent_mcp_share_the_same_asset_identity(catalog: Catalog, free_tcp
             async with Client(transport) as client:
                 fetched = await client.call_tool("get_asset", {"asset_id": asset_id})
                 updated = await client.call_tool(
-                    "update_asset", {"asset_id": asset_id, "site": "Example Site"}
+                    "update_asset", {"asset_id": asset_id, "site": "Sede Norte"}
                 )
             return fetched.structured_content, updated.structured_content
 
@@ -91,7 +91,7 @@ def test_rest_agent_mcp_share_the_same_asset_identity(catalog: Catalog, free_tcp
         after = httpx.get(f"{base}/api/v1/assets/{asset_id}", headers=headers(token), timeout=10)
         assert after.status_code == 200
         assert after.json()["id"] == asset_id
-        assert after.json()["site"] == "Example Site"
+        assert after.json()["site"] == "Sede Norte"
 
         # A repeated quickCode update through REST keeps the permanent id.
         repeated = httpx.patch(

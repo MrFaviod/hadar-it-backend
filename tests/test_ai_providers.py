@@ -1341,7 +1341,7 @@ def test_guarded_client_refuses_a_private_resolution_without_an_allowlist(
 
     def fake_resolve(host: str, port: int) -> list[str]:
         seen.append((host, port))
-        return ["192.0.2.10"]
+        return ["192.168.50.80"]
 
     monkeypatch.setattr(providers_module, "resolve_addresses", fake_resolve)
     client = provider_http_client(policy=ProviderNetworkPolicy())

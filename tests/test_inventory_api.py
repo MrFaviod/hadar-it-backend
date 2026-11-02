@@ -47,10 +47,10 @@ def test_create_read_and_search_return_the_same_asset(
 
     created = create_asset(test_client, auth)
 
-    assert created["quickCode"] == "SITE-DEMO-001"
+    assert created["quickCode"] == "SW-SN-001"
     assert created["status"] == "in_use"
     assert created["statusLabel"] == "En uso"
-    assert created["site"] == "Example Site"
+    assert created["site"] == "Sede Norte"
     assert set(created) == {
         "id",
         "quickCode",
@@ -133,20 +133,20 @@ def test_duplicate_numeric_quick_code_advances_without_overwriting(
     catalog: Catalog,
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
-    original = create_asset(test_client, auth, quick_code="SITE-DEMO-001")
+    original = create_asset(test_client, auth, quick_code="SW-SN-001")
 
     duplicate = test_client.post(
         "/api/v1/assets",
-        json=api_values(quick_code="SITE-DEMO-001", name="Otro switch"),
+        json=api_values(quick_code="sw-sn-001", name="Otro switch"),
         headers=auth,
     )
 
     assert duplicate.status_code == 201, duplicate.text
-    assert duplicate.json()["quickCode"] == "SITE-DEMO-002"
+    assert duplicate.json()["quickCode"] == "sw-sn-002"
     assert duplicate.json()["id"] != original["id"]
     assert catalog.asset_count() == 2
     stored = test_client.get(f"/api/v1/assets/{original['id']}", headers=auth)
-    assert stored.json()["quickCode"] == "SITE-DEMO-001"
+    assert stored.json()["quickCode"] == "SW-SN-001"
 
 
 def test_validation_rejects_extra_fields_and_unknown_status(
@@ -174,12 +174,12 @@ def test_patch_updates_quick_code_and_rejects_id_changes(
 
     updated = test_client.patch(
         f"/api/v1/assets/{created['id']}",
-        json={"quickCode": "SITE-DEMO-777", "responsible": "Soporte Example Site"},
+        json={"quickCode": "SW-SN-777", "responsible": "Soporte Sede Norte"},
         headers=auth,
     )
     repeated = test_client.patch(
         f"/api/v1/assets/{created['id']}",
-        json={"quickCode": "SITE-DEMO-777"},
+        json={"quickCode": "SW-SN-777"},
         headers=auth,
     )
     forged = test_client.patch(
@@ -190,12 +190,12 @@ def test_patch_updates_quick_code_and_rejects_id_changes(
 
     assert updated.status_code == 200, updated.text
     assert updated.json()["id"] == created["id"]
-    assert updated.json()["quickCode"] == "SITE-DEMO-777"
+    assert updated.json()["quickCode"] == "SW-SN-777"
     assert repeated.status_code == 200
     assert forged.status_code == 422
     stored = test_client.get(f"/api/v1/assets/{created['id']}", headers=auth)
     assert stored.json()["id"] == created["id"]
-    assert stored.json()["quickCode"] == "SITE-DEMO-777"
+    assert stored.json()["quickCode"] == "SW-SN-777"
 
 
 def test_batch_is_atomic_and_reports_both_halves(
@@ -240,13 +240,13 @@ def test_search_filters_and_pagination_are_bounded(
     catalog: Catalog,
 ) -> None:
     test_client, auth = signed_in_client(catalog.settings)
-    create_asset(test_client, auth, quick_code="NET-1", site="Example Site")
+    create_asset(test_client, auth, quick_code="NET-1", site="Sede Norte")
     create_asset(test_client, auth, quick_code="NET-2", site="Asuncion", category="Computo")
-    create_asset(test_client, auth, quick_code="NET-3", site="Example Site", status="maintenance")
+    create_asset(test_client, auth, quick_code="NET-3", site="Sede Norte", status="maintenance")
 
     page = test_client.get(
         "/api/v1/assets",
-        params={"site": "Example Site", "limit": 1, "offset": 1},
+        params={"site": "Sede Norte", "limit": 1, "offset": 1},
         headers=auth,
     )
     exact = test_client.get("/api/v1/assets", params={"quickCode": "net-2"}, headers=auth)

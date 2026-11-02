@@ -625,7 +625,7 @@ def test_sparse_and_legacy_assets_keep_working(catalog: Catalog) -> None:
     assert payload["responsibleLabel"] is None
     assert payload["positionX"] is None
     assert payload["positionY"] is None
-    assert payload["site"] == "Example Site"
+    assert payload["site"] == "Sede Norte"
     assert payload["responsible"] == "Matriz NOC"
     assert payload["cost"] is None
     assert payload["technical"] is None
@@ -705,7 +705,7 @@ def test_explicit_person_clear_clears_the_reference_and_its_mirrored_text(
     )
     cleared_by_text = create_asset(
         catalog,
-        quick_code="SITE-DEMO-002",
+        quick_code="SW-SN-002",
         site=None,
         location=None,
         responsible_person_id=person,
@@ -750,7 +750,7 @@ def test_clearing_or_switching_the_site_drops_its_location_and_position(
     )
     switched = create_asset(
         catalog,
-        quick_code="SITE-DEMO-002",
+        quick_code="SW-SN-002",
         site=None,
         location=None,
         site_id=site,
@@ -971,7 +971,7 @@ def test_restore_accepts_reactivated_references_and_sparse_assets(catalog: Catal
         responsible_person_id=person,
         responsible=None,
     )
-    sparse = create_asset(catalog, quick_code="SITE-DEMO-002")
+    sparse = create_asset(catalog, quick_code="SW-SN-002")
     for asset_id in (bound.id, sparse.id):
         inventory(
             catalog,
@@ -1073,11 +1073,11 @@ def test_legacy_text_and_archived_references_keep_reading(catalog: Catalog) -> N
     site, _, room, _ = hierarchy(catalog)
     legacy = create_asset(catalog)
     legacy_payload = legacy.as_payload()
-    assert legacy_payload["site"] == "Example Site"
+    assert legacy_payload["site"] == "Sede Norte"
     assert legacy_payload["location"] == "Rack 2"
 
     bound = create_asset(
-        catalog, quick_code="SITE-DEMO-002", site=None, location=None, site_id=site, location_id=room
+        catalog, quick_code="SW-SN-002", site=None, location=None, site_id=site, location_id=room
     )
     inventory(
         catalog,
@@ -1100,7 +1100,7 @@ def test_legacy_text_and_archived_references_keep_reading(catalog: Catalog) -> N
     legacy_after = inventory_read(
         catalog, lambda service: service.get(catalog.admin(), legacy.id)
     ).as_payload()
-    assert legacy_after["site"] == "Example Site"
+    assert legacy_after["site"] == "Sede Norte"
     assert legacy_after["location"] == "Rack 2"
     assert legacy_after["siteId"] is None
 

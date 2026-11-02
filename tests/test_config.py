@@ -132,14 +132,14 @@ def test_personal_private_endpoints_default_to_disabled() -> None:
 
 def test_personal_private_endpoints_accept_cidrs_and_exact_hosts() -> None:
     settings = make_settings(
-        ai_personal_private_endpoints="10.0.0.0/8, 192.0.2.20,models.internal:8443,fd00::/8"
+        ai_personal_private_endpoints="10.0.0.0/8, 192.168.60.5,models.internal:8443,fd00::/8"
     )
 
     entries = parse_personal_private_endpoints(settings.ai_personal_private_endpoints)
 
     assert [entry.describe() for entry in entries] == [
         "10.0.0.0/8",
-        "192.0.2.20/32",
+        "192.168.60.5/32",
         "models.internal:8443",
         "fd00::/8",
     ]
@@ -153,11 +153,11 @@ def test_personal_private_endpoints_accept_cidrs_and_exact_hosts() -> None:
 def test_personal_private_endpoints_follow_the_environment_prefix(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    monkeypatch.setenv("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", "192.0.2.10/24")
+    monkeypatch.setenv("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", "192.168.50.0/24")
 
     settings = Settings(_env_file=None)
 
-    assert settings.ai_personal_private_endpoints == "192.0.2.10/24"
+    assert settings.ai_personal_private_endpoints == "192.168.50.0/24"
 
 
 @pytest.mark.parametrize(

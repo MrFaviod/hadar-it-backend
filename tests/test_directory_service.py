@@ -93,7 +93,7 @@ def audit(catalog: Catalog, action: str) -> list[dict[str, Any]]:
         ]
 
 
-def make_site(service: DirectoryService, catalog: Catalog, name: str = "Example Site") -> Any:
+def make_site(service: DirectoryService, catalog: Catalog, name: str = "Sede Norte") -> Any:
     return service.create_location(catalog.admin(), {"level": "site", "name": name}, source="rest")
 
 
@@ -161,13 +161,13 @@ def test_person_reference_and_contact_fields_stay_sparse(catalog: Catalog) -> No
         updated = service.update_person(
             catalog.admin(),
             person.id,
-            {"department_id": department.id, "contact_email": "bruno@example-org.local"},
+            {"department_id": department.id, "contact_email": "bruno@example.invalid"},
             source="rest",
         )
 
     assert (updated.site_id, updated.department_id) == (site.id, department.id)
     assert updated.job_title is None
-    assert updated.contact_email == "bruno@example-org.local"
+    assert updated.contact_email == "bruno@example.invalid"
     assert updated.contact_phone is None
 
 
@@ -293,7 +293,7 @@ def test_person_reactivation_requires_an_active_reference(
 def test_person_reactivation_uses_the_references_from_the_patch(catalog: Catalog) -> None:
     with directory(catalog) as service:
         closed_site = make_site(service, catalog)
-        active_site = make_site(service, catalog, "Example City")
+        active_site = make_site(service, catalog, "Sede Sur")
         department = service.create_department(catalog.admin(), {"name": "Redes"}, source="rest")
         person = service.create_person(
             catalog.admin(),
@@ -463,7 +463,7 @@ def test_location_levels_require_their_exact_parent(catalog: Catalog) -> None:
         with pytest.raises(ValidationFailed):
             service.create_location(catalog.admin(), {"level": "attic", "name": "Techo"})
         building = make_child(service, catalog, "building", site.id, "Edificio A")
-        other_site = make_site(service, catalog, "Example City")
+        other_site = make_site(service, catalog, "Sede Sur")
         with pytest.raises(Conflict):
             make_child(service, catalog, "building", site.id, " edificio a ")
         make_child(service, catalog, "building", other_site.id, "Edificio A")
@@ -479,7 +479,7 @@ def test_location_levels_require_their_exact_parent(catalog: Catalog) -> None:
 def test_location_reparent_rejects_cycles_and_level_mismatch(catalog: Catalog) -> None:
     with directory(catalog) as service:
         site = make_site(service, catalog)
-        other = make_site(service, catalog, "Example City")
+        other = make_site(service, catalog, "Sede Sur")
         building = make_child(service, catalog, "building", site.id, "Edificio A")
         floor = make_child(service, catalog, "floor", building.id, "Piso 1")
         with pytest.raises(ValidationFailed):
@@ -565,12 +565,12 @@ def test_plan_reference_rejects_paths_and_urls(catalog: Catalog) -> None:
         stored = service.update_location(
             catalog.admin(),
             site.id,
-            {"plan_ref": "SITE-DEMO-2026", "plan_page": "P3"},
+            {"plan_ref": "PLANO-SN-2026", "plan_page": "P3"},
             source="rest",
         )
 
-    assert (stored.plan_ref, stored.plan_page) == ("SITE-DEMO-2026", "P3")
-    assert events(catalog)[-1]["after"]["planRef"] == "SITE-DEMO-2026"
+    assert (stored.plan_ref, stored.plan_page) == ("PLANO-SN-2026", "P3")
+    assert events(catalog)[-1]["after"]["planRef"] == "PLANO-SN-2026"
 
 
 def test_location_deactivation_requires_no_active_children_or_people(catalog: Catalog) -> None:
@@ -624,7 +624,7 @@ def test_location_reactivation_requires_an_active_parent(catalog: Catalog) -> No
 def test_location_reactivation_uses_the_parent_from_the_patch(catalog: Catalog) -> None:
     with directory(catalog) as service:
         closed = make_site(service, catalog)
-        active = make_site(service, catalog, "Example City")
+        active = make_site(service, catalog, "Sede Sur")
         building = make_child(service, catalog, "building", closed.id, "Edificio A")
         service.update_location(catalog.admin(), building.id, {"active": False}, source="rest")
         service.update_location(catalog.admin(), closed.id, {"active": False}, source="rest")

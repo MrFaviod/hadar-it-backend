@@ -443,7 +443,7 @@ def test_retrying_a_capability_mutation_with_the_same_key_is_safe(
     with pytest.raises(ExtensionIdempotencyConflict):
         env.invoke(
             "probe_asset_create",
-            {"values": asset_values(quick_code="SITE-DEMO-002"), "idempotency_key": key},
+            {"values": asset_values(quick_code="SW-SN-002"), "idempotency_key": key},
         )
 
 

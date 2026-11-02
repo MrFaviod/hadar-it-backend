@@ -74,10 +74,10 @@ def seed_asset(test_client: TestClient, auth: dict[str, str]) -> dict[str, Any]:
     response = test_client.post(
         "/api/v1/assets",
         json={
-            "quickCode": "SITE-DEMO-001",
+            "quickCode": "SW-SN-001",
             "name": "Switch Aruba 2930F",
             "category": "Red",
-            "site": "Example Site",
+            "site": "Sede Norte",
             "responsible": "Matriz NOC",
         },
         headers=auth,
@@ -91,7 +91,7 @@ def test_chat_without_configured_model_is_factually_unavailable(
 ) -> None:
     test_client, auth = signed_in_client()
 
-    response = chat(test_client, auth, message="Consultá los activos de Example Site")
+    response = chat(test_client, auth, message="Consultá los activos de Sede Norte")
 
     assert response.status_code == 503
     assert response.json()["error"]["code"] == "unavailable"
@@ -146,7 +146,7 @@ def test_chat_chains_search_tool_and_returns_compact_actions(
         FunctionModel(
             scripted(
                 [ToolCallPart("search_assets", {"query": "Aruba"})],
-                [TextPart("Encontré un switch Aruba en Example Site.")],
+                [TextPart("Encontré un switch Aruba en Sede Norte.")],
             )
         ),
     )
@@ -155,11 +155,11 @@ def test_chat_chains_search_tool_and_returns_compact_actions(
 
     assert response.status_code == 200, response.text
     payload = response.json()
-    assert payload["message"] == "Encontré un switch Aruba en Example Site."
+    assert payload["message"] == "Encontré un switch Aruba en Sede Norte."
     assert payload["actions"] == [
         {"tool": "search_assets", "status": "completed", "assetIds": [asset["id"]]}
     ]
-    assert payload["results"][0]["quickCode"] == "SITE-DEMO-001"
+    assert payload["results"][0]["quickCode"] == "SW-SN-001"
     assert payload["approvalPending"] is False
 
 
@@ -177,9 +177,9 @@ def test_chat_creates_and_updates_through_the_canonical_service(
                     ToolCallPart(
                         "create_asset",
                         {
-                            "name": "Switch Aruba en Example Site",
+                            "name": "Switch Aruba en Sede Norte",
                             "quick_code": "SW-NEW-1",
-                            "site": "Example Site",
+                            "site": "Sede Norte",
                             "category": "Red",
                         },
                     )
@@ -189,7 +189,7 @@ def test_chat_creates_and_updates_through_the_canonical_service(
         ),
     )
 
-    response = chat(test_client, auth, message="Registrá un switch Aruba en Example Site")
+    response = chat(test_client, auth, message="Registrá un switch Aruba en Sede Norte")
 
     assert response.status_code == 200, response.text
     created = response.json()["actions"][0]

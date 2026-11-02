@@ -1,0 +1,140 @@
+"""Publication privacy gate for the backend sources.
+
+The backend is published as an independent repository, so the files a reader can
+check out must not describe the private installation it was written for: real
+organization and site names, real private network addresses, the administrator's
+home path or a local design-tool project id (spec S4 in
+``odd/tasks/publish-readiness.md``). The same gate covers the ignore rules that
+keep local agent records and local snapshots out of the published history (S3).
+
+These checks read the working tree only; they never depend on Git history or on
+Git being available at all.
+"""
+
+from __future__ import annotations
+
+import re
+from collections.abc import Iterator
+from pathlib import Path
+
+import pytest
+from tests.conftest import BACKEND_ROOT
+
+# Directories and files that are published as product or public documentation.
+PRODUCT_ROOTS = ("itsm", "tests", "docs", "migrations")
+PRODUCT_FILES = (
+    ".dockerignore",
+    ".gitignore",
+    "README.md",
+    "alembic.ini",
+    "pyproject.toml",
+    "requirements-dev.txt",
+    "requirements.txt",
+)
+TEXT_SUFFIXES = frozenset(
+    {".cfg", ".ini", ".js", ".json", ".mako", ".md", ".py", ".toml", ".txt", ".yaml", ".yml"}
+)
+# Local records that are kept outside the published history, plus this file,
+# which has to spell out the patterns it forbids.
+EXCLUDED_FILES = frozenset({"AGENTS.md", "tests/test_public_sanitization.py"})
+EXCLUDED_PREFIXES = ("docs/reviews/",)
+
+# (label, pattern). The label is what a failing test reports, so no private
+# value from the file is echoed into the output.
+DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
+    ("real organization name", re.compile(r"example-org", re.IGNORECASE)),
+    ("real site name", re.compile(r"bella\s+vista", re.IGNORECASE)),
+    (
+        "identifier derived from the real site",
+        re.compile(r"\b[A-Za-z]{2,5}-BV\b", re.IGNORECASE),
+    ),
+    ("real private network", re.compile(r"\b192\.168\.120\.\d+")),
+    ("real private network", re.compile(r"\b192\.168\.10\.\d+")),
+    ("real private network", re.compile(r"\b10\.30\.\d+\.\d+")),
+    ("administrator home path", re.compile(r"/home/example-user")),
+    ("local design-tool project id", re.compile(r"00000000-0000-4000-8000-000000000000")),
+    ("organization-specific domain", re.compile(r"(?:empresa|example-org)\.local", re.IGNORECASE)),
+)
+
+# Ignore rules that keep local-only records out of the published tree.
+REQUIRED_IGNORE_RULES = {
+    ".dockerignore": ("AGENTS.md", "odd/", "docs/reviews/", ".worktrees/", ".publish/", ".env*"),
+    ".gitignore": ("AGENTS.md", "odd/", "docs/reviews/", ".worktrees/", ".publish/", ".env*"),
+}
+
+
+def _published_sources() -> Iterator[tuple[str, Path]]:
+    """Yield the relative path and location of every published text file."""
+    seen: set[Path] = set()
+    for name in PRODUCT_FILES:
+        path = BACKEND_ROOT / name
+        if path.is_file():
+            seen.add(path)
+            yield name, path
+    for root in PRODUCT_ROOTS:
+        for path in sorted((BACKEND_ROOT / root).rglob("*")):
+            if not path.is_file() or path.suffix not in TEXT_SUFFIXES:
+                continue
+            relative = path.relative_to(BACKEND_ROOT).as_posix()
+            if relative in EXCLUDED_FILES or relative.startswith(EXCLUDED_PREFIXES):
+                continue
+            if any(part.startswith(".") for part in path.relative_to(BACKEND_ROOT).parts):
+                continue
+            if path in seen:
+                continue
+            seen.add(path)
+            yield relative, path
+
+
+def _violations(relative: str, text: str) -> list[str]:
+    return [
+        f"{relative}:{text.count(chr(10), 0, match.start()) + 1} matches {label}"
+        for label, pattern in DENYLIST
+        for match in pattern.finditer(text)
+    ]
+
+
+def test_published_sources_carry_no_private_installation_identifiers() -> None:
+    found: list[str] = []
+    for relative, path in _published_sources():
+        found.extend(_violations(relative, path.read_text(encoding="utf-8", errors="replace")))
+    assert found == []
+
+
+@pytest.mark.parametrize("name", sorted(REQUIRED_IGNORE_RULES))
+def test_ignore_rules_keep_local_records_out_of_the_published_tree(name: str) -> None:
+    rules = (BACKEND_ROOT / name).read_text(encoding="utf-8").splitlines()
+    entries = {line.strip() for line in rules if line.strip() and not line.startswith("#")}
+    missing = [rule for rule in REQUIRED_IGNORE_RULES[name] if rule not in entries]
+    assert missing == []
+
+
+@pytest.mark.parametrize(
+    "sample",
+    [
+        "SITE-DEMO-001",
+        "SITE-DEMO-001",
+        "SITE-DEMO-2026",
+        "SITE-DEMO-001",
+        "ip 192.0.2.10",
+        "ip 192.0.2.20",
+        "ip 198.51.100.10",
+        "ops@example-org.local",
+        "branding: example-org",
+        "site: Example Site",
+        "/home/example-user/Dev",
+        "00000000-0000-4000-8000-000000000000",
+    ],
+)
+def test_gate_recognizes_private_installation_identifiers(sample: str) -> None:
+    assert _violations("sample.py", sample) != []
+
+
+def test_gate_accepts_the_published_replacements() -> None:
+    sample = (
+        '{"quickCode": "SW-SN-001", "site": "Sede Norte", "ip": "192.168.50.11"}\n'
+        '{"contact": "bruno@example.invalid", "branding": "Acme"}\n'
+        "/srv/itsm/backend/.venv/bin/python -m pytest tests/test_generic.py -q\n"
+        "ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS=192.168.1.0/24,models.internal:8443\n"
+    )
+    assert _violations("sample.py", sample) == []

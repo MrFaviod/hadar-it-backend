@@ -11,3 +11,11 @@ __pycache__/
 *.db-journal
 *.db-wal
 *.db-shm
+
+# Local-only records and material that is never published.
+AGENTS.md
+odd/
+docs/reviews/
+.worktrees/
+.publish/
+.env*
