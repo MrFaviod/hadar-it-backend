@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 import pytest
 from fastapi.testclient import TestClient
 from itsm.config import Settings
+from itsm.i18n import t
 from itsm.inventory.service import InventoryService
 from itsm.main import create_app
 from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME
@@ -372,10 +373,13 @@ def test_archiving_an_active_group_member_is_a_conflict_and_changes_nothing(
         headers=auth,
     )
     assert refused.status_code == 409
+    key = "api.inventory.redundancy_active_archive_block"
     assert refused.json() == {
         "error": {
             "code": "conflict",
-            "message": "an active redundancy group cannot include archived assets",
+            "key": key,
+            "params": {},
+            "message": t(key, "es"),
         }
     }
     assert snapshot() == before
