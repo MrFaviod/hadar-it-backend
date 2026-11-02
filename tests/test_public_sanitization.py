@@ -3,9 +3,9 @@
 The backend is published as an independent repository, so the files a reader can
 check out must not describe the private installation it was written for: real
 organization and site names, real private network addresses, the administrator's
-home path or a local design-tool project id (spec S4 in
-``odd/tasks/publish-readiness.md``). The same gate covers the ignore rules that
-keep local agent records and local snapshots out of the published history (S3).
+home path or a local design-tool project id. The same gate covers the ignore
+rules that keep local agent records and local snapshots out of the published
+history, and keeps published docs from pointing at those unpublished records.
 
 These checks read the working tree only; they never depend on Git history or on
 Git being available at all.
@@ -25,6 +25,9 @@ PRODUCT_ROOTS = ("itsm", "tests", "docs", "migrations")
 PRODUCT_FILES = (
     ".dockerignore",
     ".gitignore",
+    "Dockerfile",
+    "Dockerfile.extension-validator",
+    "Dockerfile.ops",
     "README.md",
     "alembic.ini",
     "pyproject.toml",
@@ -44,6 +47,7 @@ EXCLUDED_PREFIXES = ("docs/reviews/",)
 DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("real organization name", re.compile(("pro" + "ducar"), re.IGNORECASE)),
     ("real site name", re.compile(r"bella\s+vista", re.IGNORECASE)),
+    ("real city name", re.compile(("san" + r"\s+lorenzo"), re.IGNORECASE)),
     (
         "identifier derived from the real site",
         re.compile(r"\b[A-Za-z]{2,5}-BV\b", re.IGNORECASE),
@@ -51,9 +55,12 @@ DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("real private network", re.compile(r"\b192\.168\.120\.\d+")),
     ("real private network", re.compile(r"\b192\.168\.10\.\d+")),
     ("real private network", re.compile(r"\b10\.30\.\d+\.\d+")),
-    ("administrator home path", re.compile(("/home/" + "infor" + "matica"))),
-    ("local design-tool project id", re.compile(("78077567-3e32-" + "4db7-92e0-6ca8cf4d351b"))),
-    ("organization-specific domain", re.compile((r"(?:empresa|pro" + r"ducar)\.local"), re.IGNORECASE)),
+    ("administrator home path", re.compile("/home/" + "infor" + "matica")),
+    ("local design-tool project id", re.compile("78077567-3e32-" + "4db7-92e0-6ca8cf4d351b")),
+    (
+        "organization-specific domain",
+        re.compile((r"(?:empresa|pro" + r"ducar)\.local"), re.IGNORECASE),
+    ),
 )
 
 # Ignore rules that keep local-only records out of the published tree.
@@ -94,6 +101,31 @@ def _violations(relative: str, text: str) -> list[str]:
     ]
 
 
+# Published docs must not link or point at local records that are never published.
+LOCAL_RECORD_REFERENCE = re.compile(r"(?<![\w.-])(?:odd/|AGENTS" + r"\.md\b|docs/" + r"reviews/)")
+
+
+def test_every_published_root_file_is_scanned() -> None:
+    scanned = {relative for relative, _ in _published_sources()}
+    root_files = {
+        path.name
+        for path in BACKEND_ROOT.iterdir()
+        if path.is_file() and path.name not in EXCLUDED_FILES
+    }
+    assert sorted(root_files - scanned) == []
+
+
+def test_published_documents_do_not_reference_unpublished_local_records() -> None:
+    found = [
+        f"{relative}:{number}"
+        for relative, path in _published_sources()
+        if path.suffix == ".md"
+        for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1)
+        if LOCAL_RECORD_REFERENCE.search(line)
+    ]
+    assert found == []
+
+
 def test_published_sources_carry_no_private_installation_identifiers() -> None:
     found: list[str] = []
     for relative, path in _published_sources():
@@ -122,6 +154,8 @@ def test_ignore_rules_keep_local_records_out_of_the_published_tree(name: str) ->
         ("ops@pro" + "ducar.local"),
         ("branding: Pro" + "ducar"),
         ("site: Bella" + " Vista"),
+        ("site: San" + " Lorenzo"),
+        ("san" + "  lorenzo"),
         ("/home/" + "infor" + "matica/Dev"),
         ("78077567-3e32-" + "4db7-92e0-6ca8cf4d351b"),
     ],
