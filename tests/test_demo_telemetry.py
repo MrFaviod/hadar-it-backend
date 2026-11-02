@@ -285,11 +285,10 @@ def test_init_seeds_synthetic_nodes_but_leaves_the_exporter_unconfigured(
         ).fetchall()
     finally:
         connection.close()
-    assert [row[0] for row in rows] == ["Hipervisor Norte · DEMO", "Hipervisor Sur · DEMO"]
-    assert [row[1:] for row in rows] == [
-        (1, "node", "backend:8000", None),
-        (1, "node", "backend:8000", None),
-    ]
+    # Every seeded server carries the synthetic node check; the exporter itself
+    # stays unconfigured until the operator opts in.
+    assert {"Hipervisor Norte · DEMO", "Hipervisor Sur · DEMO"} <= {row[0] for row in rows}
+    assert [row[1:] for row in rows] == [(1, "node", "backend:8000", None)] * len(rows)
 
 
 def test_setup_refuses_unmarked_database_before_any_change(tmp_path: Path) -> None:

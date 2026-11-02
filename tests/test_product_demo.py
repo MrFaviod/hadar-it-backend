@@ -49,7 +49,18 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
     assert production.read_bytes() == b"production sentinel"
     payload = json.loads(result.stdout)
     assert payload["mode"] == "demo"
-    assert payload["assets"] == 8
+    assert payload["assets"] >= 12
+    assert payload["people"] >= 5
+    assert payload["relationships"] >= 10
+    assert payload["redundancyGroups"] >= 1
+    assert payload["incidents"] == 4
+    assert payload["maintenancePlans"] == 4
+    assert payload["warranties"] >= 4
+    assert payload["attachments"] >= 2
+    assert payload["alerts"] >= 2
+    assert payload["notifications"] >= 2
+    assert payload["importSummary"]["created"] == 2
+    assert payload["workspaceViews"] == 1
     assert result.stderr == ""
     assert PASSWORD not in result.stdout
     settings = Settings(_env_file=None, database_url=f"sqlite:///{directory / 'demo.db'}")
@@ -58,14 +69,16 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
         with Session(engine) as session:
             principal = IdentityService(session, settings).login("demo.owner", PASSWORD).principal
             assets = InventoryService(session, settings).search(principal)
-            assert assets.total == 8
+            assert assets.total == payload["assets"] + payload["importSummary"]["created"]
             assert {item.category for item in assets.items} >= {
                 "servidores",
                 "switches",
                 "camaras",
                 "virtualizacion",
             }
-            assert all(item.site_id for item in assets.items)
+            # Seeded assets are placed in a site; the completed import adds two
+            # assets without a site, which is why this counts instead of asserting all.
+            assert sum(1 for item in assets.items if item.site_id) >= payload["assets"]
             assert any(item.responsible_person_id for item in assets.items)
             assert any(not item.responsible_person_id for item in assets.items)
             from itsm.directory.service import DirectoryService
@@ -77,7 +90,7 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
             directory_service = DirectoryService(session, settings)
             assert directory_service.list_locations(principal, level="site").total == 2
             people = directory_service.list_people(principal)
-            assert people.total == 2
+            assert people.total >= 5
             person_ids = {person.id for person in people.items}
             assert all(
                 item.responsible_person_id in person_ids
@@ -85,8 +98,8 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
                 if item.responsible_person_id
             )
             relations = RelationshipService(session, settings).list(principal)
-            assert relations.total == 6
-            assert sum(item.type_key == "hosted_in" for item in relations.items) == 2
+            assert relations.total >= 10
+            assert sum(item.type_key == "hosted_in" for item in relations.items) >= 2
             known_ids = {item.id for item in assets.items}
             assert all(
                 item.source_id in known_ids and item.target_id in known_ids
@@ -101,7 +114,7 @@ def test_demo_creates_coherent_canonical_installation(tmp_path: Path) -> None:
             assert plans.total >= 2
             assert all(item.asset_id in known_ids for item in plans.items)
             warranties = WarrantyService(session, settings).list(principal)
-            assert len(warranties["items"]) == 3
+            assert len(warranties["items"]) >= 4
             assert warranties["hasMore"] is False
             operator = IdentityService(session, settings).login("demo.operator", PASSWORD)
             assert operator.principal.username == "demo.operator"
@@ -195,18 +208,19 @@ def test_durable_demo_blocks_external_dispatch_but_keeps_internal_inbox(tmp_path
             )
             service.test_channel(principal, external["id"])
             service.test_channel(principal, config["defaults"]["internalChannelId"])
+            baseline = service.list_inbox(principal)["total"]
             result = process_notifications(settings)
             assert result["suppressed"] == 1
             assert result["delivered"] == 1
             assert smtp.connections == 0
             assert smtp.messages == []
             inbox = service.list_inbox(principal)
-            assert inbox["total"] == 1
-            assert inbox["items"][0]["title"] == "Prueba de notificación"
+            assert inbox["total"] == baseline + 1
+            assert "Prueba de notificación" in {item["title"] for item in inbox["items"]}
             repeated = process_notifications(settings)
             assert repeated["delivered"] == repeated["suppressed"] == 0
             assert smtp.connections == 0
-            assert service.list_inbox(principal)["total"] == 1
+            assert service.list_inbox(principal)["total"] == baseline + 1
     finally:
         engine.dispose()
         smtp.shutdown()

@@ -39,7 +39,10 @@ from tests.conftest import bootstrap_superadmin, run_migrations
 
 BACKEND_ROOT = Path(__file__).resolve().parents[1]
 PASSWORD = "Dev-Tools-Password-42"
-DATASET_ASSETS = 8
+# Development reuses the shared populated demo seed: 14 authored assets, plus the
+# two rows its completed import creates through the canonical workflow.
+DATASET_ASSETS = 14
+INVENTORY_ASSETS = DATASET_ASSETS + 2
 
 
 def env_for(tmp_path: Path, **overrides: str | None) -> dict[str, str]:
@@ -170,7 +173,7 @@ def test_init_creates_schema_dev_marker_admin_and_dataset(tmp_path: Path) -> Non
     identity = persisted_identity(settings)
     assert identity is not None and identity.release_mode == "dev"
     assets, users = login_and_count(settings, "dev.admin", PASSWORD)
-    assert assets == DATASET_ASSETS
+    assert assets == INVENTORY_ASSETS
     assert users >= 2
 
     # The environment is explicit in the command output, without the password.
@@ -223,7 +226,7 @@ def test_init_generates_and_prints_a_password_once(tmp_path: Path) -> None:
     generated = admin["password"]
     assert len(generated) >= 12
     assets, _ = login_and_count(dev_settings(tmp_path), "dev.admin", generated)
-    assert assets == DATASET_ASSETS
+    assert assets == INVENTORY_ASSETS
 
     second = payload(run(tmp_path, "init", ITSM_DEV_ADMIN_PASSWORD=None))
     assert second["status"] == "unchanged"
@@ -309,7 +312,7 @@ def test_regenerate_recreates_the_sqlite_file(tmp_path: Path) -> None:
     settings = dev_settings(tmp_path)
     assert schema_state(settings).is_current
     assets, _ = login_and_count(settings, "dev.admin", PASSWORD)
-    assert assets == DATASET_ASSETS
+    assert assets == INVENTORY_ASSETS
 
 
 @pytest.mark.parametrize("mode", [None, "prod", "demo"])
@@ -436,7 +439,7 @@ def test_reset_requires_the_flag_and_a_matching_confirmation(tmp_path: Path) -> 
     # The refusals changed nothing.
     assert schema_state(settings).current == before.current
     assets, _ = login_and_count(settings, "dev.admin", PASSWORD)
-    assert assets == DATASET_ASSETS
+    assert assets == INVENTORY_ASSETS
 
 
 def test_reset_refuses_attachment_paths_outside_the_dev_data_directory(
