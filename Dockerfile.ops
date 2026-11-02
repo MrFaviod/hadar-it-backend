@@ -15,11 +15,17 @@ ARG POSTGRES_CLIENT_IMAGE=postgres:16.13-bookworm@sha256:472efd9a66f2b2f1a5aeb18
 
 FROM ${POSTGRES_CLIENT_IMAGE} AS pg-client
 USER root
+# Debian's /usr/bin/pg_dump is a symlink to pg_wrapper, a wrapper script, so PATH
+# lookup would copy a wrapper that `ldd` rejects. The versioned ELF binaries are
+# selected by absolute path and must be regular, non-symlinked executables.
 RUN set -eu; \
     mkdir -p "/pg-client/bin" "/pg-client/lib"; \
     for tool in pg_dump pg_restore; do \
-        binary="$(command -v "$tool")"; \
-        test -x "$binary"; \
+        binary="/usr/lib/postgresql/16/bin/$tool"; \
+        if [ -L "$binary" ] || [ ! -f "$binary" ] || [ ! -x "$binary" ]; then \
+            echo "$binary is not a regular donor file" >&2; \
+            exit 1; \
+        fi; \
         cp "$binary" "/pg-client/bin/$tool"; \
         ldd "$binary" > "/tmp/$tool.ldd" \
             || { echo "ldd failed for $tool" >&2; exit 1; }; \

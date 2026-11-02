@@ -32,6 +32,7 @@ PG16_IMAGE = (
 BACKEND_IMAGE = "itsm-backend:0.1.0"
 CLIENT_ROOT = "/opt/pg16-client"
 DONOR_ROOT = "/pg-client"
+DONOR_BINDIR = "/usr/lib/postgresql/16/bin"
 ARCHIVE_TOOLS = ("pg_dump", "pg_restore")
 DONOR_LDD_MARKER = 'ldd "$binary"'
 IMAGE_LDD_MARKER = 'ldd "/opt/pg16-client/bin/$tool"'
@@ -147,8 +148,14 @@ def _execute(
 
 
 def _donor_environment(
-    tmp_path: Path, *, ldd_body: str | None = None
+    tmp_path: Path, *, ldd_body: str | None = None, bindir: str = "regular"
 ) -> tuple[Path, list[tuple[str, str]]]:
+    """A donor stand-in whose PATH ``pg_dump`` is a pg_wrapper-style script.
+
+    The real versioned binaries live in ``versioned-bin``; only that directory is
+    meant to be selected. ``bindir`` models the regular, missing and symlinked
+    states of the versioned binary.
+    """
     client = tmp_path / "client"
     (client / "bin").mkdir(parents=True)
     (client / "lib").mkdir(parents=True)
@@ -156,13 +163,27 @@ def _donor_environment(
     library.parent.mkdir(parents=True)
     library.write_bytes(b"fake shared library")
     tools = tmp_path / "tools"
+    versioned = tmp_path / "versioned-bin"
+    versioned.mkdir()
+    real = 'echo "pg_dump (PostgreSQL) 16.13 (Debian 16.13-1.pgdg12+1)"\n'
     for tool in ARCHIVE_TOOLS:
-        _write_tool(tools / tool, f'echo "{tool} (PostgreSQL) 16.13 (Debian 16.13-1.pgdg120+1)"\n')
+        _write_tool(tools / tool, f'echo "{tool} (PostgreSQL) 16.1 (Debian 16.1-1)"\n')
+        path = versioned / tool
+        if bindir == "regular":
+            _write_tool(path, f'echo "{tool} (PostgreSQL) 16.13 (Debian 16.13-1.pgdg12+1)"\n')
+        elif bindir == "symlink":
+            wrapper = tmp_path / f"pg_wrapper-{tool}"
+            _write_tool(wrapper, real)
+            path.symlink_to(wrapper)
     body = ldd_body
     if body is None:
         body = f'echo "libz.so.1 => {library} (0x00007f0000000000)"\n'
     _write_tool(tools / "ldd", body)
-    return tools, [("/tmp/", f"{tmp_path}/"), (DONOR_ROOT, str(client))]
+    return tools, [
+        ("/tmp/", f"{tmp_path}/"),
+        (DONOR_BINDIR, str(versioned)),
+        (DONOR_ROOT, str(client)),
+    ]
 
 
 def _image_ldd_environment(tmp_path: Path, *, ldd_body: str) -> tuple[Path, list[tuple[str, str]]]:
@@ -328,6 +349,49 @@ def test_the_donor_run_accepts_a_resolved_closure(tmp_path: Path) -> None:
     assert result.returncode == 0, result.stderr
     assert (tmp_path / "client" / "bin" / "pg_dump").is_file()
     assert (tmp_path / "client" / "lib" / "libz.so.1").read_bytes() == b"fake shared library"
+
+
+def test_the_donor_does_not_resolve_the_tools_through_path() -> None:
+    donor = _run_containing(DONOR_LDD_MARKER)
+
+    # Debian's /usr/bin/pg_dump is a pg_wrapper script, not an ELF binary, and
+    # `ldd` refuses it. The versioned path is selected explicitly.
+    assert "command -v" not in donor
+    assert f'binary="{DONOR_BINDIR}/$tool"' in donor
+    assert '[ -L "$binary" ]' in donor
+    assert "not a regular donor file" in donor
+
+
+def test_the_donor_selects_the_versioned_binary_not_the_path_wrapper(tmp_path: Path) -> None:
+    tools, replacements = _donor_environment(tmp_path)
+
+    result = _execute(tmp_path, marker=DONOR_LDD_MARKER, replacements=replacements, tools=tools)
+
+    assert result.returncode == 0, result.stderr
+    versioned = tmp_path / "versioned-bin" / "pg_dump"
+    copied = tmp_path / "client" / "bin" / "pg_dump"
+    assert copied.read_bytes() == versioned.read_bytes()
+    # The PATH script stays a 16.1 wrapper and must not have been selected.
+    assert "16.1-1" not in copied.read_text()
+    assert copied.read_bytes() != (tmp_path / "tools" / "pg_dump").read_bytes()
+
+
+def test_the_donor_refuses_a_missing_versioned_binary(tmp_path: Path) -> None:
+    tools, replacements = _donor_environment(tmp_path, bindir="missing")
+
+    result = _execute(tmp_path, marker=DONOR_LDD_MARKER, replacements=replacements, tools=tools)
+
+    assert result.returncode != 0, result.stdout
+    assert "not a regular donor file" in result.stderr
+
+
+def test_the_donor_refuses_a_symlinked_donor_binary(tmp_path: Path) -> None:
+    tools, replacements = _donor_environment(tmp_path, bindir="symlink")
+
+    result = _execute(tmp_path, marker=DONOR_LDD_MARKER, replacements=replacements, tools=tools)
+
+    assert result.returncode != 0, result.stdout
+    assert "not a regular donor file" in result.stderr
 
 
 @pytest.mark.parametrize("step", ["cat", "awk", "sort"])
