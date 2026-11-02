@@ -5,32 +5,45 @@
 # candidate code in the backend process; candidate execution happens inside this
 # fixed container with no network, no host mounts and a non-root user.
 #
-# The base is a locally present application image because this workstation has
-# no authorized package download. Its content address is asserted through the
-# build arg/label and must be rechecked by the caller (docs/extensions-sdk.md):
+# The base is the current public backend image that the operator builds from
+# this repository's Dockerfile (`itsm-backend:0.1.0`), identified by its locally
+# inspected image ID. There is no implicit or machine-specific base ID and no
+# private verification image: the caller must pass VALIDATOR_BASE_ID and the
+# build fails closed when it is missing or is not a full `sha256:` image ID.
 #
-#   docker image inspect itsm-phase11-backend:verification --format '{{.Id}}'
-#   # sha256:c3b29b814929ab5107c91ecf042d3830b25d0380b2d72d9c87274441a556529f
+#   docker build -t itsm-backend:0.1.0 .
+#   docker image inspect itsm-backend:0.1.0 --format '{{.Id}}'
 #
-# Build without network or pulls (the base and Bun image are already local):
+# Build without network or pulls once that base and the Bun image are local:
 #
 #   docker build --pull=false --network=none \
-#     --build-arg VALIDATOR_BASE_ID=sha256:c3b29b... \
+#     --build-arg VALIDATOR_BASE_ID=sha256:<id from docker image inspect> \
+#     --build-arg BUN_IMAGE=oven/bun@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895 \
 #     -f Dockerfile.extension-validator -t itsm-extension-validator:1 .
 #
 # The image contains no application checkout, database, credentials or Docker
 # socket. Only the SDK validator resources and a fixed Bun binary are copied.
 # Candidate code runs with no network and no host mounts.
 
-ARG VALIDATOR_BASE=itsm-phase11-backend:verification
+ARG VALIDATOR_BASE=itsm-backend:0.1.0
 ARG BUN_IMAGE=oven/bun@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
 
 FROM ${BUN_IMAGE} AS js
 
 FROM ${VALIDATOR_BASE}
 
-ARG VALIDATOR_BASE_ID=sha256:c3b29b814929ab5107c91ecf042d3830b25d0380b2d72d9c87274441a556529f
+ARG VALIDATOR_BASE_ID
+ARG VALIDATOR_BASE
 ARG BUN_IMAGE
+
+# Fail closed before copying anything: the label below is only meaningful for a
+# caller-supplied, locally inspected ID, never for a tag or a remembered digest.
+RUN set -eu; \
+    python3 -c 'import re, sys; sys.exit(0 if re.fullmatch(r"sha256:[0-9a-f]{64}", sys.argv[1]) else 1)' "${VALIDATOR_BASE_ID}" || { \
+      echo "VALIDATOR_BASE_ID is required: docker image inspect ${VALIDATOR_BASE} --format '{{.Id}}'" >&2; \
+      echo "then pass --build-arg VALIDATOR_BASE_ID=sha256:<id>; a tag is not provenance" >&2; \
+      exit 1; \
+    }
 
 LABEL org.opencontainers.image.title="ITMS extension validator"
 LABEL org.itsm.validator.protocol="2"
