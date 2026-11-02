@@ -1,5 +1,7 @@
 """Private-network discovery follows the current demo generation."""
 
+from pathlib import Path
+
 from fastapi.testclient import TestClient
 from itsm.demo.seed import seed
 from itsm.main import create_app
@@ -40,6 +42,38 @@ def test_demo_discovery_and_metrics_follow_reset(settings_factory, monkeypatch, 
         assert client.get(metrics_path).status_code == 404
         after = client.get("/api/v1/demo/telemetry/targets").json()
         assert after and after[0]["labels"]["asset_id"] != item["labels"]["asset_id"]
+
+
+def test_initializer_publishes_first_generation_node_targets(
+    settings_factory, monkeypatch, tmp_path: Path
+) -> None:
+    from tests.test_product_demo import initialize
+
+    # The published demo configuration supplies the data directory, not the CLI.
+    monkeypatch.delenv("ITSM_DEMO_DATA_DIRECTORY", raising=False)
+    directory = tmp_path / "demo-initialized"
+    initialized = initialize(directory)
+    assert initialized.returncode == 0, initialized.stdout + initialized.stderr
+
+    monkeypatch.setenv("RELEASE_MODE", "demo")
+    settings = settings_factory(
+        database_url=f"sqlite:///{directory / 'demo.db'}",
+        demo_data_directory=directory,
+        attachment_storage_path=directory / "attachments",
+        task_sqlite_path=directory / "tasks.db",
+    )
+    with TestClient(create_app(settings)) as client:
+        discovered = client.get("/api/v1/demo/telemetry/targets")
+        assert discovered.status_code == 200, discovered.text
+        targets = discovered.json()
+        assert targets, "the initialized demo must publish its synthetic node targets"
+        labels = targets[0]["labels"]
+        assert labels["check_type"] == "node"
+        assert labels["module"] == "node"
+        assert labels["asset_id"]
+        metrics = client.get(labels["__metrics_path__"])
+        assert metrics.status_code == 200, metrics.text
+        assert "node_cpu_seconds_total" in metrics.text
 
 
 def test_ordinary_mode_has_no_demo_discovery(settings_factory):

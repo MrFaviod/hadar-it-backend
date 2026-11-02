@@ -268,15 +268,28 @@ def test_generated_targets_reach_a_live_exporter_on_the_configured_port(tmp_path
             assert _sample(body, "node_cpu_seconds_total", 'mode="idle"') >= 0
 
 
-def test_init_alone_does_not_configure_telemetry(tmp_path: Path) -> None:
+def test_init_seeds_synthetic_nodes_but_leaves_the_exporter_unconfigured(
+    tmp_path: Path,
+) -> None:
+    """The first generation carries its node checks; the exporter stays opt-in."""
     directory = tmp_path / "demo"
     _initialize(directory)
     connection = sqlite3.connect(directory / "demo.db")
     try:
         assert connection.execute("select count(*) from monitor_exporters").fetchone()[0] == 0
-        assert connection.execute("select count(*) from monitor_assets").fetchone()[0] == 0
+        rows = connection.execute(
+            "select assets.name, monitor_assets.enabled, monitor_assets.check_type,"
+            " monitor_assets.target, monitor_assets.exporter_id"
+            " from monitor_assets join assets on assets.id = monitor_assets.asset_id"
+            " order by assets.name"
+        ).fetchall()
     finally:
         connection.close()
+    assert [row[0] for row in rows] == ["Hipervisor Norte · DEMO", "Hipervisor Sur · DEMO"]
+    assert [row[1:] for row in rows] == [
+        (1, "node", "backend:8000", None),
+        (1, "node", "backend:8000", None),
+    ]
 
 
 def test_setup_refuses_unmarked_database_before_any_change(tmp_path: Path) -> None:
