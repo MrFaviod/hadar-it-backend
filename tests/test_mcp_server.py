@@ -288,33 +288,62 @@ def test_mcp_is_not_a_rest_export(mcp: McpServer) -> None:
             call_tool(mcp, token, tool, {})
 
 
-def _initialize(
-    server: McpServer, token: str, locale: str
-) -> tuple[str | None, list[dict[str, Any]]]:
-    async def run() -> tuple[str | None, list[dict[str, Any]]]:
+@dataclass(frozen=True)
+class Listing:
+    """One ``tools/list`` answer split into instructions, contract and copy."""
+
+    instructions: str | None
+    contract: list[dict[str, Any]]
+    descriptions: dict[str, str | None]
+
+
+def _initialize(server: McpServer, token: str, locale: str) -> Listing:
+    async def run() -> tuple[str | None, list[dict[str, Any]], dict[str, str | None]]:
         transport = server.transport(token, **{"Accept-Language": locale})
         async with Client(transport) as client:
             tools = await client.list_tools()
             result = client.instructions
-        return result, [
-            {
-                "name": tool.name,
-                "inputSchema": getattr(tool, "input_schema", None) or tool.inputSchema,
-            }
-            for tool in tools
-        ]
+        return (
+            result,
+            [
+                {
+                    "name": tool.name,
+                    "inputSchema": getattr(tool, "input_schema", None) or tool.inputSchema,
+                }
+                for tool in tools
+            ],
+            {tool.name: tool.description for tool in tools},
+        )
 
-    return asyncio.run(run())
+    instructions, contract, descriptions = asyncio.run(run())
+    return Listing(instructions, contract, descriptions)
 
 
 def test_mcp_instructions_carry_the_caller_locale_and_keep_the_tool_contract(
     mcp: McpServer,
 ) -> None:
     _, token = operator(mcp)
-    english, english_tools = _initialize(mcp, token, "en-US,en;q=0.9")
-    spanish, spanish_tools = _initialize(mcp, token, "es")
+    english = _initialize(mcp, token, "en-US,en;q=0.9")
+    spanish = _initialize(mcp, token, "es")
 
-    assert "Preferred user language: en." in (english or "")
-    assert "Idioma preferido del usuario: es." in (spanish or "")
-    assert english_tools == spanish_tools
-    assert sorted(tool["name"] for tool in english_tools) == sorted(CANONICAL_TOOL_NAMES)
+    assert "Preferred user language: en." in (english.instructions or "")
+    assert "Idioma preferido del usuario: es." in (spanish.instructions or "")
+    assert english.contract == spanish.contract
+    assert sorted(tool["name"] for tool in english.contract) == sorted(CANONICAL_TOOL_NAMES)
+
+
+def test_mcp_tool_descriptions_follow_the_request_locale(mcp: McpServer) -> None:
+    _, token = operator(mcp)
+    english = _initialize(mcp, token, "en-US,en;q=0.9")
+    spanish = _initialize(mcp, token, "es")
+
+    assert english.descriptions["i18n_keys"] == (
+        "List translatable core and installed-extension keys with their context."
+    )
+    assert spanish.descriptions["i18n_keys"] == (
+        "Listá las claves traducibles del núcleo y de las extensiones instaladas, con su contexto."
+    )
+    assert (
+        english.descriptions["extension_sdk_index"] != spanish.descriptions["extension_sdk_index"]
+    )
+    assert english.contract == spanish.contract

@@ -156,7 +156,12 @@ def _accept_language() -> str | None:
 
 
 class LocaleContextMiddleware(Middleware):
-    """Attach the caller's language to the negotiated metadata, never the tools."""
+    """Attach the caller's language to the negotiated metadata and tool copy.
+
+    Instructions and catalog-backed tool descriptions follow the request locale;
+    tool names, arguments and input schemas never do, so a client caching the
+    contract keeps working across languages.
+    """
 
     @staticmethod
     def _decorate(result: Any) -> Any:
@@ -170,6 +175,24 @@ class LocaleContextMiddleware(Middleware):
 
     async def on_discover(self, context: Any, call_next: Any) -> Any:
         return self._decorate(await call_next(context))
+
+    async def on_list_tools(self, context: Any, call_next: Any) -> Any:
+        """Localize catalog-backed descriptions per request (registration stays static)."""
+        tools = await call_next(context)
+        locale = negotiate_accept_language(_accept_language())
+        if not locale or not isinstance(tools, (list, tuple)):
+            return tools
+        return [self._localized(tool, locale) for tool in tools]
+
+    @staticmethod
+    def _localized(tool: Any, locale: str) -> Any:
+        name = getattr(tool, "name", None)
+        if not isinstance(name, str):
+            return tool
+        description = agent_locales.tool_description(name, locale)
+        if not description or description == getattr(tool, "description", None):
+            return tool
+        return tool.model_copy(update={"description": description})
 
 
 def compact(view: AssetView, fields: list[str] | None = None) -> dict[str, Any]:

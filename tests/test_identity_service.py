@@ -316,6 +316,67 @@ def test_last_access_is_recorded_on_the_identity_and_the_session(harness: Harnes
     assert session_seen > created_seen
 
 
+def test_session_access_writes_are_throttled_within_the_interval(harness: Harness) -> None:
+    query = (
+        "SELECT i.last_access_at, s.last_access_at "
+        "FROM identity_identities i JOIN identity_sessions s ON s.identity_id = i.id"
+    )
+    bootstrap_superadmin(harness)
+    with harness.service() as service:
+        grant = service.login("ana.admin", PASSWORD)
+    stored = harness.sql(query)[0]
+
+    harness.clock = harness.now() + timedelta(seconds=30)
+    with harness.service() as service:
+        assert service.authenticate_session(grant.token).principal.username == "ana.admin"
+
+    assert harness.sql(query)[0] == stored
+
+    harness.clock = harness.now() + timedelta(seconds=31)
+    with harness.service() as service:
+        assert service.authenticate_session(grant.token).principal.username == "ana.admin"
+
+    expected = harness.now().replace(tzinfo=None)
+    assert [datetime.fromisoformat(str(value)) for value in harness.sql(query)[0]] == [
+        expected,
+        expected,
+    ]
+
+
+def test_machine_token_access_writes_are_throttled_within_the_interval(harness: Harness) -> None:
+    with harness.service() as service:
+        service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
+        machine = service.bootstrap_machine(
+            "mcp-operator", "MCP Operator", "external_client", "operator"
+        )
+    with harness.service() as service:
+        credential = service.issue_machine_credential("mcp-operator")
+    with harness.service() as service:
+        service.authenticate_token(
+            credential.token, execution_id="run-1", authorization_ref="ref-1"
+        )
+    query = f"SELECT last_access_at FROM identity_identities WHERE id = '{machine.id}'"
+    stored = harness.sql(query)[0]
+
+    harness.clock = harness.now() + timedelta(seconds=30)
+    with harness.service() as service:
+        context = service.authenticate_token(
+            credential.token, execution_id="run-2", authorization_ref="ref-2"
+        )
+        assert context.principal.username == "mcp-operator"
+
+    assert harness.sql(query)[0] == stored
+
+    harness.clock = harness.now() + timedelta(seconds=31)
+    with harness.service() as service:
+        service.authenticate_token(
+            credential.token, execution_id="run-3", authorization_ref="ref-3"
+        )
+
+    refreshed = harness.sql(query)[0][0]
+    assert datetime.fromisoformat(str(refreshed)) == harness.now().replace(tzinfo=None)
+
+
 def test_services_enforce_permissions_response_independently_of_http(harness: Harness) -> None:
     with harness.service() as service:
         service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)

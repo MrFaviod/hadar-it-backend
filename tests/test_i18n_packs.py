@@ -23,7 +23,9 @@ from itsm.extensions.sdk import contract
 from itsm.extensions.sdk.generator import generate_package
 from itsm.extensions.sdk.package import build_package, parse_package
 from itsm.i18n import packs
+from itsm.i18n.documents import recipient_locales
 from itsm.main import create_app
+from sqlalchemy.orm import Session
 from tests.conftest import run_migrations
 from tests.identity_support import Harness
 
@@ -114,6 +116,23 @@ def extension_package(
     files["i18n/en.json"] = json.dumps({f"ext.{extension_id}.title": "Notes"})
     files["extension.json"] = json.dumps(manifest)
     return archive(files)
+
+
+def parent_pack_manifest() -> dict[str, Any]:
+    """A reviewed pack that installs the parent locale of an uninstalled tag."""
+    return {
+        "sdkVersion": 2,
+        "kind": "language-pack",
+        "id": "pack-pt",
+        "name": "Português",
+        "version": "1.0.0",
+        "locales": [{"tag": "pt", "name": "Portuguese", "nativeName": "Português"}],
+        "compatibility": {"core": "^0.1.0", "extensions": {}},
+        "catalogs": {"pt": "i18n/pt.json"},
+        "overrides": [],
+        "priority": 0,
+        "review": {"status": "reviewed"},
+    }
 
 
 def trusted_report(digest: str) -> dict[str, Any]:
@@ -364,6 +383,54 @@ def test_pack_locale_serves_backend_errors_for_a_user_preference(env: Env) -> No
     error = response.json()["error"]
     assert error["message"] == "Não há documentação para missing em pt-BR."
     assert error["key"] == "api.i18n.unknown_doc_topic"
+
+
+def test_uninstalled_pack_preference_falls_back_to_the_installed_chain(env: Env) -> None:
+    headers = env.login()
+    env.install(pack_package(manifest=pack_manifest(status="reviewed")), headers)
+    preferred = env.client.patch(
+        f"{API}/auth/me/preferences", json={"locale": "pt-BR"}, headers=headers
+    )
+    assert preferred.status_code == 200, preferred.text
+    assert str(preferred.json()["preferences"]["locale"]).lower() == "pt-br"
+    identity_id = str(preferred.json()["user"]["id"])
+
+    removed = env.uninstall(PACK_ID, env.module(PACK_ID)["revision"], headers)
+    assert removed.status_code == 200, removed.text
+
+    envelope = env.client.get(f"{API}/auth/me", headers=headers)
+    assert envelope.status_code == 200, envelope.text
+    body = envelope.json()
+    assert body["preferences"]["locale"] == "pt-br"
+    assert body["locale"] == "es"
+    assert body["installation"]["defaultLocale"] == "es"
+
+    missing_doc = env.client.get(f"{API}/i18n/docs", params={"locale": "pt-BR", "topic": "missing"})
+    assert missing_doc.status_code == 404, missing_doc.text
+    error = missing_doc.json()["error"]
+    assert error["message"] == "No hay documentación para missing en pt-BR."
+    assert error["key"] == "api.i18n.unknown_doc_topic"
+
+    with Session(env.harness.engine) as session:
+        assert recipient_locales(session, [identity_id]) == {identity_id: "es"}
+
+    env.install(pack_package(manifest=parent_pack_manifest(), catalogs={"pt": PT_CATALOG}), headers)
+    assert env.module("pack-pt")["version"] == "1.0.0"
+
+    parent = env.client.get(f"{API}/auth/me", headers=headers)
+    assert parent.status_code == 200, parent.text
+    parent_body = parent.json()
+    assert parent_body["preferences"]["locale"] == "pt-br"
+    assert parent_body["locale"] == "pt"
+
+    localized_doc = env.client.get(
+        f"{API}/i18n/docs", params={"locale": "pt-BR", "topic": "missing"}
+    )
+    assert localized_doc.status_code == 404, localized_doc.text
+    assert localized_doc.json()["error"]["message"] == "Não há documentação para missing em pt-BR."
+
+    with Session(env.harness.engine) as session:
+        assert recipient_locales(session, [identity_id]) == {identity_id: "pt"}
 
 
 def test_pack_update_replaces_translations_and_uninstall_restores(env: Env) -> None:

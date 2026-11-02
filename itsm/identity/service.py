@@ -65,6 +65,17 @@ SESSION_MINUTES_MIN = 5
 SESSION_MINUTES_MAX = 1440
 AUDIT_PAGE_MAX = 200
 AUDIT_RESOURCE_MAX = 200
+#: Minimum gap between two persisted access timestamps. An authenticated read
+#: inside this window reuses the stored value, so a burst of GETs never writes
+#: to SQLite while a background import commits row by row.
+SESSION_ACCESS_WRITE_INTERVAL = timedelta(seconds=60)
+
+
+def _access_is_stale(stored: datetime | None, now: datetime) -> bool:
+    """True when a persisted access timestamp is old enough to be rewritten."""
+    if stored is None:
+        return True
+    return now - as_utc(stored) >= SESSION_ACCESS_WRITE_INTERVAL
 
 
 class IdentityError(Exception):
@@ -749,8 +760,13 @@ class IdentityService:
             )
 
         permissions = self._effective_permissions(identity, frozenset())
-        row.last_access_at = now
-        identity.last_access_at = now
+        touched = False
+        if _access_is_stale(row.last_access_at, now):
+            row.last_access_at = now
+            touched = True
+        if _access_is_stale(identity.last_access_at, now):
+            identity.last_access_at = now
+            touched = True
         context = AuthContext(
             principal=self._principal(identity, session_id=row.id),
             permissions=permissions,
@@ -758,7 +774,10 @@ class IdentityService:
             session_minutes=self.session_minutes(),
             session_id=row.id,
         )
-        self._session.commit()
+        if touched:
+            self._session.commit()
+        else:
+            self._session.rollback()
         return context
 
     def logout(self, principal: Principal) -> None:
@@ -912,7 +931,10 @@ class IdentityService:
             )
 
         now = self._now()
-        identity.last_access_at = now
+        touched = False
+        if _access_is_stale(identity.last_access_at, now):
+            identity.last_access_at = now
+            touched = True
         principal = Principal(
             actor_id=identity.id,
             kind=identity.actor_kind,
@@ -929,7 +951,10 @@ class IdentityService:
             csrf_token=None,
             session_minutes=self.session_minutes(),
         )
-        self._session.commit()
+        if touched:
+            self._session.commit()
+        else:
+            self._session.rollback()
         return context
 
     def resolve_actor(

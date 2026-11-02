@@ -379,6 +379,61 @@ def test_i18n_package_scaffolds_a_draft_pack_covering_core_and_extensions(
     assert report["status"] == "passed"
 
 
+def test_workspace_validate_applies_the_language_pack_content_rules(
+    catalog: Catalog, admin: Any, tmp_path: Path
+) -> None:
+    seed_extension(catalog)
+    development = service(catalog, tmp_path)
+    development.dispatch("i18n_package", {"workspace_id": "pt-br", "locale": "pt-BR"}, admin)
+    path = "i18n/pt-BR.json"
+    translated = json.loads(
+        development.dispatch(
+            "extension_workspace_read", {"workspace_id": "pt-br", "path": path}, admin
+        )["content"]
+    )
+    translated["api.i18n.locale_count"] = "Idiomas instalados"
+    development.dispatch(
+        "extension_workspace_write",
+        {"workspace_id": "pt-br", "path": path, "content": json.dumps(translated)},
+        admin,
+    )
+
+    report = development.dispatch("extension_workspace_validate", {"workspace_id": "pt-br"}, admin)
+
+    assert report["status"] == "failed"
+    assert any("api.i18n.locale_count" in error and "count" in error for error in report["errors"])
+
+
+def test_workspace_validate_applies_the_extension_catalog_rules(
+    catalog: Catalog, admin: Any, tmp_path: Path
+) -> None:
+    development = service(catalog, tmp_path)
+    development.dispatch(
+        "extension_workspace_create",
+        {"id": "notes-lab", "name": "Notes lab", "description": "Sample declarative module."},
+        admin,
+    )
+    path = "i18n/en.json"
+    english = json.loads(
+        development.dispatch(
+            "extension_workspace_read", {"workspace_id": "notes-lab", "path": path}, admin
+        )["content"]
+    )
+    english.pop(sorted(english)[0])
+    development.dispatch(
+        "extension_workspace_write",
+        {"workspace_id": "notes-lab", "path": path, "content": json.dumps(english)},
+        admin,
+    )
+
+    report = development.dispatch(
+        "extension_workspace_validate", {"workspace_id": "notes-lab"}, admin
+    )
+
+    assert report["status"] == "failed"
+    assert any("translation is missing" in error for error in report["errors"])
+
+
 def test_i18n_package_never_marks_a_pack_reviewed(
     catalog: Catalog, admin: Any, tmp_path: Path
 ) -> None:

@@ -18,6 +18,7 @@ from itsm.demo.restrictions import DEMO_HIDDEN_PERMISSIONS, visitor_password_wai
 from itsm.demo.state import is_demo
 from itsm.i18n.envelope import error_payload
 from itsm.i18n.messages import t
+from itsm.i18n.registry import effective_locale
 from itsm.i18n.request import resolve_request_locale
 from itsm.i18n.settings import InstallationSettings
 from itsm.identity.service import (
@@ -246,7 +247,7 @@ def session_envelope(
         csrfToken=view.csrf_token,
         sessionMinutes=view.session_minutes,
         demoMode=demo_mode,
-        locale=view.user.locale or installation.default_locale,
+        locale=effective_locale(view.user.locale, installation.default_locale),
         preferences=PreferencesDTO(locale=view.user.locale),
         installation=InstallationDTO(
             defaultLocale=installation.default_locale,

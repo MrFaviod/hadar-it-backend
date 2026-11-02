@@ -443,6 +443,26 @@ class DevelopmentService:
             "validation": "invalidated",
         }
 
+    def _i18n_content_problems(
+        self, manifest: Mapping[str, Any], files: Mapping[str, str]
+    ) -> list[str]:
+        """The catalog and doc rules the approval path also enforces.
+
+        The isolated container proves the package contract; the content rules
+        (parameters, plural forms, owned keys, extension namespaces) belong to
+        the adapter, so a broken translation fails validation here instead of
+        passing and being rejected later at human approval.
+        """
+        try:
+            with self._session_factory() as session:
+                sources = _i18n_source_catalogs(session)
+                owners = registry.owner_catalogs(session)
+            return packs.validate_i18n_files(
+                manifest, files, sources=sources, owner_catalogs=owners
+            )
+        except CatalogError as exc:
+            return [str(exc)]
+
     def _workspace_validate(self, arguments: Any, principal: Any) -> dict[str, Any]:
         data = _arguments(arguments, {"workspace_id"}, {"workspace_id"})
         workspace = self._workspace(principal, data["workspace_id"])
@@ -451,6 +471,13 @@ class DevelopmentService:
             built = build_package(files, known_core_permissions=self._known_core)
         except (PackageError, ManifestError, WorkspacePathRejected, OSError) as exc:
             report = _failure("", f"package preflight failed: {exc}")
+            self._persist_validation(workspace, report)
+            return report
+
+        problems = self._i18n_content_problems(built.manifest, files)
+        if problems:
+            report = _failure(built.digest, f"language content rejected: {problems[0]}")
+            report["errors"] = [problem[:1000] for problem in problems]
             self._persist_validation(workspace, report)
             return report
 
@@ -1040,6 +1067,16 @@ def _i18n_sources(session: Session) -> _I18nSources:
         )
     }
     return _I18nSources(messages=messages, owners=owners, extension_versions=versions)
+
+
+def _i18n_source_catalogs(session: Session) -> dict[str, dict[str, str]]:
+    """One source catalog per provider, the shape the pack rules expect."""
+    collected = _i18n_sources(session)
+    catalogs: dict[str, dict[str, str]] = {}
+    for key, message in collected.messages.items():
+        provider = collected.owners.get(key, "core")
+        catalogs.setdefault(provider, {})[key] = message
+    return catalogs
 
 
 @cache

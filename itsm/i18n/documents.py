@@ -22,6 +22,7 @@ from babel.dates import format_date as _format_date
 from itsm.i18n.catalog import DEFAULT_LOCALE, resolve_installed_locale
 from itsm.i18n.formats import format_currency, format_datetime, format_number
 from itsm.i18n.messages import render, t
+from itsm.i18n.registry import effective_locale
 from itsm.i18n.settings import (
     DEFAULT_CURRENCY,
     DEFAULT_TIMEZONE,
@@ -206,7 +207,12 @@ def identity_locale(session: Session, identity_id: str | None) -> str | None:
 
 
 def recipient_locales(session: Session, identity_ids: Iterable[str | None]) -> dict[str, str]:
-    """Effective locale per recipient: own preference, else the installation default."""
+    """Effective locale per recipient: own preference, else the installation default.
+
+    A stored preference survives the uninstall of its language pack (D4), so it
+    is resolved through the installed chain (parent locale, then the default)
+    exactly like the request locale.
+    """
     installation = read_installation_settings(session)
     wanted = sorted({value for value in identity_ids if isinstance(value, str) and value})
     stored: dict[str, str] = {}
@@ -218,10 +224,9 @@ def recipient_locales(session: Session, identity_ids: Iterable[str | None]) -> d
         for identity_id, locale in session.execute(
             select(Identity.id, Identity.locale).where(Identity.id.in_(wanted))
         ):
-            resolved = resolve_installed_locale(locale)
-            if resolved is not None:
-                stored[identity_id] = resolved
-    default = resolve_installed_locale(installation.default_locale) or DEFAULT_LOCALE
+            if isinstance(locale, str) and locale.strip():
+                stored[identity_id] = effective_locale(locale, installation.default_locale)
+    default = effective_locale(None, installation.default_locale)
     return {identity_id: stored.get(identity_id, default) for identity_id in wanted}
 
 

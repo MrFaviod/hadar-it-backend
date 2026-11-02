@@ -242,6 +242,31 @@ def resolve_installed(tag: str | None) -> str | None:
     return snapshot.resolve(tag)
 
 
+def effective_locale(tag: str | None, default_locale: str = DEFAULT_LOCALE) -> str:
+    """The installed tag that serves a stored preference (D4/D5).
+
+    A preference outlives the pack that provided it: uninstalling a pack never
+    rewrites the stored choice, so the effective language comes from the
+    remaining installed chain (parent locale first, then the installation
+    default). Callers report the stored value separately; this is the locale
+    every rendered artifact must use.
+    """
+    snapshot = current_snapshot()
+    if snapshot is not None:
+        chain = snapshot.fallback(tag if isinstance(tag, str) else None, default_locale)
+        if chain:
+            return chain[0]
+        return DEFAULT_LOCALE
+    for candidate in (tag, default_locale, DEFAULT_LOCALE):
+        if not isinstance(candidate, str) or not candidate.strip():
+            continue
+        for parent in tag_chain(candidate):
+            installed = resolve_installed(parent)
+            if installed is not None:
+                return installed
+    return DEFAULT_LOCALE
+
+
 def lookup(
     key: str, locale: str | None, default_locale: str = DEFAULT_LOCALE
 ) -> tuple[str, str] | None:

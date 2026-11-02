@@ -14,7 +14,7 @@ from fastapi import Request
 
 from itsm.config import Settings
 from itsm.i18n.catalog import DEFAULT_LOCALE
-from itsm.i18n.registry import installed_tags, resolve_installed
+from itsm.i18n.registry import effective_locale, installed_tags, resolve_installed
 from itsm.i18n.settings import InstallationSettings, read_installation_settings
 
 logger = logging.getLogger("itsm.i18n")
@@ -106,7 +106,7 @@ def resolve_request_locale(request: Request) -> str:
             preference = None
 
     locale = (
-        resolve_installed(preference)
+        (effective_locale(preference, installation.default_locale) if preference else None)
         or negotiate_accept_language(request.headers.get("accept-language"))
         or resolve_installed(installation.default_locale)
         or DEFAULT_LOCALE
