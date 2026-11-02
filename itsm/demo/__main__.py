@@ -61,7 +61,14 @@ def initialize(directory: Path, username: str) -> dict:
     engine = create_engine_from_settings(settings)
     try:
         with create_session_factory(engine)() as session:
-            payload = seed(session, settings, username, password)
+            # Seeding is a demo-mode write that also configures the first generation's
+            # synthetic node monitoring, so it needs the owned directory in settings.
+            payload = seed(
+                session,
+                settings.model_copy(update={"demo_data_directory": directory}),
+                username,
+                password,
+            )
     finally:
         engine.dispose()
     return {
