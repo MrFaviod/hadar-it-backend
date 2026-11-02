@@ -37,6 +37,7 @@ from itsm.extensions.host import (
     ExtensionValidationFailed,
 )
 from itsm.extensions.manifest import MAX_ARCHIVE_BYTES
+from itsm.i18n import resolve_request_locale, t
 from itsm.identity.api import AuthDependency, MutationDependency, error_body
 
 NO_STORE = {"Cache-Control": "no-store"}
@@ -134,13 +135,44 @@ def _failure(exc: ExtensionHostError) -> tuple[int, str, str]:
     return 500, "extension_error", "extension operation failed"
 
 
+#: Stable translation key for every mapped failure code. ``detail`` keeps the
+#: server-side explanation the host produced, so no diagnostic text is lost.
+FAILURE_KEYS = {
+    "stale": "api.extensions.stale",
+    "extension_disabled": "api.extensions.extension_disabled",
+    "digest_mismatch": "api.extensions.digest_mismatch",
+    "extension_requires_upgrade": "api.extensions.extension_requires_upgrade",
+    "rollback_incompatible": "api.extensions.rollback_incompatible",
+    "idempotency_conflict": "api.extensions.idempotency_conflict",
+    "sandbox_unavailable": "api.extensions.sandbox_unavailable",
+    "version_conflict": "api.extensions.version_conflict",
+    "import_failed": "api.extensions.import_failed",
+    "validation_failed": "api.extensions.validation_failed",
+    "package_too_large": "api.extensions.package_too_large",
+    "not_found": "api.extensions.not_found",
+    "conflict": "api.extensions.conflict",
+    "migration_failed": "api.extensions.migration_failed",
+    "handler_failed": "api.extensions.handler_failed",
+    "unavailable": "api.extensions.unavailable",
+    "extension_error": "api.extensions.extension_error",
+}
+
+
+def _localized_detail(request: Request, code: str, detail: str) -> tuple[str, str, dict[str, str]]:
+    """Localize one host refusal; the code and ``detail`` stay unchanged."""
+    key = FAILURE_KEYS.get(code, "api.extensions.extension_error")
+    params = {"detail": detail}
+    return t(key, resolve_request_locale(request), **params), key, params
+
+
 def install_extension_error_handlers(app: FastAPI) -> None:
     """Register one handler so every host refusal keeps the error envelope."""
 
     @app.exception_handler(ExtensionHostError)
-    async def _extension_error(_: Request, exc: ExtensionHostError) -> JSONResponse:
+    async def _extension_error(request: Request, exc: ExtensionHostError) -> JSONResponse:
         status_code, code, message = _failure(exc)
-        body = error_body(code, message)
+        localized, key, params = _localized_detail(request, code, message)
+        body = error_body(code, localized, key=key, params=params)
         if isinstance(exc, ExtensionValidationFailed) and exc.errors:
             body["error"]["errors"] = list(exc.errors)  # type: ignore[assignment]
         return JSONResponse(status_code=status_code, content=body)

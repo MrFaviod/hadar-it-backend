@@ -45,7 +45,11 @@ def enqueue_extension_notice(
         or not _MODULE_ID.fullmatch(module_id)
         or permission not in module_permissions
     ):
-        raise ValidationFailed("notice permission must be declared by its module")
+        raise ValidationFailed(
+            "notice permission must be declared by its module",
+            key="api.extensions.notice_permission_undeclared",
+            params={"permission": permission},
+        )
     if (
         not isinstance(key, str)
         or not 1 <= len(key) <= 200
@@ -54,23 +58,41 @@ def enqueue_extension_notice(
         or not isinstance(body, str)
         or not 1 <= len(body) <= 4000
     ):
-        raise ValidationFailed("notice key, title and body must be bounded text")
+        raise ValidationFailed(
+            "notice key, title and body must be bounded text",
+            key="api.extensions.notice_text_bounded",
+            params={},
+        )
     if isinstance(recipient_ids, str) or not isinstance(recipient_ids, (list, tuple)):
-        raise ValidationFailed("recipient_ids must be a list")
+        raise ValidationFailed(
+            "recipient_ids must be a list",
+            key="api.extensions.notice_recipients_list",
+            params={},
+        )
     if not 1 <= len(recipient_ids) <= 100 or any(
         not isinstance(value, str) or not 1 <= len(value) <= 36 for value in recipient_ids
     ):
-        raise ValidationFailed("notice recipients must contain 1-100 identity ids")
+        raise ValidationFailed(
+            "notice recipients must contain 1-100 identity ids",
+            key="api.extensions.notice_recipient_count",
+            params={"minimum": 1, "maximum": 100},
+        )
     if url is not None and (
         not isinstance(url, str)
         or len(url) > 500
         or not url.startswith(f"#/extensiones/{module_id}/")
     ):
-        raise ValidationFailed("notice url must point to its native extension page")
+        raise ValidationFailed(
+            "notice url must point to its native extension page",
+            key="api.extensions.notice_url_native_page",
+            params={},
+        )
     identity_service = IdentityService(session, settings)
     granted = identity_service.effective_permissions(principal)
     if permission not in granted or (asset_id is not None and "assets.view" not in granted):
-        raise PermissionDenied()
+        raise PermissionDenied(
+            "permission denied", key="api.extensions.permission_denied", params={}
+        )
     if asset_id is not None:
         from itsm.inventory.service import InventoryService
 

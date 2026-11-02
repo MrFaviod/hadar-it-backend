@@ -50,11 +50,19 @@ def dispatch_extension_tool(
         return development.dispatch(name, arguments, principal)
     if name == "extension_list":
         if arguments:
-            raise ValidationFailed("extension_list accepts no arguments")
+            raise ValidationFailed(
+                "extension_list accepts no arguments",
+                key="api.extensions.tool_list_no_arguments",
+                params={},
+            )
         return host.discovery(principal)
     if name == "extension_operations":
         if set(arguments) != {"id"} or not isinstance(arguments["id"], str):
-            raise ValidationFailed("extension_operations requires an extension id")
+            raise ValidationFailed(
+                "extension_operations requires an extension id",
+                key="api.extensions.tool_operations_id",
+                params={},
+            )
         return {"operations": host.operations(principal, arguments["id"])}
     if name == "extension_skill":
         if (
@@ -62,7 +70,11 @@ def dispatch_extension_tool(
             or not isinstance(arguments["id"], str)
             or not isinstance(arguments["name"], str)
         ):
-            raise ValidationFailed("extension_skill requires an extension id and skill name")
+            raise ValidationFailed(
+                "extension_skill requires an extension id and skill name",
+                key="api.extensions.tool_skill_id_and_name",
+                params={},
+            )
         return host.skill(principal, arguments["id"], arguments["name"])
     if name == "extension_invoke":
         if (
@@ -71,9 +83,17 @@ def dispatch_extension_tool(
             or not isinstance(arguments["operation"], str)
             or not isinstance(arguments["arguments"], dict)
         ):
-            raise ValidationFailed("extension_invoke requires id, operation and arguments")
+            raise ValidationFailed(
+                "extension_invoke requires id, operation and arguments",
+                key="api.extensions.tool_invoke_arguments",
+                params={},
+            )
         return {"result": host.invoke(principal, arguments["id"], arguments["operation"], arguments["arguments"])}
-    raise ValidationFailed("unknown extension tool")
+    raise ValidationFailed(
+        "unknown extension tool",
+        key="api.extensions.tool_unknown",
+        params={"tool": name},
+    )
 
 
 def _present(**arguments: Any) -> dict[str, Any]:

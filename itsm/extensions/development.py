@@ -532,7 +532,9 @@ class DevelopmentService:
 
     def _authorize(self, principal: Any) -> None:
         if principal is None or not getattr(principal, "actor_id", None):
-            raise PermissionDenied("permission denied")
+            raise PermissionDenied(
+                "permission denied", key="api.extensions.permission_denied", params={}
+            )
         with self._session_factory() as session:
             identity = self._identity_factory(session)
             identity.authorize(principal, self._permission, resource="extensions:development")
@@ -540,7 +542,9 @@ class DevelopmentService:
     def _actor_root(self, principal: Any, *, create: bool = False) -> Path:
         actor = getattr(principal, "actor_id", None)
         if not isinstance(actor, str) or not actor:
-            raise PermissionDenied("permission denied")
+            raise PermissionDenied(
+                "permission denied", key="api.extensions.permission_denied", params={}
+            )
         key = hashlib.sha256(actor.encode("utf-8")).hexdigest()[:32]
         root = self._root / key
         if create:

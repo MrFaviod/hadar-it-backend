@@ -2,8 +2,8 @@
 
 The scanner walks the package with ``ast`` instead of grepping, so a raise split
 over several lines is still checked and the message expression can be inspected.
-Group A modules (T4a) must key every user-visible domain raise; the group B
-modules still pending T4b live in an allowlist that may only shrink.
+Every module is converted (T4a group A, T4b group B), so the pending allowlist is
+empty and every user-visible domain raise must carry a stable key.
 
 The HTTP cases prove the localized envelope end to end: ``key`` and ``params``
 travel next to the localized ``message`` for both core locales.
@@ -71,12 +71,8 @@ GROUP_A = frozenset(
     }
 )
 
-#: T4b modules: pending conversion. This set may only shrink.
-PENDING = frozenset(
-    {
-        "extensions",
-    }
-)
+#: Modules still pending conversion. T4b closed the last one; it may only shrink.
+PENDING = frozenset()
 
 #: Shared namespaces that a module may reuse instead of its own.
 SHARED_PREFIXES = ("api.auth.", "api.error.", "api.i18n.", "api.validation.")
@@ -132,9 +128,16 @@ def _static_params(call: ast.Call) -> frozenset[str] | None:
     return frozenset()
 
 
+#: Code that runs inside the extension sandbox. Its ``NotFound`` is a fixture of
+#: the validator contract and never reaches the ITSM error envelope.
+SANDBOX_ONLY = frozenset({PACKAGE_ROOT / "extensions" / "sdk" / "validator" / "harness.py"})
+
+
 def scan_raises() -> list[RaiseSite]:
     sites: list[RaiseSite] = []
     for path in sorted(PACKAGE_ROOT.rglob("*.py")):
+        if path in SANDBOX_ONLY:
+            continue
         tree = ast.parse(path.read_text(encoding="utf-8"))
         for node in ast.walk(tree):
             if not isinstance(node, ast.Raise) or not isinstance(node.exc, ast.Call):
@@ -352,6 +355,14 @@ CASES = [
         404,
         "api.agent_integrations.record_not_found",
         {"field": "agent session"},
+    ),
+    (
+        "extensions",
+        "GET",
+        "/extensions/00000000-0000-0000-0000-000000000000/status",
+        404,
+        "api.extensions.not_found",
+        {"detail": "extension not found"},
     ),
 ]
 

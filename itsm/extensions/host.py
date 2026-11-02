@@ -500,7 +500,11 @@ class ExtensionHostService:
     def _require_human_superadmin(self, session: Session, principal: Principal) -> Identity:
         identity = session.get(Identity, principal.actor_id)
         if not _is_human_superadmin(identity) or identity.id != principal.actor_id:
-            raise PermissionDenied("extension installation requires a persisted human Superadmin")
+            raise PermissionDenied(
+                "extension installation requires a persisted human Superadmin",
+                key="api.extensions.installation_requires_human_superadmin",
+                params={},
+            )
         return identity
 
     # ---------------------------------------------------------------- loading
@@ -788,7 +792,9 @@ class ExtensionHostService:
             if not _is_human_superadmin(identity) and not any(
                 item["permission"] in permissions for item in manifest["operations"]
             ):
-                raise PermissionDenied()
+                raise PermissionDenied(
+                    "permission denied", key="api.extensions.permission_denied", params={}
+                )
             return self._member_bytes(version_row.package_bytes, "frontend.js")
 
     def skill(self, principal: Principal, extension_id: str, name: str) -> dict[str, Any]:
@@ -814,7 +820,9 @@ class ExtensionHostService:
             if not _is_human_superadmin(identity) and not any(
                 item["permission"] in permissions for item in manifest["operations"]
             ):
-                raise PermissionDenied()
+                raise PermissionDenied(
+                    "permission denied", key="api.extensions.permission_denied", params={}
+                )
             content = self._member_bytes(version_row.package_bytes, declaration["path"]).decode(
                 "utf-8"
             )
@@ -2701,7 +2709,9 @@ class ExtensionHostService:
         )
         if not _is_human_superadmin(owner):
             raise PermissionDenied(
-                "event dispatch requires the persisted human Superadmin that installed the module"
+                "event dispatch requires the persisted human Superadmin that installed the module",
+                key="api.extensions.event_dispatch_requires_human_superadmin",
+                params={},
             )
         return IdentityService(session, self._settings).resolve_actor(owner.id)
 
