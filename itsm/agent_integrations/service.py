@@ -62,6 +62,7 @@ from itsm.agent_integrations.providers import (
     unseal_credential,
     validate_provider_endpoint,
 )
+from itsm.agents import locales as agent_locales
 from itsm.agents.isolation import IsolatedRuntime, is_privileged_human
 from itsm.agents.runtime import (
     AgentUnavailable,
@@ -186,6 +187,7 @@ class _SessionSnapshot:
     messages: list[dict[str, Any]]
     capabilities: dict[str, bool]
     asset_id: str | None
+    locale: str | None = None
     provider_id: str | None = None
 
 
@@ -1989,6 +1991,7 @@ class AgentIntegrationService:
             "results": list(row.results or []),
             "approvalPending": bool(row.approval_pending),
             "assetId": row.asset_id,
+            "locale": row.locale,
             "createdAt": row.created_at.isoformat(),
             "updatedAt": row.updated_at.isoformat(),
         }
@@ -2335,6 +2338,7 @@ class AgentIntegrationService:
                 results=[],
                 approval_pending=False,
                 asset_id=asset_id,
+                locale=self._session_locale(db, principal),
                 cancel_requested=False,
                 capabilities=capabilities,
             )
@@ -2342,6 +2346,19 @@ class AgentIntegrationService:
             db.commit()
             db.refresh(row)
             return self._session_dto(row)
+
+    def _session_locale(self, db: Session, principal: Principal) -> str:
+        """The conversation's language: the person's own locale, else the default."""
+        from itsm.i18n.catalog import DEFAULT_LOCALE, resolve_installed_locale
+        from itsm.i18n.settings import read_installation_settings
+        from itsm.identity.models import Identity
+
+        row = db.get(Identity, principal.actor_id)
+        preference = resolve_installed_locale(row.locale) if row is not None else None
+        if preference:
+            return preference
+        installation = read_installation_settings(db)
+        return resolve_installed_locale(installation.default_locale) or DEFAULT_LOCALE
 
     def _runtime_configured(self) -> bool:
         if self._runtime is not None:
@@ -2828,6 +2845,7 @@ class AgentIntegrationService:
                 messages=messages,
                 capabilities=dict(row.capabilities or {}),
                 asset_id=asset_id,
+                locale=row.locale,
                 provider_id=row.provider_id,
             )
             instance_snapshot = instance
@@ -2974,6 +2992,7 @@ class AgentIntegrationService:
             "credential_digest": None,
             "usage": usage,
             "quota": turn.quota,
+            "locale": turn.session.locale,
         }
         if turn.provider_selection is not None:
             options["provider_selection"] = turn.provider_selection
@@ -3137,15 +3156,7 @@ class AgentIntegrationService:
                     turn.external_session_id = external_id
                 elif self._cancel_requested(turn.session.id) and not turn.cancel_sent:
                     await engine.cancel(external_id)
-                history = [
-                    {"role": item["role"], "content": item["content"][:8000]}
-                    for item in turn.session.messages[:-1]
-                    if item.get("role") in {"user", "assistant"}
-                ]
-                if self._settings.agent_max_history_messages:
-                    history = history[-self._settings.agent_max_history_messages :]
-                else:
-                    history = []
+                history = self._external_history(turn.session.messages[:-1], turn.session.locale)
                 attempt = 0
                 while True:
                     produced = False
@@ -3187,6 +3198,28 @@ class AgentIntegrationService:
             }
         finally:
             await _quiet_close(engine)
+
+    def _external_history(
+        self, messages: list[dict[str, Any]], locale: str | None
+    ) -> list[dict[str, str]]:
+        """Bounded turn history plus the user's language as explicit context.
+
+        The context line survives trimming: an external engine must answer in the
+        conversation's language even when earlier turns were dropped.
+        """
+        history = [
+            {"role": item["role"], "content": item["content"][:8000]}
+            for item in messages
+            if item.get("role") in {"user", "assistant"}
+        ]
+        if self._settings.agent_max_history_messages:
+            history = history[-self._settings.agent_max_history_messages :]
+        else:
+            history = []
+        context = agent_locales.locale_context(locale)
+        if context:
+            history.insert(0, {"role": "system", "content": context})
+        return history
 
     def _cancel_requested(self, session_id: str) -> bool:
         with self._session() as db:

@@ -322,7 +322,7 @@ def _history_text(history: object) -> str:
     ]
     used = len(lines[0])
     for item in items:
-        label = "Asistente" if item["role"] == "assistant" else "Usuario"
+        label = {"assistant": "Asistente", "system": "Sistema"}.get(item["role"], "Usuario")
         line = f"{label}: {item['content']}"
         if used + len(line) > _MAX_CONTEXT_CHARS:
             break

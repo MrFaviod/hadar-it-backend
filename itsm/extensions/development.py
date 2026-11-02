@@ -17,9 +17,16 @@ import time
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from functools import cache
 from pathlib import Path, PurePosixPath
 from typing import Any
 
+from babel import Locale
+from babel.core import UnknownLocaleError
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from itsm import __version__ as CORE_VERSION
 from itsm.extensions import storage
 from itsm.extensions.sdk.contract import SDK_VERSION, ManifestError
 from itsm.extensions.sdk.generator import generate_package, write_package
@@ -29,10 +36,21 @@ from itsm.extensions.sdk.package import (
     build_package,
     read_workspace,
 )
+from itsm.i18n import packs, registry
+from itsm.i18n.catalog import CATALOG_DIR
+from itsm.i18n.messages import plural_categories
+from itsm.i18n.models import I18nProvider
+from itsm.i18n.packs import CatalogError
 from itsm.identity.service import IdentityError, PermissionDenied
 
 WORKSPACE_ID = re.compile(r"^[a-z][a-z0-9]*(?:-[a-z0-9]+)*$")
 TEST_FILE = re.compile(r"^tests/[a-z0-9_]{1,64}\.py$")
+I18N_FILE = re.compile(r"^i18n/[A-Za-z0-9][A-Za-z0-9._-]*\.json$")
+I18N_DEFAULT_PAGE = 50
+I18N_MAX_PAGE = 200
+I18N_NAMESPACES = frozenset({"api", "ui", "ext"})
+I18N_PACK_PRIORITY = 10
+I18N_PACK_VERSION = "1.0.0"
 SAFE_ACTOR = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 MAX_REFERENCE_BYTES = 24_384
 MAX_DESCRIPTION = 1024
@@ -59,6 +77,11 @@ REFERENCE_INDEX: tuple[tuple[str, str, str], ...] = (
     ("migrations", "Migrations", "Ordered explicit data migrations and rollback."),
     ("security", "Security", "Trusted native code, permissions and package safety."),
     ("validation", "Validation", "Fixed offline container checks and report."),
+    (
+        "i18n",
+        "Languages and language packs",
+        "Discover keys, validate translations and package a draft language pack.",
+    ),
     (
         "workspace-tools",
         "Workspace tools",
@@ -627,6 +650,7 @@ class DevelopmentService:
             path in ("extension.json", "backend.py", "frontend.js")
             or path == f"skills/{workspace_id}/SKILL.md"
             or TEST_FILE.fullmatch(path) is not None
+            or I18N_FILE.fullmatch(path) is not None
         ):
             pure = PurePosixPath(path)
             if pure.is_absolute() or ".." in pure.parts or "." in pure.parts:
@@ -726,6 +750,241 @@ class DevelopmentService:
             "capability": capability,
         }
 
+    # --------------------------------------------------------- language packs
+
+    def _i18n_keys(self, arguments: Any, principal: Any) -> dict[str, Any]:
+        """Every source key with its translator context, bounded and filterable.
+
+        The source of truth is the core ``es`` catalog plus the source catalogs
+        of installed modules; pack contributions never change what is translated.
+        """
+        data = _arguments(arguments, {"namespace", "prefix", "limit", "offset"}, set())
+        include, prefix = _i18n_filter(data)
+        limit, offset = _i18n_page(data)
+        with self._session_factory() as session:
+            sources = _i18n_sources(session)
+        context = _translator_context()
+        keys = [key for key in sorted(sources.messages) if _i18n_selected(key, include, prefix)]
+        page = keys[offset : offset + limit]
+        return {
+            "total": len(keys),
+            "limit": limit,
+            "offset": offset,
+            "keys": [
+                {
+                    "key": key,
+                    "namespace": packs.key_namespace(key) or "",
+                    "source": sources.owners.get(key, "core"),
+                    "context": context.get(key),
+                    "message": sources.messages[key],
+                }
+                for key in page
+            ],
+        }
+
+    def _i18n_missing(self, arguments: Any, principal: Any) -> dict[str, Any]:
+        """Source keys the target locale still lacks, fallback chain included."""
+        data = _arguments(
+            arguments, {"locale", "namespace", "prefix", "limit", "offset"}, {"locale"}
+        )
+        tag, display = _i18n_pack_tag(data["locale"])
+        include, prefix = _i18n_filter(data)
+        limit, offset = _i18n_page(data)
+        with self._session_factory() as session:
+            sources = _i18n_sources(session)
+            snapshot = registry.snapshot(session)
+        chain = tuple(
+            candidate for candidate in registry.tag_chain(tag) if candidate in snapshot.locale_views
+        )
+        covered: set[str] = set()
+        for installed in chain:
+            view = snapshot.locale_views.get(installed)
+            if view is not None:
+                covered.update(view.messages)
+        missing = [
+            key
+            for key in sorted(sources.messages)
+            if key not in covered and _i18n_selected(key, include, prefix)
+        ]
+        page = missing[offset : offset + limit]
+        return {
+            "locale": display,
+            "sourceLocale": "es",
+            "chain": list(chain),
+            "total": len(missing),
+            "limit": limit,
+            "offset": offset,
+            "missing": [
+                {
+                    "key": key,
+                    "namespace": packs.key_namespace(key) or "",
+                    "source": sources.owners.get(key, "core"),
+                }
+                for key in page
+            ],
+        }
+
+    def _i18n_validate(self, arguments: Any, principal: Any) -> dict[str, Any]:
+        """Check a draft catalog with the same rules the host applies on install."""
+        data = _arguments(arguments, {"locale", "catalog", "overrides"}, {"locale", "catalog"})
+        tag, display = _i18n_pack_tag(data["locale"])
+        overrides = _i18n_overrides(data.get("overrides"))
+        errors: list[str] = []
+        catalog: dict[str, str] = {}
+        value = data["catalog"]
+        try:
+            if isinstance(value, str):
+                catalog = packs.parse_catalog(value, name=tag)
+            elif isinstance(value, Mapping):
+                catalog = _i18n_catalog_object(value)
+            else:
+                raise InvalidArguments("catalog must be an object or JSON text")
+        except CatalogError as exc:
+            errors.append(str(exc))
+        except InvalidArguments as exc:
+            errors.append(str(exc))
+        with self._session_factory() as session:
+            sources = _i18n_sources(session)
+            owners = registry.owner_catalogs(session).get(registry.canonical_tag(tag) or tag, {})
+        categories = plural_categories(tag)
+        source_categories = plural_categories("es")
+        for key in sorted(catalog):
+            message = catalog[key]
+            errors.extend(packs.key_errors(key))
+            source = sources.messages.get(key)
+            if source is None:
+                errors.append(f"{key}: no source message defines this key")
+            else:
+                errors.extend(packs.validate_translation(key, tag, message, source, "es"))
+                if len(packs.plural_forms(source)) > 1 and categories != source_categories:
+                    forms = len(packs.plural_forms(message))
+                    if forms != len(categories):
+                        errors.append(
+                            f"{tag} {key}: the locale selects by {len(categories)} plural"
+                            f" categories ({', '.join(categories)}), found {forms}"
+                        )
+            if key in owners and key not in overrides:
+                owner = sources.owners.get(key, "its owner")
+                errors.append(
+                    f"{key}: already defined by {owner}; "
+                    "list it in overrides to replace it explicitly"
+                )
+        return {"locale": display, "valid": not errors, "keys": len(catalog), "errors": errors}
+
+    def _i18n_package(self, arguments: Any, principal: Any) -> dict[str, Any]:
+        """Scaffold a draft language-pack workspace; a human still publishes it."""
+        data = _arguments(
+            arguments,
+            {"workspace_id", "locale", "name", "native_name", "overrides"},
+            {"workspace_id", "locale"},
+        )
+        workspace_id = data["workspace_id"]
+        if not isinstance(workspace_id, str) or not WORKSPACE_ID.fullmatch(workspace_id):
+            raise InvalidArguments("workspace id is invalid")
+        if not 2 <= len(workspace_id) <= 48:
+            raise InvalidArguments("workspace id must be between 2 and 48 characters")
+        _, display = _i18n_pack_tag(data["locale"])
+        name = _i18n_pack_name(data.get("name"), display)
+        native_name = _i18n_pack_native(data.get("native_name"), display, name)
+        overrides = _i18n_overrides(data.get("overrides"))
+        actor_root = self._actor_root(principal, create=True)
+        workspaces = actor_root / "workspaces"
+        self._assert_directory_safe(actor_root)
+        self._assert_directory_safe(workspaces, create=True)
+        if self._workspace_count(actor_root) >= self.max_workspaces:
+            raise WorkspaceLimitExceeded("workspace limit reached")
+        target = workspaces / workspace_id
+        if target.exists() or target.is_symlink():
+            raise WorkspaceConflict("workspace already exists")
+        with self._session_factory() as session:
+            sources = _i18n_sources(session)
+        compatibility = {
+            "core": f"^{CORE_VERSION}",
+            "extensions": {
+                provider_id: f"^{version}"
+                for provider_id, version in sorted(sources.extension_versions.items())
+            },
+        }
+        manifest = {
+            "sdkVersion": 2,
+            "id": workspace_id,
+            "name": name,
+            "version": "1.0.0",
+            "kind": "language-pack",
+            "locales": [{"tag": display, "name": name, "nativeName": native_name}],
+            "compatibility": compatibility,
+            "catalogs": {display: f"i18n/{display}.json"},
+            "overrides": overrides,
+            "priority": I18N_PACK_PRIORITY,
+            "review": {"status": "draft"},
+        }
+        catalog = {key: sources.messages[key] for key in sorted(sources.messages)}
+        try:
+            problems = packs.pack_manifest_errors(manifest)
+        except CatalogError as exc:  # pragma: no cover - defensive parity with the host
+            raise DevelopmentError(str(exc)) from exc
+        if problems:
+            raise DevelopmentError("language pack manifest is invalid: " + "; ".join(problems))
+        self._assert_directory_safe(workspaces, create=True)
+        target.mkdir(mode=0o700)
+        _atomic_text(
+            target / "extension.json",
+            json.dumps(manifest, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        _atomic_text(
+            target / "i18n" / f"{display}.json",
+            json.dumps(catalog, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
+        )
+        description = f"Language pack for {display}."
+        _atomic_text(
+            actor_root / "meta" / f"{workspace_id}.json",
+            json.dumps(
+                {
+                    "id": workspace_id,
+                    "name": name,
+                    "description": description,
+                    "createdAt": self._now(),
+                },
+                ensure_ascii=False,
+            ),
+        )
+        workspace = self._workspace(principal, workspace_id)
+        with self._session_factory() as session:
+            from itsm.i18n.catalog import DEFAULT_LOCALE, resolve_installed_locale
+            from itsm.i18n.messages import message_for, render
+            from itsm.i18n.settings import read_installation_settings
+
+            installation = read_installation_settings(session)
+            locale = resolve_installed_locale(installation.default_locale) or DEFAULT_LOCALE
+            template, _tag = message_for("api.i18n.pack_created", locale)
+        message = None
+        if template:
+            message = {
+                "key": "api.i18n.pack_created",
+                "params": {"tag": display, "workspace": workspace_id},
+                "locale": locale,
+                "text": render(template, locale, {"tag": display, "workspace": workspace_id}),
+            }
+        return {
+            "workspace": self._workspace_payload(workspace),
+            "id": workspace_id,
+            "tag": display,
+            "kind": "language-pack",
+            "review": "draft",
+            "compatibility": compatibility,
+            "keys": len(catalog),
+            "manifest": manifest,
+            "files": [
+                {"path": "extension.json", "bytes": (target / "extension.json").stat().st_size},
+                {
+                    "path": f"i18n/{display}.json",
+                    "bytes": (target / "i18n" / f"{display}.json").stat().st_size,
+                },
+            ],
+            "message": message,
+            "next": "extension_workspace_validate",
+        }
+
     @staticmethod
     def _now() -> str:
         return time.strftime("%Y-%m-%dT%H:%M:%S%z", time.localtime())
@@ -740,6 +999,158 @@ def _gap_text(value: Any, label: str, limit: int) -> str:
     return text
 
 
+@dataclass(frozen=True)
+class _I18nSources:
+    """Owner catalogs a translation is checked against, plus installed modules."""
+
+    messages: dict[str, str]
+    owners: dict[str, str]
+    extension_versions: dict[str, str]
+
+
+def _i18n_sources(session: Session) -> _I18nSources:
+    """Core ``es`` text plus each installed module's own catalogs.
+
+    Packs and custom translations are deliberately absent: they are what a new
+    pack fills, never the source that defines a key.
+    """
+    catalogs = registry.owner_catalogs(session)
+    ordered = ["es", "en", *(sorted(set(catalogs) - {"es", "en"}))]
+    messages: dict[str, str] = {}
+    for locale in ordered:
+        for key, value in catalogs.get(locale, {}).items():
+            messages.setdefault(key, value)
+    owners: dict[str, str] = {}
+    for key in messages:
+        namespace = packs.key_namespace(key) or ""
+        if namespace in {"api", "ui"}:
+            owners[key] = "core"
+        elif namespace.startswith("ext."):
+            owners[key] = namespace.split(".", 1)[1]
+    versions = {
+        provider.id: provider.version
+        for provider in session.scalars(
+            select(I18nProvider)
+            .where(I18nProvider.kind == registry.EXTENSION)
+            .order_by(I18nProvider.id)
+        )
+    }
+    return _I18nSources(messages=messages, owners=owners, extension_versions=versions)
+
+
+@cache
+def _translator_context() -> dict[str, str]:
+    """Where each core key is used, so a translation keeps the right meaning."""
+    try:
+        stored = json.loads((Path(CATALOG_DIR) / "context.json").read_text(encoding="utf-8"))
+    except OSError, json.JSONDecodeError, UnicodeDecodeError:
+        return {}
+    if not isinstance(stored, dict):
+        return {}
+    return {str(key): str(value) for key, value in stored.items() if isinstance(value, str)}
+
+
+def _i18n_page(data: Mapping[str, Any]) -> tuple[int, int]:
+    limit = data.get("limit", I18N_DEFAULT_PAGE)
+    offset = data.get("offset", 0)
+    if isinstance(limit, bool) or not isinstance(limit, int):
+        raise InvalidArguments("limit must be an integer")
+    if isinstance(offset, bool) or not isinstance(offset, int):
+        raise InvalidArguments("offset must be an integer")
+    if not 1 <= limit <= I18N_MAX_PAGE:
+        raise InvalidArguments(f"limit must be between 1 and {I18N_MAX_PAGE}")
+    if offset < 0:
+        raise InvalidArguments("offset must not be negative")
+    return limit, offset
+
+
+def _i18n_filter(data: Mapping[str, Any]) -> tuple[str | None, str]:
+    namespace = data.get("namespace")
+    prefix = data.get("prefix", "")
+    if not isinstance(prefix, str) or len(prefix) > packs.MAX_KEY_LENGTH:
+        raise InvalidArguments("prefix must be text")
+    if namespace is None:
+        return None, prefix
+    if not isinstance(namespace, str) or not namespace:
+        raise InvalidArguments("namespace must be text")
+    if namespace in I18N_NAMESPACES:
+        return namespace, prefix
+    if namespace.startswith("ext.") and packs.key_namespace(f"{namespace}.x") == namespace:
+        return namespace, prefix
+    raise InvalidArguments("unknown i18n namespace")
+
+
+def _i18n_selected(key: str, namespace: str | None, prefix: str) -> bool:
+    if prefix and not key.startswith(prefix):
+        return False
+    if namespace is None:
+        return True
+    own = packs.key_namespace(key) or ""
+    if namespace == "ext":
+        return own.startswith("ext.")
+    return own == namespace
+
+
+def _i18n_tag(value: Any) -> str:
+    canonical = registry.canonical_tag(value) if isinstance(value, str) else None
+    if canonical is None:
+        raise InvalidArguments("locale must be a valid language tag")
+    return canonical
+
+
+def _i18n_pack_tag(value: Any) -> tuple[str, str]:
+    canonical = _i18n_tag(value)
+    parts = canonical.split("-")
+    display = "-".join(
+        [parts[0]] + [part.upper() if len(part) == 2 else part for part in parts[1:]]
+    )
+    return canonical, display
+
+
+def _i18n_babel_name(tag: str, language: str) -> str | None:
+    try:
+        return Locale.parse(tag.replace("-", "_")).get_display_name(language)
+    except UnknownLocaleError, ValueError:
+        return None
+
+
+def _i18n_pack_name(value: Any, display: str) -> str:
+    if value is not None:
+        return _text(value, "name", 120)
+    return _i18n_babel_name(display, "en") or display
+
+
+def _i18n_pack_native(value: Any, display: str, fallback: str) -> str:
+    if value is not None:
+        return _text(value, "native_name", 120)
+    return _i18n_babel_name(display, display.replace("-", "_")) or fallback
+
+
+def _i18n_overrides(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (str, bytes)) or not isinstance(value, Collection):
+        raise InvalidArguments("overrides must be a list of keys")
+    selected: list[str] = []
+    for item in value:
+        if not isinstance(item, str) or packs.key_errors(item):
+            raise InvalidArguments("overrides must list valid translation keys")
+        if item not in selected:
+            selected.append(item)
+    return selected
+
+
+def _i18n_catalog_object(value: Mapping[Any, Any]) -> dict[str, str]:
+    catalog: dict[str, str] = {}
+    for key, message in value.items():
+        if not isinstance(key, str):
+            raise InvalidArguments("catalog keys must be text")
+        if not isinstance(message, str):
+            raise InvalidArguments("catalog values must be text")
+        catalog[key] = message
+    return catalog
+
+
 _METHODS: dict[str, Callable[[DevelopmentService, Any, Any], dict[str, Any]]] = {
     "extension_contract_gap": DevelopmentService._contract_gap,
     "extension_sdk_index": DevelopmentService._sdk_index,
@@ -750,6 +1161,10 @@ _METHODS: dict[str, Callable[[DevelopmentService, Any, Any], dict[str, Any]]] = 
     "extension_workspace_write": DevelopmentService._workspace_write,
     "extension_workspace_validate": DevelopmentService._workspace_validate,
     "extension_workspace_submit": DevelopmentService._workspace_submit,
+    "i18n_keys": DevelopmentService._i18n_keys,
+    "i18n_missing": DevelopmentService._i18n_missing,
+    "i18n_validate": DevelopmentService._i18n_validate,
+    "i18n_package": DevelopmentService._i18n_package,
 }
 METHODS = tuple(sorted(_METHODS))
 

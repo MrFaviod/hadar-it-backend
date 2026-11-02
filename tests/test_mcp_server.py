@@ -17,6 +17,7 @@ from fastmcp.client.transports import StreamableHttpTransport
 from fastmcp.exceptions import ToolError
 from itsm.config import Settings
 from itsm.main import create_app
+from itsm.mcp.server import TOOL_NAMES as CANONICAL_TOOL_NAMES
 from mcp.shared.exceptions import MCPError
 from tests.inventory_support import Catalog, prepare
 
@@ -285,3 +286,35 @@ def test_mcp_is_not_a_rest_export(mcp: McpServer) -> None:
     for tool in ("identity_state", "create_user", "admin_roles", "tasks_demo"):
         with pytest.raises((MCPError, ToolError)):
             call_tool(mcp, token, tool, {})
+
+
+def _initialize(
+    server: McpServer, token: str, locale: str
+) -> tuple[str | None, list[dict[str, Any]]]:
+    async def run() -> tuple[str | None, list[dict[str, Any]]]:
+        transport = server.transport(token, **{"Accept-Language": locale})
+        async with Client(transport) as client:
+            tools = await client.list_tools()
+            result = client.instructions
+        return result, [
+            {
+                "name": tool.name,
+                "inputSchema": getattr(tool, "input_schema", None) or tool.inputSchema,
+            }
+            for tool in tools
+        ]
+
+    return asyncio.run(run())
+
+
+def test_mcp_instructions_carry_the_caller_locale_and_keep_the_tool_contract(
+    mcp: McpServer,
+) -> None:
+    _, token = operator(mcp)
+    english, english_tools = _initialize(mcp, token, "en-US,en;q=0.9")
+    spanish, spanish_tools = _initialize(mcp, token, "es")
+
+    assert "Preferred user language: en." in (english or "")
+    assert "Idioma preferido del usuario: es." in (spanish or "")
+    assert english_tools == spanish_tools
+    assert sorted(tool["name"] for tool in english_tools) == sorted(CANONICAL_TOOL_NAMES)

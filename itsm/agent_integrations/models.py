@@ -90,6 +90,7 @@ class AgentSession(InventoryBase):
     results: Mapped[list[dict[str, Any]]] = mapped_column(JSON, nullable=False, default=list)
     approval_pending: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     asset_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    locale: Mapped[str | None] = mapped_column(String(32), nullable=True)
     cancel_requested: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow

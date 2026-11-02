@@ -20,6 +20,8 @@ from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
 from fastmcp.server.auth import AccessToken, TokenVerifier
 from fastmcp.server.dependencies import get_http_headers
+from fastmcp.server.middleware import Middleware
+from itsm.agents import locales as agent_locales
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
 from itsm.extensions.tools import (
@@ -27,6 +29,7 @@ from itsm.extensions.tools import (
     dispatch_extension_tool,
     register_mcp_extension_tools,
 )
+from itsm.i18n.request import negotiate_accept_language
 from itsm.identity.hashing import hash_token
 from itsm.identity.service import (
     AuthenticationFailed,
@@ -130,6 +133,43 @@ returns a durable job; only completed status confirms protected document referen
 Operational summaries and global search report their period, engine and provenance;
 relational queries start from a focus or page the global graph, never dump every module.
 """
+
+
+def instructions_for(locale: str | None) -> str:
+    """The MCP contract plus one sentence naming the caller's language (S8).
+
+    Only the instruction text varies: tool names, arguments and input schemas
+    are part of the stable contract an external model was trained against.
+    """
+    context = agent_locales.locale_context(locale)
+    return f"{INSTRUCTIONS}\n{context}" if context else INSTRUCTIONS
+
+
+def _accept_language() -> str | None:
+    """The trusted transport's language preference, if the client sent one."""
+    try:
+        headers = get_http_headers(include={"accept-language"})
+    except Exception:  # outside a request scope the static contract stands
+        return None
+    value = headers.get("accept-language") if headers else None
+    return value if isinstance(value, str) and value else None
+
+
+class LocaleContextMiddleware(Middleware):
+    """Attach the caller's language to the negotiated metadata, never the tools."""
+
+    @staticmethod
+    def _decorate(result: Any) -> Any:
+        locale = negotiate_accept_language(_accept_language())
+        if locale and hasattr(result, "instructions"):
+            result.instructions = instructions_for(locale)
+        return result
+
+    async def on_initialize(self, context: Any, call_next: Any) -> Any:
+        return self._decorate(await call_next(context))
+
+    async def on_discover(self, context: Any, call_next: Any) -> Any:
+        return self._decorate(await call_next(context))
 
 
 def compact(view: AssetView, fields: list[str] | None = None) -> dict[str, Any]:
@@ -296,6 +336,7 @@ def create_mcp_server(
         "itsm-inventory",
         instructions=INSTRUCTIONS,
         auth=DatabaseTokenVerifier(settings, session_factory),
+        middleware=[LocaleContextMiddleware()],
     )
 
     @contextmanager

@@ -25,6 +25,7 @@ from itsm.agent_integrations.providers import (
 from itsm.agent_integrations.providers import (
     provider_http_client as build_provider_http_client,
 )
+from itsm.agents import locales as agent_locales
 from itsm.config import Settings
 from itsm.directory.service import DirectoryService
 from itsm.extensions.tools import (
@@ -133,41 +134,13 @@ TOOL_NAMES: tuple[str, ...] = (
 
 MAX_RESULTS = 50
 
-INSTRUCTIONS = """\
-Sos el asistente de inventario del ITSM. Respondés en español, de forma breve y factual.
+#: Source-language prompt; the per-turn prompt follows the conversation locale.
+INSTRUCTIONS = agent_locales.INSTRUCTIONS[agent_locales.SOURCE_LOCALE]
 
-Reglas:
-- Usá solamente las herramientas de inventario disponibles; no inventes activos,
-  identificadores, sitios ni responsables.
-- Si falta el activo o un dato necesario para modificar algo, preguntá cuál es;
-  nunca elijas un activo por suposición.
-- El código rápido (quickCode) identifica al activo pero puede cambiar; el id
-  permanente nunca cambia.
-- No afirmes permisos que no ejercitaste: si una herramienta devuelve un error de
-  permiso, explicalo sin inventar alternativas.
-- No menciones detalles internos de configuración, tokens ni rutas del servidor.
-- Los mantenimientos y las intervenciones se registran con las herramientas técnicas;
-  completar un mantenimiento recalcula su próximo vencimiento.
-- Preparar una resolución de incidente no lo resuelve: solo la confirmación con el
-  token preparado y la autoridad vigente lo cambia de estado.
-- Las métricas proceden de Prometheus; indicá el período y distinguí sin datos,
-  sin supervisión y servicio no disponible de una caída confirmada.
-- Reconocer una alerta no la resuelve y una recuperación no cierra su incidente.
-- Preparar mantenimiento solo propone una ventana; no cambia la supervisión.
-- Los reportes y etiquetas usan plantillas y filtros estructurados; nunca generes HTML,
-  rutas de servidor ni comandos. Preparar no genera un archivo; generar devuelve un
-  trabajo pendiente y solo su estado final confirma los documentos disponibles.
-- El resumen operativo y la búsqueda global respetan el período, el motor y los permisos
-  vigentes; no supongas que una coincidencia existe si la herramienta no la devuelve.
-- Las relaciones se consultan desde un activo concreto o de forma paginada; no recorras
-  todo el grafo para responder por un solo equipo.
-Para desarrollar funciones nuevas, primero consulta extension_sdk_index y las referencias del SDK.
-Trabaja solo en los archivos del espacio independiente mediante extension_workspace_*; valida
-el paquete exacto en el contenedor aislado y remítelo a revisión humana. Nunca apruebes ni
-instales el paquete tú mismo, ni modifiques el núcleo. Explica los permisos y la ejecución
-nativa de confianza. Para módulos instalados, descubre extension_list/extension_operations
-y usa extension_invoke con sus parámetros declarados y los permisos vigentes.
-"""
+
+def _instructions(ctx: RunContext[AgentDeps]) -> str:
+    """Return the prompt for the locale of this exact conversation turn."""
+    return agent_locales.instructions(ctx.deps.locale)
 
 
 class AgentUnavailable(Exception):
@@ -252,6 +225,7 @@ class AgentDeps:
     extensions: Any = None
     extension_development: Any = None
     approval_pending: bool = False
+    locale: str | None = None
 
 
 class BatchUpdateArg(BaseModel):
@@ -607,11 +581,13 @@ def _execute(
     return {"ok": True, "result": result}
 
 
-def build_toolset() -> FunctionToolset[AgentDeps]:
+def build_toolset(locale: str | None = None) -> FunctionToolset[AgentDeps]:
     """Canonical typed tool inventory shared by the agent and the isolated proxy.
 
     Every execution path must use this builder; it is the single source of the
     tools the model can see and therefore the single authorization surface.
+    ``locale`` only localizes catalog-defined descriptions; names, arguments and
+    schemas are locale-independent.
     """
     toolset: FunctionToolset[AgentDeps] = FunctionToolset()
 
@@ -1919,6 +1895,7 @@ def build_toolset() -> FunctionToolset[AgentDeps]:
         )
 
     register_agent_extension_tools(toolset, _extension_collect)
+    agent_locales.localize_toolset(toolset, locale)
     return toolset
 
 
@@ -2029,13 +2006,15 @@ class AgentRuntime:
         self._extension_development = extension_development
         self._owns_provider_client = provider_http_client is None
         self._agent: Agent[AgentDeps, str] | None = None
-        self._selection_key: tuple[str, str] | None = None
+        self._selection_key: tuple[str, str, str] | None = None
+        self._agent_locale: str | None = None
 
     async def aclose(self) -> None:
         """Close the provider transport this runtime created, if any."""
         client = self._provider_http_client
         self._agent = None
         self._selection_key = None
+        self._agent_locale = None
         if client is None or not self._owns_provider_client:
             return
         self._provider_http_client = None
@@ -2067,15 +2046,15 @@ class AgentRuntime:
             logger.warning("provider selection could not be read: %s", type(exc).__name__)
             return None
 
-    def _compose(self, model: Model) -> Agent[AgentDeps, str]:
+    def _compose(self, model: Model, locale: str | None = None) -> Agent[AgentDeps, str]:
         agent: Agent[AgentDeps, str] = Agent(
             model,
             deps_type=AgentDeps,
             output_type=str,
-            instructions=INSTRUCTIONS,
+            instructions=_instructions,
             retries=1,
             model_settings=ModelSettings(max_tokens=self._settings.agent_max_output_tokens),
-            toolsets=[build_toolset()],
+            toolsets=[build_toolset(locale)],
         )
         return agent
 
@@ -2085,6 +2064,7 @@ class AgentRuntime:
         provider_selection: ProviderModelSelection | None = None,
         *,
         http_client: Any = None,
+        locale: str | None = None,
     ) -> Agent[AgentDeps, str]:
         model = self._model
         if model is None:
@@ -2117,27 +2097,33 @@ class AgentRuntime:
                 except Exception as exc:  # provider construction must stay explicit
                     logger.warning("agent model could not be configured: %s", type(exc).__name__)
                     raise AgentUnavailable() from None
-        return self._compose(model)
+        return self._compose(model, locale)
 
     def _ensure(
         self,
         provider_selection: ProviderModelSelection | None = None,
         *,
         http_client: Any = None,
+        locale: str | None = None,
     ) -> Agent[AgentDeps, str]:
+        language = agent_locales.instruction_locale(locale)
         if provider_selection is not None:
             # Provider records can change between turns; never reuse a model
             # built for a previous endpoint or credential.
-            return self._build(provider_selection=provider_selection, http_client=http_client)
+            return self._build(
+                provider_selection=provider_selection, http_client=http_client, locale=locale
+            )
         if self._model is not None:
-            if self._agent is None:
-                self._agent = self._build()
+            if self._agent is None or self._agent_locale != language:
+                self._agent = self._build(locale=locale)
+                self._agent_locale = language
             return self._agent
         selection = self._selection()
-        key = None if selection is None else (selection.provider, selection.model)
+        key = None if selection is None else (selection.provider, selection.model, language)
         if self._agent is None or key != self._selection_key:
-            self._agent = self._build(selection)
+            self._agent = self._build(selection, locale=locale)
             self._selection_key = key
+            self._agent_locale = language
         return self._agent
 
     def chat(
@@ -2147,6 +2133,7 @@ class AgentRuntime:
         *,
         credential_digest: str | None = None,
         provider_selection: ProviderModelSelection | None = None,
+        locale: str | None = None,
     ) -> ChatReply:
         """Run one bounded turn; tool authorization happens per operation."""
         reply, _ = self.chat_with_usage(
@@ -2154,6 +2141,7 @@ class AgentRuntime:
             request,
             credential_digest=credential_digest,
             provider_selection=provider_selection,
+            locale=locale,
         )
         return reply
 
@@ -2167,6 +2155,7 @@ class AgentRuntime:
         token_limit: int | None = None,
         provider_selection: ProviderModelSelection | None = None,
         quota: Any = None,
+        locale: str | None = None,
     ) -> tuple[ChatReply, AgentUsage]:
         """Shared run that also returns real usage, including on failure."""
         turn_client = None
@@ -2175,7 +2164,7 @@ class AgentRuntime:
             # unrestricted pool must never be reused for a personal one.
             turn_client = build_provider_http_client(allow_private=provider_selection.allow_private)
         try:
-            agent = self._ensure(provider_selection, http_client=turn_client)
+            agent = self._ensure(provider_selection, http_client=turn_client, locale=locale)
             if quota is not None:
                 from itsm.agents.quota import BudgetedModel
 
@@ -2185,7 +2174,8 @@ class AgentRuntime:
                         quota,
                         context_tokens=self._settings.agent_context_token_bound,
                         output_tokens=self._settings.agent_max_output_tokens,
-                    )
+                    ),
+                    locale,
                 )
             deps = AgentDeps(
                 settings=self._settings,
@@ -2195,6 +2185,7 @@ class AgentRuntime:
                 system=self._system,
                 extensions=self._extensions,
                 extension_development=self._extension_development,
+                locale=locale,
             )
             prompt = user_prompt(request)
             tokens = usage if usage is not None else AgentUsage()

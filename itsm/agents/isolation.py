@@ -30,8 +30,8 @@ from uuid import UUID
 
 from itsm.agent_integrations.attachments import ChatAttachmentInput
 from itsm.agent_integrations.providers import ProviderModelSelection
+from itsm.agents import locales as agent_locales
 from itsm.agents.runtime import (
-    INSTRUCTIONS,
     AgentDeps,
     AgentUnavailable,
     AgentUsage,
@@ -334,12 +334,14 @@ class IsolatedRuntime:
         *,
         credential_digest: str | None = None,
         provider_selection: ProviderModelSelection | None = None,
+        locale: str | None = None,
     ) -> ChatReply:
         reply, _ = self.chat_with_usage(
             principal,
             request,
             credential_digest=credential_digest,
             provider_selection=provider_selection,
+            locale=locale,
         )
         return reply
 
@@ -353,6 +355,7 @@ class IsolatedRuntime:
         token_limit: int | None = None,
         provider_selection: ProviderModelSelection | None = None,
         quota: Any = None,
+        locale: str | None = None,
     ) -> tuple[ChatReply, AgentUsage]:
         if not self.configured:
             raise IsolationUnavailable(_UNAVAILABLE)
@@ -363,8 +366,9 @@ class IsolatedRuntime:
             principal=principal,
             credential_digest=credential_digest,
             system=self._system,
+            locale=locale,
         )
-        prepared = self._prepare_tools(deps)
+        prepared = self._prepare_tools(deps, locale)
         prompt = request.message
         if request.assetId:
             marker = f"Activo seleccionado: {request.assetId}"
@@ -374,7 +378,7 @@ class IsolatedRuntime:
             user_id=_uuid_text(principal.actor_id, "principal"),
             timeout_seconds=_run_timeout(self._settings),
             provider=provider,
-            instructions=INSTRUCTIONS,
+            instructions=agent_locales.instructions(locale),
             prompt=prompt,
             attachments=[_attachment_spec(item) for item in request.attachments],
             history=_history(request),
@@ -400,8 +404,8 @@ class IsolatedRuntime:
             tokens,
         )
 
-    def _prepare_tools(self, deps: AgentDeps) -> _PreparedTools:
-        toolset = build_toolset()
+    def _prepare_tools(self, deps: AgentDeps, locale: str | None = None) -> _PreparedTools:
+        toolset = build_toolset(locale)
         context: RunContext[AgentDeps] = RunContext(
             deps=deps,
             model=FunctionModel(_never_model, model_name="itsm-toolset"),

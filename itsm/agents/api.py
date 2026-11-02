@@ -11,6 +11,7 @@ from itsm.agents.isolation import IsolatedRuntime, IsolationUnavailable, is_priv
 from itsm.agents.quota import reserve_run
 from itsm.agents.runtime import AgentUnavailable, ChatRequest
 from itsm.ai_usage.service import QuotaExceeded
+from itsm.i18n.request import resolve_request_locale
 from itsm.identity.api import MutationDependency
 from itsm.identity.hashing import hash_token
 from itsm.identity.service import Principal
@@ -86,6 +87,7 @@ def create_agent_router() -> APIRouter:
                 payload,
                 credential_digest=_bearer_digest(request),
                 quota=quota,
+                locale=resolve_request_locale(request),
             )
         except QuotaExceeded:
             raise
