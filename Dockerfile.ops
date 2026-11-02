@@ -1,14 +1,114 @@
 # Separate maintenance image: never used by the application API or worker.
 # Build explicitly; preparing this file does not authorize downloads or deployment.
+#
+# PostgreSQL archive tools come from the same digest-pinned server image the
+# local Compose profile runs, so `pg_dump`/`pg_restore` match the PG16 server.
+# The distro client package is not installed and is not used.
+#
+# The donor stage exports exactly two binaries and the shared libraries `ldd`
+# resolves for them. It never imports the donor's server, package metadata or
+# data directory. The dynamic loader stays the one from the base image: both
+# stages are Debian bookworm, so loader compatibility is deliberate, and the
+# final build re-checks it instead of assuming it.
+
+ARG POSTGRES_CLIENT_IMAGE=postgres:16.13-bookworm@sha256:472efd9a66f2b2f1a5aeb18b28de74332e6ef88c2b93a1a5d812fb6db67a5f60
+
+FROM ${POSTGRES_CLIENT_IMAGE} AS pg-client
+USER root
+RUN set -eu; \
+    mkdir -p "/pg-client/bin" "/pg-client/lib"; \
+    for tool in pg_dump pg_restore; do \
+        binary="$(command -v "$tool")"; \
+        test -x "$binary"; \
+        cp "$binary" "/pg-client/bin/$tool"; \
+        ldd "$binary" > "/tmp/$tool.ldd" \
+            || { echo "ldd failed for $tool" >&2; exit 1; }; \
+        if grep -q 'not found' "/tmp/$tool.ldd"; then \
+            echo "unresolved shared library for $tool" >&2; \
+            exit 1; \
+        fi; \
+    done; \
+    cat /tmp/pg_dump.ldd /tmp/pg_restore.ldd > /tmp/client.libraries \
+        || { echo 'could not read the ldd reports' >&2; exit 1; }; \
+    awk '/=> \//{print $3}' /tmp/client.libraries > /tmp/client.paths \
+        || { echo 'could not extract library paths' >&2; exit 1; }; \
+    sort -u /tmp/client.paths > /tmp/client.unique-paths \
+        || { echo 'could not deduplicate library paths' >&2; exit 1; }; \
+    while read -r library; do \
+        case "$(basename "$library")" in \
+            libc.so.6|libm.so.6|libpthread.so.0|libdl.so.2|librt.so.1|ld-linux*) \
+                continue ;; \
+        esac; \
+        cp -L "$library" "/pg-client/lib/" \
+            || { echo "could not copy $library" >&2; exit 1; }; \
+    done < /tmp/client.unique-paths; \
+    /pg-client/bin/pg_dump --version > /tmp/pg_dump.version \
+        || { echo 'could not run the donor pg_dump' >&2; exit 1; }; \
+    grep -Eq '^pg_dump \(PostgreSQL\) 16\.13( |$)' /tmp/pg_dump.version \
+        || { echo 'donor pg_dump is not the PostgreSQL 16.13 release' >&2; exit 1; }; \
+    /pg-client/bin/pg_restore --version > /tmp/pg_restore.version \
+        || { echo 'could not run the donor pg_restore' >&2; exit 1; }; \
+    grep -Eq '^pg_restore \(PostgreSQL\) 16\.13( |$)' /tmp/pg_restore.version \
+        || { echo 'donor pg_restore is not the PostgreSQL 16.13 release' >&2; exit 1; }
+
 FROM itsm-backend:0.1.0
 USER root
-# Debian's PostgreSQL client must match the target server major. PG16 servers
-# require a PG16 tool image supplied by the maintainer, not an arbitrary newer dump.
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends postgresql-client mariadb-client unixodbc \
+    && apt-get install -y --no-install-recommends mariadb-client unixodbc \
     && rm -rf /var/lib/apt/lists/* \
     && mkdir -p /data/backups \
     && chown 10001:10001 /data/backups
+COPY --from=pg-client /pg-client /opt/pg16-client
+# The two tools are invoked by bare name from `itsm/ops/engines.py`, so the
+# wrapper carries the private library path for those processes only.
+RUN set -eu; \
+    for tool in pg_dump pg_restore; do \
+        test -x "/opt/pg16-client/bin/$tool"; \
+        printf '%s\n' \
+            '#!/bin/sh' \
+            '# PostgreSQL 16 archive client imported from the pinned donor image.' \
+            '# The library path is scoped to this process; Python and MariaDB keep' \
+            '# the runtime they were installed against.' \
+            'LD_LIBRARY_PATH=/opt/pg16-client/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH} exec /opt/pg16-client/bin/'"$tool"' "$@"' \
+            > "/usr/local/bin/$tool"; \
+        chmod 0755 "/usr/local/bin/$tool"; \
+    done
+
+# Every imported library must resolve for the base image's own loader. `ldd` is
+# run into a report first: a nonzero exit (missing binary, unreadable object) is
+# refused explicitly, because a silent failure would otherwise read as
+# "nothing unresolved". Only then is the report inspected.
+RUN set -eu; \
+    for tool in pg_dump pg_restore; do \
+        report="/tmp/$tool.ldd"; \
+        LD_LIBRARY_PATH=/opt/pg16-client/lib ldd "/opt/pg16-client/bin/$tool" > "$report" \
+            || { echo "ldd failed for $tool" >&2; exit 1; }; \
+        if grep -q 'not found' "$report"; then \
+            echo "unresolved shared library for $tool" >&2; \
+            exit 1; \
+        fi; \
+    done
+
+# The requirement is the exact pinned release, not merely major 16: a donor
+# override to 16.14 is deliberately refused, so the image cannot drift from the
+# release the pinned PG16 server and the backup path are exercised against.
+RUN set -eu; \
+    LD_LIBRARY_PATH=/opt/pg16-client/lib /opt/pg16-client/bin/pg_dump --version \
+        > /tmp/pg_dump.version \
+        || { echo 'could not run the imported pg_dump' >&2; exit 1; }; \
+    grep -Eq '^pg_dump \(PostgreSQL\) 16\.13( |$)' /tmp/pg_dump.version \
+        || { echo 'imported pg_dump is not the PostgreSQL 16.13 release' >&2; exit 1; }; \
+    LD_LIBRARY_PATH=/opt/pg16-client/lib /opt/pg16-client/bin/pg_restore --version \
+        > /tmp/pg_restore.version \
+        || { echo 'could not run the imported pg_restore' >&2; exit 1; }; \
+    grep -Eq '^pg_restore \(PostgreSQL\) 16\.13( |$)' /tmp/pg_restore.version \
+        || { echo 'imported pg_restore is not the PostgreSQL 16.13 release' >&2; exit 1; }; \
+    for tool in pg_dump pg_restore; do \
+        "/usr/local/bin/$tool" --version > "/tmp/$tool.wrapper.version" \
+            || { echo "could not run the $tool wrapper" >&2; exit 1; }; \
+        grep -Eq "^$tool \\(PostgreSQL\\) 16\\.13( |$)" "/tmp/$tool.wrapper.version" \
+            || { echo "$tool wrapper does not expose the PostgreSQL 16.13 release" >&2; exit 1; }; \
+    done
 USER 10001:10001
 CMD ["python", "-m", "itsm.deployment", "backup-loop"]
 # MSSQL requires an explicitly supplied licensed sqlcmd/ODBC tool variant.
