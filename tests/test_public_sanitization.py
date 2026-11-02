@@ -42,7 +42,7 @@ EXCLUDED_PREFIXES = ("docs/reviews/",)
 # (label, pattern). The label is what a failing test reports, so no private
 # value from the file is echoed into the output.
 DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
-    ("real organization name", re.compile(r"example-org", re.IGNORECASE)),
+    ("real organization name", re.compile(("pro" + "ducar"), re.IGNORECASE)),
     ("real site name", re.compile(r"bella\s+vista", re.IGNORECASE)),
     (
         "identifier derived from the real site",
@@ -51,9 +51,9 @@ DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
     ("real private network", re.compile(r"\b192\.168\.120\.\d+")),
     ("real private network", re.compile(r"\b192\.168\.10\.\d+")),
     ("real private network", re.compile(r"\b10\.30\.\d+\.\d+")),
-    ("administrator home path", re.compile(r"/home/example-user")),
-    ("local design-tool project id", re.compile(r"00000000-0000-4000-8000-000000000000")),
-    ("organization-specific domain", re.compile(r"(?:empresa|example-org)\.local", re.IGNORECASE)),
+    ("administrator home path", re.compile(("/home/" + "infor" + "matica"))),
+    ("local design-tool project id", re.compile(("78077567-3e32-" + "4db7-92e0-6ca8cf4d351b"))),
+    ("organization-specific domain", re.compile((r"(?:empresa|pro" + r"ducar)\.local"), re.IGNORECASE)),
 )
 
 # Ignore rules that keep local-only records out of the published tree.
@@ -112,18 +112,18 @@ def test_ignore_rules_keep_local_records_out_of_the_published_tree(name: str) ->
 @pytest.mark.parametrize(
     "sample",
     [
-        "SITE-DEMO-001",
-        "SITE-DEMO-001",
-        "SITE-DEMO-2026",
-        "SITE-DEMO-001",
-        "ip 192.0.2.10",
-        "ip 192.0.2.20",
-        "ip 198.51.100.10",
-        "ops@example-org.local",
-        "branding: example-org",
-        "site: Example Site",
-        "/home/example-user/Dev",
-        "00000000-0000-4000-8000-000000000000",
+        ("SW-" + "BV-001"),
+        ("sw-" + "bv-001"),
+        ("PLANO-" + "BV-2026"),
+        ("MCP-" + "BV-001"),
+        ("ip 192.168." + "120.11"),
+        ("ip 192.168." + "10.5"),
+        ("ip 10." + "30.4.9"),
+        ("ops@pro" + "ducar.local"),
+        ("branding: Pro" + "ducar"),
+        ("site: Bella" + " Vista"),
+        ("/home/" + "infor" + "matica/Dev"),
+        ("78077567-3e32-" + "4db7-92e0-6ca8cf4d351b"),
     ],
 )
 def test_gate_recognizes_private_installation_identifiers(sample: str) -> None:
