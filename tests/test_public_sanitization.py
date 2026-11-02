@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import re
 from collections.abc import Iterator
+from fnmatch import fnmatch
 from pathlib import Path
 
 import pytest
@@ -105,14 +106,33 @@ def _violations(relative: str, text: str) -> list[str]:
 LOCAL_RECORD_REFERENCE = re.compile(r"(?<![\w.-])(?:odd/|AGENTS" + r"\.md\b|docs/" + r"reviews/)")
 
 
+def _is_local_only(name: str) -> bool:
+    """Hidden root files and names the root ignore rules keep local are never published."""
+    if name.startswith(".") and name not in PRODUCT_FILES:
+        return True
+    rules = (BACKEND_ROOT / ".gitignore").read_text(encoding="utf-8").splitlines()
+    patterns = [rule.strip() for rule in rules if rule.strip() and not rule.startswith("#")]
+    return any("/" not in pattern and fnmatch(name, pattern) for pattern in patterns)
+
+
 def test_every_published_root_file_is_scanned() -> None:
     scanned = {relative for relative, _ in _published_sources()}
     root_files = {
         path.name
         for path in BACKEND_ROOT.iterdir()
-        if path.is_file() and path.name not in EXCLUDED_FILES
+        if path.is_file() and path.name not in EXCLUDED_FILES and not _is_local_only(path.name)
     }
     assert sorted(root_files - scanned) == []
+
+
+@pytest.mark.parametrize("name", [".coverage", ".env.local", "local.db", "module.pyc"])
+def test_local_only_root_files_are_not_publication_candidates(name: str) -> None:
+    assert _is_local_only(name)
+
+
+@pytest.mark.parametrize("name", ["Dockerfile", "compose.yaml", "Makefile", ".dockerignore"])
+def test_new_visible_root_files_stay_publication_candidates(name: str) -> None:
+    assert not _is_local_only(name)
 
 
 def test_published_documents_do_not_reference_unpublished_local_records() -> None:
