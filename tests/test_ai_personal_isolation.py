@@ -723,6 +723,8 @@ def test_mcp_tools_expose_no_personal_credentials(environment, free_tcp_port: in
         name
         for name in MCP_TOOL_NAMES
         if any(word in name for word in ("provider", "usage", "session", "credential", "key"))
+        # i18n_* tools list translation catalog keys, not credentials.
+        and not name.startswith("i18n_")
     ]
     assert exposed == ["list_system_providers", "configure_system_provider"]
     assert [name for name in TOOL_NAMES if "provider" in name] == [
