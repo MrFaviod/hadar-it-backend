@@ -27,7 +27,9 @@ from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME, run_migrations
 
 MODULE_ID = "probe"
 DECLARATIVE_ID = "declarative-notes"
-NOW = datetime(2026, 11, 1, 12, 0, tzinfo=UTC)
+# Anchored to the real clock: the event feed compares this injected time with
+# the database `created_at`, so a fixed date turns into a time bomb.
+NOW = datetime.now(UTC).replace(microsecond=0)
 README = "Use only the declared operations and capabilities.\n"
 
 PROBE_BACKEND = r"""
