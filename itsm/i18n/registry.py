@@ -20,6 +20,8 @@ so an uninstall or an update recomputes the view and the earlier text returns.
 
 from __future__ import annotations
 
+import hashlib
+import json
 import logging
 import re
 from collections.abc import Callable, Iterable, Mapping
@@ -28,7 +30,7 @@ from typing import Any, Final
 
 from babel import Locale
 from babel.core import UnknownLocaleError
-from sqlalchemy import delete, select
+from sqlalchemy import delete, func, select
 from sqlalchemy.orm import Session
 
 from itsm.i18n.catalog import (
@@ -44,6 +46,7 @@ from itsm.i18n.models import (
     I18nProviderDoc,
     I18nProviderLocale,
     I18nRegistryState,
+    I18nSourceContext,
 )
 
 logger = logging.getLogger("itsm.i18n")
@@ -51,6 +54,12 @@ logger = logging.getLogger("itsm.i18n")
 CORE_PROVIDER: Final[str] = "core"
 EXTENSION: Final[str] = "extension"
 LANGUAGE_PACK: Final[str] = "language-pack"
+#: A provider that ships *source* text only (the frontend ``ui.*`` catalog).
+#: It is deliberately inactive in the D5 overlay: the browser merges its own
+#: built-in catalog, so the registration feeds coverage/validation, not serving.
+UI_SOURCE: Final[str] = "ui-source"
+UI_SOURCE_PROVIDER: Final[str] = "ui"
+CUSTOM: Final[str] = "custom"
 REVIEWED: Final[str] = "reviewed"
 DRAFT: Final[str] = "draft"
 REVIEW_STATUSES: Final[tuple[str, ...]] = (DRAFT, REVIEWED)
@@ -412,7 +421,11 @@ class _ProviderRows:
 
     @property
     def active(self) -> bool:
-        return self.provider.kind == EXTENSION or self.provider.review_status == REVIEWED
+        if self.provider.kind == EXTENSION:
+            return True
+        if self.provider.kind == LANGUAGE_PACK:
+            return self.provider.review_status == REVIEWED
+        return False
 
 
 def _load_providers(session: Session) -> tuple[_ProviderRows, ...]:
@@ -573,3 +586,273 @@ def resolve_doc(
 def _descending_id(value: str) -> tuple[int, ...]:
     """Sort key that orders ids descending inside a plain ``sorted`` call."""
     return tuple(-ord(character) for character in value)
+
+
+# --------------------------------------------------------------------------- #
+# installation custom translations (T7, highest D5 precedence)
+# --------------------------------------------------------------------------- #
+
+
+def custom_catalog(session: Session) -> dict[str, dict[str, str]]:
+    """Every stored custom translation as ``locale -> key -> text``."""
+    catalog: dict[str, dict[str, str]] = {}
+    for row in session.scalars(
+        select(I18nCustomTranslation).order_by(
+            I18nCustomTranslation.locale, I18nCustomTranslation.key
+        )
+    ):
+        catalog.setdefault(canonical_tag(row.locale) or row.locale, {})[row.key] = row.value
+    return catalog
+
+
+def set_custom_translations(session: Session, locale: str, entries: Mapping[str, str]) -> int:
+    """Upsert custom translations for one locale; returns the changed row count.
+
+    Unchanged values are not rewritten, so importing the same catalog twice is a
+    no-op and does not bump the revision.
+    """
+    canonical = canonical_tag(locale)
+    if canonical is None:
+        raise ValueError(f"invalid locale tag: {locale!r}")
+    existing = {
+        row.key: row
+        for row in session.scalars(
+            select(I18nCustomTranslation).where(I18nCustomTranslation.locale == canonical)
+        )
+    }
+    changed = 0
+    for key in sorted(entries):
+        value = entries[key]
+        row = existing.get(key)
+        if row is None:
+            session.add(I18nCustomTranslation(locale=canonical, key=key, value=value))
+            changed += 1
+        elif row.value != value:
+            row.value = value
+            changed += 1
+    if changed:
+        bump_revision(session)
+        session.flush()
+    return changed
+
+
+def delete_custom_translations(
+    session: Session, locale: str, keys: Iterable[str] | None = None
+) -> int:
+    """Delete one custom translation or the whole locale layer; returns the count."""
+    canonical = canonical_tag(locale)
+    if canonical is None:
+        raise ValueError(f"invalid locale tag: {locale!r}")
+    statement = delete(I18nCustomTranslation).where(I18nCustomTranslation.locale == canonical)
+    if keys is not None:
+        wanted = sorted(set(keys))
+        if not wanted:
+            return 0
+        statement = statement.where(I18nCustomTranslation.key.in_(wanted))
+    result = session.execute(statement)
+    deleted = int(result.rowcount or 0)
+    if deleted:
+        bump_revision(session)
+        session.flush()
+    return deleted
+
+
+# --------------------------------------------------------------------------- #
+# source catalogs registered at runtime (T7 ``PUT /i18n/sources/ui``)
+# --------------------------------------------------------------------------- #
+
+
+def _source_content(
+    session: Session, provider_id: str
+) -> tuple[dict[str, dict[str, str]], dict[str, str]]:
+    catalogs: dict[str, dict[str, str]] = {}
+    for entry in session.scalars(
+        select(I18nProviderCatalog)
+        .where(I18nProviderCatalog.provider_id == provider_id)
+        .order_by(I18nProviderCatalog.locale, I18nProviderCatalog.key)
+    ):
+        catalogs.setdefault(entry.locale, {})[entry.key] = entry.value
+    context = {
+        row.key: row.context
+        for row in session.scalars(
+            select(I18nSourceContext)
+            .where(I18nSourceContext.provider_id == provider_id)
+            .order_by(I18nSourceContext.key)
+        )
+    }
+    return catalogs, context
+
+
+def source_digest(catalogs: Mapping[str, Mapping[str, str]], context: Mapping[str, str]) -> str:
+    """Content hash of a normalized source payload; idempotency is by this hash."""
+    normalized = {
+        "catalogs": {
+            locale: dict(sorted(catalog.items())) for locale, catalog in sorted(catalogs.items())
+        },
+        "context": dict(sorted(context.items())),
+    }
+    encoded = json.dumps(
+        normalized, sort_keys=True, ensure_ascii=False, separators=(",", ":")
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def write_source_catalog(
+    session: Session,
+    provider_id: str,
+    catalogs: Mapping[str, Mapping[str, str]],
+    context: Mapping[str, str],
+    *,
+    version: str = "1.0.0",
+) -> tuple[bool, str]:
+    """Replace one source provider's catalogs and context; ``(changed, digest)``.
+
+    Re-registering the same content is a no-op: no row is touched and the
+    revision does not move, so a repeated frontend build keeps the bundle ETag.
+    """
+    normalized: dict[str, dict[str, str]] = {}
+    for locale, catalog in catalogs.items():
+        canonical = canonical_tag(locale)
+        if canonical is None:
+            raise ValueError(f"invalid locale tag: {locale!r}")
+        target = normalized.setdefault(canonical, {})
+        for key in sorted(catalog):
+            target[key] = catalog[key]
+    normalized_context = {str(key): str(value) for key, value in context.items()}
+    digest = source_digest(normalized, normalized_context)
+
+    stored_catalogs, stored_context = _source_content(session, provider_id)
+    if source_digest(stored_catalogs, stored_context) == digest:
+        return False, digest
+
+    row = session.get(I18nProvider, provider_id)
+    if row is None:
+        row = I18nProvider(
+            id=provider_id,
+            kind=UI_SOURCE,
+            version=version,
+            priority=0,
+            review_status=REVIEWED,
+        )
+        session.add(row)
+    else:
+        row.kind = UI_SOURCE
+        row.version = version
+        row.priority = 0
+        row.review_status = REVIEWED
+    session.flush()
+
+    _replace_children(session, provider_id)
+    session.execute(delete(I18nSourceContext).where(I18nSourceContext.provider_id == provider_id))
+    for locale in sorted(normalized):
+        for key in sorted(normalized[locale]):
+            session.add(
+                I18nProviderCatalog(
+                    provider_id=provider_id,
+                    locale=locale,
+                    key=key,
+                    value=normalized[locale][key],
+                    is_override=False,
+                )
+            )
+    for key in sorted(normalized_context):
+        session.add(
+            I18nSourceContext(provider_id=provider_id, key=key, context=normalized_context[key])
+        )
+    bump_revision(session)
+    return True, digest
+
+
+def source_catalogs(session: Session, provider_id: str | None = None) -> dict[str, dict[str, str]]:
+    """Source text registered at runtime as ``locale -> key -> text``.
+
+    Only ``ui-source`` providers are returned: extension and pack entries are
+    overlay content and already appear in the resolved locale views.
+    """
+    providers = [
+        row
+        for row in session.scalars(select(I18nProvider).order_by(I18nProvider.id))
+        if row.kind == UI_SOURCE and (provider_id is None or row.id == provider_id)
+    ]
+    merged: dict[str, dict[str, str]] = {}
+    for provider in providers:
+        catalogs, _ = _source_content(session, provider.id)
+        for locale, catalog in catalogs.items():
+            merged.setdefault(locale, {}).update(catalog)
+    return merged
+
+
+def source_context(session: Session, provider_id: str | None = None) -> dict[str, str]:
+    """Translator context registered with a source catalog, merged by provider id."""
+    providers = [
+        row
+        for row in session.scalars(select(I18nProvider).order_by(I18nProvider.id))
+        if row.kind == UI_SOURCE and (provider_id is None or row.id == provider_id)
+    ]
+    merged: dict[str, str] = {}
+    for provider in providers:
+        _, context = _source_content(session, provider.id)
+        merged.update(context)
+    return merged
+
+
+def extension_source_entries(session: Session, locale: str = DEFAULT_LOCALE) -> dict[str, str]:
+    """The source-locale entries active extension providers own (``ext.<id>.*``)."""
+    canonical = canonical_tag(locale) or locale
+    entries: dict[str, str] = {}
+    for row in sorted(
+        (item for item in _load_providers(session) if item.provider.kind == EXTENSION),
+        key=lambda item: item.provider.id,
+    ):
+        entries.update(row.entries.get(canonical, {}))
+    return entries
+
+
+# --------------------------------------------------------------------------- #
+# coverage attribution
+# --------------------------------------------------------------------------- #
+
+
+@dataclass(frozen=True)
+class Contribution:
+    """One provider's supplied entries for a locale, for the translator report."""
+
+    provider_id: str
+    kind: str
+    entries: int
+
+
+def contributions(session: Session, canonical: str) -> tuple[Contribution, ...]:
+    """Which providers supply entries for ``canonical``, in a stable order."""
+    result: list[Contribution] = []
+    if canonical in CORE_LOCALES:
+        core = load_catalog(canonical)
+        if core:
+            result.append(Contribution(CORE_PROVIDER, CORE_PROVIDER, len(core)))
+    rows = _load_providers(session)
+    for row in rows:
+        kind = row.provider.kind
+        if kind == UI_SOURCE:
+            count = len(row.entries.get(canonical, {}))
+            if count:
+                result.append(Contribution(row.provider.id, UI_SOURCE, count))
+    for row in rows:
+        if row.provider.kind != EXTENSION:
+            continue
+        count = len(row.entries.get(canonical, {}))
+        if count:
+            result.append(Contribution(row.provider.id, EXTENSION, count))
+    for row in _pack_order(
+        item for item in rows if item.active and item.provider.kind == LANGUAGE_PACK
+    ):
+        count = len(row.entries.get(canonical, {}))
+        if count:
+            result.append(Contribution(row.provider.id, LANGUAGE_PACK, count))
+    custom = session.scalar(
+        select(func.count())
+        .select_from(I18nCustomTranslation)
+        .where(I18nCustomTranslation.locale == canonical)
+    )
+    if custom:
+        result.append(Contribution(CUSTOM, CUSTOM, int(custom)))
+    return tuple(result)

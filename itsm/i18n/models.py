@@ -114,3 +114,27 @@ class I18nCustomTranslation(I18nBase):
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
     )
+
+
+class I18nSourceContext(I18nBase):
+    """Translator context for a key registered by a *source* provider (T7).
+
+    The core catalogs ship ``catalogs/context.json``; the frontend registers its
+    ``ui.*`` source catalog over HTTP, so its context arrives the same way and
+    needs a provider-scoped row set. Context is metadata only: it never changes
+    a resolved message, it only describes where the text is used.
+    """
+
+    __tablename__ = "i18n_source_context"
+    __table_args__ = (
+        UniqueConstraint("provider_id", "key", name="uq_i18n_source_context_key"),
+        Index("ix_i18n_source_context_provider", "provider_id"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    provider_id: Mapped[str] = mapped_column(String(48), nullable=False)
+    key: Mapped[str] = mapped_column(String(200), nullable=False)
+    context: Mapped[str] = mapped_column(Text, nullable=False)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, default=utcnow, onupdate=utcnow
+    )
