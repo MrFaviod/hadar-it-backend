@@ -435,6 +435,16 @@ def test_accept_language_honors_quality_values_and_exclusions() -> None:
     assert negotiate_accept_language("*,en;q=0.2", available) == "en"
 
 
+def test_accept_language_matches_hyphenated_installed_pack_tags() -> None:
+    from itsm.i18n.request import negotiate_accept_language
+
+    available = ("es", "en", "pt-br")
+    assert negotiate_accept_language("pt-BR", available) == "pt-br"
+    assert negotiate_accept_language("pt-BR,pt;q=0.9", available) == "pt-br"
+    assert negotiate_accept_language("en-US", available) == "en"
+    assert negotiate_accept_language("fr", available) is None
+
+
 def test_accept_language_exclusion_reaches_the_http_error_locale(env) -> None:
     client, _ = env
 

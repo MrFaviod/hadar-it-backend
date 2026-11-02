@@ -64,12 +64,20 @@ def negotiate_accept_language(
     preferred = list(negotiated_preferences(header))
     if not preferred:
         return None
-    candidates = list(installed_tags() if available is None else available)
+    installed = list(installed_tags() if available is None else available)
+    # Header ranges are compared with ``_`` separators; installed pack tags such
+    # as ``pt-br`` must use the same separator or Babel never matches them.
+    candidates = {tag.replace("-", "_").lower(): tag for tag in installed}
     try:
-        matched = Locale.negotiate(preferred, candidates, sep="_")
+        matched = Locale.negotiate(preferred, list(candidates), sep="_")
     except TypeError, ValueError:
         return None
-    return resolve_installed(matched) if matched else None
+    if not matched:
+        return None
+    tag = candidates.get(str(matched).lower(), str(matched))
+    # An explicit ``available`` list is authoritative when the registry does not
+    # know the tag yet (callers negotiating against a candidate pack).
+    return resolve_installed(tag) or (tag if available is not None else None)
 
 
 def resolve_request_locale(request: Request) -> str:
