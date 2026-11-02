@@ -95,6 +95,9 @@ class DemoController:
         self.factory: Callable[[], Session] | None = None
         self._stuck_reported = False
         self._lock: DemoDirectoryLock | None = None
+        # Serializes reset ownership inside this process: a tick that loses the
+        # race re-reads the persisted state instead of resetting a second time.
+        self._reset_lock = asyncio.Lock()
 
     @property
     def resetting(self) -> bool:
@@ -148,38 +151,110 @@ class DemoController:
         with self.factory() as session:
             return cycle_status(session)
 
+    async def _read_status(self) -> dict | None:
+        """Read the persisted cycle; ``None`` means this process is unavailable."""
+        try:
+            return await asyncio.to_thread(self.status)
+        except Exception:
+            self.unavailable = True
+            log_event(logger, "demo.reset_failed", level=logging.ERROR)
+            return None
+
     async def tick(self, now: datetime | None = None) -> None:
         """Run one due cycle; clock injection allows deterministic scheduler tests."""
         if self.unavailable:
             return
-        try:
-            status = await asyncio.to_thread(self.status)
-        except Exception:
-            self.unavailable = True
-            log_event(logger, "demo.reset_failed", level=logging.ERROR)
+        status = await self._read_status()
+        if status is None:
             return
         if status["resetting"]:
-            self._mark_stuck()
+            if self.gate.resetting:
+                return
+            # The snapshot may predate the end of this process's own reset, so a
+            # stale ``resetting`` flag is only stuck when a fresh read agrees.
+            status = await self._read_status()
+            if status is None:
+                return
+            if status["resetting"]:
+                self._mark_stuck()
+                return
+        moment = now or datetime.now(UTC)
+        if moment < datetime.fromisoformat(status["nextResetAt"]):
             return
-        deadline = datetime.fromisoformat(status["nextResetAt"])
-        if (now or datetime.now(UTC)) < deadline:
-            return
-        if not await self.gate.begin_reset(self.DRAIN_SECONDS):
+        async with self._reset_lock:
+            # Two ticks can both observe a due deadline before either owns the
+            # reset; only the holder of this lock may start one, and it re-reads
+            # the state it is about to act on.
+            fresh = await self._read_status()
+            if fresh is None:
+                return
+            if fresh["resetting"]:
+                if not self.gate.resetting:
+                    self._mark_stuck()
+                return
+            if moment < datetime.fromisoformat(fresh["nextResetAt"]):
+                return
+            await self._begin_reset()
+            try:
+                await self._reset_and_wait()
+            except Exception:
+                self.unavailable = True
+                log_event(logger, "demo.reset_failed", level=logging.ERROR)
+            finally:
+                self.gate.end_reset()
+
+    async def _begin_reset(self) -> None:
+        """Open the gate for this tick's reset.
+
+        A cancellation while draining in-flight requests arrives before any
+        reset work exists, so ownership is released and the gate reopened here
+        instead of leaking a shut gate that later looks like a stuck reset.
+        """
+        try:
+            opened = await self.gate.begin_reset(self.DRAIN_SECONDS)
+        except asyncio.CancelledError:
+            self.gate.end_reset()
+            raise
+        if not opened:
             log_event(
                 logger,
                 "demo.reset_drain_timeout",
                 level=logging.WARNING,
                 inFlight=self.gate.in_flight,
             )
+
+    async def _reset_and_wait(self) -> None:
+        """Run one reset without letting cancellation abandon the worker.
+
+        The worker runs in a thread, which cancellation cannot stop. Ownership
+        therefore stays held until the real reset finishes: the caller is only
+        allowed to unwind afterwards, and a failed worker is still reported.
+        """
+        if self.engine is None:
+            raise RuntimeError("demo controller is not initialized")
+        worker = asyncio.ensure_future(asyncio.to_thread(reset_demo, self.settings, self.engine))
+        cancelled = False
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                cancelled = True
+            except Exception:
+                # The failure is re-raised from the result below.
+                break
         try:
-            if self.engine is None:
-                raise RuntimeError("demo controller is not initialized")
-            await asyncio.to_thread(reset_demo, self.settings, self.engine)
+            worker.result()
         except Exception:
-            self.unavailable = True
             log_event(logger, "demo.reset_failed", level=logging.ERROR)
-        finally:
-            self.gate.end_reset()
+            if cancelled:
+                # The caller is unwinding, so ``tick`` cannot mark this failure
+                # itself; a partially reset installation must stay failclosed
+                # instead of admitting requests with a broken dataset.
+                self.unavailable = True
+            else:
+                raise
+        if cancelled:
+            raise asyncio.CancelledError()
 
     async def run(self) -> None:
         validate_reset_paths(self.settings)
