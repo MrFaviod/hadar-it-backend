@@ -23,6 +23,10 @@ DEVELOPMENT_TOOL_NAMES = (
     "extension_workspace_validate",
     "extension_workspace_submit",
     "extension_contract_gap",
+    "i18n_keys",
+    "i18n_missing",
+    "i18n_validate",
+    "i18n_package",
 )
 EXTENSION_TOOL_NAMES = (
     *DEVELOPMENT_TOOL_NAMES,
@@ -70,6 +74,11 @@ def dispatch_extension_tool(
             raise ValidationFailed("extension_invoke requires id, operation and arguments")
         return {"result": host.invoke(principal, arguments["id"], arguments["operation"], arguments["arguments"])}
     raise ValidationFailed("unknown extension tool")
+
+
+def _present(**arguments: Any) -> dict[str, Any]:
+    """Keep only the optional arguments the caller actually supplied."""
+    return {name: value for name, value in arguments.items() if value is not None}
 
 
 def register_agent_extension_tools(
@@ -135,6 +144,62 @@ def register_agent_extension_tools(
         if extensionId is not None:
             arguments["extensionId"] = extensionId
         return execute(ctx.deps, "extension_contract_gap", arguments)
+
+    @toolset.tool
+    def i18n_keys(
+        ctx: RunContext[Any],
+        namespace: str | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """List translatable source keys with their translator context."""
+        arguments = _present(namespace=namespace, prefix=prefix, limit=limit, offset=offset)
+        return execute(ctx.deps, "i18n_keys", arguments)
+
+    @toolset.tool
+    def i18n_missing(
+        ctx: RunContext[Any],
+        locale: str,
+        namespace: str | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """List source keys a target locale does not translate yet."""
+        arguments = {
+            "locale": locale,
+            **_present(namespace=namespace, prefix=prefix, limit=limit, offset=offset),
+        }
+        return execute(ctx.deps, "i18n_missing", arguments)
+
+    @toolset.tool
+    def i18n_validate(
+        ctx: RunContext[Any],
+        locale: str,
+        catalog: dict[str, Any] | str,
+        overrides: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate a draft catalog for a locale: params, plurals, keys and owner conflicts."""
+        arguments = {"locale": locale, "catalog": catalog, **_present(overrides=overrides)}
+        return execute(ctx.deps, "i18n_validate", arguments)
+
+    @toolset.tool
+    def i18n_package(
+        ctx: RunContext[Any],
+        workspace_id: str,
+        locale: str,
+        name: str | None = None,
+        native_name: str | None = None,
+        overrides: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Scaffold a draft language-pack workspace; it stays a draft until a human reviews it."""
+        arguments = {
+            "workspace_id": workspace_id,
+            "locale": locale,
+            **_present(name=name, native_name=native_name, overrides=overrides),
+        }
+        return execute(ctx.deps, "i18n_package", arguments)
 
     @toolset.tool
     def extension_list(ctx: RunContext[Any]) -> dict[str, Any]:
@@ -219,6 +284,58 @@ def register_mcp_extension_tools(
         if extensionId is not None:
             arguments["extensionId"] = extensionId
         return execute("extension_contract_gap", arguments)
+
+    @server.tool
+    def i18n_keys(
+        namespace: str | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """List translatable source keys with their translator context."""
+        arguments = _present(namespace=namespace, prefix=prefix, limit=limit, offset=offset)
+        return execute("i18n_keys", arguments)
+
+    @server.tool
+    def i18n_missing(
+        locale: str,
+        namespace: str | None = None,
+        prefix: str | None = None,
+        limit: int | None = None,
+        offset: int | None = None,
+    ) -> dict[str, Any]:
+        """List source keys a target locale does not translate yet."""
+        arguments = {
+            "locale": locale,
+            **_present(namespace=namespace, prefix=prefix, limit=limit, offset=offset),
+        }
+        return execute("i18n_missing", arguments)
+
+    @server.tool
+    def i18n_validate(
+        locale: str,
+        catalog: dict[str, Any] | str,
+        overrides: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Validate a draft catalog for a locale: params, plurals, keys and owner conflicts."""
+        arguments = {"locale": locale, "catalog": catalog, **_present(overrides=overrides)}
+        return execute("i18n_validate", arguments)
+
+    @server.tool
+    def i18n_package(
+        workspace_id: str,
+        locale: str,
+        name: str | None = None,
+        native_name: str | None = None,
+        overrides: list[str] | None = None,
+    ) -> dict[str, Any]:
+        """Scaffold a draft language-pack workspace; it stays a draft until a human reviews it."""
+        arguments = {
+            "workspace_id": workspace_id,
+            "locale": locale,
+            **_present(name=name, native_name=native_name, overrides=overrides),
+        }
+        return execute("i18n_package", arguments)
 
     @server.tool
     def extension_list() -> dict[str, Any]:

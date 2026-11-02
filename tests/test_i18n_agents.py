@@ -588,3 +588,60 @@ def test_sdk_index_references_the_language_pack_guidance(catalog, admin, tmp_pat
     reference = development.dispatch("extension_sdk_reference", {"name": "i18n"}, admin)
     for tool in ("i18n_keys", "i18n_missing", "i18n_validate", "i18n_package"):
         assert tool in reference["content"]
+
+
+PACK_TOOLS = ("i18n_keys", "i18n_missing", "i18n_validate", "i18n_package")
+
+
+def test_pack_tools_are_registered_on_both_transports_with_bounded_arguments() -> None:
+    from itsm.extensions import tools as extension_tools
+
+    assert set(PACK_TOOLS) <= set(extension_tools.DEVELOPMENT_TOOL_NAMES)
+    assert set(PACK_TOOLS) <= set(extension_tools.EXTENSION_TOOL_NAMES)
+
+    class Collector:
+        def __init__(self) -> None:
+            self.functions: dict[str, Any] = {}
+
+        def tool(self, function: Any) -> Any:
+            self.functions[function.__name__] = function
+            return function
+
+    calls: list[tuple[str, dict[str, Any]]] = []
+    server = Collector()
+    extension_tools.register_mcp_extension_tools(
+        server, lambda name, arguments: calls.append((name, arguments)) or {}
+    )
+    toolset = Collector()
+    extension_tools.register_agent_extension_tools(
+        toolset, lambda deps, name, arguments: calls.append((name, arguments)) or {}
+    )
+    assert set(PACK_TOOLS) <= set(server.functions)
+    assert set(PACK_TOOLS) <= set(toolset.functions)
+
+    server.functions["i18n_keys"]()
+    server.functions["i18n_missing"]("pt-BR", namespace="ui", limit=10)
+    server.functions["i18n_validate"]("pt-BR", {"ui.common.save": "Salvar"})
+    server.functions["i18n_package"]("pack-pt-br", "pt-BR", name="Português")
+    context = type("Context", (), {"deps": None})()
+    toolset.functions["i18n_missing"](context, "pt-BR", offset=5)
+    assert calls == [
+        ("i18n_keys", {}),
+        ("i18n_missing", {"locale": "pt-BR", "namespace": "ui", "limit": 10}),
+        ("i18n_validate", {"locale": "pt-BR", "catalog": {"ui.common.save": "Salvar"}}),
+        ("i18n_package", {"workspace_id": "pack-pt-br", "locale": "pt-BR", "name": "Português"}),
+        ("i18n_missing", {"locale": "pt-BR", "offset": 5}),
+    ]
+
+    forwarded: list[str] = []
+
+    class Development:
+        def dispatch(self, name: str, arguments: Any, principal: Any) -> dict[str, Any]:
+            forwarded.append(name)
+            return {}
+
+    for name in PACK_TOOLS:
+        extension_tools.dispatch_extension_tool(
+            name, {}, principal=None, host=None, development=Development()
+        )
+    assert forwarded == list(PACK_TOOLS)
