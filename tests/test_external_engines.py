@@ -151,6 +151,7 @@ def test_v2_discovery_uses_live_schema_and_never_treats_spa_as_connected() -> No
             "tools": True,
             "usage": True,
             "history": True,
+            "attachments": False,
         }
         model_request = next(request for request in seen if request.url.path == "/api/model")
         assert model_request.url.params["location[directory]"] == "/srv/itsm"
@@ -1865,6 +1866,7 @@ def test_hermes_native_loopback_login_uses_process_token_and_real_models() -> No
         "tools": True,
         "usage": True,
         "history": False,
+        "attachments": False,
     }
     assert urls and "token=process-token" in urls[0]
     assert "ticket=" not in urls[0]

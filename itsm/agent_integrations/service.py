@@ -2384,6 +2384,7 @@ class AgentIntegrationService:
                 )
             original_updated_at = row.updated_at
             current_model = row.model
+            current_capabilities = dict(row.capabilities or {})
             target_id = instance_id or row.instance_id
             snapshot, provider = self._resolve_instance(db, principal, target_id)
             if not snapshot.enabled:
@@ -2458,6 +2459,7 @@ class AgentIntegrationService:
                     value = self._settings.agent_model
                     if value is None:
                         raise IntegrationUnavailable("agent model is not configured")
+            selected_provider_id = None if selected_provider is None else selected_provider.id
         capabilities = self._session_capabilities(snapshot.engine, None)
         if snapshot.engine != PYDANTIC_ENGINE:
             if not capabilities.get("model_switch", True):
@@ -2467,7 +2469,7 @@ class AgentIntegrationService:
                 )
             if snapshot.quota_mode == "managed":
                 # Managed runs never touch the shared instance; the gateway owns the models.
-                capabilities = dict(row.capabilities or {})
+                capabilities = dict(current_capabilities)
             else:
                 info = await self._discover(snapshot)
                 model_ids = [item["id"] for item in info["models"]]
@@ -2510,11 +2512,11 @@ class AgentIntegrationService:
                 identity = IdentityService(db, self._settings)
                 self._assert_binding_ceiling(db, identity, principal, instance)
                 self._require_verified_profile(db, instance)
-                if target.quota_mode == "managed" and selected_provider is not None:
+                if target.quota_mode == "managed" and selected_provider_id is not None:
                     current_selected = self._managed_provider(
                         db, principal, instance, final_provider_id
                     )
-                    if current_selected.id != selected_provider.id:
+                    if current_selected.id != selected_provider_id:
                         raise Conflict(
                             "the selected provider changed while switching engines",
                             key="api.agent_integrations.provider_changed",
