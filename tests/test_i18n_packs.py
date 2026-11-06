@@ -607,3 +607,41 @@ def test_sdk_contract_checks_the_i18n_block_without_the_host_package():
     assert "i18n/*.json" in str(excinfo.value) or "i18n.catalogs" in str(excinfo.value)
 
     validate_manifest(manifest, known_core_permissions=())
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '{ "sample": "value" }',
+        '{\n  "api.assets.created": "Asset created"\n}',
+        ' { "rows": "a|b" } ',
+    ],
+)
+def test_literal_json_message_accepts_json_grammar_whitespace(message: str) -> None:
+    assert packs.is_literal_json_message(message)
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '{"sample": "a", "sample": "b"}',
+        '{"sample": 1, "sample": "two"}',
+        '{"sample": 1}',
+        '{"sample": null}',
+        '{"sample": {"nested": "value"}}',
+        '{"sample": ["a"]}',
+        "{}",
+        '{"sample": ',
+    ],
+)
+def test_literal_json_message_rejects_duplicates_and_non_string_values(message: str) -> None:
+    assert not packs.is_literal_json_message(message)
+
+
+def test_literal_json_message_counts_one_plural_form_in_pack_comparison() -> None:
+    literal = '{"filters": "a|b"}'
+    assert packs.plural_forms(literal) == (literal,)
+    assert packs.placeholder_names(literal) == frozenset()
+    assert packs.validate_translation("ui.test.filters", "en", "Filters", literal, "es") == []
+    plain = "{count} active | {count} active items"
+    assert packs.validate_translation("ui.test.count", "en", "{count} active", plain, "es")

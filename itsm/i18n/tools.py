@@ -34,6 +34,7 @@ from itsm.i18n.catalog import CATALOG_DIR, DEFAULT_LOCALE
 from itsm.i18n.messages import plural_categories, t
 from itsm.i18n.packs import (
     MAX_MESSAGE_LENGTH,
+    is_literal_json_message,
     key_namespace,
     placeholder_names,
     plural_forms,
@@ -48,7 +49,7 @@ MAX_LIMIT: Final[int] = 500
 MAX_NAMESPACE_LENGTH: Final[int] = 200
 
 _NAMESPACE = re.compile(r"^[a-z0-9][a-z0-9._-]*$")
-_PARAM = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+_PARAM = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class UnsupportedFormat(ValueError):
@@ -133,6 +134,8 @@ def namespace_of(key: str) -> str:
 
 def _malformed(message: str) -> bool:
     """True when a ``{parameter}`` is unbalanced or not a valid named parameter."""
+    if is_literal_json_message(message):
+        return False
     index = 0
     while index < len(message):
         character = message[index]

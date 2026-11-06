@@ -24,6 +24,7 @@ from itsm.i18n.catalog import (
     load_catalog,
     resolve_installed_locale,
 )
+from itsm.i18n.packs import is_literal_json_message
 
 logger = logging.getLogger("itsm.i18n")
 
@@ -53,7 +54,7 @@ _PLURAL_SAMPLE_COUNTS = (
     1000000,
 )
 
-_PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 _missing_logged: set[str] = set()
 
 
@@ -120,6 +121,8 @@ def message_for(
 
 
 def render(template: str, locale: str, params: dict[str, object]) -> str:
+    if is_literal_json_message(template):
+        return template
     count = params.get("count")
     if isinstance(count, (int, float)) and not isinstance(count, bool) and "|" in template:
         template = select_plural_form(template, locale, count)

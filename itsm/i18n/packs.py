@@ -29,7 +29,7 @@ MAX_KEY_LENGTH: Final = 200
 MAX_MESSAGE_LENGTH: Final = 4000
 REVIEW_STATUSES: Final = ("draft", "reviewed")
 
-_PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+_PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 class CatalogError(ValueError):
@@ -60,13 +60,41 @@ def parse_catalog(text: str, name: str = "catalog") -> dict[str, str]:
     return data
 
 
+def is_literal_json_message(message: str) -> bool:
+    """Recognize a complete, non-empty JSON string map used as example copy."""
+    if not message.lstrip().startswith("{"):
+        return False
+    duplicate = False
+
+    def pairs(items: list[tuple[str, Any]]) -> dict[str, Any]:
+        nonlocal duplicate
+        result: dict[str, Any] = {}
+        for key, value in items:
+            if key in result:
+                duplicate = True
+            result[key] = value
+        return result
+
+    try:
+        value = json.loads(message, object_pairs_hook=pairs)
+    except json.JSONDecodeError, ValueError:
+        return False
+    if duplicate or not isinstance(value, dict) or not value:
+        return False
+    return all(isinstance(key, str) and isinstance(item, str) for key, item in value.items())
+
+
 def placeholder_names(message: str) -> frozenset[str]:
     """The named parameters a message uses."""
+    if is_literal_json_message(message):
+        return frozenset()
     return frozenset(_PLACEHOLDER.findall(message))
 
 
 def plural_forms(message: str) -> tuple[str, ...]:
     """The plural forms of a message (one item when it does not pluralize)."""
+    if is_literal_json_message(message):
+        return (message,)
     return tuple(form.strip() for form in message.split("|"))
 
 

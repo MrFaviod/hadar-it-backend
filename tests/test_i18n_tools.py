@@ -706,3 +706,66 @@ def test_custom_translations_survive_a_core_upgrade_and_orphans_are_reported(
     assert "api.i18n.locale_count" not in json.dumps(payload["source"])
     assert english["total"] == payload["source"]["total"]
     assert english["total"] == payload["source"]["total"]
+
+
+def test_ui_source_accepts_existing_camel_case_and_literal_json(env) -> None:
+    client, harness = env
+    headers = auth_headers(client)
+    messages = {
+        "ui.chat.usage_line": "{input} {cacheRead} {cacheWrite}",
+        "ui.monitoring.card.unmonitored_hint": "{noData} {unavailable}",
+        "ui.monitoring.channel.template": "{detectedAt} {message}",
+        "ui.monitoring.notice.incident_created": "{id} {alertId}",
+        "ui.translations.import.content_placeholder": '{"api.assets.created": "Asset created"}',
+    }
+    response = register_ui(client, headers, catalogs={"es": messages, "en": messages}, context={})
+    assert response.status_code == 200, response.text
+    before = revision(harness)
+    repeated = register_ui(client, headers, catalogs={"es": messages, "en": messages}, context={})
+    assert repeated.status_code == 200, repeated.text
+    assert revision(harness) == before
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Bad {name",
+        "{name",
+        "stray }",
+        "{bad-name}",
+        "{name.with.dot}",
+        "{123abc}",
+        "{}",
+        "{name with space}",
+        '{"sample": broken}',
+    ],
+)
+def test_message_compatibility_still_rejects_malformed_source(message: str) -> None:
+    from itsm.i18n.tools import normalize_ui_source
+
+    _, problems = normalize_ui_source({"es": {"ui.test.message": message}}, {})
+    assert any(problem.reason == "malformed_message" for problem in problems)
+
+
+def test_ui_source_accepts_spaced_literal_json_with_pipes() -> None:
+    from itsm.i18n.tools import normalize_ui_source
+
+    source = '{ "rows": "a|b", "alert": "{alertId}|{bad-name}" }'
+    _, problems = normalize_ui_source(
+        {"es": {"ui.test.rows": source}, "en": {"ui.test.rows": "Rows"}}, {}
+    )
+    assert problems == [], [problem.reason for problem in problems]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        '{"sample": "a", "sample": "b"}',
+        '{"sample": 1, "sample": "two"}',
+    ],
+)
+def test_ui_source_rejects_duplicate_json_literals(message: str) -> None:
+    from itsm.i18n.tools import normalize_ui_source
+
+    _, problems = normalize_ui_source({"es": {"ui.test.sample": message}}, {})
+    assert any(problem.reason == "malformed_message" for problem in problems)

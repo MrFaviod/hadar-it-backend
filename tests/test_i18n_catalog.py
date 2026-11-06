@@ -17,7 +17,7 @@ from itsm.i18n import (
     t,
 )
 
-PLACEHOLDER = re.compile(r"\{([a-z_][a-z0-9_]*)\}")
+PLACEHOLDER = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
 
 
 def read_catalog(locale: str) -> dict[str, str]:
@@ -88,3 +88,33 @@ def test_formatting_helpers_use_babel_with_installation_values() -> None:
     assert format_currency(1000, "es", "PYG") == "1.000\u00a0PYG"
     moment = datetime(2026, 3, 1, 12, 0, tzinfo=UTC)
     assert format_datetime(moment, "en", "America/Asuncion") == "Mar 1, 2026, 9:00:00\u202fAM"
+
+
+def test_camel_case_parameters_and_json_literals_keep_their_meaning() -> None:
+    from itsm.i18n.messages import render
+    from itsm.i18n.packs import placeholder_names
+
+    sample = '{"api.assets.created": "Asset created"}'
+    assert placeholder_names("{cacheRead} {noData} {detectedAt} {alertId}") == {
+        "cacheRead",
+        "noData",
+        "detectedAt",
+        "alertId",
+    }
+    assert (
+        render("{cacheRead}/{alertId}/{unknown}", "en", {"cacheRead": 2, "alertId": "a"})
+        == "2/a/{unknown}"
+    )
+    assert placeholder_names(sample) == set()
+    assert render(sample, "en", {}) == sample
+
+
+def test_literal_json_survives_render_with_whitespace_and_pipes() -> None:
+    from itsm.i18n.messages import render
+    from itsm.i18n.packs import is_literal_json_message, placeholder_names, plural_forms
+
+    sample = '{ "rows": "a|b", "alert": "{alertId}|{bad-name}" }'
+    assert is_literal_json_message(sample)
+    assert placeholder_names(sample) == set()
+    assert plural_forms(sample) == (sample,)
+    assert render(sample, "en", {"count": 2}) == sample
