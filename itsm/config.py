@@ -13,7 +13,8 @@ from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
-from pydantic import Field, field_validator, model_validator
+from pydantic import ValidationInfo
+from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -96,8 +97,54 @@ class Settings(BaseSettings):
     agent_openai_base_url: str | None = None
 
     prometheus_url: str | None = None
+    prometheus_token: SecretStr | None = None
+    alertmanager_url: str | None = None
+    alertmanager_token: SecretStr | None = None
+    monitoring_ingest_token: SecretStr | None = None
+    monitoring_discovery_token: SecretStr | None = None
+    monitoring_http_timeout_seconds: int = Field(default=10, ge=1, le=60)
+    monitoring_secrets: dict[str, SecretStr] = Field(default_factory=dict)
+    monitoring_public_url: str = "http://localhost:18080"
+    monitoring_poll_seconds: int = Field(default=60, ge=60, le=3600)
+    notification_retention_days: int = Field(default=90, ge=1, le=3650)
     meilisearch_url: str | None = None
     service_redis_url: str | None = None
+
+    @field_validator("prometheus_url", "alertmanager_url", "monitoring_public_url")
+    @classmethod
+    def _validate_monitoring_endpoint(cls, value: str | None, info: ValidationInfo) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().rstrip("/")
+        if not normalized and info.field_name != "monitoring_public_url":
+            return None
+        try:
+            parts = urlsplit(normalized)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("monitoring endpoint must be an http(s) URL") from exc
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or parts.query
+            or parts.fragment
+            or any(character.isspace() for character in normalized)
+            or (port is not None and port < 1)
+        ):
+            raise ValueError("monitoring endpoint must use http(s) without credentials, query or fragment")
+        return normalized
+
+    @field_validator(
+        "prometheus_token", "alertmanager_token", "monitoring_ingest_token",
+        "monitoring_discovery_token", mode="before"
+    )
+    @classmethod
+    def _normalize_monitoring_token(cls, value: Any) -> Any:
+        if isinstance(value, str) and not value.strip():
+            return None
+        return value
 
     @field_validator("database_url")
     @classmethod
@@ -225,6 +272,25 @@ class Settings(BaseSettings):
             values.add(self.task_redis_url)
         if self.service_redis_url:
             values.add(self.service_redis_url)
+        for secret in (
+            self.prometheus_token,
+            self.alertmanager_token,
+            self.monitoring_ingest_token,
+            self.monitoring_discovery_token,
+            *self.monitoring_secrets.values(),
+        ):
+            if secret is not None:
+                raw = secret.get_secret_value()
+                if raw:
+                    values.add(raw)
+                    try:
+                        parts = urlsplit(raw)
+                    except ValueError:
+                        continue
+                    if parts.password:
+                        values.add(parts.password)
+                    if parts.scheme == "tgram" and parts.netloc:
+                        values.add(parts.netloc)
         for raw in (self.database_url, self.task_postgres_dsn, self.task_redis_url):
             if not raw:
                 continue
