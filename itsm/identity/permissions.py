@@ -14,7 +14,10 @@ custom business grant is assigned. ``operator`` is preserved as an ordinary
 from __future__ import annotations
 
 from collections.abc import Iterable
-from typing import Final, Literal
+from typing import TYPE_CHECKING, Final, Literal
+
+if TYPE_CHECKING:
+    from sqlalchemy.orm import Session
 
 ActorKind = Literal["human", "internal_agent", "external_agent", "external_client"]
 
@@ -144,8 +147,21 @@ def split_permission(code: str) -> tuple[str, str]:
     return resource, operation
 
 
-def is_known_permission(code: str) -> bool:
-    return code in PERMISSION_CODES
+def is_known_permission(code: str, session: "Session | None" = None) -> bool:
+    """Static core code, or an installed namespaced code read from this session.
+
+    The session parameter is optional so transport/catalog callers that only
+    know the core vocabulary keep their previous behavior.  Authorization
+    always passes its live session, so a revoked or newly installed extension
+    grant is never served from a process-global registry.
+    """
+    if code in PERMISSION_CODES:
+        return True
+    if session is None or not isinstance(code, str) or not code.startswith("ext_"):
+        return False
+    from itsm.extensions.storage import extension_permission_exists
+
+    return extension_permission_exists(session, code)
 
 
 def is_full_administrator(grants: Iterable[tuple[str, str]]) -> bool:

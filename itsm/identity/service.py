@@ -361,7 +361,7 @@ class IdentityService:
             raise ValidationFailed("permissions must be a list of permission codes")
         cleaned: set[str] = set()
         for code in permissions:
-            if not isinstance(code, str) or not is_known_permission(code):
+            if not isinstance(code, str) or not is_known_permission(code, self._session):
                 raise ValidationFailed("permissions contain an unknown code")
             cleaned.add(code)
         return tuple(sorted(cleaned))
@@ -473,12 +473,15 @@ class IdentityService:
         permission: str,
         *,
         resource: str | None = None,
+        commit_denial: bool = True,
     ) -> None:
-        """Authorize one operation for a resolved principal; deny by default."""
+        """Authorize an operation; callers may retain denial transaction ownership."""
         target = resource or permission
         identity = self._session.get(Identity, principal.actor_id)
         allowed = False
-        if identity is not None and identity.active and is_known_permission(permission):
+        if identity is not None and identity.active and is_known_permission(
+            permission, self._session
+        ):
             allowed = permission in self._effective_permissions(identity, principal.scopes)
             if (
                 allowed
@@ -501,7 +504,8 @@ class IdentityService:
                     execution_id=principal.execution_id,
                     authorization_ref=principal.authorization_ref,
                 )
-            self._session.commit()
+            if commit_denial:
+                self._session.commit()
             raise PermissionDenied()
 
     def _principal(self, identity: Identity, *, session_id: str | None = None) -> Principal:
@@ -1393,8 +1397,13 @@ class IdentityService:
         action: str,
         resource: str,
         outcome: str = "success",
+        commit: bool = True,
     ) -> None:
-        """Audit an operation performed by another module through this service."""
+        """Audit an operation performed by another module through this service.
+
+        Callers that own a larger transaction pass ``commit=False`` so the
+        audit row commits or rolls back with the business rows it describes.
+        """
         identity = self._session.get(Identity, principal.actor_id)
         self._audit(
             actor_id=principal.actor_id,
@@ -1407,7 +1416,8 @@ class IdentityService:
             delegated_by=identity.delegated_by_id if identity is not None else None,
             authorization_ref=principal.authorization_ref,
         )
-        self._session.commit()
+        if commit:
+            self._session.commit()
 
     def state(self, context: AuthContext) -> StateView:
         """Authorized subsets for the startup screen; 200 for any authenticated actor."""
@@ -1420,9 +1430,85 @@ class IdentityService:
             session_minutes=self.session_minutes(),
         )
 
+    def effective_permissions(self, principal: Principal) -> frozenset[str]:
+        """Live effective grants for a resolved principal; never mutates state."""
+        identity = self._session.get(Identity, principal.actor_id)
+        if identity is None or not identity.active:
+            return frozenset()
+        return self._effective_permissions(identity, principal.scopes)
+
+    def grant_extension_permissions(
+        self,
+        principal: Principal,
+        *,
+        role_id: str,
+        permissions: Iterable[str],
+        resource: str,
+    ) -> tuple[str, ...]:
+        """Installation effect: add declared extension codes to the Superadmin role.
+
+        Only a persisted active human Superadmin may call this.  Codes must
+        already be registered in this session's ``extension_permissions`` table
+        and cannot be core codes.  The caller owns the transaction.
+        """
+        if role_id != ROLE_SUPERADMIN:
+            raise PermissionDenied("extension grants belong to the Superadmin role only")
+        identity = self._session.get(Identity, principal.actor_id)
+        if (
+            identity is None
+            or not identity.active
+            or identity.actor_kind != HUMAN_ACTOR_KIND
+            or identity.role_id != ROLE_SUPERADMIN
+        ):
+            raise PermissionDenied(
+                "installation grants require a persisted human Superadmin"
+            )
+        codes = self._validate_permissions(permissions)
+        for code in codes:
+            if code in PERMISSION_CATALOG or not code.startswith("ext_"):
+                raise PermissionDenied("installation grants are limited to extension codes")
+        existing = {
+            f"{resource}.{operation}"
+            for resource, operation in self._session.execute(
+                select(
+                    IdentityRolePolicy.resource,
+                    IdentityRolePolicy.operation,
+                ).where(IdentityRolePolicy.role_id == ROLE_SUPERADMIN)
+            ).all()
+        }
+        added: list[str] = []
+        for code in codes:
+            if code in existing:
+                continue
+            resource_name, operation = code.rsplit(".", 1)
+            self._session.add(
+                IdentityRolePolicy(
+                    role_id=ROLE_SUPERADMIN,
+                    resource=resource_name,
+                    operation=operation,
+                )
+            )
+            added.append(code)
+        self._session.flush()
+        self._audit(
+            actor_id=identity.id,
+            actor_kind=identity.actor_kind,
+            actor_username=identity.username,
+            action="extensions.permissions_granted",
+            resource=resource,
+            outcome="success",
+            delegated_by=identity.delegated_by_id,
+        )
+        return tuple(sorted(added))
+
     def catalog(self, principal: Principal) -> CatalogView:
         self.authorize(principal, "roles.manage", resource="identity:permissions")
-        return CatalogView(permissions=PERMISSION_CATALOG, actor_kinds=tuple(ACTOR_KINDS))
+        from itsm.extensions.storage import registered_permission_codes
+
+        return CatalogView(
+            permissions=PERMISSION_CATALOG + registered_permission_codes(self._session),
+            actor_kinds=tuple(ACTOR_KINDS),
+        )
 
     def list_audit(self, principal: Principal, *, limit: int = 50) -> tuple[AuditView, ...]:
         self.authorize(principal, "sessions.manage", resource="identity:audit")
