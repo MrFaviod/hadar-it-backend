@@ -1179,7 +1179,7 @@ def test_strict_profile_boundary_requires_explicit_wildcard_resource() -> None:
         {"action": "itsm_*", "resource": "*", "effect": "allow"},
         {"action": "skill", "resource": "itsm-inventory", "effect": "allow"},
     ]
-    assert _restrictive_permissions(approved, skills) is True
+    assert _restrictive_permissions(approved, skills, []) is True
     assert _strict_permission_suffix(approved, skills) is True
 
     missing_deny_resource = [
@@ -1187,21 +1187,21 @@ def test_strict_profile_boundary_requires_explicit_wildcard_resource() -> None:
         {"action": "itsm_*", "resource": "*", "effect": "allow"},
         {"action": "skill", "resource": "itsm-inventory", "effect": "allow"},
     ]
-    assert _restrictive_permissions(missing_deny_resource, skills) is False
+    assert _restrictive_permissions(missing_deny_resource, skills, []) is False
 
     missing_tool_resource = [
         {"action": "*", "resource": "*", "effect": "deny"},
         {"action": "itsm_search_assets", "effect": "allow"},
         {"action": "skill", "resource": "itsm-inventory", "effect": "allow"},
     ]
-    assert _restrictive_permissions(missing_tool_resource, skills) is False
+    assert _restrictive_permissions(missing_tool_resource, skills, []) is False
 
     missing_skill_resource = [
         {"action": "*", "resource": "*", "effect": "deny"},
         {"action": "itsm_*", "resource": "*", "effect": "allow"},
         {"action": "skill", "effect": "allow"},
     ]
-    assert _restrictive_permissions(missing_skill_resource, skills) is False
+    assert _restrictive_permissions(missing_skill_resource, skills, []) is False
     assert _strict_permission_suffix(missing_skill_resource, skills) is False
 
 
