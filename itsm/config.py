@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     attachment_storage_path: Path = Path("/data/attachments")
     attachment_max_bytes: int = Field(default=10 * 1024 * 1024, ge=1, le=50 * 1024 * 1024)
 
+    report_base_url: str = "http://localhost:18080"
+    report_retention_days: int = Field(default=7, ge=1, le=3650)
+    report_max_assets: int = Field(default=1000, ge=1, le=10000)
+    report_max_document_bytes: int = Field(default=50 * 1024 * 1024, ge=1, le=200 * 1024 * 1024)
+    report_render_timeout_seconds: int = Field(default=120, ge=1, le=600)
+    report_render_memory_mb: int = Field(default=512, ge=64, le=4096)
+
     demo_message_max_length: int = Field(default=200, ge=1, le=1000)
     demo_max_delay_seconds: int = Field(default=30, ge=0, le=300)
     demo_periodic_minutes: int = Field(default=0, ge=0, le=60)
@@ -108,6 +115,30 @@ class Settings(BaseSettings):
     notification_retention_days: int = Field(default=90, ge=1, le=3650)
     meilisearch_url: str | None = None
     service_redis_url: str | None = None
+
+    @field_validator("report_base_url")
+    @classmethod
+    def _validate_report_base_url(cls, value: str) -> str:
+        normalized = value.strip().rstrip("/")
+        try:
+            parts = urlsplit(normalized)
+            port = parts.port
+        except ValueError as exc:
+            raise ValueError("report base URL must use http(s)") from exc
+        if (
+            parts.scheme not in {"http", "https"}
+            or not parts.hostname
+            or parts.username is not None
+            or parts.password is not None
+            or "?" in normalized
+            or "#" in normalized
+            or "\\" in normalized
+            or any(character.isspace() or ord(character) < 32 or ord(character) == 127 for character in normalized)
+            or parts.netloc.endswith(":")
+            or (port is not None and port < 1)
+        ):
+            raise ValueError("report base URL must use http(s) without credentials, query or fragment")
+        return normalized
 
     @field_validator("prometheus_url", "alertmanager_url", "monitoring_public_url")
     @classmethod
