@@ -26,6 +26,7 @@ from itsm.identity.hashing import hash_token
 from itsm.identity.service import (
     AuthenticationFailed,
     Conflict,
+    IdentityError,
     IdentityService,
     NotFound,
     PermissionDenied,
@@ -36,6 +37,7 @@ from itsm.inventory.catalog import InventoryCatalog
 from itsm.inventory.organization import moment
 from itsm.inventory.projection import history_payload, project, validate_fields
 from itsm.inventory.service import BATCH_LIMIT, AssetView, InventoryService
+from itsm.operations import tools as operations_tools
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from itsm.reports.schemas import ReportRequest
@@ -96,6 +98,10 @@ TOOL_NAMES: tuple[str, ...] = (
     "report_job_status",
     "report_documents",
     "generate_labels",
+    "get_operational_summary",
+    "search_everything",
+    "query_relationships",
+    "list_saved_views",
 )
 
 INSTRUCTIONS = """\
@@ -113,6 +119,8 @@ maintenance window does not persist or silence anything.
 Reports and labels accept structured templates, canonical filters and bounded physical
 dimensions, never HTML or shell commands. Preparation does not queue a file. Generation
 returns a durable job; only completed status confirms protected document references.
+Operational summaries and global search report their period, engine and provenance;
+relational queries start from a focus or page the global graph, never dump every module.
 """
 
 
@@ -391,6 +399,33 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 ),
                 context.principal,
             )
+
+    @contextmanager
+    def operations() -> Iterator[tuple[Session, IdentityService, Principal]]:
+        """Expose one revalidated session to the shared operational tools."""
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            yield session, identity, context.principal
+
+    def run_operations(
+        operation: Callable[[Session, IdentityService, Principal], Any],
+    ) -> Any:
+        """Run one shared query, mapping only identity errors to tool text."""
+        try:
+            with operations() as (session, identity, principal):
+                return operation(session, identity, principal)
+        except ToolError:
+            raise
+        except IdentityError as exc:
+            raise _translate(exc) from None
+        except Exception as exc:
+            logger.warning("mcp operational tool failed: %s", type(exc).__name__)
+            raise ToolError("operational query failed") from None
 
     @server.tool
     def search_assets(
@@ -1426,6 +1461,81 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
         """Prepare a maintenance suggestion; it never saves a window or creates a silence."""
         return run_with(
             monitoring, lambda service, principal: service.prepare_maintenance(principal, alert_id)
+        )
+
+    @server.tool
+    def get_operational_summary(
+        period: str = "24h", category: str | None = None, site_id: str | None = None
+    ) -> dict[str, Any]:
+        """Read the bounded operational summary for the requested period and scope."""
+        return run_operations(
+            lambda session, identity, principal: operations_tools.operational_summary(
+                session,
+                identity,
+                settings,
+                principal,
+                source="mcp",
+                period=period,
+                category=category,
+                site_id=site_id,
+            )
+        )
+
+    @server.tool
+    def search_everything(
+        query: str,
+        kinds: list[str] | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Search authorized canonical entities with a bounded page and reported engine."""
+        return run_operations(
+            lambda session, identity, principal: operations_tools.search_everything(
+                session,
+                identity,
+                settings,
+                principal,
+                source="mcp",
+                query=query,
+                kinds=kinds,
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+    @server.tool
+    def query_relationships(
+        asset_id: str | None = None,
+        depth: int = 2,
+        direction: str = "both",
+        type_key: str | None = None,
+        limit: int = 20,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Traverse persisted relationships from one focus or page the global graph."""
+        return run_operations(
+            lambda session, identity, principal: operations_tools.query_relationships(
+                session,
+                identity,
+                settings,
+                principal,
+                source="mcp",
+                asset_id=asset_id,
+                depth=depth,
+                direction=direction,
+                type_key=type_key,
+                limit=limit,
+                offset=offset,
+            )
+        )
+
+    @server.tool
+    def list_saved_views() -> dict[str, Any]:
+        """Read the caller's own views, favorites and shortcuts; shared state stays read-only."""
+        return run_operations(
+            lambda session, identity, principal: operations_tools.list_saved_views(
+                session, identity, principal, source="mcp"
+            )
         )
 
     return server
