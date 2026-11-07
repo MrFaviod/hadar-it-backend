@@ -187,7 +187,7 @@ def test_revocation_requires_the_independent_share_permission(catalog: Catalog) 
     with catalog.session() as session:
         session.execute(
             delete(IdentityRolePolicy).where(
-                IdentityRolePolicy.role_id == "admin",
+                IdentityRolePolicy.role_id == "superadmin",
                 IdentityRolePolicy.resource == "reports",
                 IdentityRolePolicy.operation == "share",
             )
@@ -196,6 +196,6 @@ def test_revocation_requires_the_independent_share_permission(catalog: Catalog) 
     with pytest.raises(NotFound):
         service.public_report(token)
     with catalog.session() as session:
-        session.add(IdentityRolePolicy(role_id="admin", resource="reports", operation="share"))
+        session.add(IdentityRolePolicy(role_id="superadmin", resource="reports", operation="share"))
         session.commit()
     assert service.public_report(token)["asset"] == {"name": asset_values()["name"]}

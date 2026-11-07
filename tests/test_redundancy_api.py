@@ -267,7 +267,7 @@ def test_redundancy_machine_bearer_uses_the_same_service_rules(
         f"/api/v1/redundancy-groups/{group_id}",
         json={"name": "Máquina admin"},
         headers={
-            "Authorization": f"Bearer {catalog.add_machine('redundancy-reader', 'R', 'reader')[1]}"
+            "Authorization": f"Bearer {catalog.add_machine('redundancy-reader', 'R', 'user')[1]}"
         },
     )
     assert forbidden.status_code == 403

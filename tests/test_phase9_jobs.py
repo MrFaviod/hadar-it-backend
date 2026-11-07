@@ -201,7 +201,7 @@ def test_lost_issuer_permission_fails_the_job(catalog: Catalog) -> None:
     with catalog.session() as session:
         session.execute(
             delete(IdentityRolePolicy).where(
-                IdentityRolePolicy.role_id == "admin",
+                IdentityRolePolicy.role_id == "superadmin",
                 IdentityRolePolicy.resource == "assets",
                 IdentityRolePolicy.operation == "view",
             )
@@ -212,7 +212,7 @@ def test_lost_issuer_permission_fails_the_job(catalog: Catalog) -> None:
     assert finished["documents"] == []
 
     with catalog.session() as session:
-        session.add(IdentityRolePolicy(role_id="admin", resource="assets", operation="view"))
+        session.add(IdentityRolePolicy(role_id="superadmin", resource="assets", operation="view"))
         session.commit()
     # The failed job is terminal; a new request would be required to retry.
     assert service.job(principal, job["id"])["status"] == "failed"
