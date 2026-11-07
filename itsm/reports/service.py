@@ -23,6 +23,7 @@ from pydantic import ValidationError
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
+from itsm.appearance.integration import appearance_report_branding, appearance_report_logo
 from itsm.attachments.models import Attachment
 from itsm.attachments.service import AttachmentService, StorageUnavailable
 from itsm.attachments.storage import BlobStorage, LocalBlobStorage
@@ -306,9 +307,14 @@ class ReportService:
         row = session.get(ReportSettings, 1)
         return {} if row is None else dict(row.data or {})
 
-    def _settings_wire(self, stored: Mapping[str, Any]) -> dict[str, Any]:
+    def _settings_wire(self, session: Session, stored: Mapping[str, Any]) -> dict[str, Any]:
         defaults = ReportSettingsInput().model_dump()
-        branding = {**defaults["branding"], **(stored.get("branding") or {})}
+        appearance = appearance_report_branding(session)
+        branding = {
+            **defaults["branding"],
+            **{key: value for key, value in appearance.items() if value},
+            **(stored.get("branding") or {}),
+        }
         label_defaults = {**defaults["labelDefaults"], **(stored.get("labelDefaults") or {})}
         return {
             "baseUrl": stored.get("baseUrl") or self.settings.report_base_url,
@@ -338,7 +344,7 @@ class ReportService:
         attachment_id: Any,
     ) -> bytes | None:
         if not attachment_id:
-            return None
+            return appearance_report_logo(session, self.settings, self._storage_backend())
         if not isinstance(attachment_id, str) or len(attachment_id) > 36:
             return None
         row = session.get(Attachment, attachment_id)
@@ -425,7 +431,7 @@ class ReportService:
         else:
             table = warranty_table(warranties, principal, assets, dump.get("filters"), fields)
         table = group_table(table, group)
-        settings_wire = self._settings_wire(self._stored_settings(session))
+        settings_wire = self._settings_wire(session, self._stored_settings(session))
         branding = settings_wire["branding"]
         base_url = self._validate_base_url(settings_wire["baseUrl"])
         qr_urls = {asset.id: qr.asset_report_url(base_url, asset.id) for asset in assets}
@@ -608,7 +614,7 @@ class ReportService:
         with self.session_factory() as session:
             identity, _, _ = self._services(session)
             identity.authorize(principal, "assets.view", resource="reports:settings")
-            return self._settings_wire(self._stored_settings(session))
+            return self._settings_wire(session, self._stored_settings(session))
 
     def save_settings(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         if not isinstance(payload, Mapping):
@@ -658,7 +664,7 @@ class ReportService:
                 principal, action="reports.settings_saved", resource="reports:settings"
             )
             session.commit()
-            return self._settings_wire(stored)
+            return self._settings_wire(session, stored)
 
     # ---------------------------------------------------------------- preview
     def preview(
@@ -841,7 +847,7 @@ class ReportService:
             identity, inventory, _ = self._services(session)
             asset = inventory.get(principal, asset_id)
             identity.authorize(principal, "assets.view", resource=f"asset:{asset.id}")
-            settings_wire = self._settings_wire(self._stored_settings(session))
+            settings_wire = self._settings_wire(session, self._stored_settings(session))
             base_url = self._validate_base_url(settings_wire["baseUrl"])
             url = qr.asset_report_url(base_url, asset.id)
             share = session.execute(
@@ -876,7 +882,7 @@ class ReportService:
             identity, inventory, _ = self._services(session)
             asset = inventory.get(principal, asset_id)
             identity.authorize(principal, "assets.view", resource=f"asset:{asset.id}")
-            settings_wire = self._settings_wire(self._stored_settings(session))
+            settings_wire = self._settings_wire(session, self._stored_settings(session))
             base_url = self._validate_base_url(settings_wire["baseUrl"])
             return {
                 "asset": project_asset(asset, ASSET_FIELDS),
@@ -916,7 +922,7 @@ class ReportService:
             identity, inventory, _ = self._services(session)
             identity.authorize(principal, "reports.share", resource="reports:shares")
             asset = inventory.get(principal, asset_id)
-            settings_wire = self._settings_wire(self._stored_settings(session))
+            settings_wire = self._settings_wire(session, self._stored_settings(session))
             base_url = self._validate_base_url(settings_wire["baseUrl"])
             token = secrets.token_urlsafe(SHARE_TOKEN_BYTES)
             now = utcnow()
