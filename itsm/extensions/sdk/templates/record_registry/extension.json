@@ -1,0 +1,98 @@
+{
+  "sdkVersion": 1,
+  "id": "{{EXT_ID}}",
+  "name": "{{EXT_NAME}}",
+  "description": "{{EXT_DESCRIPTION}}",
+  "version": "{{EXT_VERSION}}",
+  "permissions": [
+    {
+      "code": "{{PERMISSION_PREFIX}}records_read",
+      "label": "Consultar registros",
+      "description": "Listar y consultar los registros del módulo."
+    },
+    {
+      "code": "{{PERMISSION_PREFIX}}records_write",
+      "label": "Gestionar registros",
+      "description": "Crear y actualizar los registros del módulo."
+    }
+  ],
+  "corePermissions": [],
+  "operations": [
+    {
+      "name": "list_records",
+      "description": "Lista los registros del módulo con un límite acotado.",
+      "permission": "{{PERMISSION_PREFIX}}records_read",
+      "mutation": false,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "limit": {"type": "integer"},
+          "status": {"type": "string"},
+          "asset_id": {"type": "string"}
+        },
+        "required": [],
+        "additionalProperties": false
+      }
+    },
+    {
+      "name": "create_record",
+      "description": "Crea un registro nuevo en el módulo.",
+      "permission": "{{PERMISSION_PREFIX}}records_write",
+      "mutation": true,
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "string"},
+          "status": {"type": "string"},
+          "notes": {"type": "string"},
+          "asset_id": {"type": "string"}
+        },
+        "required": ["title"],
+        "additionalProperties": false
+      }
+    }
+  ],
+  "collections": [
+    {
+      "name": "records",
+      "description": "Registros propios del módulo, aislados por espacio de nombres."
+    }
+  ],
+  "schemaVersion": 2,
+  "compatibleSchemaVersions": [1, 2],
+  "migrations": [
+    {
+      "from": 1,
+      "to": 2,
+      "handler": "normalize_status"
+    }
+  ],
+  "frontend": {
+    "entry": "frontend.js",
+    "pages": [
+      {
+        "id": "records",
+        "label": "Registros",
+        "component": "RecordList",
+        "permission": "{{PERMISSION_PREFIX}}records_read",
+        "icon": "list"
+      }
+    ],
+    "assetPanels": [
+      {
+        "id": "record-summary",
+        "label": "Registro",
+        "component": "RecordSummary",
+        "permission": "{{PERMISSION_PREFIX}}records_read"
+      }
+    ]
+  },
+  "schedules": [],
+  "skills": [
+    {
+      "name": "{{EXT_ID}}",
+      "description": "Consultar y crear registros del módulo.",
+      "path": "skills/{{EXT_ID}}/SKILL.md"
+    }
+  ]
+}

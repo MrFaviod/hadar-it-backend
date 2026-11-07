@@ -1,0 +1,59 @@
+# Fixed offline validator for trusted native ITMS extensions.
+#
+# The base is a locally present application image because this workstation has
+# no authorized package download. Its content address is asserted through the
+# build arg/label and must be rechecked by the caller (docs/extensions-sdk.md):
+#
+#   docker image inspect itsm-phase11-backend:verification --format '{{.Id}}'
+#   # sha256:c3b29b814929ab5107c91ecf042d3830b25d0380b2d72d9c87274441a556529f
+#
+# Build without network or pulls (the base and Bun image are already local):
+#
+#   docker build --pull=false --network=none \
+#     --build-arg VALIDATOR_BASE_ID=sha256:c3b29b... \
+#     -f Dockerfile.extension-validator -t itsm-extension-validator:1 .
+#
+# The image contains no application checkout, database, credentials or Docker
+# socket. Only the SDK validator resources and a fixed Bun binary are copied.
+# Candidate code runs with no network and no host mounts.
+
+ARG VALIDATOR_BASE=itsm-phase11-backend:verification
+ARG BUN_IMAGE=oven/bun@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895
+
+FROM ${BUN_IMAGE} AS js
+
+FROM ${VALIDATOR_BASE}
+
+ARG VALIDATOR_BASE_ID=sha256:c3b29b814929ab5107c91ecf042d3830b25d0380b2d72d9c87274441a556529f
+ARG BUN_IMAGE
+
+LABEL org.opencontainers.image.title="ITMS extension validator"
+LABEL org.itsm.validator.protocol="1"
+LABEL org.itsm.validator.base.id="${VALIDATOR_BASE_ID}"
+LABEL org.itsm.validator.js="bun 1.4.2 (oven/bun@sha256:9114c058aeae42162ee16dd5084b95fe9473970bb6bcb5b232ab1630f0546895)"
+LABEL org.itsm.validator.network="none"
+LABEL org.itsm.validator.user="10001:10001"
+
+# The base carries the backend checkout at /app and persistent data at /data.
+# Neither belongs in a validator, and removing them prevents candidate code
+# from reading the host core implementation.
+USER root
+RUN rm -rf /app /data \
+    && mkdir -p /validator/itsm/extensions \
+    && chown -R 10001:10001 /validator
+
+# Only the SDK resources are copied: schema, contract, package containment and
+# the in-container harness. No backend module, migration or test is included.
+COPY --chown=10001:10001 itsm/extensions/sdk /validator/itsm/extensions/sdk
+
+# Bun is the honest JavaScript engine available offline. Node is not present.
+COPY --from=js --chown=10001:10001 /usr/local/bin/bun /usr/local/bin/bun
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    HOME=/tmp
+
+WORKDIR /work
+USER 10001:10001
+
+CMD ["/usr/local/bin/python3", "-I", "-B", "/validator/itsm/extensions/sdk/validator/run.py"]
