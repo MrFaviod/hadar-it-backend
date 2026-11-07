@@ -1399,7 +1399,15 @@ class InterventionService:
         )
 
     @serialized
-    def create_incident(self, principal: Principal, values: Mapping[str, Any]) -> IncidentView:
+    def create_incident_in_transaction(
+        self, principal: Principal, values: Mapping[str, Any]
+    ) -> Incident:
+        """Create the incident rows and flush them; the caller owns the commit.
+
+        ``create_incident`` is the committing door. Monitoring link creation
+        uses this seam so the incident, its history and the alert link share one
+        terminal audit commit and a failure can never leave a half-written link.
+        """
         self._identity.authorize(principal, "assets.edit", resource="maintenance:incidents")
         prepared = self._prepare_incident(principal, values)
         now = utcnow()
@@ -1446,6 +1454,11 @@ class InterventionService:
             },
             note=row.description,
         )
+        self._session.flush()
+        return row
+
+    def create_incident(self, principal: Principal, values: Mapping[str, Any]) -> IncidentView:
+        row = self.create_incident_in_transaction(principal, values)
         self._identity.record_operation(
             principal,
             action="maintenance.incident_created",
