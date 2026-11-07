@@ -16,6 +16,13 @@ from sqlalchemy.orm import Session
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from itsm import __version__
+from itsm.agent_integrations.api import (
+    create_agent_integrations_router,
+    install_agent_integration_error_handlers,
+)
+from itsm.agent_integrations.catalog import SkillCatalog
+from itsm.agent_integrations.extensions import ExtensionRegistry, load_extension_modules
+from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
 from itsm.appearance import build_appearance_service, create_appearance_router
@@ -43,7 +50,7 @@ from itsm.inventory.api import create_inventory_router
 from itsm.inventory.catalog_api import create_catalog_router
 from itsm.logging import configure_logging, log_event
 from itsm.maintenance.api import create_maintenance_router
-from itsm.mcp.server import create_mcp_server
+from itsm.mcp.server import TOOL_NAMES, create_mcp_server
 from itsm.monitoring.api import create_monitoring_router
 from itsm.notifications.api import create_notification_router
 from itsm.notifications.service import record_alert_event
@@ -115,6 +122,16 @@ def _task_storage_ok(queue: TaskQueue) -> bool:
     return True
 
 
+def _extension_components(settings: Settings) -> tuple[Any, Any]:
+    """Build the official catalog, registry and trusted installed modules."""
+    catalog = SkillCatalog()
+    registry = ExtensionRegistry(catalog, reserved_names=TOOL_NAMES)
+    loaded = load_extension_modules(catalog, registry, settings.agent_extension_modules)
+    if loaded:
+        log_event(logger, "agent.extensions.loaded", modules=",".join(loaded))
+    return catalog, registry
+
+
 def create_app(settings: Settings | None = None) -> FastAPI:
     """Build the API application for one settings snapshot."""
     settings = settings or get_settings()
@@ -126,7 +143,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         return sessions["factory"]()
 
     # FastMCP requires its own lifespan and reuses the API session factory.
-    mcp_app = create_mcp_server(settings, late_session_factory).http_app(path="/mcp")
+    skill_catalog, extension_registry = _extension_components(settings)
+    mcp_server = create_mcp_server(settings, late_session_factory, extensions=extension_registry)
+    extension_mount = getattr(mcp_server, "extension_mount", None)
+    mcp_app = mcp_server.http_app(path="/mcp")
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
@@ -139,6 +159,14 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         install_search_sync(settings)
         app.state.task_queue = create_task_queue(settings)
         app.state.agent_runtime = AgentRuntime(settings, app.state.session_factory)
+        app.state.agent_integrations = AgentIntegrationService(
+            settings,
+            app.state.session_factory,
+            runtime=app.state.agent_runtime,
+            catalog=skill_catalog,
+            extension_sync=getattr(extension_mount, "sync", None),
+        )
+        app.state.agent_integrations.initialize()
         app.state.reports_service = build_report_service(
             settings, factory, task_queue=app.state.task_queue
         )
@@ -164,6 +192,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         lifespan=lifespan,
     )
     install_error_handlers(app)
+    install_agent_integration_error_handlers(app)
 
     @app.middleware("http")
     async def log_requests(request: Request, call_next: Any) -> Any:
@@ -319,6 +348,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_directory_router())
     api.include_router(create_directory_media_router())
     api.include_router(create_agent_router())
+    api.include_router(create_agent_integrations_router())
     api.include_router(create_identity_router())
     app.include_router(api)
     app.mount(settings.api_prefix, mcp_app)

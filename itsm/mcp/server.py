@@ -266,7 +266,12 @@ def _translate(exc: Exception) -> ToolError:
     return ToolError("inventory operation failed")
 
 
-def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]) -> FastMCP:
+def create_mcp_server(
+    settings: Settings,
+    session_factory: Callable[[], Session],
+    *,
+    extensions: Any = None,
+) -> FastMCP:
     """Build the mounted server with typed inventory, directory and technical tools."""
     server = FastMCP(
         "itsm-inventory",
@@ -1537,6 +1542,17 @@ def create_mcp_server(settings: Settings, session_factory: Callable[[], Session]
                 session, identity, principal, source="mcp"
             )
         )
+
+    if extensions is not None:
+        from itsm.agent_integrations.extensions import bind_fastmcp_tools
+
+        mount = bind_fastmcp_tools(
+            server,
+            extensions,
+            settings=settings,
+            session_factory=session_factory,
+        )
+        server.extension_mount = mount
 
     return server
 

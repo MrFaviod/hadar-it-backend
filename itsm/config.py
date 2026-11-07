@@ -101,6 +101,12 @@ class Settings(BaseSettings):
     agent_max_output_tokens: int = Field(default=1024, ge=64, le=4096)
     agent_message_max_length: int = Field(default=4000, ge=1, le=8000)
     agent_openai_base_url: str | None = None
+    agent_engine_timeout_seconds: int = Field(default=15, ge=1, le=120)
+    agent_run_timeout_seconds: int = Field(default=180, ge=10, le=900)
+    agent_install_timeout_seconds: int = Field(default=120, ge=10, le=600)
+    agent_daily_token_budget: int = Field(default=200_000, ge=0, le=100_000_000)
+    agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
+    agent_extension_modules: list[str] = Field(default_factory=list)
 
     prometheus_url: str | None = None
     prometheus_token: SecretStr | None = None
