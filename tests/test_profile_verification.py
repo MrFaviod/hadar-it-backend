@@ -220,7 +220,7 @@ def test_unselected_skill_allowance_is_rejected(tmp_path: Path) -> None:
     assert (status, verified) == ("fail", False)
 
 
-def test_hermes_active_profile_attestation_is_explicitly_unavailable(tmp_path: Path) -> None:
+def test_hermes_profile_evidence_without_trusted_launch_is_rejected(tmp_path: Path) -> None:
     state, digest = profile_state(tmp_path)
     state.profile = "itsm"
     state.target = IntegrationTarget("hermes", str(state.root), "itsm", "0.16.0")
@@ -239,4 +239,4 @@ def test_hermes_active_profile_attestation_is_explicitly_unavailable(tmp_path: P
         skill_names=list(SELECTED),
     )
     assert (status, verified) == ("fail", False)
-    assert "unavailable" in detail.lower()
+    assert "launch" in detail.lower()

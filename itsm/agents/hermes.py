@@ -1,132 +1,297 @@
-"""Hermes Agent adapter over its official HTTP API.
+"""Hermes Agent adapter over its native serve JSON-RPC/WebSocket protocol.
 
-The adapter uses the documented capabilities document to select a transport:
+Hermes 0.22.5 ``hermes serve`` exposes a dashboard WebSocket at ``/api/ws``
+authenticated by the bundled basic dashboard provider. A loopback-only serve
+also publishes its per-process session token at ``/`` (the desktop handshake);
+a gated serve requires ``POST /api/auth/ws-ticket`` after password login.
 
-* session chat streaming when both session resources and streamed chat exist,
-* native runs with an event stream and an official stop endpoint,
-* stateless OpenAI-compatible chat completions for older variants.
-
-No capability is advertised unless the selected transport actually supports it.
-The profile is selected by the authenticated API credential configured on the
-Hermes server; the official request bodies do not accept an arbitrary profile
-name, so this adapter never invents one.
+The adapter never falls back to invented ``/v1`` resources or HTTP Basic auth.
 """
 
 from __future__ import annotations
 
 import asyncio
-import uuid
+import json
+import re
+import time
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
+from urllib.parse import urlencode, urlsplit, urlunsplit
+
+import httpx
 
 from itsm.agents.engines import (
     EngineConfig,
     EngineError,
     EngineInfo,
     EngineModel,
-    _append_fragment,
     _bounded_value,
     _compose_prompt,
-    _decode_sse_data,
     _error_text,
-    _history_items,
-    _HTTPEngine,
     _money,
     _number,
-    _snapshot_fragment,
+    _HTTPEngine,
     _tool_content_text,
 )
 
-_RECONNECT_ATTEMPTS = 1
-_RECONNECT_DELAY_SECONDS = 0.05
+_RPC_TIMEOUT = 30.0
+_CONNECT_TIMEOUT = 10.0
+_MAX_FRAME = 16 * 1024 * 1024
+_TOKEN_PAGE = re.compile(r"__HERMES_SESSION_TOKEN__\s*=\s*\"([^\"]+)\"")
+
+
+def _native_error(error: object) -> EngineError:
+    if not isinstance(error, Mapping):
+        return EngineError("protocol", "Hermes returned an invalid RPC error", retryable=False)
+    code = error.get("code")
+    message = error.get("message")
+    text = message if isinstance(message, str) and message else "Hermes rejected the request"
+    lowered = text.lower()
+    if "session not found" in lowered or "not found" in lowered:
+        return EngineError("not_found", "Hermes session was not found", retryable=False)
+    if "interrupt" in lowered and "not" in lowered:
+        return EngineError("not_found", "no active Hermes turn for this session", retryable=False)
+    if code == -32601:
+        return EngineError(
+            "unsupported",
+            "the Hermes serve build does not expose the required native method",
+            retryable=False,
+        )
+    return EngineError("upstream", text, retryable=bool(code == -32000))
+
+
+def _usage_event(payload: Mapping[str, Any]) -> dict[str, object] | None:
+    usage = payload.get("usage")
+    if not isinstance(usage, Mapping):
+        usage = payload
+    input_tokens = _number(usage.get("input"))
+    if input_tokens is None:
+        input_tokens = _number(usage.get("input_tokens"))
+    output_tokens = _number(usage.get("output"))
+    if output_tokens is None:
+        output_tokens = _number(usage.get("output_tokens"))
+    if input_tokens is None or output_tokens is None:
+        return None
+    event: dict[str, object] = {
+        "type": "usage",
+        "inputTokens": input_tokens,
+        "outputTokens": output_tokens,
+        "source": "reported",
+    }
+    cost = _money(usage.get("cost_usd"))
+    if cost is not None:
+        event["cost"] = cost
+    return event
+
+
+def _message_complete(payload: Mapping[str, Any]) -> tuple[dict[str, object] | None, bool, bool]:
+    """Return ``(usage, cancelled, failed)`` for a terminal message event."""
+
+    status = payload.get("status")
+    usage = _usage_event(payload)
+    if status == "interrupted":
+        return usage, True, False
+    if status == "error" or payload.get("failure_reason"):
+        return usage, False, True
+    return usage, False, False
 
 
 class HermesEngine(_HTTPEngine):
-    """Translate Hermes session, run, or stateless chat responses to neutral events."""
+    """Native Hermes serve transport with persisted native sessions."""
 
     def __init__(
         self,
         config: EngineConfig,
         *,
-        client: Any = None,
+        client: httpx.AsyncClient | None = None,
+        socket_factory: Any = None,
     ) -> None:
         super().__init__(config, client=client)
-        self._features: dict[str, bool] = {}
-        self._transport = "none"
-        self._active_runs: dict[str, str] = {}
+        self._socket_factory = socket_factory
+        self._ws: Any = None
+        self._socket_cm: Any = None
+        self._reader: asyncio.Task[None] | None = None
+        self._ready = asyncio.Event()
+        self._pending: dict[int, asyncio.Future[Mapping[str, Any]]] = {}
+        self._queues: dict[str, asyncio.Queue[tuple[str, Mapping[str, Any]] | None]] = {}
+        self._live: dict[str, str] = {}
+        self._runtime_session: str | None = None
+        self._needs_history: set[str] = set()
         self._cancel_requested: set[str] = set()
+        self._rpc_id = 0
+
+    @property
+    def _password(self) -> str | None:
+        return self.config.password or self.config.token
 
     async def discover(self) -> EngineInfo:
-        capabilities_payload: Mapping[str, Any] | None = None
-        try:
-            payload = await self._json("GET", "/v1/capabilities")
-            if isinstance(payload, Mapping):
-                capabilities_payload = payload
-        except EngineError as exc:
-            if exc.code != "not_found":
-                raise
-
-        version = "unknown"
-        if capabilities_payload is not None:
-            features = capabilities_payload.get("features")
-            if features is not None and not isinstance(features, Mapping):
-                raise EngineError(
-                    "protocol",
-                    "Hermes returned an invalid capability document",
-                    retryable=False,
-                )
-            self._features = (
-                {str(key): value is True for key, value in features.items()}
-                if isinstance(features, Mapping)
-                else {}
+        await self._connect()
+        version = await self._version()
+        payload = await self._call("model.options")
+        providers = payload.get("providers")
+        if not isinstance(providers, list):
+            raise EngineError(
+                "protocol", "Hermes returned an unexpected provider list", retryable=False
             )
-            raw_version = capabilities_payload.get("version")
-            if isinstance(raw_version, str) and raw_version:
-                version = raw_version
-            self._transport = _choose_transport(self._features)
-        else:
-            health = await self._json("GET", "/health")
-            status = health.get("status")
-            if status not in {"ok", "healthy", "ready"}:
-                raise EngineError(
-                    "upstream",
-                    "Hermes reported an unavailable status",
-                    retryable=True,
+        models: list[EngineModel] = []
+        seen: set[tuple[str, str]] = set()
+        for row in providers:
+            if not isinstance(row, Mapping):
+                continue
+            slug = row.get("slug")
+            ids = row.get("models")
+            if not isinstance(slug, str) or not slug or not isinstance(ids, list):
+                continue
+            for model_id in ids:
+                if not isinstance(model_id, str) or not model_id:
+                    continue
+                key = (slug, model_id)
+                if key in seen:
+                    continue
+                seen.add(key)
+                free = row.get("free")
+                models.append(
+                    EngineModel(
+                        id=model_id,
+                        name=model_id,
+                        provider=slug,
+                        free=free if isinstance(free, bool) else None,
+                    )
                 )
-            raw_version = health.get("version")
-            if isinstance(raw_version, str) and raw_version:
-                version = raw_version
-            self._features = {}
-            self._transport = "chat"
-
-        models = await self._discover_models()
-        capabilities = _capabilities(self._transport, self._features)
         self._models = models
-        self._model_refs = {model.id: (model.provider, model.id) for model in models}
+        self._model_refs = {(model.provider, model.id): model.id for model in models}
+        self._model_refs.update({model.id: model.id for model in models})
+        capabilities = {
+            "streaming": True,
+            "sessions": True,
+            "model_switch": True,
+            "cancel": True,
+            "tools": True,
+            "usage": True,
+            "history": False,
+        }
         self._capabilities = capabilities
         return EngineInfo(version=version, models=models, capabilities=dict(capabilities))
 
-    async def create_session(self) -> str:
-        if self._transport == "none":
-            await self.discover()
-        if self._transport == "session":
-            payload = await self._json(
-                "POST",
-                "/api/sessions",
-                json_body={"title": "ITSM chat"},
-                expected=(200, 201),
+    async def inspect_profile_runtime(self) -> dict[str, object]:
+        """Read the active profile's live native surface without running a turn.
+
+        The host launch proof owns HOME/identity; this method only corroborates
+        what the already-authenticated child exposes.  It creates a disposable
+        CLI session so ``tools.list`` reflects the launch profile instead of the
+        dashboard profile roster.
+        """
+
+        await self._connect()
+        params: dict[str, object] = {"source": "cli", "close_on_disconnect": True}
+        if self.config.directory:
+            params["cwd"] = self.config.directory
+        created = await self._call("session.create", params)
+        runtime = created.get("session_id")
+        stored = created.get("stored_session_id")
+        if not isinstance(runtime, str) or not runtime:
+            raise EngineError(
+                "protocol", "Hermes did not return an inspection session", retryable=False
             )
-            session = payload.get("session")
-            session_id = session.get("id") if isinstance(session, Mapping) else None
-            if not isinstance(session_id, str) or not session_id:
+        try:
+            tools_payload = await self._call("tools.list", {"session_id": runtime})
+            rows = tools_payload.get("toolsets")
+            if not isinstance(rows, list):
+                raise EngineError(
+                    "protocol", "Hermes returned an unexpected toolset list", retryable=False
+                )
+            toolsets: list[str] = []
+            tool_names: list[str] = []
+            for row in rows:
+                if not isinstance(row, Mapping) or row.get("enabled") is not True:
+                    continue
+                name = row.get("name")
+                if isinstance(name, str) and name:
+                    toolsets.append(name)
+                values = row.get("tools")
+                if isinstance(values, list):
+                    tool_names.extend(item for item in values if isinstance(item, str) and item)
+            if not any(name.startswith("mcp__itsm__") for name in tool_names):
                 raise EngineError(
                     "protocol",
-                    "Hermes did not return a session identifier",
+                    "Hermes did not expose the managed ITSM MCP tools",
                     retryable=False,
                 )
-            return session_id
-        # No engine-side session resource is used by the selected transport.
-        return f"itsm-{uuid.uuid4().hex}"
+            mcp_payload = await self._call("mcp.servers.list", {})
+            skills_payload = await self._call("skills.manage", {"action": "list"})
+        finally:
+            for method, identifier in (
+                ("session.close", runtime),
+                (
+                    "session.delete",
+                    stored if isinstance(stored, str) and stored else None,
+                ),
+            ):
+                if identifier is None:
+                    continue
+                try:
+                    await self._call(method, {"session_id": identifier})
+                except EngineError:
+                    pass
+
+        servers = mcp_payload.get("servers")
+        if not isinstance(servers, list):
+            raise EngineError(
+                "protocol", "Hermes returned an unexpected MCP server list", retryable=False
+            )
+        mcp_servers: list[dict[str, object]] = []
+        for server in servers:
+            if (
+                not isinstance(server, Mapping)
+                or not isinstance(server.get("name"), str)
+                or server.get("enabled") is not True
+            ):
+                continue
+            mcp_servers.append(
+                {
+                    "name": server["name"],
+                    "url": server.get("url"),
+                    "enabled": True,
+                }
+            )
+
+        grouped = skills_payload.get("skills")
+        skills: list[str] = []
+        if isinstance(grouped, Mapping):
+            for names in grouped.values():
+                if isinstance(names, list):
+                    skills.extend(name for name in names if isinstance(name, str) and name)
+
+        base = (self.config.base_url or "").strip().rstrip("/")
+        return {
+            "protocol": "hermes-native-serve-v1",
+            "endpoint": base,
+            "profileHome": self.config.directory,
+            "toolsets": sorted(set(toolsets)),
+            "mcpServers": mcp_servers,
+            "skills": sorted(set(skills)),
+            "tools": sorted(set(tool_names)),
+        }
+
+    async def create_session(self) -> str:
+        await self._connect()
+        params: dict[str, object] = {
+            "source": "cli",
+            "close_on_disconnect": False,
+        }
+        if self.config.directory:
+            params["cwd"] = self.config.directory
+        payload = await self._call("session.create", params)
+        stored = payload.get("stored_session_id")
+        runtime = payload.get("session_id")
+        if not isinstance(stored, str) or not stored or not isinstance(runtime, str) or not runtime:
+            raise EngineError(
+                "protocol", "Hermes did not return a session identifier", retryable=False
+            )
+        self._live[stored] = runtime
+        self._needs_history.add(stored)
+        self._queue(runtime)
+        return stored
 
     async def stream(
         self,
@@ -140,643 +305,386 @@ class HermesEngine(_HTTPEngine):
             raise EngineError("protocol", "message must not be empty", retryable=False)
         if not isinstance(session_id, str) or not session_id:
             raise EngineError("protocol", "session identifier is required", retryable=False)
-        if self._transport == "none":
-            await self.discover()
-        if self._transport == "session":
-            async for event in self._stream_session(
-                message,
-                session_id=session_id,
-                model=model,
-                history=history,
-            ):
-                yield event
-            return
-        if self._transport == "runs":
-            async for event in self._stream_run(
-                message,
-                session_id=session_id,
-                model=model,
-                history=history,
-            ):
-                yield event
-            return
-        if self._transport == "chat":
-            async for event in self._stream_chat(
-                message,
-                session_id=session_id,
-                model=model,
-                history=history,
-            ):
-                yield event
-            return
-        raise EngineError(
-            "unsupported",
-            "this Hermes instance exposes no compatible chat API",
-            retryable=False,
-        )
-
-    async def cancel(self, session_id: str) -> None:
-        if self._transport != "runs" or not self._features.get("run_stop"):
-            raise EngineError(
-                "unsupported",
-                "this Hermes transport has no official turn cancellation",
-                retryable=False,
+        await self._connect()
+        runtime = await self._ensure_session(session_id)
+        queue = self._queue(runtime)
+        self._cancel_requested.discard(session_id)
+        if model:
+            provider = self._provider_for(model)
+            value = f"{model} --session --provider {provider}" if provider else f"{model} --session"
+            switch = await self._call(
+                "config.set",
+                {"key": "model", "value": value, "session_id": runtime},
             )
-        run_id = self._active_runs.get(session_id)
-        if run_id is None:
-            raise EngineError(
-                "not_found",
-                "no active Hermes run for this session",
-                retryable=False,
-            )
-        self._cancel_requested.add(session_id)
-        try:
-            payload = await self._json(
-                "POST",
-                f"/v1/runs/{run_id}/stop",
-            )
-        except EngineError:
-            self._cancel_requested.discard(session_id)
-            raise
-        status = payload.get("status")
-        if not isinstance(status, str) or not status:
-            self._cancel_requested.discard(session_id)
-            raise EngineError(
-                "protocol",
-                "Hermes did not confirm the stop request",
-                retryable=False,
-            )
-
-    async def _discover_models(self) -> list[EngineModel]:
-        payload = await self._json("GET", "/v1/models")
-        data = payload.get("data")
-        if not isinstance(data, list):
-            raise EngineError(
-                "protocol",
-                "Hermes returned an unexpected model list",
-                retryable=False,
-            )
-        models: list[EngineModel] = []
-        for item in data:
-            if isinstance(item, str):
-                raw_id = item
-                name = item
-                provider = "hermes"
-            elif isinstance(item, Mapping):
-                raw_id = item.get("id")
-                if not isinstance(raw_id, str) or not raw_id:
-                    continue
-                name = item.get("name")
-                if not isinstance(name, str) or not name:
-                    name = raw_id
-                provider = item.get("owned_by")
-                if not isinstance(provider, str) or not provider:
-                    provider = "hermes"
-            else:
+            if switch.get("confirm_required"):
+                raise EngineError(
+                    "confirmation_required",
+                    str(switch.get("confirm_message") or "Hermes requires model confirmation"),
+                    retryable=False,
+                )
+        prompt = message
+        if session_id in self._needs_history:
+            prompt = _compose_prompt(message, history)
+        yield {"type": "session", "sessionId": session_id}
+        await self._call("prompt.submit", {"session_id": runtime, "text": prompt})
+        self._needs_history.discard(session_id)
+        cancelled = False
+        failed = False
+        text_emitted = False
+        terminal_error: str | None = None
+        pending_usage: dict[str, object] | None = None
+        while True:
+            item = await queue.get()
+            if item is None:
+                if not cancelled and not failed:
+                    failed = True
+                    terminal_error = "Hermes closed the event stream before the turn completed"
+                break
+            kind, payload = item
+            if kind == "message.delta":
+                fragment = payload.get("text")
+                if isinstance(fragment, str) and fragment:
+                    text_emitted = True
+                    yield {"type": "delta", "text": fragment}
                 continue
-            models.append(
-                EngineModel(
-                    id=raw_id,
-                    name=name,
-                    provider=provider,
-                    free=None,
-                )
-            )
-        return models
-
-    def _resolve_model(self, model: str | None) -> str | None:
-        if model is None or model == "":
-            return None
-        if model in self._model_refs:
-            return model
-        if "/" in model:
-            provider, model_id = model.split("/", 1)
-            if not self._models:
-                return model_id
-            combined = f"{provider}/{model_id}"
-            if combined in self._model_refs:
-                return combined
-        if not self._models:
-            return model
-        raise EngineError(
-            "model_unavailable",
-            "the selected model is not available on this instance",
-            retryable=False,
-        )
-
-    async def _stream_session(
-        self,
-        message: str,
-        *,
-        session_id: str,
-        model: str | None,
-        history: object,
-    ) -> AsyncIterator[dict[str, object]]:
-        model_id = self._resolve_model(model)
-        prompt = _compose_prompt(message, history)
-        self._cancel_requested.discard(session_id)
-        yield {"type": "session", "sessionId": session_id}
-
-        body: dict[str, object] = {"input": prompt}
-        if model_id is not None:
-            body["model"] = model_id
-
-        current_text = ""
-        emitted_tools: set[tuple[str, str]] = set()
-        cancelled_by_engine = False
-        terminal = False
-        failure: EngineError | None = None
-
-        try:
-            try:
-                async with self._open_sse(
-                    "POST",
-                    f"/api/sessions/{session_id}/chat/stream",
-                    json_body=body,
-                    expected=(200, 201),
-                ) as frames:
-                    async for event_name, raw_data in frames:
-                        payload = _decode_sse_data(raw_data)
-                        if payload == "[DONE]":
-                            terminal = True
-                            break
-                        data = payload if isinstance(payload, Mapping) else {}
-                        event_type = event_name or data.get("type")
-                        if not isinstance(event_type, str):
-                            continue
-                        if _session_hint(data) not in {None, session_id}:
-                            continue
-
-                        if event_type == "assistant.delta":
-                            fragment, current_text = _append_fragment(
-                                current_text, _payload_text(data)
-                            )
-                            if fragment:
-                                yield {"type": "delta", "text": fragment}
-                        elif event_type in {"tool.started", "tool.completed", "tool.failed"}:
-                            for event in _tool_events(event_type, data, emitted_tools):
-                                yield event
-                        elif event_type == "run.completed":
-                            final_text = _final_text(data)
-                            fragment, current_text = _snapshot_fragment(current_text, final_text)
-                            if fragment:
-                                yield {"type": "delta", "text": fragment}
-                            usage = _usage_event(data)
-                            if usage is not None:
-                                yield usage
-                            terminal = True
-                            break
-                        elif event_type == "run.cancelled":
-                            cancelled_by_engine = True
-                            terminal = True
-                            break
-                        elif event_type == "run.failed":
-                            yield _error_event(
-                                EngineError(
-                                    "upstream",
-                                    _error_text(data.get("error") or data),
-                                    retryable=False,
-                                )
-                            )
-                            terminal = True
-                            break
-            except EngineError as exc:
-                failure = exc
-
-            if not terminal and failure is None:
-                failure = EngineError(
-                    "unreachable",
-                    "Hermes session stream ended before completion",
-                    retryable=True,
-                )
-            if failure is not None and not (
-                terminal and (session_id in self._cancel_requested or cancelled_by_engine)
-            ):
-                yield _error_event(failure)
-        finally:
-            cancelled = session_id in self._cancel_requested or cancelled_by_engine
-            self._cancel_requested.discard(session_id)
-        yield {"type": "done", "cancelled": cancelled}
-
-    async def _stream_run(
-        self,
-        message: str,
-        *,
-        session_id: str,
-        model: str | None,
-        history: object,
-    ) -> AsyncIterator[dict[str, object]]:
-        model_id = self._resolve_model(model)
-        self._cancel_requested.discard(session_id)
-        yield {"type": "session", "sessionId": session_id}
-
-        body: dict[str, object] = {"input": message, "session_id": session_id}
-        history_items = _history_items(history)
-        if history_items:
-            body["conversation_history"] = history_items
-        if model_id is not None:
-            body["model"] = model_id
-
-        emitted_tools: set[tuple[str, str]] = set()
-        cancelled_by_engine = False
-        terminal = False
-        failure: EngineError | None = None
-        run_id: str | None = None
-        current_text = ""
-
-        try:
-            try:
-                created = await self._json(  # type: ignore[assignment]
-                    "POST",
-                    "/v1/runs",
-                    json_body=body,
-                    expected=(200, 201, 202),
-                )
-            except EngineError as exc:
-                failure = exc
-            else:
-                raw_run_id = created.get("run_id")
-                if not isinstance(raw_run_id, str) or not raw_run_id:
-                    failure = EngineError(
-                        "protocol",
-                        "Hermes did not return a run identifier",
-                        retryable=False,
+            if kind == "message.complete":
+                usage, cancelled, failed = _message_complete(payload)
+                usage = usage or pending_usage
+                if usage is not None:
+                    yield usage
+                text = payload.get("text")
+                if isinstance(text, str) and text and not text_emitted:
+                    yield {"type": "delta", "text": text}
+                if failed:
+                    reason = payload.get("failure_reason")
+                    detail = payload.get("error")
+                    terminal_error = (
+                        (_error_text(detail) if detail else None)
+                        or (reason if isinstance(reason, str) and reason else None)
+                        or "Hermes reported a failed turn"
                     )
-                else:
-                    run_id = raw_run_id
-                    self._active_runs[session_id] = run_id
-
-            if failure is None and run_id is not None:
-                for attempt in range(_RECONNECT_ATTEMPTS + 1):
-                    try:
-                        async with self._open_sse(
-                            "GET",
-                            f"/v1/runs/{run_id}/events",
-                        ) as frames:
-                            async for event_name, raw_data in frames:
-                                payload = _decode_sse_data(raw_data)
-                                if payload == "[DONE]":
-                                    terminal = True
-                                    break
-                                data = payload if isinstance(payload, Mapping) else {}
-                                event_type = event_name or data.get("type")
-                                if not isinstance(event_type, str):
-                                    continue
-                                if _session_hint(data) not in {None, session_id}:
-                                    continue
-                                if event_type in {
-                                    "tool.started",
-                                    "tool.completed",
-                                    "tool.failed",
-                                }:
-                                    for event in _tool_events(event_type, data, emitted_tools):
-                                        yield event
-                                elif event_type == "run.completed":
-                                    final_text = _final_text(data)
-                                    fragment, current_text = _snapshot_fragment(
-                                        current_text, final_text
-                                    )
-                                    if fragment:
-                                        yield {"type": "delta", "text": fragment}
-                                    usage = _usage_event(data)
-                                    if usage is not None:
-                                        yield usage
-                                    terminal = True
-                                    break
-                                elif event_type == "run.cancelled":
-                                    cancelled_by_engine = True
-                                    terminal = True
-                                    break
-                                elif event_type == "run.failed":
-                                    yield _error_event(
-                                        EngineError(
-                                            "upstream",
-                                            _error_text(data.get("error") or data),
-                                            retryable=False,
-                                        )
-                                    )
-                                    terminal = True
-                                    break
-                    except EngineError as exc:
-                        if exc.code == "unreachable" and attempt < _RECONNECT_ATTEMPTS:
-                            await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
-                            continue
-                        failure = exc
-                        break
-                    if terminal:
-                        break
-                    if attempt < _RECONNECT_ATTEMPTS:
-                        await asyncio.sleep(_RECONNECT_DELAY_SECONDS)
-                        continue
-                    failure = EngineError(
-                        "unreachable",
-                        "Hermes run event stream ended before completion",
-                        retryable=True,
-                    )
-
-            if failure is not None and not (
-                terminal and (session_id in self._cancel_requested or cancelled_by_engine)
-            ):
-                yield _error_event(failure)
-        finally:
-            if run_id is not None:
-                self._active_runs.pop(session_id, None)
-                if not terminal:
-                    await self._stop_quietly(run_id)
-            cancelled = session_id in self._cancel_requested or cancelled_by_engine
-            self._cancel_requested.discard(session_id)
-        yield {"type": "done", "cancelled": cancelled}
-
-    async def _stream_chat(
-        self,
-        message: str,
-        *,
-        session_id: str,
-        model: str | None,
-        history: object,
-    ) -> AsyncIterator[dict[str, object]]:
-        model_id = self._resolve_model(model)
-        self._cancel_requested.discard(session_id)
-        yield {"type": "session", "sessionId": session_id}
-
-        messages = _history_items(history)
-        messages.append({"role": "user", "content": message})
-        body: dict[str, object] = {"messages": messages, "stream": True}
-        if model_id is not None:
-            body["model"] = model_id
-
-        current_text = ""
-        emitted_tools: set[tuple[str, str]] = set()
-        failure: EngineError | None = None
-
-        try:
-            try:
-                async with self._open_sse(
-                    "POST",
-                    "/v1/chat/completions",
-                    json_body=body,
-                ) as frames:
-                    async for event_name, raw_data in frames:
-                        if raw_data.strip() == "[DONE]":
-                            break
-                        payload = _decode_sse_data(raw_data)
-                        if payload == "[DONE]":
-                            break
-                        data = payload if isinstance(payload, Mapping) else {}
-                        if event_name == "hermes.tool.progress":
-                            for event in _progress_events(data, emitted_tools):
-                                yield event
-                            continue
-                        usage = _usage_event(data)
-                        if usage is not None:
-                            yield usage
-                        choices = data.get("choices")
-                        if isinstance(choices, list):
-                            for choice in choices:
-                                if not isinstance(choice, Mapping):
-                                    continue
-                                delta = choice.get("delta")
-                                if not isinstance(delta, Mapping):
-                                    continue
-                                fragment, current_text = _append_fragment(
-                                    current_text, _payload_text(delta)
-                                )
-                                if fragment:
-                                    yield {"type": "delta", "text": fragment}
-            except EngineError as exc:
-                failure = exc
-
-            if failure is not None:
-                yield _error_event(failure)
-        finally:
+                break
+            if kind == "tool.start":
+                event = self._tool_event(payload, "running")
+                if event is not None:
+                    yield event
+                continue
+            if kind == "tool.complete":
+                event = self._tool_event(payload, "completed")
+                if event is not None:
+                    yield event
+                continue
+            if kind == "tool.progress":
+                event = self._tool_event(payload, "running")
+                if event is not None:
+                    yield event
+                continue
+            if kind == "session.usage":
+                pending_usage = _usage_event(payload)
+                continue
+            if kind in {"session.error", "error"}:
+                failed = True
+                reason = payload.get("failure_reason")
+                detail = payload.get("error")
+                terminal_error = (
+                    (_error_text(detail) if detail else None)
+                    or (reason if isinstance(reason, str) and reason else None)
+                    or _error_text(payload)
+                )
+                break
+        if terminal_error is not None:
+            yield {
+                "type": "error",
+                "code": "upstream",
+                "message": terminal_error,
+                "retryable": False,
+            }
+        if cancelled:
             cancelled = session_id in self._cancel_requested
             self._cancel_requested.discard(session_id)
         yield {"type": "done", "cancelled": cancelled}
 
-    async def _stop_quietly(self, run_id: str) -> None:
+    async def cancel(self, session_id: str) -> None:
+        runtime = self._live.get(session_id)
+        if runtime is None:
+            raise EngineError(
+                "not_found", "no active Hermes session for this turn", retryable=False
+            )
+        self._cancel_requested.add(session_id)
         try:
-            await self._json("POST", f"/v1/runs/{run_id}/stop")
+            payload = await self._call("session.interrupt", {"session_id": runtime})
         except EngineError:
+            self._cancel_requested.discard(session_id)
+            raise
+        status = payload.get("status")
+        if status == "not_interrupted":
+            self._cancel_requested.discard(session_id)
+            raise EngineError("not_found", "no active Hermes turn to interrupt", retryable=False)
+
+    # ---------------------------------------------------------------- transport
+    async def _connect(self) -> None:
+        if self._ws is not None:
             return
+        if not self._password:
+            raise EngineError(
+                "authentication", "Hermes development credential is not configured", retryable=False
+            )
+        username = self.config.username or "admin"
+        try:
+            response = await self._http.post(
+                self._url("/auth/password-login"),
+                json={
+                    "provider": "basic",
+                    "username": username,
+                    "password": self._password,
+                    "next": "",
+                },
+                timeout=_RPC_TIMEOUT,
+            )
+        except httpx.HTTPError as exc:
+            raise EngineError(
+                "authentication", f"Hermes login failed: {type(exc).__name__}", retryable=True
+            ) from None
+        if response.status_code != 200:
+            raise EngineError(
+                "authentication", "Hermes rejected the development credentials", retryable=False
+            )
+        credential_name, credential = await self._ws_credential()
+        base = (self.config.base_url or "").strip().rstrip("/")
+        parsed = urlsplit(base)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise EngineError(
+                "protocol", "engine base URL must be an absolute http(s) URL", retryable=False
+            )
+        scheme = "wss" if parsed.scheme == "https" else "ws"
+        uri = urlunsplit(
+            (scheme, parsed.netloc, "/api/ws", urlencode({credential_name: credential}), "")
+        )
+        try:
+            if self._socket_factory is None:
+                from websockets.asyncio.client import connect
 
+                self._socket_cm = connect(
+                    uri, proxy=None, max_size=_MAX_FRAME, open_timeout=_CONNECT_TIMEOUT
+                )
+                self._ws = await self._socket_cm.__aenter__()
+            else:
+                self._ws = await self._socket_factory(uri)
+        except Exception as exc:
+            self._socket_cm = None
+            raise EngineError(
+                "upstream", f"Hermes WebSocket connection failed: {type(exc).__name__}", retryable=True
+            ) from None
+        self._ready.clear()
+        self._reader = asyncio.create_task(self._read_loop())
+        try:
+            await asyncio.wait_for(self._ready.wait(), timeout=_CONNECT_TIMEOUT)
+        except asyncio.TimeoutError:
+            await self._close_socket()
+            raise EngineError(
+                "upstream", "Hermes did not complete its native handshake", retryable=True
+            ) from None
 
-def _choose_transport(features: Mapping[str, bool]) -> str:
-    if features.get("session_resources") and features.get("session_chat_stream"):
-        return "session"
-    if features.get("run_submission") and features.get("run_events_sse"):
-        return "runs"
-    if features.get("chat_completions"):
-        return "chat"
-    return "none"
+    async def _ws_credential(self) -> tuple[str, str]:
+        try:
+            response = await self._http.post(
+                self._url("/api/auth/ws-ticket"), timeout=_RPC_TIMEOUT
+            )
+        except httpx.HTTPError as exc:
+            raise EngineError(
+                "authentication", f"Hermes ticket request failed: {type(exc).__name__}"
+            ) from None
+        if response.status_code == 200:
+            payload = response.json()
+            ticket = payload.get("ticket") if isinstance(payload, Mapping) else None
+            if isinstance(ticket, str) and ticket:
+                return "ticket", ticket
+        root = await self._http.get(self._url("/"), timeout=_RPC_TIMEOUT)
+        match = _TOKEN_PAGE.search(root.text) if root.status_code == 200 else None
+        gate = re.search(
+            r"__HERMES_AUTH_REQUIRED__\s*=\s*(true|false)", root.text
+        ) if root.status_code == 200 else None
+        if match is None or gate is None or gate.group(1) != "false":
+            raise EngineError(
+                "authentication",
+                "Hermes requires a WebSocket ticket, but none was issued",
+                retryable=False,
+            )
+        return "token", match.group(1)
 
+    async def _version(self) -> str:
+        try:
+            response = await self._http.get(self._url("/openapi.json"), timeout=_RPC_TIMEOUT)
+        except httpx.HTTPError:
+            return "unknown"
+        if response.status_code != 200:
+            return "unknown"
+        try:
+            payload = response.json()
+        except ValueError:
+            return "unknown"
+        info = payload.get("info") if isinstance(payload, Mapping) else None
+        version = info.get("version") if isinstance(info, Mapping) else None
+        return version if isinstance(version, str) and version else "unknown"
 
-def _capabilities(transport: str, features: Mapping[str, bool]) -> dict[str, bool]:
-    if transport == "session":
-        return {
-            "streaming": True,
-            "sessions": True,
-            "model_switch": True,
-            "cancel": False,
-            "tools": True,
-            "usage": True,
-            "history": True,
+    async def _read_loop(self) -> None:
+        try:
+            while self._ws is not None:
+                raw = await self._ws.recv()
+                if isinstance(raw, bytes):
+                    raw = raw.decode("utf-8", "replace")
+                try:
+                    frame = json.loads(raw)
+                except (TypeError, ValueError):
+                    continue
+                if not isinstance(frame, Mapping):
+                    continue
+                method = frame.get("method")
+                if "id" in frame and method is None:
+                    future = self._pending.pop(frame.get("id"), None)
+                    if future is not None and not future.done():
+                        future.set_result(frame)
+                    continue
+                if method != "event":
+                    continue
+                params = frame.get("params")
+                if not isinstance(params, Mapping):
+                    continue
+                kind = params.get("type")
+                if kind == "gateway.ready":
+                    self._ready.set()
+                    continue
+                session = params.get("session_id")
+                payload = params.get("payload")
+                if not isinstance(kind, str):
+                    continue
+                if not isinstance(payload, Mapping):
+                    payload = {}
+                queue = self._queues.get(session) if isinstance(session, str) else None
+                if queue is not None:
+                    queue.put_nowait((kind, payload))
+        except Exception:
+            pass
+        finally:
+            self._ready.set()
+            for future in self._pending.values():
+                if not future.done():
+                    future.set_exception(
+                        EngineError("upstream", "Hermes WebSocket closed", retryable=True)
+                    )
+            self._pending.clear()
+            for queue in self._queues.values():
+                queue.put_nowait(None)
+
+    async def _call(self, method: str, params: Mapping[str, object] | None = None) -> Mapping[str, Any]:
+        if self._ws is None:
+            raise EngineError("upstream", "Hermes is not connected", retryable=True)
+        self._rpc_id += 1
+        request_id = self._rpc_id
+        future: asyncio.Future[Mapping[str, Any]] = asyncio.get_running_loop().create_future()
+        self._pending[request_id] = future
+        frame = {
+            "jsonrpc": "2.0",
+            "id": request_id,
+            "method": method,
+            "params": dict(params or {}),
         }
-    if transport == "runs":
-        return {
-            "streaming": False,
-            "sessions": False,
-            "model_switch": True,
-            "cancel": bool(features.get("run_stop")),
-            "tools": True,
-            "usage": True,
-            "history": True,
-        }
-    if transport == "chat":
-        return {
-            "streaming": True,
-            "sessions": False,
-            "model_switch": True,
-            "cancel": False,
-            "tools": bool(features.get("tool_progress_events")),
-            "usage": True,
-            "history": True,
-        }
-    return {
-        "streaming": False,
-        "sessions": False,
-        "model_switch": False,
-        "cancel": False,
-        "tools": False,
-        "usage": False,
-        "history": False,
-    }
+        try:
+            await self._ws.send(json.dumps(frame))
+        except Exception as exc:
+            self._pending.pop(request_id, None)
+            raise EngineError(
+                "upstream", f"Hermes WebSocket send failed: {type(exc).__name__}", retryable=True
+            ) from None
+        try:
+            response = await asyncio.wait_for(future, timeout=_RPC_TIMEOUT)
+        except asyncio.TimeoutError:
+            self._pending.pop(request_id, None)
+            raise EngineError("upstream", "Hermes did not answer the request", retryable=True) from None
+        if "error" in response:
+            raise _native_error(response.get("error"))
+        result = response.get("result")
+        return result if isinstance(result, Mapping) else {}
 
+    async def _ensure_session(self, session_id: str) -> str:
+        runtime = self._live.get(session_id)
+        if runtime is not None:
+            return runtime
+        try:
+            payload = await self._call("session.resume", {"session_id": session_id})
+        except EngineError as exc:
+            if exc.code == "not_found":
+                raise
+            raise
+        runtime = payload.get("session_id")
+        if not isinstance(runtime, str) or not runtime:
+            raise EngineError(
+                "protocol", "Hermes did not resume the native session", retryable=False
+            )
+        self._live[session_id] = runtime
+        self._queue(runtime)
+        return runtime
 
-def _session_hint(data: Mapping[str, Any]) -> str | None:
-    for key in ("session_id", "sessionID"):
-        value = data.get(key)
-        if isinstance(value, str) and value:
-            return value
-    session = data.get("session")
-    if isinstance(session, Mapping):
-        value = session.get("id")
-        if isinstance(value, str) and value:
-            return value
-    nested = data.get("data")
-    if isinstance(nested, Mapping):
-        return _session_hint(nested)
-    return None
+    def _queue(self, runtime: str) -> asyncio.Queue[tuple[str, Mapping[str, Any]] | None]:
+        queue = self._queues.get(runtime)
+        if queue is None:
+            queue = asyncio.Queue()
+            self._queues[runtime] = queue
+        return queue
 
-
-def _payload_text(data: Mapping[str, Any]) -> str:
-    for key in ("delta", "text", "content"):
-        value = data.get(key)
-        if isinstance(value, str):
-            return value
-    nested = data.get("data")
-    if isinstance(nested, Mapping):
-        return _payload_text(nested)
-    return ""
-
-
-def _content_text(value: object) -> str:
-    if isinstance(value, str):
-        return value
-    if isinstance(value, list):
-        pieces: list[str] = []
-        for item in value:
-            if isinstance(item, str):
-                pieces.append(item)
-            elif isinstance(item, Mapping):
-                for key in ("text", "content"):
-                    text = item.get(key)
-                    if isinstance(text, str):
-                        pieces.append(text)
-                        break
-        return "".join(pieces)
-    if isinstance(value, Mapping):
-        for key in ("text", "content"):
-            text = value.get(key)
-            if isinstance(text, str):
-                return text
-    return ""
-
-
-def _final_text(data: Mapping[str, Any]) -> str:
-    for key in ("content", "answer", "text", "response", "final", "output"):
-        text = _content_text(data.get(key))
-        if text:
-            return text
-    message = data.get("message")
-    text = _content_text(message)
-    if text:
-        return text
-    messages = data.get("messages")
-    if isinstance(messages, list):
-        for item in reversed(messages):
-            if isinstance(item, Mapping) and item.get("role") == "assistant":
-                text = _content_text(item.get("content"))
-                if text:
-                    return text
-    nested = data.get("data")
-    if isinstance(nested, Mapping):
-        return _final_text(nested)
-    return ""
-
-
-def _tool_events(
-    event_type: str,
-    data: Mapping[str, Any],
-    emitted: set[tuple[str, str]],
-) -> list[dict[str, object]]:
-    name = data.get("tool") or data.get("name")
-    if not isinstance(name, str) or not name:
-        return []
-    status = {
-        "tool.started": "running",
-        "tool.completed": "completed",
-        "tool.failed": "failed",
-    }[event_type]
-    if (name, status) in emitted:
-        return []
-    emitted.add((name, status))
-    event: dict[str, object] = {"type": "tool", "tool": name, "status": status}
-    if status == "running":
-        value = _bounded_value(data.get("preview") or data.get("input"))
-        if value is not None:
-            event["input"] = value
-    elif status == "completed":
-        value = _tool_content_text(data.get("preview") or data.get("output"))
-        if value is None:
-            value = _tool_content_text(data.get("result"))
-        if value is not None:
-            event["output"] = value
-    else:
-        value = _error_text(data.get("error") or data.get("preview") or data)
-        event["output"] = value
-    return [event]
-
-
-def _progress_events(
-    data: Mapping[str, Any],
-    emitted: set[tuple[str, str]],
-) -> list[dict[str, object]]:
-    name = data.get("tool") or data.get("name")
-    if not isinstance(name, str) or not name:
-        return []
-    raw_status = data.get("status")
-    if raw_status in {"completed", "success", "succeeded"}:
-        status = "completed"
-    elif raw_status in {"failed", "error"}:
-        status = "failed"
-    else:
-        status = "running"
-    if (name, status) in emitted:
-        return []
-    emitted.add((name, status))
-    event: dict[str, object] = {"type": "tool", "tool": name, "status": status}
-    value = _bounded_value(data.get("input") or data.get("preview"))
-    if value is not None and status == "running":
-        event["input"] = value
-    if status != "running":
-        output = _tool_content_text(data.get("output") or data.get("preview"))
-        if output is None and status == "failed":
-            output = _error_text(data.get("error") or data)
-        if output is not None:
-            event["output"] = output
-    return [event]
-
-
-def _usage_event(payload: Mapping[str, Any]) -> dict[str, object] | None:
-    usage = payload.get("usage")
-    if not isinstance(usage, Mapping):
-        usage = payload
-    input_tokens = _number(usage.get("input_tokens"))
-    if input_tokens is None:
-        input_tokens = _number(usage.get("prompt_tokens"))
-    output_tokens = _number(usage.get("output_tokens"))
-    if output_tokens is None:
-        output_tokens = _number(usage.get("completion_tokens"))
-    if input_tokens is None or output_tokens is None:
+    def _provider_for(self, model: str) -> str | None:
+        for candidate in self._models:
+            if candidate.id == model:
+                return candidate.provider
         return None
-    event: dict[str, object] = {
-        "type": "usage",
-        "inputTokens": input_tokens,
-        "outputTokens": output_tokens,
-        "source": "reported",
-    }
-    cost = _money(usage.get("cost_usd"))
-    if cost is None:
-        cost = _money(payload.get("cost_usd"))
-    if cost is not None:
-        event["cost"] = cost
-    return event
 
+    def _tool_event(self, payload: Mapping[str, Any], default: str) -> dict[str, object] | None:
+        name = payload.get("name")
+        if not isinstance(name, str) or not name:
+            return None
+        status = default
+        if default == "completed":
+            raw = payload.get("status")
+            if raw in {"failed", "error"} or payload.get("error"):
+                status = "failed"
+        event: dict[str, object] = {"type": "tool", "tool": name, "status": status}
+        if status == "running":
+            value = _bounded_value(payload.get("args") or payload.get("preview"))
+            if value is not None:
+                event["input"] = value
+        else:
+            result = payload.get("result")
+            value = _tool_content_text(result)
+            if value is None and isinstance(result, Mapping):
+                value = _bounded_value(json.dumps(result, ensure_ascii=False))
+            if value is None:
+                value = _tool_content_text(payload.get("result_text"))
+            if value is None:
+                value = _tool_content_text(payload.get("summary"))
+            if value is None and status == "failed":
+                value = _error_text(payload.get("error") or payload)
+            if value is not None:
+                event["output"] = value
+        return event
 
-def _error_event(error: EngineError) -> dict[str, object]:
-    return {
-        "type": "error",
-        "code": error.code,
-        "message": error.message,
-        "retryable": error.retryable,
-    }
+    async def _close_socket(self) -> None:
+        reader = self._reader
+        self._reader = None
+        if reader is not None and reader is not asyncio.current_task():
+            reader.cancel()
+            try:
+                await reader
+            except (asyncio.CancelledError, Exception):
+                pass
+        socket_cm = self._socket_cm
+        self._socket_cm = None
+        self._ws = None
+        if socket_cm is not None:
+            try:
+                await socket_cm.__aexit__(None, None, None)
+            except Exception:
+                pass
+
+    async def close(self) -> None:
+        await self._close_socket()
+        await super().close()

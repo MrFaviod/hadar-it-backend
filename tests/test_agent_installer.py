@@ -313,8 +313,6 @@ mcp_servers:
     url: http://example.invalid/mcp
     headers:
       Authorization: Bearer user-token
-platform_toolsets:
-  cli: [file]
 """
     (home / "config.yaml").write_text(original)
     receipt = run(
@@ -345,10 +343,8 @@ platform_toolsets:
         "url": mcp_server["url"],
         "headers": {"Authorization": f"Bearer ${{{TOKEN_ENV}}}"},
         "enabled": True,
-        "tools": {"resources": False, "prompts": False},
     }
-    assert parsed["platform_toolsets"]["cli"] == ["file"]
-    assert parsed["platform_toolsets"]["api_server"] == ["itsm", "skills"]
+    assert parsed["platform_toolsets"]["cli"] == ["itsm", "skills"]
     skill = home / "skills" / "itsm-inventory" / "SKILL.md"
     assert skill.read_bytes() == catalog.skills["itsm-inventory"]["SKILL.md"]
     manifest_text = (home / ".itsm-agent" / "manifest.json").read_text()
@@ -437,7 +433,7 @@ def test_hermes_conflicts_preserve_preexisting_and_customized_entries(
         "    url: http://user.invalid/mcp\n"
         "    enabled: true\n"
         "platform_toolsets:\n"
-        "  api_server: [itsm, skills]\n"
+        "  cli: [hermes, web]\n"
     )
     (home / "config.yaml").write_text(original)
     receipt = run(
@@ -492,7 +488,7 @@ def test_hermes_conflicts_preserve_preexisting_and_customized_entries(
     assert not (disabled_home / "skills").exists()
 
     other_target, other_home = hermes_target(tmp_path / "other-toolsets")
-    (other_home / "config.yaml").write_text("platform_toolsets:\n  api_server: [hermes, web]\n")
+    (other_home / "config.yaml").write_text("platform_toolsets:\n  cli: [hermes, web]\n")
     other = run(
         installer.apply(
             other_target,
@@ -503,7 +499,7 @@ def test_hermes_conflicts_preserve_preexisting_and_customized_entries(
     )
     assert other["status"] == "conflict"
     assert (other_home / "config.yaml").read_text() == (
-        "platform_toolsets:\n  api_server: [hermes, web]\n"
+        "platform_toolsets:\n  cli: [hermes, web]\n"
     )
 
 
@@ -1046,7 +1042,105 @@ def test_initial_install_can_verify_with_trusted_inspector(
     assert checks(receipt)["profile.safety"] == "pass"
 
 
-def test_hermes_runtime_evidence_requires_live_profile_binding(
+def test_hermes_install_disables_unselected_skills_and_keeps_essential(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, home = hermes_target(tmp_path)
+    (home / "config.yaml").write_text(
+        "model: openai/gpt\nskills:\n  disabled:\n  - user-disabled\n"
+    )
+    for category, name in (
+        ("creative", "other"),
+        ("autonomous-ai-agents", "hermes-agent"),
+        ("productivity", "itsm-inventory"),
+    ):
+        skill = home / "skills" / category / name / "SKILL.md"
+        skill.parent.mkdir(parents=True)
+        skill.write_text(f"---\nname: {name}\ndescription: fixture\n---\nbody\n")
+
+    installed = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    assert installed["status"] == "configured", (
+        installed.get("checks"),
+        installed.get("error"),
+        installed.get("limitations"),
+    )
+    config = yaml_config(home / "config.yaml")
+    assert config["skills"]["disabled"] == ["other", "user-disabled"]
+    assert "hermes-agent" not in config["skills"]["disabled"]
+    assert "itsm-inventory" not in config["skills"]["disabled"]
+
+    removed = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="uninstall",
+        )
+    )
+    assert removed["status"] == "removed"
+    config = yaml_config(home / "config.yaml")
+    assert config["skills"]["disabled"] == ["user-disabled"]
+
+
+def test_hermes_install_accepts_indentless_toolset_and_agent_sequences(
+    tmp_path: Path,
+    installer: IntegrationInstaller,
+    mcp_server: dict[str, Any],
+    verified_token: str,
+) -> None:
+    target, home = hermes_target(tmp_path)
+    (home / "config.yaml").write_text(
+        "model:\n"
+        "  provider: itsm-omp\n"
+        "  default: omni/deepseek-v4.1-flash\n"
+        "toolsets: []\n"
+        "platform_toolsets:\n"
+        "  cli:\n"
+        "  - itsm\n"
+        "  - skills\n"
+        "dashboard:\n"
+        "  public_url: http://127.0.0.1:19119\n"
+        "  basic_auth:\n"
+        "    username: admin\n"
+        "agent:\n"
+        "  max_turns: 4\n"
+        "  disabled_toolsets:\n"
+        "  - project\n"
+        "max_turns: 4\n"
+    )
+
+    receipt = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="install",
+        )
+    )
+    assert receipt["status"] == "configured", (
+        receipt.get("checks"),
+        receipt.get("error"),
+        receipt.get("limitations"),
+    )
+    config = yaml_config(home / "config.yaml")
+    assert config["platform_toolsets"]["cli"] == ["itsm", "skills"]
+    assert config["agent"]["disabled_toolsets"] == ["project"]
+    assert config["agent"]["max_turns"] == 4
+    assert config["dashboard"]["basic_auth"]["username"] == "admin"
+    assert config["max_turns"] == 4
+
+
+def test_hermes_runtime_evidence_requires_trusted_launch_binding(
     tmp_path: Path,
     installer: IntegrationInstaller,
     mcp_server: dict[str, Any],
@@ -1062,25 +1156,42 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
         )
     )
     assert installed["status"] == "configured"
+    endpoint = "http://127.0.0.1:19119"
     evidence = {
-        "source": "hermes:http://127.0.0.1:1",
+        "source": f"hermes:{endpoint}",
         "verified": True,
         "configDigest": installed["configDigest"],
         "targetPath": str(home),
-        "runtime": {
-            "profile": "itsm",
-            "home": str(home),
-            "capabilities": {"chat": True, "mcp": True, "models": ["test-model"]},
+        "launch": {
+            "protocol": "itsm-hermes-launch-v1",
+            "profileHome": str(home),
+            "endpoint": endpoint,
+            "launchId": "launch-123",
+            "processId": 4321,
+            "configDigest": installed["configDigest"],
         },
-        "checks": [{"name": "runtime.profile", "status": "pass", "detail": "profile bound"}],
+        "runtime": {
+            "protocol": "hermes-native-serve-v1",
+            "profileHome": str(home),
+            "endpoint": endpoint,
+            "toolsets": ["itsm", "skills"],
+            "mcpServers": [
+                {"name": "itsm", "url": mcp_server["url"], "enabled": True}
+            ],
+            "skills": ["hermes-agent", "itsm-inventory"],
+        },
+        "checks": [{"name": "runtime.profile", "status": "pass", "detail": "launch bound"}],
     }
+
+    missing_launch = dict(evidence)
+    missing_launch.pop("launch")
     unverified = run(
         installer.apply(
             target,
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_inspector=evidence_inspector(evidence),
+            profile_inspector=evidence_inspector(missing_launch),
         )
     )
     assert unverified["status"] == "configured"
@@ -1090,21 +1201,84 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
         for item in unverified["checks"]
         if item["name"] == "profile.safety"
     )
-    assert "unavailable" in detail.lower()
+    assert "launch" in detail.lower()
 
-    yaml_only = dict(evidence)
-    yaml_only.pop("runtime")
-    unproven = run(
+    wrong_home = {**evidence, "launch": {**evidence["launch"], "profileHome": str(tmp_path)}}
+    mismatched = run(
         installer.apply(
             target,
             mcp=mcp_spec(mcp_server),
             skills=["itsm-inventory"],
             operation="verify",
-            profile_inspector=evidence_inspector(yaml_only),
+            profile_inspector=evidence_inspector(wrong_home),
         )
     )
-    assert unproven["status"] == "configured"
-    assert unproven["profileSafetyVerified"] is False
+    assert mismatched["status"] == "configured"
+    assert mismatched["profileSafetyVerified"] is False
+
+    extended = {**evidence, "runtime": {**evidence["runtime"], "toolsets": ["itsm", "skills", "web"]}}
+    overbroad = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(extended),
+        )
+    )
+    assert overbroad["status"] == "configured"
+    assert overbroad["profileSafetyVerified"] is False
+
+    extra_server = {
+        **evidence,
+        "runtime": {
+            **evidence["runtime"],
+            "mcpServers": [
+                *evidence["runtime"]["mcpServers"],
+                {"name": "plugin-search", "url": "http://127.0.0.1:9000/mcp", "enabled": True},
+            ],
+        },
+    }
+    extra = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(extra_server),
+        )
+    )
+    assert extra["status"] == "configured"
+    assert extra["profileSafetyVerified"] is False
+
+    missing_server = {
+        **evidence,
+        "runtime": {**evidence["runtime"], "mcpServers": []},
+    }
+    absent = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(missing_server),
+        )
+    )
+    assert absent["status"] == "configured"
+    assert absent["profileSafetyVerified"] is False
+
+    verified = run(
+        installer.apply(
+            target,
+            mcp=mcp_spec(mcp_server),
+            skills=["itsm-inventory"],
+            operation="verify",
+            profile_inspector=evidence_inspector(evidence),
+        )
+    )
+    assert verified["status"] == "verified"
+    assert verified["verified"] is True
+    assert verified["profileSafetyVerified"] is True
 
     raw_evidence = run(
         installer.apply(
