@@ -10,6 +10,7 @@ catalog and the installer through their frozen boundaries.
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import json
 import logging
 import os
@@ -4297,12 +4298,8 @@ class AgentIntegrationService:
         if agent_info.get("hidden") is not False:
             return None
         permissions = agent_info.get("permissions")
-        if not _restrictive_permissions(permissions, skills):
-            return None
         grant_items = grants.get("data") if isinstance(grants, Mapping) else None
-        if not isinstance(grant_items, list):
-            return None
-        if any(_broad_grant(item, skills) for item in grant_items):
+        if not _restrictive_permissions(permissions, skills, grant_items):
             return None
         if not isinstance(skill_payload, Mapping):
             return None
@@ -4747,7 +4744,7 @@ def _config_profile_entries(
     return directory_entries[0], document_entries
 
 
-def _restrictive_permissions(permissions: Any, skills: list[str]) -> bool:
+def _restrictive_permissions(permissions: Any, skills: list[str], saved: Any) -> bool:
     """Require a final deny-all and only approved overrides after it.
 
     OpenCode evaluates an ordered rule list with last-match-wins semantics and
@@ -4774,7 +4771,38 @@ def _restrictive_permissions(permissions: Any, skills: list[str]) -> bool:
             boundary = index
     if boundary is None:
         return False
-    return _strict_permission_suffix(permissions[boundary:], skills)
+    if not _strict_permission_suffix(permissions[boundary:], skills):
+        return False
+    if not isinstance(saved, list):
+        return False
+    for rule in saved:
+        if not isinstance(rule, Mapping):
+            return False
+        action, resource, effect = rule.get("action"), rule.get("resource"), rule.get("effect")
+        if (
+            not isinstance(action, str)
+            or not action
+            or not isinstance(resource, str)
+            or not resource
+            or effect not in {"allow", "deny"}
+        ):
+            return False
+        if _broad_grant(rule, skills):
+            return False
+    combined = permissions + saved
+
+    def effective(action: str, resource: str) -> str | None:
+        result = None
+        for rule in combined:
+            if fnmatch.fnmatchcase(action, rule["action"]) and fnmatch.fnmatchcase(
+                resource, rule["resource"]
+            ):
+                result = rule["effect"]
+        return result
+
+    return effective("itsm_search_assets", "*") == "allow" and all(
+        effective("skill", skill) == "allow" for skill in skills
+    )
 
 
 def _strict_permission_suffix(permissions: list[Any], skills: list[str]) -> bool:

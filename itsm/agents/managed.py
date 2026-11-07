@@ -82,6 +82,33 @@ _PROFILE_DIRS = ("home", "config", "data", "state", "cache")
 _NATIVE_USERNAMES = {"hermes": "admin", "opencode": "opencode"}
 
 
+_RESERVED_ENV = frozenset(
+    {
+        GATEWAY_KEY_ENV,
+        *_BASE_ENV,
+        "HOME",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "HERMES_HOME",
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+        "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_TEST_HOME",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_DISABLE_CLAUDE_CODE",
+        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+        "OPENCODE_DISABLE_MODELS_FETCH",
+    }
+)
+
+
 class ManagedEngineError(EngineError):
     """Public, redacted managed-run failure."""
 
@@ -839,6 +866,10 @@ def _validate_mcp(url: str, token: str | None, token_env: str) -> None:
     if not isinstance(token_env, str) or SECRET_REFERENCE.fullmatch(token_env) is None:
         raise ManagedEngineError(
             "misconfigured", "the MCP token environment name must be an environment variable name"
+        )
+    if token_env.upper() in _RESERVED_ENV:
+        raise ManagedEngineError(
+            "misconfigured", "the MCP token environment name is reserved by the managed runner"
         )
     if not isinstance(url, str) or len(url) > 2000:
         raise ManagedEngineError("misconfigured", "the MCP URL is invalid")
