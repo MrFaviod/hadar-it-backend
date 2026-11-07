@@ -164,8 +164,8 @@ def test_read_only_identities_can_view_but_not_change_images(
     catalog: Catalog,
     inventory: Iterator[InventoryService],
 ) -> None:
-    catalog.add_user("reader-user", "Reader User", "reader")
-    _principal, _token = catalog.add_machine(*MACHINE, role_id="reader")
+    catalog.add_user("reader-user", "Reader User", "user")
+    _principal, _token = catalog.add_machine(*MACHINE, role_id="user")
     created = add_asset(catalog)
     inventory.set_image(catalog.admin(), created["id"], "photo", PNG)
 

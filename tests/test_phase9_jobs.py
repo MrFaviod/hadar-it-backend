@@ -226,7 +226,7 @@ def test_job_visibility_is_owner_or_admin(catalog: Catalog) -> None:
     service.execute(job["id"])
     document_id = service.job(principal, job["id"])["documents"][0]["id"]
 
-    reader = catalog.add_user("reader-jobs", "Reader Jobs", "reader")
+    reader = catalog.add_user("reader-jobs", "Reader Jobs", "user")
     with pytest.raises(NotFound):
         service.job(reader, job["id"])
     with pytest.raises(NotFound):

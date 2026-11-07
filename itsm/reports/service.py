@@ -30,7 +30,7 @@ from itsm.attachments.storage import BlobStorage, LocalBlobStorage
 from itsm.config import Settings
 from itsm.identity.clock import as_utc, utcnow
 from itsm.identity.models import IdentityCredential, IdentitySession
-from itsm.identity.permissions import ROLE_ADMIN
+from itsm.identity.permissions import ROLE_ADMIN, ROLE_SUPERADMIN
 from itsm.identity.service import (
     IdentityService,
     NotFound,
@@ -797,7 +797,7 @@ class ReportService:
 
     @staticmethod
     def _is_admin(principal: Principal) -> bool:
-        return principal.role_id == ROLE_ADMIN
+        return principal.role_id in {ROLE_ADMIN, ROLE_SUPERADMIN}
 
     def job(self, principal: Principal, job_id: str) -> dict[str, Any]:
         with self.session_factory() as session:

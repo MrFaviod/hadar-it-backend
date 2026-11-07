@@ -446,7 +446,7 @@ def test_custom_template_crud_and_reserved_builtins(catalog: Catalog) -> None:
 
 
 def test_template_save_is_denied_without_assets_edit(catalog: Catalog) -> None:
-    reader = catalog.add_user("reader-tpl", "Reader Tpl", "reader")
+    reader = catalog.add_user("reader-tpl", "Reader Tpl", "user")
     service = reports(catalog)
     definition = builtin_templates()[0]
     definition["id"] = "reader-attempt"
@@ -511,7 +511,7 @@ def test_settings_defaults_save_and_logo_authorization(catalog: Catalog) -> None
             admin,
             {**payload, "branding": {**payload["branding"], "logoAttachmentId": "https://evil"}},
         )
-    reader = catalog.add_user("reader-settings", "Reader Settings", "reader")
+    reader = catalog.add_user("reader-settings", "Reader Settings", "user")
     with pytest.raises(PermissionDenied):
         service.save_settings(reader, payload)
     with catalog.session() as session:
@@ -521,7 +521,7 @@ def test_settings_defaults_save_and_logo_authorization(catalog: Catalog) -> None
 
 def test_reports_deny_readers_without_assets_view(catalog: Catalog) -> None:
     service = reports(catalog)
-    reader = catalog.add_user("reader-none", "Reader None", "reader")
+    reader = catalog.add_user("reader-none", "Reader None", "user")
     # A reader does hold assets.view in this product; removing the policy proves
     # the denial path and that nothing is stored.
     with catalog.session() as session:
@@ -529,7 +529,7 @@ def test_reports_deny_readers_without_assets_view(catalog: Catalog) -> None:
 
         session.execute(
             IdentityRolePolicy.__table__.delete().where(
-                IdentityRolePolicy.role_id == "reader",
+                IdentityRolePolicy.role_id == "user",
                 IdentityRolePolicy.resource == "assets",
                 IdentityRolePolicy.operation == "view",
             )

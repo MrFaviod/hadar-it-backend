@@ -478,7 +478,7 @@ def install_verified(
 # ------------------------------------------------------------------- admin gate
 def test_admin_surface_requires_full_human_administrator(app_client) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     headers = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
 
     response = client.get(f"{API}/agent/integrations", headers=headers)
@@ -556,7 +556,7 @@ def test_instance_validation_never_echoes_the_secret(app_client, monkeypatch) ->
 
 def test_preferences_and_installation_defaults(app_client) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     admin = login(client, settings, ADMIN_USERNAME, ADMIN_PASSWORD)
 
     defaults = client.put(
@@ -681,8 +681,8 @@ def test_pydantic_common_session_streams_cards_and_keeps_agent_chat(app_client) 
 
 def test_sessions_are_owned_by_their_human(app_client) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
-    catalog.add_user("reader-two", "Reader Two", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
+    catalog.add_user("reader-two", "Reader Two", "user")
     runtime = FakeRuntime(ChatReply(message="ok"))
     build_service(client, catalog, runtime=runtime)
 
@@ -750,7 +750,7 @@ def test_external_discovery_error_is_per_instance(app_client) -> None:
 
 def test_integration_identity_ceiling_denies_stronger_machine(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     operator_machine, operator_token = catalog.add_machine("ops-client", "Ops Client", "operator")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", operator_token)
     engine = FakeEngine()
@@ -822,7 +822,7 @@ def test_external_session_stream_redacts_usage_and_enforces_local_budget(
 ) -> None:
     catalog, client, settings = app_client
     settings.agent_daily_token_budget = 5
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     events = [
@@ -910,7 +910,7 @@ def test_external_session_stream_redacts_usage_and_enforces_local_budget(
 
 def test_reconnect_does_not_duplicate_usage(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(
@@ -953,7 +953,7 @@ def test_reconnect_does_not_duplicate_usage(app_client, monkeypatch) -> None:
 
 def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(
@@ -1004,7 +1004,7 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
 
 def test_install_receipts_are_truthful_and_gate_external_chat(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     other_machine, _ = catalog.add_machine("other-client", "Other Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
@@ -1217,7 +1217,7 @@ def test_module_state_is_persisted_and_applied(app_client) -> None:
 
 def test_run_concurrency_cancel_and_model_switch_are_owner_scoped(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(block=True)
@@ -1266,7 +1266,7 @@ def test_run_concurrency_cancel_and_model_switch_are_owner_scoped(app_client, mo
 
 def test_stale_run_is_recovered_and_budget_precheck_skips_engine(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine()
@@ -1308,7 +1308,7 @@ def test_stale_run_is_recovered_and_budget_precheck_skips_engine(app_client, mon
 
 def test_budget_precheck_blocks_before_engine_call(app_client, monkeypatch) -> None:
     catalog, client, settings = app_client
-    catalog.add_user("reader-one", "Reader One", "reader")
+    catalog.add_user("reader-one", "Reader One", "user")
     machine, machine_token = catalog.add_machine("hermes-client", "Hermes Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine()
@@ -1414,7 +1414,7 @@ def test_mcp_reader_lists_core_operations_and_forged_mutation_is_denied(
     app_client, free_tcp_port: int
 ) -> None:
     catalog, _, settings = app_client
-    _, reader = catalog.add_machine("list-reader", "List Reader", "reader")
+    _, reader = catalog.add_machine("list-reader", "List Reader", "user")
     app = create_app(settings)
     server = uvicorn.Server(
         uvicorn.Config(app, host="127.0.0.1", port=free_tcp_port, log_level="warning")

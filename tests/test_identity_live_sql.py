@@ -34,7 +34,9 @@ def test_live_identity_migration_login_and_policy_persistence(variable: str) -> 
     try:
         with factory() as db:
             service = IdentityService(db, settings)
-            installed = service.bootstrap_admin("sql-" + suffix, "SQL test administrator", password)
+            installed = service.bootstrap_superadmin(
+                "sql-" + suffix, "SQL test administrator", password
+            )
             grant = service.login(installed.username, password)
             role = service.create_role(
                 grant.principal, name="SQL reader " + suffix, permissions=["assets.view"]

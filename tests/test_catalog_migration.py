@@ -10,7 +10,7 @@ from itsm.identity.service import IdentityService
 from itsm.inventory.service import InventoryService
 from sqlalchemy import text
 from sqlalchemy.orm import Session
-from tests.conftest import BACKEND_ROOT, bootstrap_admin, run_cli, run_migrations
+from tests.conftest import BACKEND_ROOT, bootstrap_superadmin, run_cli, run_migrations
 
 
 def test_upgrade_installs_defaults_without_changing_existing_assets(settings_factory):
@@ -20,15 +20,12 @@ def test_upgrade_installs_defaults_without_changing_existing_assets(settings_fac
         settings,
     )
     assert initial.returncode == 0, initial.stderr
-    bootstrap_admin(settings)
     engine = create_engine_from_settings(settings)
+    asset_id = str(uuid4())
+    now = datetime.now(UTC)
     with Session(engine) as session:
-        identity = IdentityService(session, settings)
-        principal = identity.resolve_actor(identity._identity_by_username("ana.admin").id)
-        # Seed the historical schema directly: current services correctly require
-        # current migrations and must not be run against an old schema.
-        asset_id = str(uuid4())
-        now = datetime.now(UTC)
+        # Seed the historical schema directly: current identity services require
+        # current migrations and must not run against this old schema.
         session.execute(
             text(
                 "INSERT INTO assets (id, quick_code, quick_code_key, name, category, "
@@ -38,9 +35,14 @@ def test_upgrade_installs_defaults_without_changing_existing_assets(settings_fac
             {"id": asset_id, "now": now},
         )
         session.commit()
+    engine.dispose()
     upgraded = run_migrations(settings)
     assert upgraded.returncode == 0, upgraded.stderr
+    bootstrap_superadmin(settings)
+    engine = create_engine_from_settings(settings)
     with Session(engine) as session:
+        identity = IdentityService(session, settings)
+        principal = identity.resolve_actor(identity._identity_by_username("ana.admin").id)
         restored = InventoryService(session, settings).get(principal, asset_id)
         assert restored.id == asset_id
         assert restored.quick_code == "LEGACY-01"

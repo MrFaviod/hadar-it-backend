@@ -397,7 +397,7 @@ def test_permissions_and_csrf_are_reused(
         == 403
     )
     create(client, headers, preset_payload("Sin permiso"))
-    catalog.add_user("reader-appearance", "Reader Appearance", "reader")
+    catalog.add_user("reader-appearance", "Reader Appearance", "user")
     reader_headers = sign_in_as(client, catalog.settings, "reader-appearance", MACHINE_PASSWORD)
     assert (
         client.post(

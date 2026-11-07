@@ -73,7 +73,7 @@ def test_agent_reader_cannot_acknowledge_and_does_not_resolve_missing_target(sig
     settings = client.app.state.settings
     isolated = Catalog(settings=settings, engine=create_engine_from_settings(settings))
     try:
-        isolated.add_user("phase8-reader", "Phase 8 Reader", "reader")
+        isolated.add_user("phase8-reader", "Phase 8 Reader", "user")
         headers = sign_in_as(client, settings, "phase8-reader")
         use_model(
             client,
@@ -103,7 +103,7 @@ def test_agent_reader_cannot_acknowledge_and_does_not_resolve_missing_target(sig
 
 
 def test_mcp_reader_denial_precedes_target_lookup_and_revocation_is_rechecked(mcp):
-    _, token = mcp.catalog.add_machine("phase8-reader-machine", "Phase 8 reader", "reader")
+    _, token = mcp.catalog.add_machine("phase8-reader-machine", "Phase 8 reader", "user")
     with pytest.raises(ToolError, match="permission"):
         call_tool(mcp, token, "acknowledge_alert", {"alert_id": "missing-alert"})
     mcp.catalog.revoke_machine("phase8-reader-machine")

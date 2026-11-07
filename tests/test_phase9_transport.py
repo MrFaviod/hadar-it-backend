@@ -135,7 +135,7 @@ def test_mcp_report_projection_and_revoked_identity(mcp):
     assert prepared["matched"] == 1
     assert prepared["assets"][0]["name"] == "MCP report selection"
     assert "html" not in prepared
-    _, reader = mcp.catalog.add_machine("report-reader", "Report reader", "reader")
+    _, reader = mcp.catalog.add_machine("report-reader", "Report reader", "user")
     with pytest.raises(ToolError):
         call_tool(
             mcp,

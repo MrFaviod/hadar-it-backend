@@ -218,7 +218,7 @@ def test_agent_denied_relationship_write_changes_nothing(signed_in_client, monke
             "username": "reader-user",
             "name": "Reader User",
             "password": "reader-password-2026",
-            "roleId": "reader",
+            "roleId": "user",
         },
         headers=auth,
     )
@@ -327,7 +327,7 @@ def test_mcp_exposes_directory_relationship_history_and_map_tools(mcp: McpServer
 
 def test_mcp_denied_relationship_and_directory_writes_change_nothing(mcp: McpServer) -> None:
     _, token = operator(mcp)
-    _, reader_token = mcp.catalog.add_machine("mcp-reader-relations", "MCP Reader", "reader")
+    _, reader_token = mcp.catalog.add_machine("mcp-reader-relations", "MCP Reader", "user")
     first = call_tool(
         mcp, token, "create_asset", {"name": "Switch A", "quick_code": "MCP-DENY-1"}
     ).structured_content

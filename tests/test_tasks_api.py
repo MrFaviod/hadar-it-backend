@@ -138,12 +138,17 @@ def test_machine_bearer_can_submit_tasks_without_origin_or_csrf(
 ) -> None:
     from itsm.database import create_engine_from_settings, create_session_factory
     from itsm.identity.service import IdentityService
-    from tests.conftest import ADMIN_PASSWORD, ADMIN_USERNAME, bootstrap_admin, sign_in  # noqa: F401
+    from tests.conftest import (  # noqa: F401
+        ADMIN_PASSWORD,
+        ADMIN_USERNAME,
+        bootstrap_superadmin,
+        sign_in,
+    )
 
     settings = settings_factory()
     migrated = run_migrations(settings)
     assert migrated.returncode == 0, migrated.stderr
-    bootstrap_admin(settings)
+    bootstrap_superadmin(settings)
     session = create_session_factory(create_engine_from_settings(settings))()
     try:
         service = IdentityService(session, settings)
@@ -152,7 +157,7 @@ def test_machine_bearer_can_submit_tasks_without_origin_or_csrf(
             username="agent.collector",
             name="Collector",
             actor_kind="internal_agent",
-            role_id="reader",
+            role_id="user",
         )
         token = service.issue_machine_credential(machine.username, "test").token
     finally:

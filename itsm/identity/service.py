@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 from typing import Any
 from uuid import uuid4
 
-from sqlalchemy import delete, func, select
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.orm import Session
 
 from itsm.config import Settings
@@ -44,7 +44,9 @@ from itsm.identity.permissions import (
     MACHINE_FORBIDDEN_PERMISSIONS,
     PERMISSION_CATALOG,
     ROLE_ADMIN,
+    ROLE_SUPERADMIN,
     SENSITIVE_MACHINE_PERMISSIONS,
+    SYSTEM_PERMISSIONS,
     is_known_permission,
 )
 from itsm.identity.policy import PolicyEngine
@@ -386,13 +388,19 @@ class IdentityService:
         engine = PolicyEngine.load(self._session)
         if identity.actor_kind == HUMAN_ACTOR_KIND:
             effective = engine.permissions(identity.role_id)
+            # Reserved installation authority belongs to the persisted owner
+            # profile only; copied system.* grants never elevate another role.
+            if identity.role_id != ROLE_SUPERADMIN:
+                effective = effective - SYSTEM_PERMISSIONS
         elif identity.actor_kind in MACHINE_ACTOR_KINDS:
-            if identity.role_id == ROLE_ADMIN:
-                # Machines never inherit the administrator role, even if stored.
+            if identity.role_id in (ROLE_ADMIN, ROLE_SUPERADMIN):
+                # Machines never inherit an administrator profile, even if stored.
                 effective = frozenset()
             else:
                 effective = engine.permissions(identity.role_id) - MACHINE_FORBIDDEN_PERMISSIONS
-            if identity.delegated_by_id:
+            if not identity.delegated_by_id:
+                effective = effective - SYSTEM_PERMISSIONS
+            else:
                 delegator = self._session.get(Identity, identity.delegated_by_id)
                 if (
                     delegator is None
@@ -401,6 +409,10 @@ class IdentityService:
                 ):
                     return frozenset()
                 effective = effective & engine.permissions(delegator.role_id)
+                # Revocation is revalidated per operation: the persisted role
+                # owner and the live delegator must both still be the owner.
+                if delegator.role_id != ROLE_SUPERADMIN or identity.role_owner != ROLE_SUPERADMIN:
+                    effective = effective - SYSTEM_PERMISSIONS
         else:
             effective = frozenset()
         if scopes:
@@ -800,15 +812,19 @@ class IdentityService:
         return revoked
 
     # ------------------------------------------------------------- bootstrap
-    def bootstrap_admin(self, username: str, name: str, password: str) -> UserView:
-        """Installation-only creation of the first human administrator."""
+    def bootstrap_superadmin(self, username: str, name: str, password: str) -> UserView:
+        """Installation-only creation of the first human installation owner.
+
+        The reserved owner role row is write-locked first so concurrent
+        bootstrap attempts serialize on every supported database, including
+        SQLite, and the first-owner check cannot race with adoption.
+        """
+        self._lock_superadmin_role()
         humans = self._session.execute(
             select(func.count(Identity.id)).where(Identity.actor_kind == HUMAN_ACTOR_KIND)
         ).scalar_one()
         if int(humans):
             raise BootstrapRefused("the installation already has a human identity")
-        if self._session.get(IdentityRole, ROLE_ADMIN) is None:
-            raise Conflict("built-in roles are missing; run the database migrations first")
         normalized = self._normalize_username(username)
         display_name = self._normalize_name(name)
         self._validate_password(password)
@@ -824,7 +840,7 @@ class IdentityService:
             person_id=None,
             active=True,
             password_hash=hash_password(password),
-            role_id=ROLE_ADMIN,
+            role_id=ROLE_SUPERADMIN,
             created_at=now,
             updated_at=now,
         )
@@ -841,32 +857,85 @@ class IdentityService:
         self._session.commit()
         return view
 
+    def adopt_superadmin(self, username: str) -> UserView:
+        """Installation-only claim of ownership on an existing installation.
+
+        Allowed only while no active human superadmin exists, so an upgraded
+        installation can explicitly designate its first owner without promoting
+        every existing administrator. The owner's password is never read or
+        replaced here.
+        """
+        self._lock_superadmin_role()
+        normalized = self._normalize_username(username)
+        target = self._identity_by_username(normalized)
+        if target is None:
+            raise NotFound("identity not found")
+        if target.actor_kind != HUMAN_ACTOR_KIND:
+            raise ValidationFailed("only human identities can own the installation")
+        if not target.active:
+            raise ValidationFailed("the identity is not active")
+        active_owners = self._session.execute(
+            select(func.count(Identity.id)).where(
+                Identity.actor_kind == HUMAN_ACTOR_KIND,
+                Identity.active.is_(True),
+                Identity.role_id == ROLE_SUPERADMIN,
+            )
+        ).scalar_one()
+        if int(active_owners):
+            raise BootstrapRefused("the installation already has an active superadministrator")
+        target.role_id = ROLE_SUPERADMIN
+        target.updated_at = self._now()
+        self._revoke_sessions(target.id)
+        view = self._user_view(target)
+        self._audit(
+            actor_kind="system",
+            action="identity.superadmin_adopted",
+            resource=f"identity:{target.id}",
+            outcome="success",
+            actor_username=target.username,
+        )
+        self._session.commit()
+        return view
+
     def bootstrap_machine(
         self,
         username: str,
         name: str,
         actor_kind: str,
         role_id: str,
+        *,
+        delegated_by: str | None = None,
     ) -> UserView:
         """Installation-only creation of a machine identity.
 
-        A machine identity never receives the built-in administrator role and can
-        only be created once a human administrator exists, so an empty database
-        cannot be turned into a machine-owned installation.
+        A machine identity never receives the superadmin or admin role and can
+        only be created once a human installation owner exists, so an empty
+        database cannot be turned into a machine-owned installation. Reserved
+        grants require an active human superadmin delegator, supplied by
+        username because this path has no authenticated principal.
         """
-        admins = self._session.execute(
+        owners = self._session.execute(
             select(func.count(Identity.id)).where(
                 Identity.actor_kind == HUMAN_ACTOR_KIND,
                 Identity.active.is_(True),
-                Identity.role_id == ROLE_ADMIN,
+                Identity.role_id == ROLE_SUPERADMIN,
             )
         ).scalar_one()
-        if not int(admins):
-            raise BootstrapRefused("bootstrap a human administrator first")
+        if not int(owners):
+            raise BootstrapRefused("bootstrap a human superadministrator first")
         if actor_kind not in MACHINE_ACTOR_KINDS:
             raise ValidationFailed("actor_kind must be a machine actor kind")
         role = self._load_role(role_id)
         self._check_machine_role(actor_kind, role.id)
+        delegated_by_id = None
+        if delegated_by is not None:
+            delegator = self._identity_by_username(self._normalize_username(delegated_by))
+            if delegator is None:
+                raise ValidationFailed("delegated-by identity is unknown")
+            delegated_by_id = delegator.id
+        delegated_by_id, role_owner = self._role_assignment(
+            actor_kind=actor_kind, role=role, delegated_by_id=delegated_by_id
+        )
         normalized = self._normalize_username(username)
         display_name = self._normalize_name(name)
         if self._identity_by_username(normalized) is not None:
@@ -882,6 +951,8 @@ class IdentityService:
             active=True,
             password_hash=None,
             role_id=role.id,
+            delegated_by_id=delegated_by_id,
+            role_owner=role_owner,
             created_at=now,
             updated_at=now,
         )
@@ -910,28 +981,82 @@ class IdentityService:
         for row in rows:
             row.revoked_at = now
 
-    def _assert_not_last_admin(self, target: Identity) -> None:
+    def _lock_superadmin_role(self) -> IdentityRole:
+        """Serialize owner installation and last-owner decisions portably.
+
+        ``SELECT ... FOR UPDATE`` is ignored by SQLite, so the no-op UPDATE is
+        the lock: it takes the row write lock (and the database write lock on
+        SQLite) before any ownership count is read, on every supported engine.
+        """
+        role = self._session.get(IdentityRole, ROLE_SUPERADMIN)
+        if role is None:
+            raise Conflict("built-in roles are missing; run the database migrations first")
+        self._session.execute(
+            update(IdentityRole)
+            .where(IdentityRole.id == ROLE_SUPERADMIN)
+            .values(name=IdentityRole.name)
+        )
+        return role
+
+    def _assert_not_last_superadmin(self, target: Identity) -> None:
+        self._lock_superadmin_role()
         remaining = self._session.execute(
             select(func.count(Identity.id)).where(
                 Identity.actor_kind == HUMAN_ACTOR_KIND,
                 Identity.active.is_(True),
-                Identity.role_id == ROLE_ADMIN,
+                Identity.role_id == ROLE_SUPERADMIN,
                 Identity.id != target.id,
             )
         ).scalar_one()
         if int(remaining) == 0:
-            raise Conflict("at least one active administrator is required")
+            raise Conflict("at least one active superadministrator is required")
 
     def _check_machine_role(self, actor_kind: str, role_id: str | None) -> None:
-        if actor_kind in MACHINE_ACTOR_KINDS and role_id == ROLE_ADMIN:
-            raise ValidationFailed("machine identities cannot use the administrator role")
+        if actor_kind in MACHINE_ACTOR_KINDS and role_id in (ROLE_ADMIN, ROLE_SUPERADMIN):
+            raise ValidationFailed("machine identities cannot use an administrator role")
 
-    def _check_delegator(self, delegated_by_id: str | None) -> None:
-        if delegated_by_id is None:
-            return
+    def _delegator(self, delegated_by_id: str, *, require_superadmin: bool) -> Identity:
         delegator = self._session.get(Identity, delegated_by_id)
         if delegator is None or delegator.actor_kind != HUMAN_ACTOR_KIND or not delegator.active:
             raise ValidationFailed("delegation requires an active human identity")
+        if require_superadmin and delegator.role_id != ROLE_SUPERADMIN:
+            raise ValidationFailed(
+                "reserved permissions require delegation by an active superadministrator"
+            )
+        return delegator
+
+    def _role_assignment(
+        self,
+        *,
+        actor_kind: str,
+        role: IdentityRole,
+        delegated_by_id: str | None,
+    ) -> tuple[str | None, str | None]:
+        """Validate a role/delegation pair and return (delegated_by_id, role_owner).
+
+        Human reserved grants are refused unless the role itself is the owner
+        profile. Machine reserved grants are refused unless an active human
+        superadmin delegates them, and the delegator's role is persisted as the
+        machine's role owner so a later change cannot silently broaden it.
+        """
+        permissions = PolicyEngine.load(self._session).permissions(role.id)
+        if actor_kind == HUMAN_ACTOR_KIND:
+            if role.id != ROLE_SUPERADMIN and permissions & SYSTEM_PERMISSIONS:
+                raise ValidationFailed("system permissions are reserved to the installation owner")
+            if delegated_by_id is not None:
+                self._delegator(delegated_by_id, require_superadmin=False)
+            return delegated_by_id, None
+        if role.id in (ROLE_ADMIN, ROLE_SUPERADMIN):
+            raise ValidationFailed("machine identities cannot use an administrator role")
+        reserved = bool(permissions & SYSTEM_PERMISSIONS)
+        if not delegated_by_id:
+            if reserved:
+                raise ValidationFailed(
+                    "reserved permissions require delegation by an active superadministrator"
+                )
+            return None, None
+        delegator = self._delegator(delegated_by_id, require_superadmin=reserved)
+        return delegator.id, delegator.role_id
 
     def create_user(
         self,
@@ -953,13 +1078,16 @@ class IdentityService:
         email_value = self._normalize_email(email)
         person_value = self._normalize_person_id(person_id)
         kind = self._validate_actor_kind(actor_kind)
-        self._check_machine_role(kind, role_id)
-        self._load_role(role_id)
+        role = self._load_role(role_id)
+        self._check_machine_role(kind, role.id)
         self._assert_permission_ceiling(
             principal,
             action="identity.user_created",
-            resource=f"identity-role:{role_id}",
-            role_ids=[role_id],
+            resource=f"identity-role:{role.id}",
+            role_ids=[role.id],
+        )
+        delegated_by_id, role_owner = self._role_assignment(
+            actor_kind=kind, role=role, delegated_by_id=delegated_by_id
         )
         if kind in MACHINE_ACTOR_KINDS and password:
             raise ValidationFailed("machine identities do not use passwords")
@@ -968,7 +1096,6 @@ class IdentityService:
             if not password:
                 raise ValidationFailed("a password is required for human identities")
             password_hash = hash_password(self._validate_password(password))
-        self._check_delegator(delegated_by_id)
         if self._identity_by_username(normalized) is not None:
             raise Conflict("username is already in use")
 
@@ -982,8 +1109,9 @@ class IdentityService:
             person_id=person_value,
             active=bool(active),
             password_hash=password_hash,
-            role_id=role_id,
+            role_id=role.id,
             delegated_by_id=delegated_by_id,
+            role_owner=role_owner,
             created_at=now,
             updated_at=now,
         )
@@ -1030,25 +1158,34 @@ class IdentityService:
         if role_id is not None and role_id != target.role_id:
             if target.id == principal.actor_id:
                 raise PermissionDenied("you cannot change your own role")
-            self._load_role(role_id)
-            self._check_machine_role(target.actor_kind, role_id)
+            new_role = self._load_role(role_id)
+            self._check_machine_role(target.actor_kind, new_role.id)
             if (
                 target.active
                 and target.actor_kind == HUMAN_ACTOR_KIND
-                and target.role_id == ROLE_ADMIN
+                and target.role_id == ROLE_SUPERADMIN
             ):
-                self._assert_not_last_admin(target)
+                self._assert_not_last_superadmin(target)
         if actor_kind is not None and actor_kind != target.actor_kind:
             raise ValidationFailed("actor_kind cannot be changed")
         if (
             active is False
             and target.active
             and target.actor_kind == HUMAN_ACTOR_KIND
-            and target.role_id == ROLE_ADMIN
+            and target.role_id == ROLE_SUPERADMIN
         ):
-            self._assert_not_last_admin(target)
-        if delegated_by_id is not None:
-            self._check_delegator(delegated_by_id)
+            self._assert_not_last_superadmin(target)
+        if role_id is not None or delegated_by_id is not None:
+            role = self._load_role(role_id if role_id is not None else target.role_id)
+            delegated_by_id, role_owner = self._role_assignment(
+                actor_kind=target.actor_kind,
+                role=role,
+                delegated_by_id=(
+                    delegated_by_id if delegated_by_id is not None else target.delegated_by_id
+                ),
+            )
+            target.delegated_by_id = delegated_by_id
+            target.role_owner = role_owner
 
         revoke = False
         if username is not None:
@@ -1069,8 +1206,6 @@ class IdentityService:
         if active is not None and bool(active) != bool(target.active):
             target.active = bool(active)
             revoke = revoke or not target.active
-        if delegated_by_id is not None:
-            target.delegated_by_id = delegated_by_id
         if password is not None:
             if target.actor_kind != HUMAN_ACTOR_KIND:
                 raise ValidationFailed("machine identities do not use passwords")
@@ -1105,8 +1240,8 @@ class IdentityService:
             role_ids=[target.role_id],
         )
         if not active and target.active:
-            if target.actor_kind == HUMAN_ACTOR_KIND and target.role_id == ROLE_ADMIN:
-                self._assert_not_last_admin(target)
+            if target.actor_kind == HUMAN_ACTOR_KIND and target.role_id == ROLE_SUPERADMIN:
+                self._assert_not_last_superadmin(target)
             self._revoke_sessions(target.id)
         target.active = bool(active)
         target.updated_at = self._now()

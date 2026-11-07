@@ -1,9 +1,10 @@
 """Installation CLI for the identity module.
 
-The CLI is the only supported way to create the first administrator and to
-issue machine credentials. It never accepts a password as an argument, never
-falls back to a default credential and never prints a password or a stored
-hash. Passwords come from ``getpass`` on an interactive terminal or from the
+The CLI is the only supported way to create the first installation owner
+(``superadmin``), to claim ownership on an existing installation and to issue
+machine credentials. It never accepts a password as an argument, never falls
+back to a default credential and never prints a password or a stored hash.
+Passwords come from ``getpass`` on an interactive terminal or from the
 ``ITSM_BOOTSTRAP_PASSWORD`` process variable for unattended installations.
 """
 
@@ -28,6 +29,7 @@ from itsm.identity.service import (
     IdentityService,
     NotFound,
     PermissionDenied,
+    UserView,
     ValidationFailed,
 )
 
@@ -68,7 +70,17 @@ def _open_service(settings: Settings) -> tuple[Any, IdentityService]:
     return session, IdentityService(session, settings)
 
 
-def _command_bootstrap_admin(args: argparse.Namespace, settings: Settings) -> int:
+def _identity_payload(view: UserView) -> dict[str, Any]:
+    return {
+        "id": view.id,
+        "username": view.username,
+        "name": view.name,
+        "roleId": view.role_id,
+        "active": view.active,
+    }
+
+
+def _command_bootstrap_superadmin(args: argparse.Namespace, settings: Settings) -> int:
     password = _read_password()
     if password is None:
         return _fail(
@@ -81,21 +93,33 @@ def _command_bootstrap_admin(args: argparse.Namespace, settings: Settings) -> in
 
     session, service = _open_service(settings)
     try:
-        view = service.bootstrap_admin(args.username, args.name, password)
+        view = service.bootstrap_superadmin(args.username, args.name, password)
     finally:
         session.close()
 
     _emit(
         {
             "status": "created",
-            "action": "bootstrap-admin",
-            "identity": {
-                "id": view.id,
-                "username": view.username,
-                "name": view.name,
-                "roleId": view.role_id,
-                "active": view.active,
-            },
+            "action": "bootstrap-superadmin",
+            "identity": _identity_payload(view),
+        },
+        ok=True,
+    )
+    return EXIT_OK
+
+
+def _command_adopt_superadmin(args: argparse.Namespace, settings: Settings) -> int:
+    session, service = _open_service(settings)
+    try:
+        view = service.adopt_superadmin(args.username)
+    finally:
+        session.close()
+
+    _emit(
+        {
+            "status": "adopted",
+            "action": "adopt-superadmin",
+            "identity": _identity_payload(view),
         },
         ok=True,
     )
@@ -110,6 +134,7 @@ def _command_create_machine(args: argparse.Namespace, settings: Settings) -> int
             name=args.name,
             actor_kind=args.actor_kind,
             role_id=args.role,
+            delegated_by=args.delegated_by,
         )
         credential = service.issue_machine_credential(identity.username, args.label)
     finally:
@@ -160,12 +185,22 @@ def build_parser() -> argparse.ArgumentParser:
     commands = parser.add_subparsers(dest="command", required=True)
 
     bootstrap = commands.add_parser(
-        "bootstrap-admin",
-        help="create the first administrator; refused once a human identity exists",
+        "bootstrap-superadmin",
+        help="create the first installation owner; refused once a human identity exists",
     )
     bootstrap.add_argument("--username", required=True)
     bootstrap.add_argument("--name", required=True)
-    bootstrap.set_defaults(handler=_command_bootstrap_admin)
+    bootstrap.set_defaults(handler=_command_bootstrap_superadmin)
+
+    adopt = commands.add_parser(
+        "adopt-superadmin",
+        help=(
+            "claim installation ownership for an existing human identity; "
+            "only when no active superadministrator exists"
+        ),
+    )
+    adopt.add_argument("--username", required=True)
+    adopt.set_defaults(handler=_command_adopt_superadmin)
 
     machine = commands.add_parser(
         "create-machine-identity",
@@ -175,6 +210,11 @@ def build_parser() -> argparse.ArgumentParser:
     machine.add_argument("--name", required=True)
     machine.add_argument("--actor-kind", required=True, choices=list(MACHINE_ACTOR_KINDS))
     machine.add_argument("--role", required=True)
+    machine.add_argument(
+        "--delegated-by",
+        default=None,
+        help="username of the active human superadmin delegating reserved grants",
+    )
     machine.add_argument("--label", default="installation")
     machine.set_defaults(handler=_command_create_machine)
 
@@ -191,8 +231,8 @@ def build_parser() -> argparse.ArgumentParser:
 def main(argv: list[str] | None = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
-    if args.command == "bootstrap-admin" and not (args.username and args.name):
-        return _fail("invalid_arguments", "--username and --name are required", EXIT_USAGE)
+    if args.command in {"bootstrap-superadmin", "adopt-superadmin"} and not args.username:
+        return _fail("invalid_arguments", "--username is required", EXIT_USAGE)
 
     settings = get_settings()
     try:

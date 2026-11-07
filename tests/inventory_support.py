@@ -15,9 +15,9 @@ from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.identity.service import IdentityService, Principal
 from sqlalchemy import Engine, select, text
 from sqlalchemy.orm import Session
-from tests.conftest import ADMIN_USERNAME, bootstrap_admin, run_migrations
+from tests.conftest import ADMIN_USERNAME, bootstrap_superadmin, run_migrations
 
-READER = ("reader-user", "Reader User", "reader")
+READER = ("reader-user", "Reader User", "user")
 OPERATOR = ("operator-user", "Operator User", "operator")
 MACHINE = ("hermes-client", "Hermes Client")
 MACHINE_PASSWORD = "machine-identity-password-2026"
@@ -63,9 +63,7 @@ class Catalog:
             )
         return self.principal(username)
 
-    def add_machine(
-        self, username: str, name: str, role_id: str = "reader"
-    ) -> tuple[Principal, str]:
+    def add_machine(self, username: str, name: str, role_id: str = "user") -> tuple[Principal, str]:
         with self.session() as session:
             service = self.service(session)
             service.bootstrap_machine(username, name, "external_client", role_id)
@@ -112,7 +110,7 @@ def prepare(settings_factory: Any, **overrides: Any) -> Catalog:
     settings = settings_factory(**overrides)
     applied = run_migrations(settings)
     assert applied.returncode == 0, applied.stderr
-    bootstrap_admin(settings)
+    bootstrap_superadmin(settings)
     engine = create_engine_from_settings(settings)
     catalog = Catalog(settings=settings, engine=engine)
     with catalog.session() as session:

@@ -64,7 +64,7 @@ def test_qr_uses_permanent_uuid_and_never_the_quick_code(catalog: Catalog) -> No
 
 def test_private_report_requires_assets_view(catalog: Catalog) -> None:
     asset_id = seed(catalog, asset_values(quick_code="PRIV-001"))
-    reader = catalog.add_user("reader-priv", "Reader Priv", "reader")
+    reader = catalog.add_user("reader-priv", "Reader Priv", "user")
     # Readers can hold assets.view; a share is a separate capability regardless.
     assert reports(catalog).asset_report(reader, asset_id)["asset"]["id"] == asset_id
     with pytest.raises(PermissionDenied):
@@ -175,7 +175,7 @@ def test_revocation_requires_the_independent_share_permission(catalog: Catalog) 
     asset_id = seed(catalog, asset_values(quick_code="PERM-001"))
     service = reports(catalog)
     admin = catalog.admin()
-    reader = catalog.add_user("reader-revoke", "Reader Revoke", "reader")
+    reader = catalog.add_user("reader-revoke", "Reader Revoke", "user")
     share = service.create_share(admin, asset_id, ["name"])
     with pytest.raises(PermissionDenied):
         service.revoke_share(reader, share["id"])

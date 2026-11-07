@@ -285,7 +285,7 @@ def test_reader_cannot_archive_retire_or_clone(
     signed_in_client: ClientFactory,
     catalog: Catalog,
 ) -> None:
-    catalog.add_user("reader-user", "Reader User", "reader")
+    catalog.add_user("reader-user", "Reader User", "user")
     test_client, auth = signed_in_client(catalog.settings)
     created = create_asset(test_client, auth, responsible="Matriz NOC")
     reader = sign_in_as(test_client, catalog.settings, "reader-user")
@@ -447,8 +447,8 @@ def test_machine_and_reader_are_read_only_for_media(
     signed_in_client: ClientFactory,
     catalog: Catalog,
 ) -> None:
-    catalog.add_user("reader-user", "Reader User", "reader")
-    _machine, machine_token = catalog.add_machine(*MACHINE, role_id="reader")
+    catalog.add_user("reader-user", "Reader User", "user")
+    _machine, machine_token = catalog.add_machine(*MACHINE, role_id="user")
     test_client, auth = signed_in_client(catalog.settings)
     created = create_asset(test_client, auth)
 
