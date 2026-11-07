@@ -108,6 +108,12 @@ class Settings(BaseSettings):
     agent_session_max_context_messages: int = Field(default=40, ge=0, le=50)
     agent_extension_modules: list[str] = Field(default_factory=list)
 
+    # Operator-configured external executor. ITSM never receives host, shell or
+    # container authority; it only calls fixed actions on this trusted endpoint.
+    system_executor_url: str = ""
+    system_executor_token: SecretStr | None = None
+    system_executor_timeout_seconds: float = Field(default=10.0, ge=1.0, le=60.0)
+
     prometheus_url: str | None = None
     prometheus_token: SecretStr | None = None
     alertmanager_url: str | None = None
@@ -262,6 +268,30 @@ class Settings(BaseSettings):
             raise ValueError("agent_openai_base_url must be an http(s) URL")
         return normalized
 
+    @field_validator("system_executor_url")
+    @classmethod
+    def _validate_system_executor_url(cls, value: str) -> str:
+        if not value:
+            return ""
+        parsed = urlsplit(value)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            raise ValueError("system_executor_url must be an http(s) URL with a host")
+        if parsed.username or parsed.password or parsed.query or parsed.fragment:
+            raise ValueError("system_executor_url must not contain credentials or query")
+        if re.search(r"\s", value):
+            raise ValueError("system_executor_url must not contain whitespace")
+        return value.rstrip("/")
+
+    @field_validator("system_executor_token")
+    @classmethod
+    def _validate_system_executor_token(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is None:
+            return None
+        raw = value.get_secret_value()
+        if raw and len(raw) < 16:
+            raise ValueError("system_executor_token must contain at least 16 characters")
+        return value
+
     @field_validator("auth_origin")
     @classmethod
     def _validate_auth_origin(cls, value: str) -> str:
@@ -330,6 +360,7 @@ class Settings(BaseSettings):
             self.alertmanager_token,
             self.monitoring_ingest_token,
             self.monitoring_discovery_token,
+            self.system_executor_token,
             self.meilisearch_api_key,
             *self.monitoring_secrets.values(),
         ):

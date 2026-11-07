@@ -14,7 +14,7 @@ import logging
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from datetime import date
-from typing import Any
+from typing import Any, Literal
 
 from fastmcp import FastMCP
 from fastmcp.exceptions import ToolError
@@ -41,6 +41,8 @@ from itsm.operations import tools as operations_tools
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from itsm.reports.schemas import ReportRequest
+from itsm.system.service import SystemService
+from itsm.system.tools import SYSTEM_TOOL_NAMES
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
 
@@ -102,6 +104,7 @@ TOOL_NAMES: tuple[str, ...] = (
     "search_everything",
     "query_relationships",
     "list_saved_views",
+    *SYSTEM_TOOL_NAMES,
 )
 
 INSTRUCTIONS = """\
@@ -170,7 +173,9 @@ class DatabaseTokenVerifier(TokenVerifier):
     """Validate machine bearer tokens against persisted credentials per request."""
 
     def __init__(self, settings: Settings, session_factory: Callable[[], Session]) -> None:
-        super().__init__(required_scopes=["assets.view"])
+        # A delegated system agent may hold only system.* grants, so every tool
+        # revalidates its own permission and the transport must not pre-filter.
+        super().__init__()
         self._settings = settings
         self._session_factory = session_factory
 
@@ -271,6 +276,7 @@ def create_mcp_server(
     session_factory: Callable[[], Session],
     *,
     extensions: Any = None,
+    system_service: Callable[[], SystemService] | None = None,
 ) -> FastMCP:
     """Build the mounted server with typed inventory, directory and technical tools."""
     server = FastMCP(
@@ -431,6 +437,35 @@ def create_mcp_server(
         except Exception as exc:
             logger.warning("mcp operational tool failed: %s", type(exc).__name__)
             raise ToolError("operational query failed") from None
+
+    def run_system(
+        operation: Callable[[SystemService, Principal], dict[str, Any]],
+    ) -> dict[str, Any]:
+        """Revalidate the bearer, then use the canonical system service boundary."""
+        token = _bearer_token()
+        with session_factory() as session:
+            identity = IdentityService(session, settings)
+            try:
+                context = identity.authenticate_token(token)
+            except AuthenticationFailed, PermissionDenied:
+                raise ToolError("authentication required") from None
+            principal = context.principal
+        service = (
+            system_service()
+            if system_service is not None
+            else SystemService(settings, session_factory)
+        )
+        try:
+            return operation(service, principal)
+        except ToolError:
+            raise
+        except PermissionDenied:
+            raise ToolError("permission denied") from None
+        except (Conflict, NotFound, ValidationFailed) as exc:
+            raise ToolError(str(exc)) from None
+        except Exception as exc:
+            logger.warning("mcp system tool failed: %s", type(exc).__name__)
+            raise ToolError("system operation failed") from None
 
     @server.tool
     def search_assets(
@@ -1542,6 +1577,56 @@ def create_mcp_server(
                 session, identity, principal, source="mcp"
             )
         )
+
+    @server.tool
+    def get_system_status() -> dict[str, Any]:
+        """Read redacted readiness and external-executor availability for the installation."""
+        return run_system(lambda service, principal: service.status(principal))
+
+    @server.tool
+    def get_system_configuration() -> dict[str, Any]:
+        """Read the application-owned deployment preferences and executor configuration."""
+        return run_system(lambda service, principal: service.configuration(principal))
+
+    @server.tool
+    def list_system_providers() -> dict[str, Any]:
+        """List allowlisted AI providers, credential presence and the persisted selection."""
+        return run_system(lambda service, principal: service.providers(principal))
+
+    @server.tool
+    def configure_system_provider(
+        provider: Literal["openai", "anthropic"], model: str
+    ) -> dict[str, Any]:
+        """Persist one allowlisted provider/model; credentials always stay external."""
+        return run_system(
+            lambda service, principal: service.set_provider(
+                principal, {"provider": provider, "model": model}
+            )
+        )
+
+    @server.tool
+    def list_system_modules() -> dict[str, Any]:
+        """List registered modules and whether each one is enabled."""
+        return run_system(lambda service, principal: service.modules(principal))
+
+    @server.tool
+    def set_system_module(module_id: str, enabled: bool) -> dict[str, Any]:
+        """Enable or disable a verified non-official module; the official module stays on."""
+        return run_system(
+            lambda service, principal: service.set_module(
+                principal, module_id, {"enabled": enabled}
+            )
+        )
+
+    @server.tool
+    def prepare_system_update() -> dict[str, Any]:
+        """Ask the operator-configured external executor to prepare an update."""
+        return run_system(lambda service, principal: service.operation(principal, "update.prepare"))
+
+    @server.tool
+    def create_system_backup() -> dict[str, Any]:
+        """Ask the operator-configured external executor for a verified backup."""
+        return run_system(lambda service, principal: service.operation(principal, "backup.create"))
 
     if extensions is not None:
         from itsm.agent_integrations.extensions import bind_fastmcp_tools

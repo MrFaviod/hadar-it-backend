@@ -40,6 +40,7 @@ from itsm.operations import tools as operations_tools
 from itsm.redundancy.service import RedundancyService
 from itsm.relationships.service import RelationshipService
 from itsm.reports.schemas import ReportRequest
+from itsm.system.tools import SYSTEM_TOOL_NAMES
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 from pydantic_ai import Agent, RunContext
 from pydantic_ai.messages import (
@@ -112,7 +113,9 @@ TOOL_NAMES: tuple[str, ...] = (
     "search_everything",
     "query_relationships",
     "list_saved_views",
+    *SYSTEM_TOOL_NAMES,
 )
+
 MAX_RESULTS = 50
 
 INSTRUCTIONS = """\
@@ -217,6 +220,7 @@ class AgentDeps:
     credential_digest: str | None = None
     actions: list[ChatAction] = field(default_factory=list)
     results: list[dict[str, Any]] = field(default_factory=list)
+    system: Any = None
 
 
 class BatchUpdateArg(BaseModel):
@@ -327,6 +331,31 @@ def _interventions(deps: AgentDeps) -> Iterator[Any]:
         )
     finally:
         session.close()
+
+
+def _system(deps: AgentDeps) -> Any:
+    """Use the application's canonical system service, or build the same boundary."""
+    if deps.system is not None:
+        return deps.system
+    from itsm.system.service import SystemService
+
+    return SystemService(deps.settings, deps.session_factory)
+
+
+def _system_collect(
+    deps: AgentDeps,
+    tool: str,
+    operation: Callable[[Any], dict[str, Any]],
+) -> dict[str, Any]:
+    """Run one typed system operation through the canonical service and record it."""
+    try:
+        payload = operation(_system(deps))
+    except IdentityError as exc:
+        return _failed(deps, tool, exc)
+    _record(deps, tool, "completed")
+    if len(deps.results) < MAX_RESULTS:
+        deps.results.append(payload)
+    return {"ok": True, **payload}
 
 
 @contextmanager
@@ -1718,10 +1747,95 @@ def _register_tools(agent: Agent[AgentDeps, str]) -> None:
             ),
         )
 
+    @agent.tool
+    def get_system_status(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Leer el estado factual y redactado de la instalación y del ejecutor externo."""
+        return _system_collect(
+            ctx.deps,
+            "get_system_status",
+            lambda service: service.status(ctx.deps.principal),
+        )
 
-def resolve_model(settings: Settings) -> Model:
-    """Build the configured provider/model; credentials come from the environment."""
-    provider_name, _, model_name = settings.agent_model.partition(":")
+    @agent.tool
+    def get_system_configuration(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Leer las preferencias finitas de despliegue propias de la aplicación."""
+        return _system_collect(
+            ctx.deps,
+            "get_system_configuration",
+            lambda service: service.configuration(ctx.deps.principal),
+        )
+
+    @agent.tool
+    def list_system_providers(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Listar los proveedores de IA permitidos y la selección persistida."""
+        return _system_collect(
+            ctx.deps,
+            "list_system_providers",
+            lambda service: service.providers(ctx.deps.principal),
+        )
+
+    @agent.tool
+    def configure_system_provider(
+        ctx: RunContext[AgentDeps],
+        provider: Literal["openai", "anthropic"],
+        model: str,
+    ) -> dict[str, Any]:
+        """Persistir el proveedor y modelo permitidos; las credenciales siguen siendo externas."""
+        return _system_collect(
+            ctx.deps,
+            "configure_system_provider",
+            lambda service: service.set_provider(
+                ctx.deps.principal, {"provider": provider, "model": model}
+            ),
+        )
+
+    @agent.tool
+    def list_system_modules(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Listar los módulos oficiales registrados y su estado habilitado."""
+        return _system_collect(
+            ctx.deps,
+            "list_system_modules",
+            lambda service: service.modules(ctx.deps.principal),
+        )
+
+    @agent.tool
+    def set_system_module(
+        ctx: RunContext[AgentDeps],
+        module_id: str,
+        enabled: bool,
+    ) -> dict[str, Any]:
+        """Habilitar o deshabilitar un módulo no oficial del catálogo verificado."""
+        return _system_collect(
+            ctx.deps,
+            "set_system_module",
+            lambda service: service.set_module(ctx.deps.principal, module_id, {"enabled": enabled}),
+        )
+
+    @agent.tool
+    def prepare_system_update(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Solicitar al ejecutor externo configurado la preparación de una actualización."""
+        return _system_collect(
+            ctx.deps,
+            "prepare_system_update",
+            lambda service: service.operation(ctx.deps.principal, "update.prepare"),
+        )
+
+    @agent.tool
+    def create_system_backup(ctx: RunContext[AgentDeps]) -> dict[str, Any]:
+        """Solicitar al ejecutor externo configurado una copia de seguridad verificada."""
+        return _system_collect(
+            ctx.deps,
+            "create_system_backup",
+            lambda service: service.operation(ctx.deps.principal, "backup.create"),
+        )
+
+
+def resolve_model(settings: Settings, selection: Any = None) -> Model:
+    """Build the selected provider/model; credentials come from the environment."""
+    if selection is not None:
+        provider_name, model_name = selection.provider, selection.model
+    else:
+        provider_name, _, model_name = settings.agent_model.partition(":")
     if provider_name == "openai":
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
@@ -1755,23 +1869,45 @@ class AgentRuntime:
         session_factory: Callable[[], Session],
         *,
         model: Model | None = None,
+        system: Any = None,
     ) -> None:
         self._settings = settings
         self._session_factory = session_factory
         self._model = model
+        self._system = system
         self._agent: Agent[AgentDeps, str] | None = None
+        self._selection_key: tuple[str, str] | None = None
+
+    def attach_system(self, system: Any) -> None:
+        """Use the application's canonical system service for typed system tools."""
+        self._system = system
 
     @property
     def configured(self) -> bool:
-        return self._model is not None or bool(self._settings.agent_model)
+        if self._model is not None:
+            return True
+        return self._selection() is not None
 
-    def _build(self) -> Agent[AgentDeps, str]:
+    def _selection(self) -> Any:
+        """Read the persisted selection now, so a change affects the next turn."""
+        if self._model is not None:
+            return None
+        from itsm.system.providers import effective_selection
+
+        try:
+            with self._session_factory() as session:
+                return effective_selection(session, self._settings)
+        except Exception as exc:  # a missing table falls back to the environment
+            logger.warning("provider selection could not be read: %s", type(exc).__name__)
+            return None
+
+    def _build(self, selection: Any = None) -> Agent[AgentDeps, str]:
         model = self._model
         if model is None:
-            if not self._settings.agent_model:
+            if selection is None:
                 raise AgentUnavailable()
             try:
-                model = resolve_model(self._settings)
+                model = resolve_model(self._settings, selection)
             except AgentUnavailable:
                 raise
             except Exception as exc:  # provider construction must stay explicit
@@ -1789,8 +1925,15 @@ class AgentRuntime:
         return agent
 
     def _ensure(self) -> Agent[AgentDeps, str]:
-        if self._agent is None:
-            self._agent = self._build()
+        if self._model is not None:
+            if self._agent is None:
+                self._agent = self._build()
+            return self._agent
+        selection = self._selection()
+        key = None if selection is None else (selection.provider, selection.model)
+        if self._agent is None or key != self._selection_key:
+            self._agent = self._build(selection)
+            self._selection_key = key
         return self._agent
 
     def chat(
@@ -1820,6 +1963,7 @@ class AgentRuntime:
             session_factory=self._session_factory,
             principal=principal,
             credential_digest=credential_digest,
+            system=self._system,
         )
         prompt = request.message
         if request.assetId:
@@ -1866,6 +2010,7 @@ class AgentRuntime:
 
 
 __all__ = [
+    "SYSTEM_TOOL_NAMES",
     "TOOL_NAMES",
     "AgentDeps",
     "AgentRuntime",

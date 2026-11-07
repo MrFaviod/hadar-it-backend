@@ -60,6 +60,8 @@ from itsm.reports.api import create_reports_router
 from itsm.reports.service import build_report_service
 from itsm.search.api import create_search_router
 from itsm.search.indexer import install_search_sync
+from itsm.system.api import create_system_router
+from itsm.system.service import SystemService
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
 from itsm.workflows.api import create_workflow_router
 
@@ -138,13 +140,25 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     configure_logging(settings.log_level, secrets=settings.sensitive_values())
 
     sessions: dict[str, Callable[[], Session]] = {}
+    services: dict[str, SystemService] = {}
 
     def late_session_factory() -> Session:
         return sessions["factory"]()
 
+    def late_system_service() -> SystemService:
+        service = services.get("system")
+        if service is None:  # pragma: no cover - only before lifespan startup
+            service = SystemService(settings, late_session_factory)
+        return service
+
     # FastMCP requires its own lifespan and reuses the API session factory.
     skill_catalog, extension_registry = _extension_components(settings)
-    mcp_server = create_mcp_server(settings, late_session_factory, extensions=extension_registry)
+    mcp_server = create_mcp_server(
+        settings,
+        late_session_factory,
+        extensions=extension_registry,
+        system_service=late_system_service,
+    )
     extension_mount = getattr(mcp_server, "extension_mount", None)
     mcp_app = mcp_server.http_app(path="/mcp")
 
@@ -167,6 +181,13 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             extension_sync=getattr(extension_mount, "sync", None),
         )
         app.state.agent_integrations.initialize()
+        app.state.system = SystemService(
+            settings,
+            factory,
+            integrations=app.state.agent_integrations,
+        )
+        services["system"] = app.state.system
+        app.state.agent_runtime.attach_system(app.state.system)
         app.state.reports_service = build_report_service(
             settings, factory, task_queue=app.state.task_queue
         )
@@ -349,6 +370,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_directory_media_router())
     api.include_router(create_agent_router())
     api.include_router(create_agent_integrations_router())
+    api.include_router(create_system_router())
     api.include_router(create_identity_router())
     app.include_router(api)
     app.mount(settings.api_prefix, mcp_app)

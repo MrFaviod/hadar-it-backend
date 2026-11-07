@@ -10,10 +10,27 @@ tools:
   - search_everything
   - query_relationships
   - list_saved_views
+  - get_system_status
+  - get_system_configuration
+  - list_system_providers
+  - configure_system_provider
+  - list_system_modules
+  - set_system_module
+  - prepare_system_update
+  - create_system_backup
 permissions:
   - assets.view
+  - system.view
+  - system.providers
+  - system.modules
+  - system.configure
+  - system.backup
+  - system.update
 capabilities:
   - operations.read
+  - system.read
+  - system.configure
+  - system.operate
 ---
 # ITSM operations
 
@@ -24,7 +41,9 @@ Load when the user asks for a daily operational overview, wants one search acros
 - These tools are read-only. Do not claim that a summary, search or view changed any record.
 - `search_everything` accepts only known result kinds and a bounded page; report `total`, `truncated` and `fallback` exactly as returned.
 - `query_relationships` reports its own `truncated`, `nodesTruncated`, `edgesTruncated` and `depthTruncated` flags; never hide a truncated graph.
-- Deployment maintenance and privileged host operations are not available here. They stay in the deployment's existing ops procedure and are never simulated through these tools.
+- Deployment maintenance and privileged host operations are not available here. System tools call only the operator-configured external executor with fixed actions; they never accept a host, path, URL, command, shell or container socket.
+- System tools are reserved for the installation owner (`superadmin`) or an explicitly delegated machine whose delegation is still active. A denial is final; never retry with another role.
+- An unconfigured or unreachable executor is `unavailable`, never success. Report its redacted detail and stop; never claim a backup, update or status that was not returned.
 - `list_saved_views` returns the caller's workspace state; it does not expose another identity's views.
 
 ## Decision Gates
@@ -34,6 +53,11 @@ Load when the user asks for a daily operational overview, wants one search acros
 | Cross-entity search | `search_everything` with a query and optional `kinds` |
 | Topology traversal | `query_relationships` with an asset id or global page |
 | Caller's saved state | `list_saved_views` |
+| Installation status | `get_system_status` |
+| Deployment preferences | `get_system_configuration` |
+| AI provider selection | `list_system_providers` / `configure_system_provider` |
+| Module state | `list_system_modules` / `set_system_module` |
+| External update or backup | `prepare_system_update` / `create_system_backup` |
 | Change a record | A domain skill such as `itsm-inventory`, not these tools |
 
 ## Execution Steps

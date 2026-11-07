@@ -48,7 +48,6 @@ from itsm.identity.clock import utcnow
 from itsm.identity.permissions import (
     HUMAN_ACTOR_KIND,
     MACHINE_ACTOR_KINDS,
-    PERMISSION_CATALOG,
     ROLE_ADMIN,
 )
 from itsm.identity.service import (
@@ -420,29 +419,22 @@ class AgentIntegrationService:
         if principal.kind != HUMAN_ACTOR_KIND:
             raise ValidationFailed("the conversational agent is available to signed-in people")
 
-    def _has_full_admin_policy(self, db: Session, principal: Principal) -> bool:
-        identity = IdentityService(db, self._settings)
-        actor = identity.resolve_actor(principal.actor_id)
-        if actor.kind != HUMAN_ACTOR_KIND:
-            return False
-        try:
-            from itsm.identity.models import IdentityRolePolicy
+    def _require_admin(
+        self,
+        db: Session,
+        principal: Principal,
+        resource: str,
+        permission: str = "system.providers",
+        *,
+        human_only: bool = False,
+    ) -> IdentityService:
+        """Use the canonical reserved-permission boundary, never a second role gate."""
+        from itsm.system.authorization import require_system_authority
 
-            rows = db.execute(
-                select(IdentityRolePolicy).where(IdentityRolePolicy.role_id == actor.role_id)
-            ).scalars()
-            granted = {(row.resource, row.operation) for row in rows}
-        except Exception:  # pragma: no cover - defensive only
-            return False
-        return all(tuple(code.split(".", 1)) in granted for code in PERMISSION_CATALOG)
-
-    def _require_admin(self, db: Session, principal: Principal, resource: str) -> IdentityService:
         identity = IdentityService(db, self._settings)
-        if principal.kind != HUMAN_ACTOR_KIND:
-            raise PermissionDenied("agent integration administration requires a signed-in person")
-        identity.authorize(principal, "config.integrations", resource=resource)
-        if not self._has_full_admin_policy(db, principal):
-            raise PermissionDenied("agent integration administration requires a full administrator")
+        if human_only and principal.kind != HUMAN_ACTOR_KIND:
+            raise PermissionDenied("installation changes require a signed-in installation owner")
+        require_system_authority(db, self._settings, principal, permission, resource)
         return identity
 
     def _instance(self, db: Session, instance_id: str) -> AgentInstance:
@@ -762,7 +754,7 @@ class AgentIntegrationService:
     # -------------------------------------------------------------- admin: instances
     def admin_snapshot(self, principal: Principal) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
             self._ensure_builtin(db)
             instances = list(
                 db.execute(select(AgentInstance).order_by(AgentInstance.created_at)).scalars()
@@ -870,7 +862,7 @@ class AgentIntegrationService:
 
     def create_instance(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._session() as db:
-            identity = self._require_admin(db, principal, "agent:integrations")
+            identity = self._require_admin(db, principal, "agent:integrations", human_only=True)
             engine = _label(payload.get("engine"), limit=32)
             if engine not in EXTERNAL_ENGINES:
                 raise ValidationFailed("engine must be one of: hermes, opencode")
@@ -885,7 +877,7 @@ class AgentIntegrationService:
         self, principal: Principal, instance_id: str, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         with self._session() as db:
-            identity = self._require_admin(db, principal, "agent:integrations")
+            identity = self._require_admin(db, principal, "agent:integrations", human_only=True)
             row = self._instance(db, instance_id)
             requested = payload.get("engine")
             if requested is not None and requested != row.engine:
@@ -904,7 +896,7 @@ class AgentIntegrationService:
         self, principal: Principal, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
             self._ensure_builtin(db)
             instance_id = payload.get("instanceId")
             if instance_id is None:
@@ -1835,7 +1827,7 @@ class AgentIntegrationService:
         self, principal: Principal, payload: Mapping[str, Any]
     ) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
         remote = self._target_remote(payload)
         target = self._target(payload)
         installer = self._installer_instance()
@@ -1879,7 +1871,7 @@ class AgentIntegrationService:
         if operation not in OPERATIONS:
             raise ValidationFailed("operation is not supported")
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
             instance = self._instance(db, str(payload.get("instanceId") or ""))
             if instance.engine not in INSTALLABLE_ENGINES:
                 raise ValidationFailed("the built-in instance has no external installation")
@@ -2086,7 +2078,7 @@ class AgentIntegrationService:
             if key in sanitized
         }
         with self._session() as db:
-            identity = self._require_admin(db, principal, "agent:integrations")
+            identity = self._require_admin(db, principal, "agent:integrations", human_only=True)
             row = self._installation_row(db, instance.id, target)
             runtime_binding = self._instance_runtime_binding(instance, target)
             if row is None:
@@ -2136,7 +2128,7 @@ class AgentIntegrationService:
         if len(encoded) > 512_000:
             raise ValidationFailed("receipt is too large")
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
             if installation_id is not None:
                 row = db.get(AgentInstallation, installation_id)
                 if row is None:
@@ -2546,7 +2538,7 @@ class AgentIntegrationService:
 
     def installation_request(self, principal: Principal, installation_id: str) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:integrations")
+            self._require_admin(db, principal, "agent:integrations", human_only=True)
             row = db.get(AgentInstallation, installation_id)
             if row is None:
                 raise NotFound("installation not found")
@@ -2563,7 +2555,7 @@ class AgentIntegrationService:
     # ------------------------------------------------------------------ modules
     def catalog_snapshot(self, principal: Principal) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:catalog")
+            self._require_admin(db, principal, "agent:catalog", permission="system.modules")
         catalog = self._catalog_instance()
         return {
             "skills": list(catalog.list_skills()),
@@ -2572,7 +2564,7 @@ class AgentIntegrationService:
 
     def list_modules(self, principal: Principal) -> dict[str, Any]:
         with self._session() as db:
-            self._require_admin(db, principal, "agent:catalog")
+            self._require_admin(db, principal, "agent:catalog", permission="system.modules")
         catalog = self._catalog_instance()
         return {"modules": list(catalog.list_modules())}
 
@@ -2596,7 +2588,7 @@ class AgentIntegrationService:
         if not isinstance(enabled, bool):
             raise ValidationFailed("enabled must be a boolean")
         with self._session() as db:
-            self._require_admin(db, principal, "agent:catalog")
+            self._require_admin(db, principal, "agent:catalog", permission="system.modules")
         catalog = self._catalog_instance()
         try:
             module = catalog.get_module(module_id)

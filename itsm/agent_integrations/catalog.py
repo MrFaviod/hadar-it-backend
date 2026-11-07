@@ -53,6 +53,9 @@ CAPABILITIES: Final[frozenset[str]] = frozenset(
         "relationships.write",
         "reports.generate",
         "reports.read",
+        "system.configure",
+        "system.operate",
+        "system.read",
     }
 )
 
