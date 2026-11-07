@@ -25,6 +25,8 @@ from itsm.agent_integrations.extensions import ExtensionRegistry, load_extension
 from itsm.agent_integrations.service import AgentIntegrationService
 from itsm.agents.api import create_agent_router
 from itsm.agents.runtime import AgentRuntime
+from itsm.ai_usage.api import create_agent_usage_router
+from itsm.ai_usage.service import AiUsageService
 from itsm.appearance import build_appearance_service, create_appearance_router
 from itsm.attachments.api import create_attachment_router
 from itsm.config import Settings, get_settings
@@ -181,6 +183,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
             extension_sync=getattr(extension_mount, "sync", None),
         )
         app.state.agent_integrations.initialize()
+        app.state.agent_usage = AiUsageService(settings, factory)
         app.state.system = SystemService(
             settings,
             factory,
@@ -370,6 +373,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
     api.include_router(create_directory_media_router())
     api.include_router(create_agent_router())
     api.include_router(create_agent_integrations_router())
+    api.include_router(create_agent_usage_router())
     api.include_router(create_system_router())
     api.include_router(create_identity_router())
     app.include_router(api)
