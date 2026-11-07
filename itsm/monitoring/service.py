@@ -894,6 +894,164 @@ class MonitoringService:
         )
         return {asset_id: int(count) for asset_id, count in rows}
 
+    def dashboard_devices(
+        self,
+        principal: Principal,
+        *,
+        period: str = "24h",
+        category: str | None = None,
+        site_id: str | None = None,
+    ) -> dict[str, Any]:
+        """Bounded full-scope device aggregate for the operations dashboard.
+
+        Unlike ``list_devices`` this intentionally reads every scoped asset (no
+        page) so the dashboard never derives installation totals from one page.
+        Prometheus is still queried in bounded chunks and every preset trend is
+        an aggregate of the same fixed availability query, never an invented
+        series. An unreachable source yields ``unknown`` states.
+        """
+        self._identity.authorize(principal, "assets.view", resource="monitoring:dashboard")
+        if period not in rules.PERIOD_PRESETS:
+            raise ValidationFailed("period must be one of 24h, 7d or 30d")
+        filters = [Asset.archived_at.is_(None)]
+        if category is not None:
+            cleaned_category = _text(category, "category", max_length=64)
+            if cleaned_category:
+                filters.append(Asset.category == cleaned_category)
+        if site_id is not None:
+            filters.append(Asset.site_id == _uuid(site_id, "siteId"))
+        assets = list(
+            self._session.scalars(
+                select(Asset).where(*filters).order_by(Asset.quick_code, Asset.id)
+            )
+        )
+        configs = {asset.id: self._effective(asset) for asset in assets}
+        pairs = [
+            (asset.id, configs[asset.id]["checkType"] or "")
+            for asset in assets
+            if configs[asset.id]["enabled"] and configs[asset.id].get("targetPresent")
+        ]
+        adapter = self._monitor_adapter() if self._settings.prometheus_url else None
+        states: dict[str, Mapping[str, Any]] = {}
+        adapter_error = False
+        if adapter is not None:
+            for start in range(0, len(pairs), rules.MAX_DEVICES):
+                chunk = pairs[start : start + rules.MAX_DEVICES]
+                try:
+                    states.update(adapter.current_states(chunk))
+                except MonitoringUnavailable:
+                    adapter_error = True
+                    logger.warning("monitoring.dashboard_source_unavailable")
+                    break
+        availability: dict[str, dict[str, Any]] = {}
+        for preset in rules.PERIOD_PRESETS:
+            availability[preset] = {"percent": None, "samples": 0}
+            if adapter is None or adapter_error:
+                continue
+            window = range_window(preset, now=self._now())
+            weighted = 0.0
+            samples = 0
+            failed = False
+            for start in range(0, len(pairs), rules.MAX_DEVICES):
+                chunk = pairs[start : start + rules.MAX_DEVICES]
+                try:
+                    result = adapter.page_availability(chunk, window)
+                except MonitoringUnavailable:
+                    adapter_error = True
+                    failed = True
+                    logger.warning("monitoring.dashboard_source_unavailable")
+                    break
+                for value in result.values():
+                    count = int(value.get("samples") or 0)
+                    if count:
+                        weighted += float(value.get("percent") or 0.0) * count
+                        samples += count
+            if not failed and samples:
+                availability[preset] = {
+                    "percent": round(weighted / samples, 3),
+                    "samples": samples,
+                }
+            elif failed:
+                availability[preset] = {"percent": None, "samples": 0}
+        alert_counts: dict[str, int] = {}
+        if assets:
+            alert_counts = {
+                asset_id: int(count)
+                for asset_id, count in self._session.execute(
+                    select(MonitoringAlert.asset_id, func.count())
+                    .where(
+                        MonitoringAlert.state.in_(ACTIVE_ALERT_STATES),
+                        MonitoringAlert.asset_id.in_([asset.id for asset in assets]),
+                    )
+                    .group_by(MonitoringAlert.asset_id)
+                )
+            }
+        items: list[dict[str, Any]] = []
+        latencies: list[float] = []
+        last_checks: list[str] = []
+        for asset in assets:
+            config = configs[asset.id]
+            state = states.get(asset.id)
+            raw_state, reason = self._device_state(
+                config, state, adapter_error=adapter_error
+            )
+            status = {
+                "up": "up",
+                "degraded": "degraded",
+                "down": "down",
+                "unmonitored": "unmonitored",
+            }.get(raw_state, "unknown")
+            if state is not None:
+                latency = state.get("latency")
+                if isinstance(latency, (int, float)):
+                    latencies.append(float(latency))
+                at = state.get("at")
+                if isinstance(at, str) and at:
+                    last_checks.append(at)
+            monitored = bool(config["enabled"] and config.get("targetPresent"))
+            items.append(
+                {
+                    "assetId": asset.id,
+                    "quickCode": asset.quick_code,
+                    "name": asset.name,
+                    "category": asset.category,
+                    "type": asset.type,
+                    "siteId": asset.site_id,
+                    "site": asset.site,
+                    "status": status,
+                    "reason": reason,
+                    "monitored": monitored,
+                    "uptimePct": availability[period]["percent"]
+                    if monitored and status not in {"unknown", "unmonitored"}
+                    else None,
+                    "latencyMs": state.get("latency") if state is not None else None,
+                    "lastCheckAt": state.get("at") if state is not None else None,
+                    "activeAlerts": alert_counts.get(asset.id, 0),
+                }
+            )
+        return {
+            "items": items,
+            "total": len(assets),
+            "prometheusConfigured": bool(self._settings.prometheus_url),
+            "sourceError": adapter_error,
+            "availability": {
+                "configured": bool(self._settings.prometheus_url),
+                "current": availability[period]["percent"],
+                "samples": [
+                    {
+                        "label": preset,
+                        "value": availability[preset]["percent"],
+                    }
+                    for preset in rules.PERIOD_PRESETS
+                ],
+                "samplesCount": availability[period]["samples"],
+                "lastCheckAt": max(last_checks) if last_checks else None,
+            },
+            "latency": {
+                "current": round(sum(latencies) / len(latencies), 3) if latencies else None
+            },
+        }
+
     def list_devices(
         self,
         principal: Principal,
