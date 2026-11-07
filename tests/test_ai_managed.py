@@ -1221,3 +1221,51 @@ def test_hermes_refuses_attachments_instead_of_inventing_a_field() -> None:
         assert "text prompts only" in str(refused.value)
 
     asyncio.run(run())
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "ITSM_AI_GATEWAY_TOKEN",
+        "itsm_ai_gateway_token",
+        "HOME",
+        "PATH",
+        "TMPDIR",
+        "XDG_CONFIG_HOME",
+        "XDG_DATA_HOME",
+        "XDG_STATE_HOME",
+        "XDG_CACHE_HOME",
+        "HERMES_HOME",
+        "HERMES_DASHBOARD_BASIC_AUTH_USERNAME",
+        "HERMES_DASHBOARD_BASIC_AUTH_PASSWORD",
+        "HERMES_DASHBOARD_BASIC_AUTH_SECRET",
+        "OPENCODE_CONFIG",
+        "OPENCODE_CONFIG_DIR",
+        "OPENCODE_CONFIG_CONTENT",
+        "OPENCODE_SERVER_PASSWORD",
+        "OPENCODE_PASSWORD",
+        "OPENCODE_TEST_HOME",
+        "OPENCODE_DISABLE_PROJECT_CONFIG",
+        "OPENCODE_DISABLE_CLAUDE_CODE",
+        "OPENCODE_DISABLE_CLAUDE_CODE_SKILLS",
+        "OPENCODE_DISABLE_MODELS_FETCH",
+        "LANG",
+        "LC_ALL",
+        "LC_CTYPE",
+        "TZ",
+    ],
+)
+def test_reserved_mcp_environment_is_rejected_before_launch(name: str):
+    with pytest.raises(ManagedEngineError, match="reserved"):
+        ManagedProfileInputs(
+            mcp_url="http://127.0.0.1:8000/mcp", mcp_token=MCP_TOKEN, mcp_token_env=name
+        )
+
+
+def test_dedicated_mcp_environment_remains_supported():
+    inputs = ManagedProfileInputs(
+        mcp_url="http://127.0.0.1:8000/mcp",
+        mcp_token=MCP_TOKEN,
+        mcp_token_env="ITSM_CUSTOM_MCP_TOKEN",
+    )
+    assert inputs.mcp_token_env == "ITSM_CUSTOM_MCP_TOKEN"

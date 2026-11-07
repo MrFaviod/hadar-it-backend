@@ -1959,7 +1959,7 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
     service = build_service(client, catalog)
     expected = "Basic " + base64.b64encode(b"opencode:engine-password").decode()
     seen: list[tuple[str, str | None]] = []
-    state: dict[str, Any] = {"agent_ready": True, "session": None}
+    state: dict[str, Any] = {"agent_ready": True, "session": None, "saved": []}
     agent_permissions = [
         {"action": "*", "resource": "*", "effect": "allow"},
         {"action": "read", "resource": "*.env", "effect": "ask"},
@@ -2058,7 +2058,7 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
             state["session"] = None
             return httpx.Response(200, json=True)
         if request.url.path == "/api/permission/saved":
-            return httpx.Response(200, json={"data": []})
+            return httpx.Response(200, json={"data": state["saved"]})
         return httpx.Response(404)
 
     real_client = httpx.AsyncClient
@@ -2145,6 +2145,42 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
         ("/api/permission/saved", expected),
         ("/api/skill", expected),
     ]
+
+    # Fresh independent inspection must evaluate the final effective grants.
+    for later in (
+        {"action": "skill", "resource": "itsm-inventory", "effect": "deny"},
+        {"action": "itsm_*", "resource": "*", "effect": "deny"},
+    ):
+        agent_permissions.append(later)
+        assert (
+            asyncio.run(
+                service._opencode_profile_safety(instance, target, mcp, ["itsm-inventory"], receipt)
+            )
+            is None
+        ), later
+        agent_permissions.pop()
+    for saved in (
+        [{"action": "*", "resource": "*", "effect": "deny"}],
+        [{"action": "skill", "resource": "itsm-inventory", "effect": "deny"}],
+        [{"action": "read", "resource": "*", "effect": "ask"}],
+        [{"unexpected": True}],
+        [{"action": "*", "resource": "*", "effect": "allow"}],
+    ):
+        state["saved"] = saved
+        assert (
+            asyncio.run(
+                service._opencode_profile_safety(instance, target, mcp, ["itsm-inventory"], receipt)
+            )
+            is None
+        ), saved
+    state["saved"] = [{"action": "read", "resource": "*", "effect": "deny"}]
+    assert (
+        asyncio.run(
+            service._opencode_profile_safety(instance, target, mcp, ["itsm-inventory"], receipt)
+        )
+        is not None
+    )
+    state["saved"] = []
 
     # An uppercase server/action grant is not the installer's managed contract.
     agent_permissions[3] = {"action": "ITSM_*", "resource": "*", "effect": "allow"}
@@ -3002,3 +3038,18 @@ def test_managed_session_switching_attributes_each_turn_to_the_used_scope(
         f"Bearer {PERSONAL_KEY}",
         f"Bearer {GLOBAL_KEY}",
     ]
+
+
+def test_inventory_skill_distinguishes_import_apply_from_bulk_preview():
+    from pathlib import Path
+
+    package = (
+        Path(__file__).parents[1] / "itsm/agent_integrations/skills/itsm-inventory/SKILL.md"
+    ).read_text()
+    table = package.split("## Decision Gates", 1)[1].split("## Execution Steps", 1)[0]
+    import_row = next(line for line in table.splitlines() if "Spreadsheet import" in line)
+    assert "get_inventory_operation" in import_row
+    assert "resolve_import_conflict" in import_row
+    assert "apply_inventory_operation" in import_row
+    assert "preview_bulk_operation" not in import_row
+    assert "Exact bulk edit preview" in table

@@ -55,7 +55,8 @@ Load when the user asks to find, create, update, copy, assign, return, transfer,
 | Several edits atomically | `batch_update_assets` |
 | New asset from an existing one | `clone_asset` |
 | Responsibility change | `assign_asset`, `return_asset` or `transfer_asset` |
-| Spreadsheet import | `prepare_inventory_import`, then `preview_bulk_operation` |
+| Spreadsheet import | `prepare_inventory_import`, inspect with `get_inventory_operation`, fix rows with `resolve_import_conflict`, obtain approval outside the tools, then `apply_inventory_operation` |
+| Exact bulk edit preview | `preview_bulk_operation` for supplied `asset_ids` and `changes`; it is a separate approval preview, not an import or an apply |
 
 ## Execution Steps
 1. Search or read the asset and confirm its permanent id.
