@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import re
 from collections.abc import AsyncIterator, Mapping
 from typing import Any
@@ -29,9 +30,9 @@ from itsm.agents.engines import (
     _error_text,
     _HTTPEngine,
     _money,
-    _number,
     _tool_content_text,
 )
+from itsm.agents.usage import genuine_count, measured_usage, unavailable_usage
 
 _RPC_TIMEOUT = 30.0
 _CONNECT_TIMEOUT = 10.0
@@ -59,35 +60,115 @@ def _native_error(error: object) -> EngineError:
     return EngineError("upstream", text, retryable=bool(code == -32000))
 
 
-def _usage_event(payload: Mapping[str, Any]) -> dict[str, object] | None:
-    usage = payload.get("usage")
-    if not isinstance(usage, Mapping):
-        usage = payload
-    input_tokens = _number(usage.get("input"))
-    if input_tokens is None:
-        input_tokens = _number(usage.get("input_tokens"))
-    output_tokens = _number(usage.get("output"))
-    if output_tokens is None:
-        output_tokens = _number(usage.get("output_tokens"))
-    if input_tokens is None or output_tokens is None:
+_USAGE_KEYS = ("input", "output", "cache_read", "cache_write", "reasoning", "total")
+_TOP_LEVEL_USAGE = {
+    "input": "input_tokens",
+    "output": "output_tokens",
+    "cache_read": "cache_read_tokens",
+    "cache_write": "cache_write_tokens",
+    "reasoning": "reasoning_tokens",
+    "total": "total_tokens",
+}
+
+
+def _cumulative_counters(payload: Mapping[str, Any]) -> dict[str, int | None] | None:
+    """Read one cumulative session snapshot without inventing absent counters."""
+
+    if any(payload.get(key) is not None for key in _TOP_LEVEL_USAGE.values()):
+        raw = {key: payload.get(alias) for key, alias in _TOP_LEVEL_USAGE.items()}
+    else:
+        nested = payload.get("usage")
+        source = nested if isinstance(nested, Mapping) else payload
+        raw = {
+            "input": source.get("input", source.get("input_tokens")),
+            "output": source.get("output", source.get("output_tokens")),
+            "cache_read": None,
+            "cache_write": None,
+            "reasoning": source.get("reasoning"),
+            "total": source.get("total", source.get("total_tokens")),
+        }
+    try:
+        counters = {key: genuine_count(raw[key]) for key in _USAGE_KEYS}
+    except ValueError:
         return None
-    event: dict[str, object] = {
-        "type": "usage",
-        "inputTokens": input_tokens,
-        "outputTokens": output_tokens,
-        "source": "reported",
-    }
-    cost = _money(usage.get("cost_usd"))
-    if cost is not None:
-        event["cost"] = cost
-    return event
+    if all(value is None for value in counters.values()):
+        return None
+    return counters
 
 
-def _message_complete(payload: Mapping[str, Any]) -> tuple[dict[str, object] | None, bool, bool]:
-    """Return ``(usage, cancelled, failed)`` for a terminal message event."""
+def _usage_cost(payload: Mapping[str, Any] | None) -> float | None:
+    if payload is None:
+        return None
+    nested = payload.get("usage")
+    source = nested if isinstance(nested, Mapping) else payload
+    for key in ("cost_usd", "cost"):
+        value = _money(source.get(key))
+        if value is not None and math.isfinite(value) and value >= 0:
+            return value
+    return None
+
+
+def _usage_rank(payload: Mapping[str, Any]) -> int:
+    """Count known counters so a richer snapshot wins over a partial TUI view."""
+
+    counters = _cumulative_counters(payload)
+    if counters is None:
+        return 0
+    return sum(value is not None for value in counters.values())
+
+
+def _turn_usage(
+    baseline: Mapping[str, int | None] | None,
+    final: Mapping[str, int | None] | None,
+    payload: Mapping[str, Any] | None,
+    cost_payload: Mapping[str, Any] | None = None,
+) -> dict[str, object]:
+    """Convert cumulative snapshots into one turn delta or explicit unknown."""
+
+    if baseline is None or final is None:
+        return unavailable_usage(
+            source="engine" if final is not None else "none",
+            output_includes_reasoning=True,
+        ).event()
+    delta: dict[str, int | None] = {}
+    comparable = False
+    for key in _USAGE_KEYS:
+        before = baseline.get(key)
+        after = final.get(key)
+        if before is None or after is None:
+            delta[key] = None
+            continue
+        if after < before:
+            return unavailable_usage(
+                source="engine", output_includes_reasoning=True
+            ).event()
+        comparable = True
+        delta[key] = after - before
+    if not comparable:
+        return unavailable_usage(
+            source="engine", output_includes_reasoning=True
+        ).event()
+    return measured_usage(
+        input_tokens=delta["input"],
+        output_tokens=delta["output"],
+        cache_read_tokens=delta["cache_read"],
+        cache_write_tokens=delta["cache_write"],
+        reasoning_tokens=delta["reasoning"],
+        total_tokens=delta["total"],
+        total_source="provider" if delta["total"] is not None else None,
+        input_includes_cache=False,
+        output_includes_reasoning=True,
+        cost=_usage_cost(cost_payload if cost_payload is not None else payload),
+    ).event()
+
+
+def _message_complete(
+    payload: Mapping[str, Any],
+) -> tuple[Mapping[str, Any] | None, bool, bool]:
+    """Return ``(cumulative_usage_payload, cancelled, failed)`` for a terminal event."""
 
     status = payload.get("status")
-    usage = _usage_event(payload)
+    usage = payload if _cumulative_counters(payload) is not None else None
     if status == "interrupted":
         return usage, True, False
     if status == "error" or payload.get("failure_reason"):
@@ -117,6 +198,7 @@ class HermesEngine(_HTTPEngine):
         self._runtime_session: str | None = None
         self._needs_history: set[str] = set()
         self._cancel_requested: set[str] = set()
+        self._usage_totals: dict[str, dict[str, int | None]] = {}
         self._rpc_id = 0
 
     @property
@@ -287,6 +369,7 @@ class HermesEngine(_HTTPEngine):
             )
         self._live[stored] = runtime
         self._needs_history.add(stored)
+        self._usage_totals[stored] = {key: 0 for key in _USAGE_KEYS}
         self._queue(runtime)
         return stored
 
@@ -303,7 +386,15 @@ class HermesEngine(_HTTPEngine):
         if not isinstance(session_id, str) or not session_id:
             raise EngineError("protocol", "session identifier is required", retryable=False)
         await self._connect()
+        was_live = session_id in self._live
         runtime = await self._ensure_session(session_id)
+        if not was_live:
+            self._usage_totals.pop(session_id, None)
+        baseline = self._usage_totals.get(session_id)
+        if baseline is None:
+            baseline = await self._session_usage(runtime)
+            if baseline is not None:
+                self._usage_totals[session_id] = baseline
         queue = self._queue(runtime)
         self._cancel_requested.discard(session_id)
         if model:
@@ -329,7 +420,8 @@ class HermesEngine(_HTTPEngine):
         failed = False
         text_emitted = False
         terminal_error: str | None = None
-        pending_usage: dict[str, object] | None = None
+        usage_payload: Mapping[str, Any] | None = None
+        cost_payload: Mapping[str, Any] | None = None
         while True:
             item = await queue.get()
             if item is None:
@@ -345,10 +437,14 @@ class HermesEngine(_HTTPEngine):
                     yield {"type": "delta", "text": fragment}
                 continue
             if kind == "message.complete":
-                usage, cancelled, failed = _message_complete(payload)
-                usage = usage or pending_usage
-                if usage is not None:
-                    yield usage
+                completion, cancelled, failed = _message_complete(payload)
+                if completion is not None:
+                    if usage_payload is None or _usage_rank(completion) > _usage_rank(
+                        usage_payload
+                    ):
+                        usage_payload = completion
+                    if _usage_cost(completion) is not None:
+                        cost_payload = completion
                 text = payload.get("text")
                 if isinstance(text, str) and text and not text_emitted:
                     yield {"type": "delta", "text": text}
@@ -377,7 +473,8 @@ class HermesEngine(_HTTPEngine):
                     yield event
                 continue
             if kind == "session.usage":
-                pending_usage = _usage_event(payload)
+                if _cumulative_counters(payload) is not None:
+                    usage_payload = payload
                 continue
             if kind in {"session.error", "error"}:
                 failed = True
@@ -389,6 +486,14 @@ class HermesEngine(_HTTPEngine):
                     or _error_text(payload)
                 )
                 break
+        final_usage = (
+            _cumulative_counters(usage_payload) if usage_payload is not None else None
+        )
+        if final_usage is not None:
+            self._usage_totals[session_id] = final_usage
+        else:
+            self._usage_totals.pop(session_id, None)
+        yield _turn_usage(baseline, final_usage, usage_payload, cost_payload)
         if terminal_error is not None:
             yield {
                 "type": "error",
@@ -627,6 +732,15 @@ class HermesEngine(_HTTPEngine):
         self._live[session_id] = runtime
         self._queue(runtime)
         return runtime
+
+    async def _session_usage(self, runtime: str) -> dict[str, int | None] | None:
+        """Read the native pre-turn cumulative baseline; unknown when unsupported."""
+
+        try:
+            payload = await self._call("session.stats", {"session_id": runtime})
+        except EngineError:
+            return None
+        return _cumulative_counters(payload)
 
     def _queue(self, runtime: str) -> asyncio.Queue[tuple[str, Mapping[str, Any]] | None]:
         queue = self._queues.get(runtime)
