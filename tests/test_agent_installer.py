@@ -729,28 +729,52 @@ def opencode_runtime_evidence(
     default_agent: str = "itsm",
     directory: str | None = None,
 ) -> dict[str, Any]:
+    parsed = json_config(workspace / "opencode.json")
     if permissions is None:
-        parsed = json_config(workspace / "opencode.json")
         permissions = parsed["agents"]["itsm"]["permissions"]
+    selected = [
+        rule["resource"]
+        for rule in permissions
+        if rule.get("action") == "skill" and rule.get("resource") != "*"
+    ]
     return {
         "source": "opencode:http://127.0.0.1:1",
         "verified": True,
         "configDigest": receipt["configDigest"],
         "targetPath": str(workspace),
         "location": {"directory": directory or str(workspace)},
-        "agent": {"id": "itsm", "name": "itsm", "mode": "primary", "permissions": permissions},
+        "agent": {
+            "id": "itsm",
+            "name": "itsm",
+            "mode": "primary",
+            "hidden": False,
+            "permissions": permissions,
+        },
         "config": [
-            {"type": "directory", "path": str(workspace)},
+            {"type": "directory", "path": str(workspace / ".opencode")},
             {
                 "type": "document",
                 "path": str(workspace / "opencode.json"),
                 "info": {"default_agent": default_agent},
             },
         ],
+        "skills": {
+            "location": {"directory": directory or str(workspace)},
+            "data": [
+                {
+                    "id": name,
+                    "name": name,
+                    "path": str(workspace / ".opencode" / "skills" / name / "SKILL.md"),
+                }
+                for name in selected
+            ]
+            + [{"id": "opencode.skill", "name": "opencode", "path": "/builtin/opencode.md"}],
+        },
         "savedPermissions": saved or [],
         "checks": [
             {"name": "runtime.agent", "status": "pass", "detail": "agent.itsm inspected"},
             {"name": "runtime.saved", "status": "pass", "detail": "saved permissions inspected"},
+            {"name": "runtime.skills", "status": "pass", "detail": "skills inspected"},
         ],
     }
 
@@ -799,7 +823,6 @@ def test_opencode_runtime_effective_permissions_follow_last_match(
     )
     projected = json.loads(json.dumps(evidence))
     projected["agent"].pop("name")
-    projected["config"][1].pop("path")
     verified = run(
         installer.apply(
             target,
@@ -1051,7 +1074,7 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
         },
         "checks": [{"name": "runtime.profile", "status": "pass", "detail": "profile bound"}],
     }
-    verified = run(
+    unverified = run(
         installer.apply(
             target,
             mcp=mcp_spec(mcp_server),
@@ -1060,8 +1083,14 @@ def test_hermes_runtime_evidence_requires_live_profile_binding(
             profile_inspector=evidence_inspector(evidence),
         )
     )
-    assert verified["status"] == "verified"
-    assert verified["profileSafetyVerified"] is True
+    assert unverified["status"] == "configured"
+    assert unverified["profileSafetyVerified"] is False
+    detail = next(
+        item["detail"]
+        for item in unverified["checks"]
+        if item["name"] == "profile.safety"
+    )
+    assert "unavailable" in detail.lower()
 
     yaml_only = dict(evidence)
     yaml_only.pop("runtime")
