@@ -108,7 +108,18 @@ class AppearanceService:
         state = self._state(session)
         if state is None or not isinstance(state.active, dict):
             return deepcopy(self._builtins()[GENERIC_ID]), GENERIC_ID, None
-        return deepcopy(state.active), state.active_id, state.previous_id
+        document = deepcopy(state.active)
+        # Upgrade only untouched legacy built-ins at presentation time. Custom
+        # snapshots, even with a familiar name, remain installation-owned.
+        builtin = self._builtins().get(state.active_id)
+        if builtin is not None:
+            legacy = deepcopy(builtin)
+            legacy["branding"]["appName"] = "Asset Manager"
+            if state.active_id == GENERIC_ID:
+                legacy["name"] = "Asset Manager"
+            if document == legacy:
+                document = deepcopy(builtin)
+        return document, state.active_id, state.previous_id
 
     def _envelope(self, session: Session) -> dict[str, Any]:
         active, active_id, previous_id = self._active(session)

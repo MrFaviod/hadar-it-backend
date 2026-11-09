@@ -270,7 +270,7 @@ def test_public_identity_and_graphic_routes_work_before_login(catalog: Catalog) 
         assert identity["activeId"] == "generic"
         assert identity["previousId"] is None
         assert identity["builtinIds"] == ["generic", "blue", "forest"]
-        assert identity["active"]["branding"]["appName"] == "Asset Manager"
+        assert identity["active"]["branding"]["appName"] == "Hadar IT"
         prefix = catalog.settings.api_prefix
         logo = client.get(f"{prefix}/appearance/assets/logo")
         assert logo.status_code == 200

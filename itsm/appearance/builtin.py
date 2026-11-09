@@ -1,7 +1,7 @@
 """Immutable original appearance presets and their neutral built-in artwork.
 
 The generic preset is always restorable and can never be edited or deleted.
-Its logo/favicon are neutral Asset Manager artwork owned by the backend so an
+Its logo/favicon are neutral Hadar IT artwork owned by the backend so an
 exported package is self-contained instead of pointing at frontend paths.
 """
 
@@ -16,7 +16,7 @@ BUILTIN_IDS: Final[tuple[str, ...]] = ("generic", "blue", "forest")
 _LOGO_SVG: Final[bytes] = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" '
     b'aria-labelledby="title">\n'
-    b'  <title id="title">Asset Manager</title>\n'
+    b'  <title id="title">Hadar IT</title>\n'
     b'  <path d="M24 4 43 14.5 24 25 5 14.5 24 4Z" fill="#7bd3ca"/>\n'
     b'  <path d="m5 22 19 10.5L43 22v6L24 38.5 5 28v-6Z" fill="#2e9e97"/>\n'
     b'  <path d="m5 33 19 10.5L43 33v5.5L24 49 5 38.5V33Z" fill="#b8e5df"/>\n'
@@ -27,7 +27,7 @@ _LOGO_SVG: Final[bytes] = (
 _FAVICON_SVG: Final[bytes] = (
     b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
     b'aria-labelledby="title">\n'
-    b'  <title id="title">Asset Manager</title>\n'
+    b'  <title id="title">Hadar IT</title>\n'
     b'  <rect width="64" height="64" rx="15" fill="#0c2333"/>\n'
     b'  <path d="M32 12 52 23 32 34 12 23l20-11Z" fill="#7bd3ca"/>\n'
     b'  <path d="m12 31 20 11 20-11v6L32 48 12 37v-6Z" fill="#2e9e97"/>\n'
@@ -57,7 +57,7 @@ def builtin_presets(api_prefix: str) -> dict[str, dict[str, Any]]:
     logo = builtin_asset_url(api_prefix, "logo")
     favicon = builtin_asset_url(api_prefix, "favicon")
     branding = {
-        "appName": "Asset Manager",
+        "appName": "Hadar IT",
         "organizationName": "Operaciones TI",
         "logo": logo,
         "logoDark": "",
@@ -66,7 +66,7 @@ def builtin_presets(api_prefix: str) -> dict[str, dict[str, Any]]:
     }
     generic = {
         "id": "generic",
-        "name": "Asset Manager",
+        "name": "Hadar IT",
         "version": 1,
         "description": "Identidad original · Siempre disponible",
         "branding": branding,

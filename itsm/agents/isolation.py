@@ -211,7 +211,8 @@ def is_privileged_human(db: Session, settings: Settings, principal: Principal) -
     identity is reloaded and a deactivated or downgraded account loses access on
     its next request, even with an existing authenticated browser session.
     """
-    if principal.kind != HUMAN_ACTOR_KIND:
+    # A bearer ceiling never delegates the owner's ambient runtime privilege.
+    if principal.kind != HUMAN_ACTOR_KIND or principal.api_key_id or principal.scopes:
         return False
     actor = IdentityService(db, settings).resolve_actor(principal.actor_id)
     return actor.kind == HUMAN_ACTOR_KIND and actor.role_id in PRIVILEGED_ROLES

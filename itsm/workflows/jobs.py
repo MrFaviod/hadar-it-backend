@@ -34,6 +34,7 @@ def _executor_payload(principal: Any, credential_digest: str | None) -> dict[str
         "executionId": principal.execution_id,
         "authorizationRef": principal.authorization_ref,
         "sessionId": principal.session_id,
+        "apiKeyId": principal.api_key_id,
         "credentialDigest": credential_digest,
     }
 
@@ -193,6 +194,7 @@ def execute_job(session: Any, settings: Any, operation_id: str) -> dict[str, Any
             scopes=executor.get("scopes") or (),
             execution_id=executor.get("executionId"),
             authorization_ref=executor.get("authorizationRef"),
+            api_key_id=executor.get("apiKeyId"),
         )
         _assert_executor_authority(session, principal, executor)
         source = operation.payload.get("source")

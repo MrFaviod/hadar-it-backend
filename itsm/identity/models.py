@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, UniqueConstraint
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, String, Text, UniqueConstraint
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 from itsm.identity.clock import utcnow
@@ -128,6 +128,26 @@ class IdentityCredential(IdentityBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class IdentityApiKey(IdentityBase):
+    """Creator-bound personal key; the immutable permission ceiling is JSON text."""
+
+    __tablename__ = "identity_api_keys"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True)
+    identity_id: Mapped[str] = mapped_column(
+        String(36),
+        ForeignKey("identity_identities.id", ondelete="CASCADE"),
+        nullable=False,
+        index=True,
+    )
+    token_digest: Mapped[str] = mapped_column(String(64), nullable=False, unique=True)
+    label: Mapped[str] = mapped_column(String(64), nullable=False)
+    permissions_json: Mapped[str] = mapped_column(Text, nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

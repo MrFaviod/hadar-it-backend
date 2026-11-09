@@ -8,6 +8,7 @@ subsystem (API, Pydantic AI, FastMCP) never asserts its own role or identity.
 
 from __future__ import annotations
 
+import json
 import re
 import secrets
 from collections.abc import Callable, Iterable
@@ -36,6 +37,7 @@ from itsm.identity.hashing import (
 )
 from itsm.identity.models import (
     Identity,
+    IdentityApiKey,
     IdentityAuditEvent,
     IdentityCredential,
     IdentityLoginAttempt,
@@ -61,6 +63,8 @@ from itsm.identity.policy import PolicyEngine
 USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 ATTEMPT_RETENTION = timedelta(hours=24)
 MACHINE_TOKEN_PREFIX = "itsm_mk_"
+PERSONAL_TOKEN_PREFIX = "itsm_pk_"
+API_KEY_DEFAULT_LIFETIME = timedelta(days=90)
 SESSION_MINUTES_MIN = 5
 SESSION_MINUTES_MAX = 1440
 AUDIT_PAGE_MAX = 200
@@ -187,6 +191,7 @@ class Principal:
     execution_id: str | None = None
     authorization_ref: str | None = None
     session_id: str | None = None
+    api_key_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -522,11 +527,24 @@ class IdentityService:
         return effective
 
     def _persisted_permissions(self, principal: Principal) -> frozenset[str]:
-        """Effective permissions the caller really holds, read from the database."""
-        identity = self._session.get(Identity, principal.actor_id)
-        if identity is None:
+        """Live actor grants intersected with an immutable personal-key ceiling."""
+        identity = self._session.get(Identity, principal.actor_id, populate_existing=True)
+        if identity is None or not identity.active:
             return frozenset()
-        return self._effective_permissions(identity, principal.scopes)
+        effective = self._effective_permissions(identity, principal.scopes)
+        if principal.api_key_id is not None:
+            key = self._session.get(IdentityApiKey, principal.api_key_id, populate_existing=True)
+            if (
+                key is None
+                or key.identity_id != identity.id
+                or identity.actor_kind != HUMAN_ACTOR_KIND
+                or key.revoked_at is not None
+                or (key.expires_at is not None and as_utc(key.expires_at) <= self._now())
+            ):
+                return frozenset()
+            # Empty means no grants, unlike legacy machine/internal scopes.
+            effective &= frozenset(json.loads(key.permissions_json))
+        return effective
 
     def _assert_permission_ceiling(
         self,
@@ -590,7 +608,7 @@ class IdentityService:
             and identity.active
             and is_known_permission(permission, self._session)
         ):
-            allowed = permission in self._effective_permissions(identity, principal.scopes)
+            allowed = permission in self._persisted_permissions(principal)
             if (
                 allowed
                 and identity.actor_kind in MACHINE_ACTOR_KINDS
@@ -897,6 +915,153 @@ class IdentityService:
         self._session.commit()
         return validated
 
+    # -------------------------------------------------------- personal keys
+    def _require_key_owner(self, principal: Principal) -> Identity:
+        """Only a live human browser session can administer its own credentials."""
+        identity = self._session.get(Identity, principal.actor_id, populate_existing=True)
+        session = (
+            self._session.get(IdentitySession, principal.session_id, populate_existing=True)
+            if principal.session_id
+            else None
+        )
+        if (
+            identity is None
+            or not identity.active
+            or identity.actor_kind != HUMAN_ACTOR_KIND
+            or principal.api_key_id is not None
+            or session is None
+            or session.identity_id != identity.id
+            or session.revoked_at is not None
+            or as_utc(session.expires_at) <= self._now()
+        ):
+            raise PermissionDenied("API key management requires a live human cookie session")
+        return identity
+
+    @staticmethod
+    def _api_key_view(key: IdentityApiKey) -> dict[str, Any]:
+        return {
+            "id": key.id,
+            "label": key.label,
+            "permissions": sorted(json.loads(key.permissions_json)),
+            "createdAt": as_utc(key.created_at).isoformat(),
+            "expiresAt": as_utc(key.expires_at).isoformat() if key.expires_at else None,
+            "revokedAt": as_utc(key.revoked_at).isoformat() if key.revoked_at else None,
+        }
+
+    def issue_api_key(
+        self,
+        principal: Principal,
+        *,
+        label: str,
+        permissions: Iterable[str] | None = None,
+        expires_at: datetime | None,
+    ) -> dict[str, Any]:
+        """Snapshot the current ceiling and return the secret exactly once."""
+        identity = self._require_key_owner(principal)
+        label = label.strip()
+        if not label or len(label) > 64:
+            raise ValidationFailed("API key label must contain 1 to 64 characters")
+        now = self._now()
+        if expires_at is not None:
+            if expires_at.tzinfo is None or expires_at.utcoffset() is None:
+                raise ValidationFailed("API key expiry must include a timezone")
+            expires_at = as_utc(expires_at)
+            if expires_at <= now:
+                raise ValidationFailed("API key expiry must be in the future")
+        current = self._persisted_permissions(principal)
+        ceiling = (
+            current if permissions is None else frozenset(self._validate_permissions(permissions))
+        )
+        if not ceiling <= current:
+            raise PermissionDenied("API key permissions exceed your current permissions")
+        token = PERSONAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
+        key = IdentityApiKey(
+            id=str(uuid4()),
+            identity_id=identity.id,
+            token_digest=hash_token(token),
+            label=label,
+            permissions_json=json.dumps(sorted(ceiling)),
+            created_at=now,
+            expires_at=expires_at,
+        )
+        self._session.add(key)
+        self.record_operation(principal, action="auth.api_key_issued", resource=f"api-key:{key.id}")
+        return {**self._api_key_view(key), "token": token}
+
+    def list_api_keys(self, principal: Principal) -> dict[str, Any]:
+        identity = self._require_key_owner(principal)
+        keys = self._session.scalars(
+            select(IdentityApiKey)
+            .where(IdentityApiKey.identity_id == identity.id)
+            .order_by(IdentityApiKey.created_at, IdentityApiKey.id)
+        )
+        return {"items": [self._api_key_view(key) for key in keys]}
+
+    def revoke_api_key(self, principal: Principal, key_id: str) -> dict[str, Any]:
+        identity = self._require_key_owner(principal)
+        key = self._session.scalar(
+            select(IdentityApiKey)
+            .where(
+                IdentityApiKey.id == key_id,
+                IdentityApiKey.identity_id == identity.id,
+            )
+            .execution_options(populate_existing=True)
+        )
+        if key is None:
+            raise NotFound("API key not found")
+        if key.revoked_at is None:
+            key.revoked_at = self._now()
+            self.record_operation(
+                principal, action="auth.api_key_revoked", resource=f"api-key:{key.id}"
+            )
+        return self._api_key_view(key)
+
+    def _authenticate_api_key(
+        self,
+        token: str,
+        *,
+        execution_id: str | None,
+        authorization_ref: str | None,
+    ) -> AuthContext:
+        key = self._session.scalar(
+            select(IdentityApiKey)
+            .where(
+                IdentityApiKey.token_digest == hash_token(token),
+            )
+            .execution_options(populate_existing=True)
+        )
+        identity = (
+            self._session.get(Identity, key.identity_id, populate_existing=True) if key else None
+        )
+        if (
+            key is None
+            or key.revoked_at is not None
+            or (key.expires_at is not None and as_utc(key.expires_at) <= self._now())
+            or identity is None
+            or not identity.active
+            or identity.actor_kind != HUMAN_ACTOR_KIND
+        ):
+            raise AuthenticationFailed(
+                "authentication required", key="api.identity.authentication_required"
+            )
+        principal = Principal(
+            actor_id=identity.id,
+            kind=identity.actor_kind,
+            username=identity.username,
+            display_name=identity.name,
+            role_id=identity.role_id,
+            scopes=frozenset(json.loads(key.permissions_json)),
+            api_key_id=key.id,
+            execution_id=execution_id,
+            authorization_ref=authorization_ref,
+        )
+        return AuthContext(
+            principal=principal,
+            permissions=self._persisted_permissions(principal),
+            csrf_token=None,
+            session_minutes=self.session_minutes(),
+        )
+
     # ------------------------------------------------------- machine identity
     def authenticate_token(
         self,
@@ -905,7 +1070,13 @@ class IdentityService:
         execution_id: str | None = None,
         authorization_ref: str | None = None,
     ) -> AuthContext:
-        """Machine bearer authentication using a stored token digest."""
+        """Authenticate existing machine bearers or creator-bound personal keys."""
+        if token and token.startswith(PERSONAL_TOKEN_PREFIX):
+            return self._authenticate_api_key(
+                token,
+                execution_id=execution_id,
+                authorization_ref=authorization_ref,
+            )
         if not token:
             raise AuthenticationFailed(
                 "authentication required", key="api.identity.authentication_required"
@@ -964,6 +1135,7 @@ class IdentityService:
         scopes: Iterable[str] = (),
         execution_id: str | None = None,
         authorization_ref: str | None = None,
+        api_key_id: str | None = None,
     ) -> Principal:
         """Resolve a principal for tool callers (Pydantic AI, FastMCP, CLI)."""
         identity = self._session.get(Identity, identity_id)
@@ -979,6 +1151,7 @@ class IdentityService:
             role_id=identity.role_id,
             delegated_by=identity.delegated_by_id,
             scopes=frozenset(scopes),
+            api_key_id=api_key_id,
             execution_id=execution_id,
             authorization_ref=authorization_ref,
         )
@@ -1742,10 +1915,7 @@ class IdentityService:
 
     def effective_permissions(self, principal: Principal) -> frozenset[str]:
         """Live effective grants for a resolved principal; never mutates state."""
-        identity = self._session.get(Identity, principal.actor_id)
-        if identity is None or not identity.active:
-            return frozenset()
-        return self._effective_permissions(identity, principal.scopes)
+        return self._persisted_permissions(principal)
 
     def grant_extension_permissions(
         self,

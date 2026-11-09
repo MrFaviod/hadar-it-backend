@@ -84,6 +84,7 @@ from itsm.search.indexer import install_search_sync
 from itsm.system.api import create_system_router
 from itsm.system.service import SystemService
 from itsm.tasks import TaskQueue, TaskStorageUnavailable, create_task_queue
+from itsm.tasks.access import authorize_task_read
 from itsm.workflows.api import create_workflow_router
 
 TASK_ID_PATTERN = r"^[A-Za-z0-9_-]{8,64}$"
@@ -523,6 +524,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         identity: IdentityService = Depends(get_identity_service),
     ) -> TaskAcceptedResponse:
         """Queue the bounded echo demo task; no caller-defined task names."""
+        identity.authorize(context.principal, "assets.view", resource="tasks:demo")
         if len(payload.message) > settings.demo_message_max_length:
             raise HTTPException(
                 status_code=422,
@@ -560,8 +562,11 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         request: Request,
         task_id: str = Path(pattern=TASK_ID_PATTERN),
         context: AuthContext = Depends(authenticated_actor),
+        identity: IdentityService = Depends(get_identity_service),
     ) -> TaskStatusResponse:
-        """Read the stored task state without consuming the result."""
+        """Read an owned task, or use current unscoped human administration."""
+        with request.app.state.session_factory() as session:
+            authorize_task_read(session, identity, context.principal, task_id)
         try:
             status = request.app.state.task_queue.get_status(task_id)
         except TaskStorageUnavailable as exc:

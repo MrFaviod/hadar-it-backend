@@ -499,7 +499,13 @@ class ExtensionHostService:
 
     def _require_human_superadmin(self, session: Session, principal: Principal) -> Identity:
         identity = session.get(Identity, principal.actor_id)
-        if not _is_human_superadmin(identity) or identity.id != principal.actor_id:
+        # Lifecycle approval creates deferred owner authority, not key authority.
+        if (
+            not _is_human_superadmin(identity)
+            or identity.id != principal.actor_id
+            or principal.api_key_id
+            or principal.scopes
+        ):
             raise PermissionDenied(
                 "extension installation requires a persisted human Superadmin",
                 key="api.extensions.installation_requires_human_superadmin",

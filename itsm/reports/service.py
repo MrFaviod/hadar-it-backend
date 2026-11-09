@@ -796,6 +796,7 @@ class ReportService:
             "executionId": principal.execution_id,
             "authorizationRef": principal.authorization_ref,
             "sessionId": principal.session_id,
+            "apiKeyId": principal.api_key_id,
             "credentialDigest": credential_digest,
         }
 
@@ -892,8 +893,11 @@ class ReportService:
             return {"items": [self._job_wire(session, row) for row in rows]}
 
     @staticmethod
-    def _is_admin(principal: Principal) -> bool:
-        return principal.role_id in {ROLE_ADMIN, ROLE_SUPERADMIN}
+    def _is_admin(identity: IdentityService, principal: Principal) -> bool:
+        if principal.kind != "human" or principal.api_key_id or principal.scopes:
+            return False
+        actor = identity.resolve_actor(principal.actor_id)
+        return actor.role_id in {ROLE_ADMIN, ROLE_SUPERADMIN}
 
     def job(self, principal: Principal, job_id: str) -> dict[str, Any]:
         with self.session_factory() as session:
@@ -901,7 +905,7 @@ class ReportService:
             identity.authorize(principal, "assets.view", resource="reports:jobs")
             job = session.get(ReportJob, job_id)
             if job is None or (
-                job.owner_id != principal.actor_id and not self._is_admin(principal)
+                job.owner_id != principal.actor_id and not self._is_admin(identity, principal)
             ):
                 raise NotFound("job not found", key="api.reports.job_not_found")
             return self._job_wire(session, job)
@@ -913,7 +917,7 @@ class ReportService:
             document = session.get(ReportDocument, document_id)
             if document is None or document.deleted_at is not None:
                 raise NotFound("document not found", key="api.reports.document_not_found")
-            if document.owner_id != principal.actor_id and not self._is_admin(principal):
+            if document.owner_id != principal.actor_id and not self._is_admin(identity, principal):
                 raise NotFound("document not found", key="api.reports.document_not_found")
             cutoff = utcnow() - timedelta(days=self.settings.report_retention_days)
             if as_utc(document.created_at) <= cutoff:
@@ -1118,6 +1122,7 @@ class ReportService:
             scopes=frozenset(executor.get("scopes") or ()),
             execution_id=executor.get("executionId"),
             authorization_ref=executor.get("authorizationRef"),
+            api_key_id=executor.get("apiKeyId"),
         )
         session_id = executor.get("sessionId")
         if principal.kind == "human":

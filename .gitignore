@@ -1,19 +1,51 @@
+# Python environment, caches and generated test output.
 .venv/
-.verification/
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+coverage/
+test-results/
+playwright-report/
+
+# Local SQLite databases and their sidecars.
 *.db
 *.db-journal
 *.db-wal
 *.db-shm
+*.sqlite
+*.sqlite-journal
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite3
+*.sqlite3-journal
+*.sqlite3-wal
+*.sqlite3-shm
 
-# Local-only records and material that is never published.
-AGENTS.md
-odd/
-docs/reviews/
-.worktrees/
-.publish/
-.env*
+# Local-only records: do not hide public nested documentation.
+/AGENTS.md
+/SYSTEM.md
+/odd/
+/docs/reviews/
+/.worktrees/
+/.atl/
+/.codegraph/
+/.omp/
+/.publish/
+/.verification/
+/.verification-*.log
+/.tmp-*/
+/.tmp-*.log
+
+# Private local configuration.
+.env
+.env.*
+*.local
+*.local.md
+AGENTS.local.md
+**/.claude/settings.local.json

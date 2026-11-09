@@ -117,8 +117,8 @@ TOOL_NAMES: tuple[str, ...] = (
 
 INSTRUCTIONS = """\
 These tools operate on the ITSM asset inventory with the permissions of the
-authenticated machine identity. IDs are permanent UUIDs; the quick code may
-change. Use search/get before updating, and never assume an asset exists.
+authenticated machine identity or creator-bound personal API key. IDs are permanent
+UUIDs; the quick code may change. Use search/get before updating, and never assume an asset exists.
 Maintenance completion recalculates the next due date; interventions and
 incidents are recorded in one structured call. Preparing an incident resolution
 never changes its status: only confirming the prepared token, revalidated

@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import secrets
 from collections.abc import Iterator
+from datetime import datetime
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, FastAPI, Query, Request, Response, status
@@ -21,7 +22,9 @@ from itsm.i18n.messages import t
 from itsm.i18n.registry import effective_locale
 from itsm.i18n.request import resolve_request_locale
 from itsm.i18n.settings import InstallationSettings
+from itsm.identity.clock import utcnow
 from itsm.identity.service import (
+    API_KEY_DEFAULT_LIFETIME,
     AccountThrottled,
     AuditView,
     AuthContext,
@@ -47,7 +50,7 @@ NO_STORE = {"Cache-Control": "no-store"}
 
 
 class AuthenticationRequired(Exception):
-    """Raised when a request has no usable session or machine credential."""
+    """Raised when a request has no usable session or bearer credential."""
 
     key = "api.auth.authentication_required"
 
@@ -139,6 +142,14 @@ class AuditDTO(BaseModel):
 
 class SettingsDTO(BaseModel):
     sessionMinutes: int
+
+
+class ApiKeyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    label: str = Field(min_length=1, max_length=64)
+    permissions: list[str] | None = None
+    expiresAt: datetime | None = Field(default_factory=lambda: utcnow() + API_KEY_DEFAULT_LIFETIME)
 
 
 class LoginRequest(BaseModel):
@@ -293,9 +304,11 @@ def authenticated_actor(
     request: Request,
     service: Annotated[IdentityService, Depends(get_identity_service)],
 ) -> AuthContext:
-    """Resolve a cookie session or a machine bearer credential."""
+    """Resolve a cookie session, personal API key or machine bearer credential."""
     token = _bearer_token(request)
     try:
+        if "authorization" in request.headers and token is None:
+            raise AuthenticationFailed()
         if token is not None:
             return service.authenticate_token(
                 token,
@@ -321,7 +334,7 @@ def mutation_guard(
     request: Request,
     context: Annotated[AuthContext, Depends(authenticated_actor)],
 ) -> AuthContext:
-    """Origin plus CSRF for cookie sessions; bearer machine calls are exempt."""
+    """Origin plus CSRF for cookie sessions; bearer calls are exempt."""
     if context.csrf_token is None:
         return context
     _require_origin(request)
@@ -381,6 +394,36 @@ def clear_session_cookie(request: Request, response: Response) -> None:
 # ---------------------------------------------------------------------- routes
 def create_identity_router() -> APIRouter:
     router = APIRouter()
+
+    @router.post("/auth/api-keys", status_code=status.HTTP_201_CREATED)
+    def issue_api_key(
+        payload: ApiKeyRequest,
+        response: Response,
+        context: MutationDependency,
+        service: ServiceDependency,
+    ):
+        response.headers.update(NO_STORE)
+        return service.issue_api_key(
+            context.principal,
+            label=payload.label,
+            permissions=payload.permissions,
+            expires_at=payload.expiresAt,
+        )
+
+    @router.get("/auth/api-keys")
+    def list_api_keys(response: Response, context: AuthDependency, service: ServiceDependency):
+        response.headers.update(NO_STORE)
+        return service.list_api_keys(context.principal)
+
+    @router.delete("/auth/api-keys/{key_id}")
+    def revoke_api_key(
+        key_id: str,
+        response: Response,
+        context: MutationDependency,
+        service: ServiceDependency,
+    ):
+        response.headers.update(NO_STORE)
+        return service.revoke_api_key(context.principal, key_id)
 
     @router.post("/auth/login")
     def login(
