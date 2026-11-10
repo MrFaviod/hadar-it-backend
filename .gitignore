@@ -27,7 +27,12 @@ playwright-report/
 *.sqlite3-wal
 *.sqlite3-shm
 
-# Local-only records: do not hide public nested documentation.
+# Internal documentation stays local; shared guides live in hadar-it.
+/docs/
+/DESIGN.md
+/brand-spec.md
+
+# Local-only records.
 /AGENTS.md
 /SYSTEM.md
 /odd/

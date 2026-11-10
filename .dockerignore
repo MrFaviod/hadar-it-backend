@@ -15,7 +15,10 @@ __pycache__/
 # Local-only records and material that is never published.
 AGENTS.md
 odd/
-docs/reviews/
+docs/
+DESIGN.md
+brand-spec.md
+SYSTEM.md
 .worktrees/
 .publish/
 .env*
