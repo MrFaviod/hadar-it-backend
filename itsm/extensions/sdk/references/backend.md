@@ -81,8 +81,11 @@ arguments.
 ```python
 context.notify(
     recipient_ids=[context.principal["actor_id"]],
-    key="record-created", title="Registro creado", body="Tu registro está listo.",
-    permission=WRITE_PERMISSION, asset_id=None,
+    key="record-created",
+    title="Registro creado",
+    body="Tu registro está listo.",
+    permission=WRITE_PERMISSION,
+    asset_id=None,
     url="#/extensiones/record-registry/records",
     idempotency_key="notice:record-created",
 )
