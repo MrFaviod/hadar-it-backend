@@ -253,14 +253,16 @@ def _kill_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
 
 
+_CHILD_ENV = ("PATH", "LANG", "LC_ALL", "LC_CTYPE", "TZ", "TMPDIR")
+
+
 def run_action(config: ExecutorConfig, action: str) -> dict[str, Any]:
     """Execute one configured action and return the bounded public envelope."""
     command = config.actions[action]
     started = datetime.now(UTC)
     clock = time.monotonic()
-    child_env = {
-        key: value for key, value in os.environ.items() if not key.startswith("ITSM_EXECUTOR_")
-    }
+    # Same base allowlist as the managed agent runtime: the host's secrets never reach an action.
+    child_env = {key: os.environ[key] for key in _CHILD_ENV if key in os.environ}
     try:
         process = subprocess.Popen(
             list(command.argv),
@@ -426,7 +428,9 @@ class _ExecutorHandler(BaseHTTPRequestHandler):
 
     def _authorized(self) -> bool:
         scheme, _, token = (self.headers.get("Authorization") or "").partition(" ")
-        return scheme == "Bearer" and hmac.compare_digest(token, self.config.secret)
+        return scheme == "Bearer" and hmac.compare_digest(
+            token.encode("utf-8", "surrogatepass"), self.config.secret.encode("utf-8")
+        )
 
     def _send(self, status: int, payload: Mapping[str, Any]) -> None:
         body = json.dumps(payload).encode("utf-8")
