@@ -51,6 +51,19 @@ def test_secrets_are_redacted_from_log_output() -> None:
     assert read_events(stream)[0]["detail"] == "cannot connect to [redacted]"
 
 
+def test_secrets_containing_json_escapes_are_redacted_before_serialization() -> None:
+    stream = io.StringIO()
+    secret = 'p@ss"w\\rd\tline'
+    configure_logging("INFO", secrets=(secret,), stream=stream)
+
+    log_event(logging.getLogger("itsm.test"), "login.failed", detail=f"got {secret} here")
+
+    output = stream.getvalue()
+    assert secret not in output
+    assert "p@ss" not in output
+    assert read_events(stream)[0]["detail"] == "got [redacted] here"
+
+
 def test_sanitize_text_without_secrets_is_identity() -> None:
     assert sanitize_text("plain message") == "plain message"
 
