@@ -186,7 +186,7 @@ def _tools(schemas: list[ToolSchema], bridge: _Bridge) -> list[Tool[Any]]:
     return tools
 
 
-def _model(start: RunStart) -> tuple[Model, Any]:
+async def _model(start: RunStart) -> tuple[Model, Any]:
     """Build the inference model, re-validating the private endpoint at use time."""
     provider = start.provider
     if provider.kind == "openai-compatible":
@@ -209,7 +209,7 @@ def _model(start: RunStart) -> tuple[Model, Any]:
         try:
             return build_provider_model(selection, http_client=client), client
         except Exception:
-            asyncio.run(client.aclose())
+            await client.aclose()
             raise
     if provider.kind == "openai":
         from pydantic_ai.models.openai import OpenAIChatModel
@@ -245,7 +245,7 @@ def _model(start: RunStart) -> tuple[Model, Any]:
 
 
 async def _run(start: RunStart, bridge: _Bridge) -> tuple[RunUsage, str]:
-    model, client = _model(start)
+    model, client = await _model(start)
     if start.quota_enabled:
         from itsm.agents.quota import BudgetedModel
 
