@@ -11,6 +11,7 @@ from __future__ import annotations
 from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Request, Response
+from starlette.concurrency import run_in_threadpool
 
 from itsm.appearance.package import MAX_ZIP_BYTES
 from itsm.appearance.schemas import ImportRequest, PresetPayload
@@ -147,7 +148,9 @@ def create_appearance_router() -> APIRouter:
                 )
             chunks.append(chunk)
         try:
-            return service.preview_import(context.principal, b"".join(chunks))
+            return await run_in_threadpool(
+                service.preview_import, context.principal, b"".join(chunks)
+            )
         except AppearanceStorageUnavailable:
             raise _storage_down() from None
 
