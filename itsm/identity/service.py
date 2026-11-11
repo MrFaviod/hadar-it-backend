@@ -8,6 +8,7 @@ subsystem (API, Pydantic AI, FastMCP) never asserts its own role or identity.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -58,7 +59,10 @@ from itsm.identity.permissions import (
     SYSTEM_PERMISSIONS,
     is_known_permission,
 )
-from itsm.identity.policy import PolicyEngine
+from itsm.identity.policy import (
+    invalidate_session_policy_engine,
+    session_policy_engine,
+)
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 ATTEMPT_RETENTION = timedelta(hours=24)
@@ -492,7 +496,7 @@ class IdentityService:
 
     # ---------------------------------------------------------- authorization
     def _effective_permissions(self, identity: Identity, scopes: frozenset[str]) -> frozenset[str]:
-        engine = PolicyEngine.load(self._session)
+        engine = session_policy_engine(self._session)
         if identity.actor_kind == HUMAN_ACTOR_KIND:
             effective = engine.permissions(identity.role_id)
             # Reserved installation authority belongs to the persisted owner
@@ -563,7 +567,7 @@ class IdentityService:
         the whole catalog, never because of a bypass.
         """
         ceiling = self._persisted_permissions(principal)
-        engine = PolicyEngine.load(self._session)
+        engine = session_policy_engine(self._session)
         needed: set[str] = set()
         for role_id in role_ids:
             if role_id:
@@ -649,6 +653,11 @@ class IdentityService:
     def _login_key(self, username: str) -> str:
         return _clip(username.strip().lower() if isinstance(username, str) else "", 64)
 
+    @staticmethod
+    def _throttle_key(username_key: str, client_ip: str) -> str:
+        """Scope failures to (username, client address) so one source cannot lock out others."""
+        return hashlib.sha256(f"{username_key}\0{client_ip}".encode()).hexdigest()
+
     def _prune_attempts(self) -> None:
         threshold = self._now() - ATTEMPT_RETENTION
         self._session.execute(
@@ -668,7 +677,7 @@ class IdentityService:
         if int(failures) >= self._settings.auth_login_max_attempts:
             raise AccountThrottled(int(window.total_seconds()))
 
-    def _record_login_failure(self, key: str, identity: Identity | None) -> None:
+    def _record_login_failure(self, key: str, username_key: str, identity: Identity | None) -> None:
         self._session.add(
             IdentityLoginAttempt(
                 username_key=key,
@@ -679,20 +688,21 @@ class IdentityService:
         self._audit(
             actor_id=None if identity is None else identity.id,
             actor_kind="anonymous" if identity is None else identity.actor_kind,
-            actor_username=key,
+            actor_username=username_key,
             action="auth.login",
             resource="identity" if identity is None else f"identity:{identity.id}",
             outcome="denied",
         )
         self._session.commit()
 
-    def login(self, username: str, password: str) -> SessionGrant:
+    def login(self, username: str, password: str, client_ip: str = "unknown") -> SessionGrant:
         """Human login: generic rejection, durable throttling, opaque session."""
-        key = self._login_key(username)
+        username_key = self._login_key(username)
+        key = self._throttle_key(username_key, client_ip)
         self._prune_attempts()
         self._assert_not_throttled(key)
 
-        identity = self._identity_by_username(key) if key else None
+        identity = self._identity_by_username(username_key) if username_key else None
         if identity is None or not identity.password_hash:
             burn_password_check()
             verified = False
@@ -707,7 +717,7 @@ class IdentityService:
             or not verified
         )
         if invalid:
-            self._record_login_failure(key, identity)
+            self._record_login_failure(key, username_key, identity)
             raise AuthenticationFailed(key="api.auth.invalid_credentials")
 
         now = self._now()
@@ -1492,7 +1502,7 @@ class IdentityService:
         superadmin delegates them, and the delegator's role is persisted as the
         machine's role owner so a later change cannot silently broaden it.
         """
-        permissions = PolicyEngine.load(self._session).permissions(role.id)
+        permissions = session_policy_engine(self._session).permissions(role.id)
         if actor_kind == HUMAN_ACTOR_KIND:
             if role.id != ROLE_SUPERADMIN and permissions & SYSTEM_PERMISSIONS:
                 raise ValidationFailed(
@@ -1766,6 +1776,7 @@ class IdentityService:
                 IdentityRolePolicy(role_id=role.id, resource=resource, operation=operation)
             )
         self._session.flush()
+        invalidate_session_policy_engine(self._session)
         view = self._role_view(role)
         self._audit(
             actor_id=principal.actor_id,
@@ -1830,6 +1841,7 @@ class IdentityService:
                     IdentityRolePolicy(role_id=role.id, resource=resource, operation=operation)
                 )
         self._session.flush()
+        invalidate_session_policy_engine(self._session)
         view = self._role_view(role)
         self._audit(
             actor_id=principal.actor_id,
@@ -1977,6 +1989,7 @@ class IdentityService:
             )
             added.append(code)
         self._session.flush()
+        invalidate_session_policy_engine(self._session)
         self._audit(
             actor_id=identity.id,
             actor_kind=identity.actor_kind,

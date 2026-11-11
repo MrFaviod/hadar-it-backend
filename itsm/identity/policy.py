@@ -82,3 +82,24 @@ class PolicyEngine:
         if not role_id:
             return frozenset()
         return self._permissions.get(role_id, frozenset())
+
+
+_SESSION_ENGINE_KEY = "identity.policy_engine"
+
+
+def session_policy_engine(session: Session) -> PolicyEngine:
+    """Return the engine for this unit of work, loading it at most once.
+
+    The cache lives on the request-scoped session, never in a process global,
+    so each request sees the policy rows committed before it started. Writers
+    in the same session must call ``invalidate_session_policy_engine``.
+    """
+    engine = session.info.get(_SESSION_ENGINE_KEY)
+    if engine is None:
+        engine = PolicyEngine.load(session)
+        session.info[_SESSION_ENGINE_KEY] = engine
+    return engine
+
+
+def invalidate_session_policy_engine(session: Session) -> None:
+    session.info.pop(_SESSION_ENGINE_KEY, None)

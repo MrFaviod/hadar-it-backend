@@ -17,6 +17,7 @@ from itsm.config import Settings
 from itsm.database import create_engine_from_settings, create_session_factory
 from itsm.identity.hashing import hash_password, hash_token, verify_password
 from itsm.identity.permissions import PERMISSION_CATALOG
+from itsm.identity.policy import PolicyEngine
 from itsm.identity.service import (
     AccountThrottled,
     AuthenticationFailed,
@@ -193,6 +194,60 @@ def test_repeated_failures_throttle_login_durably_and_expire_with_the_window(
         grant = service.login("ana.admin", PASSWORD)
     assert grant.permissions == frozenset(PERMISSION_CATALOG) | SYSTEM_PERMISSIONS
     assert harness.scalar("SELECT COUNT(*) FROM identity_login_attempts WHERE successful = 0") == 0
+
+
+def test_throttle_is_scoped_to_the_client_address_not_only_the_username(
+    harness: Harness,
+) -> None:
+    bootstrap_superadmin(harness)
+
+    with harness.service() as service:
+        for _ in range(5):
+            with pytest.raises(AuthenticationFailed):
+                service.login("ana.admin", "wrong-password-value", client_ip="198.51.100.9")
+
+    with harness.service() as service:  # an attacker from one address cannot lock the owner out
+        grant = service.login("ana.admin", PASSWORD, client_ip="203.0.113.7")
+    assert grant.principal.username == "ana.admin"
+
+    with harness.service() as service, pytest.raises(AccountThrottled):
+        service.login("ana.admin", PASSWORD, client_ip="198.51.100.9")
+
+
+def test_policy_engine_is_loaded_once_per_session_and_follows_policy_writes(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    bootstrap_superadmin(harness)
+    real_load = PolicyEngine.load
+    loads: list[int] = []
+    monkeypatch.setattr(
+        PolicyEngine,
+        "load",
+        classmethod(lambda cls, session: (loads.append(1), real_load(session))[1]),
+    )
+
+    with harness.service() as service:
+        admin = service.login("ana.admin", PASSWORD).principal
+        role = service.create_role(admin, name="Viewers", permissions=["assets.view"])
+        service.create_user(
+            admin,
+            username="vic.viewer",
+            name="Vic Viewer",
+            role_id=role.id,
+            password=PASSWORD,
+        )
+        viewer = service.login("vic.viewer", PASSWORD).principal
+
+        loads.clear()
+        for _ in range(3):
+            service.authorize(admin, "assets.view")
+        assert len(loads) <= 1
+
+        service.authorize(viewer, "assets.view")
+        service.update_role(admin, role.id, permissions=["assets.edit"])
+        with pytest.raises(PermissionDenied):  # same session: the policy write is visible
+            service.authorize(viewer, "assets.view")
+        service.authorize(viewer, "assets.edit")
 
 
 def test_successful_login_resets_the_failure_budget(harness: Harness) -> None:
