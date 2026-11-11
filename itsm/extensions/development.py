@@ -8,6 +8,7 @@ or any workspace during application startup.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import json
 import os
@@ -178,10 +179,8 @@ def _atomic_text(path: Path, content: str, mode: int = 0o600) -> None:
             handle.write(content.encode("utf-8"))
         os.replace(temporary, path)
     finally:
-        try:
+        with contextlib.suppress(FileNotFoundError):
             os.unlink(temporary)
-        except FileNotFoundError:
-            pass
 
 
 def _failure(digest: str, error: str) -> dict[str, Any]:
@@ -576,10 +575,8 @@ class DevelopmentService:
         root = self._root / key
         if create:
             root.mkdir(parents=True, exist_ok=True, mode=0o700)
-            try:
+            with contextlib.suppress(OSError):
                 os.chmod(root, 0o700)
-            except OSError:
-                pass
         return root
 
     def _workspace(self, principal: Any, workspace_id: Any) -> _Workspace:

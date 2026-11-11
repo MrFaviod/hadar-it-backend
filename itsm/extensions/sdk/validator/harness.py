@@ -591,10 +591,8 @@ def _package_on_path(root: Path):
         yield
     finally:
         if added:
-            try:
+            with contextlib.suppress(ValueError):
                 sys.path.remove(str(root))
-            except ValueError:
-                pass
 
 
 def _run_package_tests(root: Path) -> str:
@@ -912,10 +910,8 @@ def _run_execution(root: Path, max_output: int) -> list[dict[str, str]]:
         return _execution_evidence(bytes(evidence))
     finally:
         if process is not None:
-            try:
+            with contextlib.suppress(ProcessLookupError):
                 os.killpg(process.pid, signal.SIGKILL)
-            except ProcessLookupError:
-                pass
             process.wait()
             for stream in (process.stdout, process.stderr):
                 if stream is not None:
@@ -940,7 +936,10 @@ def _declarative_evidence(root: Path, manifest: dict[str, Any]) -> list[dict[str
         {
             "name": "operations",
             "status": "passed",
-            "detail": f"{len(manifest['operations'])} declarative operations executed by the host: {kinds}",
+            "detail": (
+                f"{len(manifest['operations'])} declarative operations executed by the host: "
+                f"{kinds}"
+            ),
         }
     )
     checks.append(
@@ -1119,10 +1118,8 @@ def validate_payload(payload: bytes) -> dict[str, Any]:
     except ProtocolError as exc:
         return _failed_report("", [f"protocol: {_detail(exc)}"], "unavailable")
     engine = "unavailable"
-    try:
+    with contextlib.suppress(ValidationFailure):
         engine = f"{_js_engine()[0]} {_js_engine()[1]}"
-    except ValidationFailure:
-        pass
     checks.append(
         {
             "name": "protocol",

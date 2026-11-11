@@ -380,7 +380,8 @@ def seed_installed_v1_module(env, marker: Path) -> None:
         session.execute(
             text(
                 "INSERT INTO extension_modules "
-                "(id, name, description, enabled, active_version, data_schema_version, revision, created_at, updated_at) "
+                "(id, name, description, enabled, active_version, data_schema_version, revision, "
+                "created_at, updated_at) "
                 "VALUES (:id, :name, :description, 1, '0.9.0', 1, 1, :now, :now)"
             ),
             {
@@ -393,7 +394,8 @@ def seed_installed_v1_module(env, marker: Path) -> None:
         session.execute(
             text(
                 "INSERT INTO extension_versions "
-                "(extension_id, version, digest, manifest_json, package_bytes, schema_version, installed_by, installed_at) "
+                "(extension_id, version, digest, manifest_json, package_bytes, schema_version, "
+                "installed_by, installed_at) "
                 "VALUES (:id, '0.9.0', :digest, :manifest, :bytes, 1, :actor, :now)"
             ),
             {

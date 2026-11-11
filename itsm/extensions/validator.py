@@ -9,6 +9,7 @@ non-root user with dropped capabilities and bounded CPU/memory/PIDs/output.
 
 from __future__ import annotations
 
+import contextlib
 import hashlib
 import hmac
 import http.client
@@ -266,7 +267,7 @@ class ContainerValidator:
         return process.returncode, bytes(output), failure
 
     def _remove_container(self, name: str) -> None:
-        try:
+        with contextlib.suppress(OSError, subprocess.TimeoutExpired):
             subprocess.run(
                 [self._docker, "rm", "--force", name],
                 stdout=subprocess.DEVNULL,
@@ -275,8 +276,6 @@ class ContainerValidator:
                 check=False,
                 env={"PATH": os.defpath, "HOME": "/nonexistent", "DOCKER_CONFIG": "/nonexistent"},
             )
-        except OSError, subprocess.TimeoutExpired:
-            pass
 
     def _checked(self, report: Any, expected: str) -> dict[str, Any]:
         error = _report_error(report, expected)
@@ -399,7 +398,8 @@ class RemoteContainerValidator:
             or any(character.isspace() for character in url)
         ):
             raise ValueError(
-                "validator broker URL must be an HTTP(S) server base URL without credentials, path, query or fragment"
+                "validator broker URL must be an HTTP(S) server base URL "
+                "without credentials, path, query or fragment"
             )
         if (
             not isinstance(timeout, (int, float))

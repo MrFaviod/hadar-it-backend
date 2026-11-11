@@ -248,7 +248,7 @@ def register_agent_extension_tools(
 
     @toolset.tool
     def extension_operations(ctx: RunContext[Any], id: str) -> dict[str, Any]:
-        """Read parameter schemas and permissions for an installed module's authorized operations."""
+        """Read parameter schemas and permissions for an installed module."""
         return execute(ctx.deps, "extension_operations", {"id": id})
 
     @toolset.tool
@@ -260,7 +260,7 @@ def register_agent_extension_tools(
     def extension_invoke(
         ctx: RunContext[Any], id: str, operation: str, arguments: dict[str, Any]
     ) -> dict[str, Any]:
-        """Invoke one installed declared operation through live host authorization, never raw code."""
+        """Invoke one installed declared operation through live host authorization only."""
         return execute(
             ctx.deps, "extension_invoke", {"id": id, "operation": operation, "arguments": arguments}
         )
