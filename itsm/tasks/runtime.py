@@ -174,7 +174,7 @@ def register_demo_tasks(huey: Huey, settings: Settings) -> DemoTasks:
                     f"head {migrations.head if migrations else None}; "
                     "run `python -m itsm.ops upgrade` before starting the worker"
                 )
-        except ReleaseModeError as exc:
+        except Exception as exc:  # any startup failure refuses to consume work
             log_event(logger, "worker.refused", level=logging.ERROR, reason=str(exc))
             # Huey logs startup-hook exceptions and keeps consuming, and hooks run
             # in the worker thread or child process, so an exception cannot stop
