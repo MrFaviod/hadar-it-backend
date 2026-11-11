@@ -664,3 +664,14 @@ def test_schema_rejects_unknown_template_and_request_keys(catalog: Catalog) -> N
     with catalog.session() as session:
         assert session.execute(select(ReportTemplate)).first() is None
         assert session.execute(select(ReportDocument)).first() is None
+
+
+def test_report_base_url_refuses_the_markup_characters_the_qr_renderer_refuses() -> None:
+    from itsm.reports.qr import qr_svg
+    from itsm.reports.schemas import _normalize_base_url
+
+    for raw in ('https://example.org/"x', "https://example.org/<x>", "https://example.org/>"):
+        with pytest.raises(ValueError):
+            _normalize_base_url(raw)
+        with pytest.raises(ValueError):
+            qr_svg(raw)
