@@ -219,9 +219,7 @@ class ExtensionRegistry:
             raise InvalidExtension("tool permissions exceed the module manifest")
 
         declared_capabilities = _declared(capabilities, "capabilities")
-        unknown_capabilities = [
-            code for code in declared_capabilities if code not in CAPABILITIES
-        ]
+        unknown_capabilities = [code for code in declared_capabilities if code not in CAPABILITIES]
         if unknown_capabilities:
             raise InvalidExtension("unknown capabilities: " + ", ".join(unknown_capabilities))
         if not set(declared_capabilities) <= set(module["capabilities"]):
@@ -423,7 +421,7 @@ def bind_fastmcp_tools(
                 identity = IdentityService(session, settings)
                 try:
                     authenticated = identity.authenticate_token(token.strip())
-                except (AuthenticationFailed, PermissionDenied):
+                except AuthenticationFailed, PermissionDenied:
                     raise ToolError("authentication required") from None
                 context = ExtensionContext(
                     settings=settings,
@@ -443,9 +441,7 @@ def bind_fastmcp_tools(
                 except ToolError:
                     raise
                 except Exception as exc:
-                    logger.warning(
-                        "extension tool failed: %s (%s)", tool.name, type(exc).__name__
-                    )
+                    logger.warning("extension tool failed: %s (%s)", tool.name, type(exc).__name__)
                     raise ToolError("tool failed") from None
 
         return call

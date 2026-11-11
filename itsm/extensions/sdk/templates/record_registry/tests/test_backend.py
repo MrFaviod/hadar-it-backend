@@ -76,7 +76,6 @@ class Context:
             raise PermissionError(permission)
 
 
-
 class SDK:
     def __init__(self):
         self.operations = {}
@@ -103,9 +102,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(set(self.sdk.migrations), {"normalize_status"})
 
     def test_create_then_list_round_trip(self):
-        created = backend.create_record(
-            self.context, title="Router principal", notes="Armario B"
-        )
+        created = backend.create_record(self.context, title="Router principal", notes="Armario B")
         record = created["record"]
         self.assertEqual(record["title"], "Router principal")
         self.assertEqual(record["status"], "open")
@@ -144,8 +141,10 @@ class BackendTests(unittest.TestCase):
     def test_migration_normalizes_records_beyond_one_store_page(self):
         for index in range(201):
             self.context.store.put(
-                "records", "legacy-%03d" % index,
-                {"title": "Legacy %d" % index, "notes": ""}, expected_version=0,
+                "records",
+                "legacy-%03d" % index,
+                {"title": "Legacy %d" % index, "notes": ""},
+                expected_version=0,
             )
         result = backend.normalize_status(self.context)
         self.assertEqual(result, {"migrated": 201})

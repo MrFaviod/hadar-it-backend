@@ -66,8 +66,29 @@ DENYLIST: tuple[tuple[str, re.Pattern[str]], ...] = (
 
 # Ignore rules that keep local-only records out of the published tree.
 REQUIRED_IGNORE_RULES = {
-    ".dockerignore": ("AGENTS.md", "SYSTEM.md", "odd/", "docs/", "DESIGN.md", "brand-spec.md", ".worktrees/", ".publish/", ".env*"),
-    ".gitignore": ("/AGENTS.md", "/SYSTEM.md", "/odd/", "/docs/", "/DESIGN.md", "/brand-spec.md", "/.worktrees/", "/.publish/", ".env", ".env.*"),
+    ".dockerignore": (
+        "AGENTS.md",
+        "SYSTEM.md",
+        "odd/",
+        "docs/",
+        "DESIGN.md",
+        "brand-spec.md",
+        ".worktrees/",
+        ".publish/",
+        ".env*",
+    ),
+    ".gitignore": (
+        "/AGENTS.md",
+        "/SYSTEM.md",
+        "/odd/",
+        "/docs/",
+        "/DESIGN.md",
+        "/brand-spec.md",
+        "/.worktrees/",
+        "/.publish/",
+        ".env",
+        ".env.*",
+    ),
 }
 
 

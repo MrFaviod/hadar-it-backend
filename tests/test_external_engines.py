@@ -305,19 +305,38 @@ def test_v212_native_execution_success_finishes_without_waiting_for_stream_close
             for payload in (
                 {"type": "session.execution.succeeded", "data": {"sessionID": "other"}},
                 {"type": "session.text.delta", "data": {"sessionID": "ses_native", "delta": "OK"}},
-                {"type": "session.tool.input.started", "data": {
-                    "sessionID": "other", "id": "call_other", "name": "wrong_tool",
-                }},
-                {"type": "session.tool.input.started", "data": {
-                    "sessionID": "ses_native", "id": "call_native", "name": "itsm_search_assets",
-                }},
-                {"type": "session.tool.called", "data": {
-                    "sessionID": "ses_native", "id": "call_native", "input": {"query": "AI"},
-                }},
-                {"type": "session.tool.success", "data": {
-                    "sessionID": "ses_native", "id": "call_native",
-                    "content": [{"type": "text", "text": "found"}],
-                }},
+                {
+                    "type": "session.tool.input.started",
+                    "data": {
+                        "sessionID": "other",
+                        "id": "call_other",
+                        "name": "wrong_tool",
+                    },
+                },
+                {
+                    "type": "session.tool.input.started",
+                    "data": {
+                        "sessionID": "ses_native",
+                        "id": "call_native",
+                        "name": "itsm_search_assets",
+                    },
+                },
+                {
+                    "type": "session.tool.called",
+                    "data": {
+                        "sessionID": "ses_native",
+                        "id": "call_native",
+                        "input": {"query": "AI"},
+                    },
+                },
+                {
+                    "type": "session.tool.success",
+                    "data": {
+                        "sessionID": "ses_native",
+                        "id": "call_native",
+                        "content": [{"type": "text", "text": "found"}],
+                    },
+                },
                 {"type": "session.execution.succeeded", "data": {"sessionID": "ses_native"}},
             ):
                 yield f"data: {json.dumps(payload)}\n\n".encode()
@@ -326,7 +345,8 @@ def test_v212_native_execution_success_finishes_without_waiting_for_stream_close
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/event":
                 return httpx.Response(
-                    200, headers={"content-type": "text/event-stream"},
+                    200,
+                    headers={"content-type": "text/event-stream"},
                     stream=_GeneratedSSE(frames()),
                 )
             if request.url.path.endswith("/prompt"):
@@ -349,7 +369,9 @@ def test_v212_native_execution_success_finishes_without_waiting_for_stream_close
     assert not [event for event in events if event["type"] == "error"]
     assert [event for event in events if event["type"] == "tool"] == [
         {
-            "type": "tool", "tool": "itsm_search_assets", "status": "running",
+            "type": "tool",
+            "tool": "itsm_search_assets",
+            "status": "running",
             "input": {"query": "AI"},
         },
         {"type": "tool", "tool": "itsm_search_assets", "status": "completed", "output": "found"},
@@ -361,12 +383,20 @@ def test_v212_native_execution_failure_finishes_without_waiting_for_stream_close
     async def scenario() -> list[dict[str, Any]]:
         async def frames() -> AsyncIterator[bytes]:
             for payload in (
-                {"type": "session.execution.failed", "data": {
-                    "sessionID": "other", "error": {"message": "foreign failure"},
-                }},
-                {"type": "session.execution.failed", "data": {
-                    "sessionID": "ses_native", "error": {"message": "output bound exceeded"},
-                }},
+                {
+                    "type": "session.execution.failed",
+                    "data": {
+                        "sessionID": "other",
+                        "error": {"message": "foreign failure"},
+                    },
+                },
+                {
+                    "type": "session.execution.failed",
+                    "data": {
+                        "sessionID": "ses_native",
+                        "error": {"message": "output bound exceeded"},
+                    },
+                },
             ):
                 yield f"data: {json.dumps(payload)}\n\n".encode()
             await asyncio.sleep(10)
@@ -374,7 +404,8 @@ def test_v212_native_execution_failure_finishes_without_waiting_for_stream_close
         def handler(request: httpx.Request) -> httpx.Response:
             if request.url.path == "/api/event":
                 return httpx.Response(
-                    200, headers={"content-type": "text/event-stream"},
+                    200,
+                    headers={"content-type": "text/event-stream"},
                     stream=_GeneratedSSE(frames()),
                 )
             if request.url.path.endswith("/prompt"):
@@ -1718,18 +1749,6 @@ def test_v2_repeated_delta_text_is_not_treated_as_cumulative() -> None:
     assert "".join(fragments) == "haha"
 
 
-
-
-
-
-
-
-
-
-
-
-
-
 class _HermesSocket:
     """Deterministic native dashboard socket; no network or provider call."""
 
@@ -1738,9 +1757,7 @@ class _HermesSocket:
         self.sent: list[dict[str, Any]] = []
         self._responder = responder
         self.incoming.put_nowait(
-            json.dumps(
-                {"jsonrpc": "2.0", "method": "event", "params": {"type": "gateway.ready"}}
-            )
+            json.dumps({"jsonrpc": "2.0", "method": "event", "params": {"type": "gateway.ready"}})
         )
 
     async def recv(self) -> str:
@@ -2122,9 +2139,7 @@ def test_hermes_native_stream_maps_deltas_tools_usage_and_completion() -> None:
                 ]
             if method == "session.create":
                 return [
-                    _native_result(
-                        request, {"session_id": "rt-1", "stored_session_id": "stored-1"}
-                    )
+                    _native_result(request, {"session_id": "rt-1", "stored_session_id": "stored-1"})
                 ]
             if method == "config.set":
                 return [_native_result(request, {"ok": True})]
@@ -2282,9 +2297,7 @@ def test_hermes_usage_reports_each_turn_delta_from_cumulative_counters() -> None
                 return [
                     _native_result(request, {}),
                     _native_event("session.usage", final, "rt-9"),
-                    _native_event(
-                        "message.complete", {"status": "complete", "text": ""}, "rt-9"
-                    ),
+                    _native_event("message.complete", {"status": "complete", "text": ""}, "rt-9"),
                 ]
             raise AssertionError(f"unexpected RPC {method}")
 
@@ -2292,14 +2305,8 @@ def test_hermes_usage_reports_each_turn_delta_from_cumulative_counters() -> None
         transport, _ = _native_http()
         async with httpx.AsyncClient(transport=transport) as client:
             engine = _native_engine(client, socket)
-            first = [
-                event
-                async for event in engine.stream("turno uno", session_id="stored-9")
-            ]
-            second = [
-                event
-                async for event in engine.stream("turno dos", session_id="stored-9")
-            ]
+            first = [event async for event in engine.stream("turno uno", session_id="stored-9")]
+            second = [event async for event in engine.stream("turno dos", session_id="stored-9")]
             await engine.close()
         return first + second, socket.sent
 
@@ -2366,10 +2373,7 @@ def test_hermes_usage_counter_reset_emits_unavailable_instead_of_a_negative_delt
         transport, _ = _native_http()
         async with httpx.AsyncClient(transport=transport) as client:
             engine = _native_engine(client, socket)
-            events = [
-                event
-                async for event in engine.stream("turno", session_id="stored-reset")
-            ]
+            events = [event async for event in engine.stream("turno", session_id="stored-reset")]
             await engine.close()
         return events
 
@@ -2419,9 +2423,7 @@ def test_hermes_usage_missing_final_evidence_emits_unavailable() -> None:
         async with httpx.AsyncClient(transport=transport) as client:
             engine = _native_engine(client, socket)
             stored = await engine.create_session()
-            events = [
-                event async for event in engine.stream("turno", session_id=stored)
-            ]
+            events = [event async for event in engine.stream("turno", session_id=stored)]
             await engine.close()
         return events
 
@@ -2513,9 +2515,7 @@ def test_hermes_native_failed_turn_emits_truthful_error_and_done() -> None:
             method = request["method"]
             if method == "session.create":
                 return [
-                    _native_result(
-                        request, {"session_id": "rt-3", "stored_session_id": "stored-3"}
-                    )
+                    _native_result(request, {"session_id": "rt-3", "stored_session_id": "stored-3"})
                 ]
             if method == "prompt.submit":
                 return [
@@ -2533,9 +2533,7 @@ def test_hermes_native_failed_turn_emits_truthful_error_and_done() -> None:
         async with httpx.AsyncClient(transport=transport) as client:
             engine = _native_engine(client, socket)
             stored = await engine.create_session()
-            events = [
-                event async for event in engine.stream("falla", session_id=stored)
-            ]
+            events = [event async for event in engine.stream("falla", session_id=stored)]
             await engine.close()
         return events
 

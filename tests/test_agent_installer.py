@@ -1175,9 +1175,7 @@ def test_hermes_runtime_evidence_requires_trusted_launch_binding(
             "profileHome": str(home),
             "endpoint": endpoint,
             "toolsets": ["itsm", "skills"],
-            "mcpServers": [
-                {"name": "itsm", "url": mcp_server["url"], "enabled": True}
-            ],
+            "mcpServers": [{"name": "itsm", "url": mcp_server["url"], "enabled": True}],
             "skills": ["hermes-agent", "itsm-inventory"],
         },
         "checks": [{"name": "runtime.profile", "status": "pass", "detail": "launch bound"}],
@@ -1197,9 +1195,7 @@ def test_hermes_runtime_evidence_requires_trusted_launch_binding(
     assert unverified["status"] == "configured"
     assert unverified["profileSafetyVerified"] is False
     detail = next(
-        item["detail"]
-        for item in unverified["checks"]
-        if item["name"] == "profile.safety"
+        item["detail"] for item in unverified["checks"] if item["name"] == "profile.safety"
     )
     assert "launch" in detail.lower()
 

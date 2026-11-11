@@ -96,10 +96,16 @@ def test_sensitive_values_include_queue_credentials() -> None:
     assert "redis://:queuepassword@redis.example:6379/0" in values
 
 
-@pytest.mark.parametrize("url", [
-    "http://user:password@localhost:8766", "http://localhost:8766/validate",
-    "http://localhost:8766?command=run", "http://localhost:8766#target", "file:///tmp/validator",
-])
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://user:password@localhost:8766",
+        "http://localhost:8766/validate",
+        "http://localhost:8766?command=run",
+        "http://localhost:8766#target",
+        "file:///tmp/validator",
+    ],
+)
 def test_extension_validator_rejects_nonfixed_base_urls(url: str) -> None:
     with pytest.raises(ValidationError, match="extension_validator_url"):
         make_settings(extension_validator_url=url, extension_validator_token="test-token-" * 4)
@@ -112,7 +118,8 @@ def test_extension_validator_requires_paired_redacted_secret() -> None:
     with pytest.raises(ValidationError, match="configured together"):
         make_settings(extension_validator_token=token)
     configured = make_settings(
-        extension_validator_url="http://127.0.0.1:8766/", extension_validator_token=token,
+        extension_validator_url="http://127.0.0.1:8766/",
+        extension_validator_token=token,
     )
     assert token in configured.sensitive_values()
     assert token not in repr(configured)

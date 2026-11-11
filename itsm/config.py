@@ -650,8 +650,7 @@ class Settings(BaseSettings):
             path = Path(raw).expanduser().resolve()
             if path == core_path or path in core_path.parents or core_path in path.parents:
                 raise ValueError(
-                    f"{label} must not equal, contain or live inside the core SQLite "
-                    "database file"
+                    f"{label} must not equal, contain or live inside the core SQLite database file"
                 )
 
     def _reject_shared_sqlite_file(self) -> None:
