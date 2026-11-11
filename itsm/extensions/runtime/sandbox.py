@@ -357,6 +357,14 @@ def build_seccomp_program(arch: str) -> tuple[bytes, int]:
         _bpf(0x06, 0, 0, SECCOMP_RET_KILL_PROCESS),
         _bpf(0x20, 0, 0, 0),  # A = syscall number
     ]
+    if arch == "x86_64":
+        # x32 ABI calls set bit 30 and would otherwise bypass the deny-list below.
+        instructions.extend(
+            [
+                _bpf(0x35, 0, 1, 0x40000000),  # A >= 0x40000000 -> KILL
+                _bpf(0x06, 0, 0, SECCOMP_RET_KILL_PROCESS),
+            ]
+        )
     for number in deny.values():
         instructions.append(_bpf(0x15, 0, 1, number))
         instructions.append(_bpf(0x06, 0, 0, retire_errno))
