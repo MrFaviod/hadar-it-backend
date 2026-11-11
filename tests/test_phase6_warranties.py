@@ -1,11 +1,30 @@
 """Individual warranty state, proof ownership, permissions and preferences."""
 
-from datetime import date, timedelta
+import os
+import time
+from contextlib import contextmanager
+from datetime import UTC, date, datetime, timedelta
 
+from itsm.workflows import warranties
 from tests.test_attachments import upload
 from tests.test_inventory_api import create_asset
 
 PDF = b"%PDF-1.7\nreceipt\n%%EOF"
+
+
+@contextmanager
+def local_zone(name):
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = name
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
 
 
 def test_warranty_expiry_receipt_queries_preferences_and_history(
@@ -92,3 +111,42 @@ def test_warranty_rejects_foreign_receipt_dates_and_unselected_asset_changes(
         assert client.get(f"/api/v1/assets/{asset['id']}/warranty").status_code == 404
         assert client.get(f"/api/v1/assets/{asset['id']}/history").json() == before
         assert client.get(f"/api/v1/assets/{asset['id']}").json() == asset
+
+
+def test_archived_asset_warranty_is_left_out_of_the_portfolio(signed_in_client):
+    client, auth = signed_in_client()
+    asset = create_asset(client, auth)
+    data = {"supplier": "Vendor", "purchaseDate": "2025-01-01", "durationMonths": 24}
+    assert (
+        client.put(f"/api/v1/assets/{asset['id']}/warranty", json=data, headers=auth).status_code
+        == 200
+    )
+    archived = client.post(
+        f"/api/v1/assets/{asset['id']}/archive", json={"reason": "guardado"}, headers=auth
+    )
+    assert archived.status_code == 200, archived.text
+    items = client.get("/api/v1/warranties").json()["items"]
+    assert all(item["assetId"] != asset["id"] for item in items)
+
+
+def test_warranty_coverage_is_computed_on_the_utc_calendar_day(signed_in_client, monkeypatch):
+    client, auth = signed_in_client()
+    asset = create_asset(client, auth)
+    # 23:30 UTC on 1 January is already 2 January in UTC+14.
+    monkeypatch.setattr(
+        warranties, "utcnow", lambda: datetime(2026, 1, 1, 23, 30, tzinfo=UTC), raising=False
+    )
+    assert (
+        client.put(
+            "/api/v1/warranty-preferences", json={"expiringDays": 1}, headers=auth
+        ).status_code
+        == 200
+    )
+    data = {"supplier": "Vendor", "purchaseDate": "2025-01-01", "expiresOn": "2026-01-01"}
+    assert (
+        client.put(f"/api/v1/assets/{asset['id']}/warranty", json=data, headers=auth).status_code
+        == 200
+    )
+    with local_zone("Pacific/Kiritimati"):
+        coverage = client.get(f"/api/v1/assets/{asset['id']}/warranty").json()["coverage"]
+    assert coverage == "expiring"
