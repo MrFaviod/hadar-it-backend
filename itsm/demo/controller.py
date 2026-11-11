@@ -156,7 +156,8 @@ class DemoController:
         try:
             return await asyncio.to_thread(self.status)
         except Exception:
-            self.unavailable = True
+            # A transient read failure is retried on the next tick; only a failed
+            # reset makes the demo unavailable.
             log_event(logger, "demo.reset_failed", level=logging.ERROR)
             return None
 

@@ -632,3 +632,14 @@ def test_tick_reports_a_reset_left_stuck_by_another_process(settings_factory, mo
         assert '"demo_reset_unavailable"' in response_body(unavailable)
 
     asyncio.run(scenario())
+
+
+def test_transient_status_read_failure_does_not_disable_the_demo(settings_factory, monkeypatch):
+    controller = DemoController(settings_factory(demo_max_in_flight=4))
+
+    def transient_failure():
+        raise RuntimeError("database locked")
+
+    monkeypatch.setattr(controller, "status", transient_failure)
+    assert asyncio.run(controller._read_status()) is None
+    assert controller.unavailable is False
