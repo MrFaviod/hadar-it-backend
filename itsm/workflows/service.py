@@ -601,8 +601,10 @@ class WorkflowService:
                 self._apply_row(principal, operation_id, index, permissions)
             except PermissionDenied:
                 raise
-            except IdentityError as exc:
-                self._fail_row(principal, operation_id, index, str(exc), permissions)
+            except Exception as exc:
+                self._session.rollback()
+                message = str(exc) if isinstance(exc, IdentityError) else "unexpected error"
+                self._fail_row(principal, operation_id, index, message, permissions)
         operation = self._session.get(Operation, operation_id)
         operation.state = "complete"
         self._session.commit()
