@@ -7,7 +7,7 @@ name = "itsm-backend"
 version = "0.1.0"
 description = "ITSM backend foundation: FastAPI API, SQLAlchemy database layer and Huey task adapter."
 requires-python = ">=3.14"
-license = "LicenseRef-Proprietary"
+license = "MIT"
 dependencies = [
     "fastapi==0.156.8",
     "uvicorn==0.54.0",
