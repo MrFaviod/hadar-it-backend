@@ -1548,18 +1548,21 @@ class AiUsageService:
                     statement = statement.where(entity.period_day <= day_to)
                 return statement
 
-            receipts = db.scalars(filtered(select(AiUsageReceipt), AiUsageReceipt)).all()
+            # One joined query instead of one reservation lookup per receipt.
+            receipts = db.execute(
+                filtered(
+                    select(AiUsageReceipt, AiUsageReservation).outerjoin(
+                        AiUsageReservation, AiUsageReservation.id == AiUsageReceipt.reservation_id
+                    ),
+                    AiUsageReceipt,
+                )
+            ).all()
             pending_statement = filtered(
                 select(AiUsageReservation).where(AiUsageReservation.status == PENDING),
                 AiUsageReservation,
             )
 
-            for receipt in receipts:
-                reservation = db.scalar(
-                    select(AiUsageReservation).where(
-                        AiUsageReservation.id == receipt.reservation_id
-                    )
-                )
+            for receipt, reservation in receipts:
                 key = _report_key(
                     groups,
                     user=receipt.actor_id,
