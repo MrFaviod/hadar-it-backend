@@ -104,7 +104,19 @@ def _cell(value: Any) -> str:
         if value is not None
         else ""
     )
-    if text.lstrip().startswith(("=", "+", "-", "@", "\t", "\r")):
+    # Preserve actual numeric values (including Decimal negatives); only text
+    # can start a spreadsheet formula. Leading whitespace/control is unsafe
+    # even without a formula, since spreadsheet importers may discard it.
+    if (
+        isinstance(value, str)
+        and text
+        and (
+            text[0] in "=+-@\ufeff"
+            or text[0].isspace()
+            or ord(text[0]) < 32
+            or 127 <= ord(text[0]) <= 159
+        )
+    ):
         text = "'" + text
     return text
 
@@ -186,13 +198,37 @@ class WorkflowService:
     def _auth(self, principal, permission="assets.edit"):
         self.identity.authorize(principal, permission, resource="inventory:operations")
 
-    def _operation(self, principal, operation_id, permission="assets.view"):
+    def _frontier(self, principal, operation, *, execution_handoff=True):
+        """Reuse persisted ownership/delegation, never caller-supplied actor labels."""
+        if operation.owner_id == principal.actor_id:
+            return
+        owner = self._session.get(Identity, operation.owner_id, populate_existing=True)
+        actor = self._session.get(Identity, principal.actor_id, populate_existing=True)
+        if owner is not None and actor is not None:
+            # A machine's human delegator can review its private proposal.
+            if owner.actor_kind != "human" and actor.actor_kind == "human":
+                if owner.delegated_by_id == actor.id:
+                    return
+            # A delegated machine may read/apply the human owner's fixed approval,
+            # but cannot change its contents or approve on that human's behalf.
+            elif (
+                execution_handoff
+                and owner.actor_kind == "human"
+                and actor.actor_kind != "human"
+                and actor.delegated_by_id == owner.id
+                and operation.approver_id == owner.id
+            ):
+                return
+        raise NotFound("operation not found", key="api.workflows.operation_not_found")
+
+    def _operation(
+        self, principal, operation_id, permission="assets.view", *, execution_handoff=True
+    ):
         self._auth(principal, permission)
         row = self._session.get(Operation, operation_id)
         if row is None:
             raise NotFound("operation not found", key="api.workflows.operation_not_found")
-        # Human approval can be shared with authorized machines; UUID is a
-        # locator, never authorization. All operations require current scope.
+        self._frontier(principal, row, execution_handoff=execution_handoff)
         return row
 
     def _rows(self, operation_id):
@@ -498,7 +534,7 @@ class WorkflowService:
 
     @serialized
     def resolve(self, principal, operation_id, index, action, asset_id=None, values=None):
-        operation = self._operation(principal, operation_id, "assets.edit")
+        operation = self._operation(principal, operation_id, "assets.edit", execution_handoff=False)
         if operation.state not in {"preview", "approved"}:
             raise Conflict(
                 "only unapplied previews can be resolved",
@@ -553,7 +589,7 @@ class WorkflowService:
 
     @serialized
     def approve(self, principal, operation_id):
-        operation = self._operation(principal, operation_id, "assets.edit")
+        operation = self._operation(principal, operation_id, "assets.edit", execution_handoff=False)
         if principal.kind != "human":
             raise PermissionDenied(
                 "only an authorized human can approve a fixed preview",
@@ -586,6 +622,7 @@ class WorkflowService:
         return self.get(principal, operation.id, limit=5000)
 
     def _approval(self, operation, principal, permissions=None):
+        self._frontier(principal, operation)
         if not operation.approver_id:
             raise Conflict(
                 "human approval of the exact preview is required",
@@ -597,6 +634,7 @@ class WorkflowService:
                 "approval is no longer valid", key="api.workflows.approval_no_longer_valid"
             )
         approver = self.identity._principal(stored)
+        self._frontier(approver, operation, execution_handoff=False)
         if permissions is None:
             permissions = self._required_permissions(self._rows(operation.id))
         for permission in permissions:

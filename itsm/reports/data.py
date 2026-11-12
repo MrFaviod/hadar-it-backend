@@ -731,7 +731,7 @@ def csv_bytes(rows: Sequence[Mapping[str, Any]], columns_: Sequence[Mapping[str,
     """UTF-8 CSV with the same header/escaped cells as the existing export."""
     buffer = io.StringIO()
     writer = csv.writer(buffer, delimiter=",")
-    writer.writerow([column["label"] for column in columns_])
+    writer.writerow([_cell(column["label"]) for column in columns_])
     for row in rows:
         writer.writerow([_cell(row.get(column["key"])) for column in columns_])
     return buffer.getvalue().encode("utf-8-sig")
