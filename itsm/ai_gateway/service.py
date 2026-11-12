@@ -1229,7 +1229,11 @@ class AiGatewayService:
         return _PreparedChat(
             payload=body,
             stream=stream,
-            reserved_tokens=context.context_tokens + cap,
+            reserved_tokens=max(
+                context.context_tokens,
+                _input_estimate(body),
+            )
+            + cap,
         )
 
 
@@ -1333,6 +1337,50 @@ def _attachment_bytes(value: Any, modalities: Sequence[str]) -> int:
             "invalid_selection", "attachment bytes require a declared input modality"
         )
     return int(value)
+
+
+def _input_estimate(body: Mapping[str, Any]) -> int:
+    """Validated binary bodies use existing modality estimates, not base64 bytes.
+
+    Preserve all other fields (including history/tools/schemas). This is not a
+    universal provider token bound; byte admission and output caps still apply.
+    """
+    from copy import deepcopy
+
+    from itsm.agent_integrations.attachments import binary_input_estimate
+
+    accounting = deepcopy(body)
+    attachment_tokens = 0
+    for message in accounting["messages"]:
+        if not isinstance(message.get("content"), list):
+            continue
+        for part in message["content"]:
+            if part["type"] == "image_url":
+                match = _DATA_URL.match(part["image_url"]["url"])
+                attachment_tokens += binary_input_estimate(
+                    base64.b64decode(match.group("data")), "image"
+                )
+                part["image_url"]["url"] = ""
+            elif part["type"] == "file":
+                document = part["file"]
+                data = document["file_data"]
+                match = _DATA_URL.match(data) if data.startswith("data:") else None
+                mime = match.group("mime") if match else ""
+                filename = document.get("filename", "").lower()
+                if mime.startswith("text/") or (not mime and filename.endswith((".txt", ".csv"))):
+                    # Text files cannot disguise a long textual input as binary.
+                    attachment_tokens += len(
+                        base64.b64decode(match.group("data") if match else data)
+                    )
+                else:
+                    attachment_tokens += binary_input_estimate(
+                        base64.b64decode(match.group("data") if match else data), "file"
+                    )
+                document["file_data"] = ""
+    return (
+        len(json.dumps(accounting, ensure_ascii=False, separators=(",", ":")).encode("utf-8"))
+        + attachment_tokens
+    )
 
 
 def _part_size(encoded: str) -> int:

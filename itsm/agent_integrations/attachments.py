@@ -41,7 +41,7 @@ MAX_CHAT_MESSAGE_BYTES = 4 * 1024 * 1024
 #: Uploading stays bounded even without sending, so rows cannot grow forever.
 MAX_SESSION_ATTACHMENTS = 20
 
-#: Conservative reservation estimate per modality, settled later by real usage.
+#: Admission estimates per modality, not universal token/billing upper bounds.
 IMAGE_TOKEN_ESTIMATE = 2048
 FILE_TOKEN_ESTIMATE = 4096
 TEXT_TOKEN_BYTES = 4
@@ -72,12 +72,13 @@ class ChatAttachmentInput:
 
 
 def estimate_attachment_tokens(items: Iterable[ChatAttachmentInput]) -> int:
-    """Conservative pre-call estimate for company-funded reservations.
+    """Pre-call estimate for company-funded reservations, not measured usage.
 
-    An image is charged a flat 2048 tokens and a document 4096, both above the
-    typical provider cost of a bounded attachment. Inlined text/CSV is charged
-    one token per four bytes plus the fence. Settlement always replaces the
-    estimate with the provider's measured usage, so precision rules do not move.
+    Images use 2048 tokens and documents 4096. These existing flat estimates
+    cannot bound every provider, resolution or PDF page count. Text/CSV uses
+    one token per four bytes plus the fence for the admission sentinel; actual
+    model calls also count the submitted text. Only available provider usage
+    replaces estimates at settlement; unknown outcomes retain their hold.
     """
 
     total = 0
@@ -89,6 +90,23 @@ def estimate_attachment_tokens(items: Iterable[ChatAttachmentInput]) -> int:
         else:
             total += 8 + (len(item.data) + TEXT_TOKEN_BYTES - 1) // TEXT_TOKEN_BYTES
     return total
+
+
+def binary_input_estimate(data: bytes, kind: str) -> int:
+    """Keep long readable text spans even under a binary label.
+
+    Runs of at least 64 printable UTF-8 characters retain their UTF-8 byte floor;
+    invalid bytes/control characters separate runs, never discard the rest.
+    Opaque/compressed binary uses the existing modality estimate, not a proven
+    token bound. This is accounting, not file validation or a provider tokenizer.
+    """
+    import re
+
+    estimate = IMAGE_TOKEN_ESTIMATE if kind == "image" else FILE_TOKEN_ESTIMATE
+    readable = re.findall(
+        r"[^\x00-\x1f\x7f-\x9f\ufffd]{64,}", data.decode("utf-8", errors="replace")
+    )
+    return max(estimate, sum(len(span.encode("utf-8")) for span in readable))
 
 
 def encoded_size(data: bytes) -> int:

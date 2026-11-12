@@ -483,6 +483,15 @@ def app_client(
     catalog = prepare(
         settings_factory,
         agent_model="openai:gpt-4o-mini",
+        ai_secret_destinations={
+            "ITSM_TEST_OPENCODE_TOKEN": ["http://127.0.0.1:9"],
+            "ITSM_TEST_MCP_TOKEN": ["http://127.0.0.1:18080/api/v1/mcp"],
+            "ITSM_SEAM_TOKEN": ["http://127.0.0.1:9/api/v1/mcp"],
+            "ITSM_MODULE_TOKEN": ["http://127.0.0.1:9/api/v1/mcp"],
+            "ITSM_INSPECTOR_TOKEN": ["http://127.0.0.1:18080/api/v1/mcp"],
+            "OPENCODE_ENGINE_PASSWORD": ["http://127.0.0.1:14963"],
+            "HERMES_SERVER_TOKEN": ["http://127.0.0.1:14964"],
+        },
         ai_broker_url="ws://127.0.0.1:9/runs",
         ai_broker_token="t" * 48,
     )
@@ -1137,7 +1146,7 @@ def test_error_events_are_sanitized_and_usage_kept_once(app_client, monkeypatch)
     ) as response:
         streamed = read_sse(response)
     error = next(event for event in streamed if event["type"] == "error")
-    assert error["code"] == "provider"
+    assert error["code"] == "engine_error"
     assert error["retryable"] is True
     assert "mcp-token-value" not in json.dumps(error)
     assert "127.0.0.1" not in error["message"]
@@ -1844,7 +1853,7 @@ def test_local_install_uses_trusted_inspector_and_never_caller_evidence(
     service = build_service(client, catalog)
     inspected: list[dict[str, Any]] = []
 
-    async def verify_connection(_mcp: dict[str, Any]) -> dict[str, Any]:
+    async def verify_connection(_mcp: dict[str, Any], **kwargs: Any) -> dict[str, Any]:
         return {"verified": True, "checks": [{"name": "mcp.handshake", "status": "pass"}]}
 
     async def profile_safety(
@@ -2064,7 +2073,8 @@ def test_opencode_inspection_uses_engine_basic_auth_and_v2_actions(app_client, m
     real_client = httpx.AsyncClient
 
     def client_factory(**kwargs: Any) -> httpx.AsyncClient:
-        return real_client(**kwargs, transport=httpx.MockTransport(handler))
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", client_factory)
 
@@ -2222,7 +2232,8 @@ def test_opencode_engine_composition_uses_server_basic_auth(app_client, monkeypa
     real_client = httpx.AsyncClient
 
     def client_factory(**kwargs: Any) -> httpx.AsyncClient:
-        return real_client(**kwargs, transport=httpx.MockTransport(handler))
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return real_client(**kwargs)
 
     monkeypatch.setattr(httpx, "AsyncClient", client_factory)
     opencode = service._build_engine(

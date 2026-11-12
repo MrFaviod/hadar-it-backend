@@ -61,11 +61,14 @@ def test_invalid_trusted_launch_never_contacts_engine(monkeypatch, tmp_path, mut
         assert request.headers["Authorization"] == "Bearer " + token
         return httpx.Response(200, json=proof)
 
-    monkeypatch.setattr(
-        httpx,
-        "AsyncClient",
-        lambda **kwargs: original(transport=httpx.MockTransport(handler), **kwargs),
-    )
+    def mock_client(**kwargs):
+        # Preserve the guarded client's policy arguments; replace only its transport.
+        assert kwargs["trust_env"] is False
+        assert kwargs["follow_redirects"] is False
+        kwargs["transport"] = httpx.MockTransport(handler)
+        return original(**kwargs)
+
+    monkeypatch.setattr(httpx, "AsyncClient", mock_client)
     monkeypatch.setattr(
         service,
         "_build_engine",

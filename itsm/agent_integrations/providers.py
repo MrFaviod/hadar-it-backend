@@ -366,6 +366,20 @@ def validate_provider_endpoint(
     return urlunsplit((parts.scheme, parts.netloc, path, "", ""))
 
 
+def require_secret_destination(settings: Settings, reference: str, url: str) -> None:
+    """Authorize an environment reference only for its operator-bound exact URL.
+
+    This is credential authority, not an address policy: private local engines
+    and the installation MCP endpoint remain valid explicit destinations.
+    """
+    normalized = validate_provider_endpoint(url, scope="global")
+    destinations = settings.ai_secret_destinations.get(reference, ())
+    if not any(
+        validate_provider_endpoint(item, scope="global") == normalized for item in destinations
+    ):
+        raise ProviderEndpointError("credential reference is not authorized for this destination")
+
+
 def resolve_addresses(host: str, port: int | None) -> tuple[str, ...]:
     """Resolve one host to unique address strings; literals resolve to themselves."""
     literal = _literal_address(host)

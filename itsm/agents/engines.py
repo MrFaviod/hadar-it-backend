@@ -88,7 +88,11 @@ class _HTTPEngine:
     @property
     def _http(self) -> httpx.AsyncClient:
         if self._client is None:
-            self._client = httpx.AsyncClient()
+            from itsm.agent_integrations.providers import provider_http_client
+
+            # Native engines are operator-trusted, including private localhost;
+            # they still must not inherit ambient proxies or follow redirects.
+            self._client = provider_http_client(allow_private=True)
         return self._client
 
     def _url(self, path: str) -> str:

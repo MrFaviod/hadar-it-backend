@@ -299,14 +299,18 @@ class _Transaction:
             snapshot = self.snapshots.get(path)
             if snapshot is None:
                 continue
+            _check_contained(self.root, path)
             if snapshot.exists:
-                path.parent.mkdir(parents=True, exist_ok=True)
+                self.ensure_dir(path.parent)
+                _check_contained(self.root, path)
                 _atomic_write(path, snapshot.data, mode=snapshot.mode)
             else:
                 path.unlink(missing_ok=True)
         for relative in reversed(self.created_dirs):
+            directory = self.root / relative
+            _check_contained(self.root, directory)
             with contextlib.suppress(OSError):
-                (self.root / relative).rmdir()
+                directory.rmdir()
 
 
 # --------------------------------------------------------------------------- JSONC
@@ -854,7 +858,8 @@ def _hermes_skill_inventory(state: _TargetState) -> list[str]:
         if "SKILL.md" not in files:
             continue
         path = Path(root) / "SKILL.md"
-        if not real_root.startswith(base_real + os.sep) and real_root != base_real:
+        resolved_file = path.resolve()
+        if not resolved_file.is_relative_to(Path(base_real)):
             # A symlinked skill outside the profile is still visible to Hermes;
             # disable it by directory name without reading outside the profile.
             names.add(path.parent.name)
@@ -2084,7 +2089,7 @@ def _public_error(exc: BaseException, secret: str | None) -> str:
     return f"{name}: {message}" if message else name
 
 
-async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
+async def verify_connection(mcp: Mapping[str, Any], *, settings: Any = None) -> dict[str, Any]:
     """Prove a real FastMCP handshake and authorized non-mutating query."""
     checks: list[dict[str, str]] = []
     try:
@@ -2093,6 +2098,25 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
         return {
             "verified": False,
             "checks": [{"name": "mcp.config", "status": "fail", "detail": exc.message}],
+            "toolCount": 0,
+        }
+    from itsm.agent_integrations.providers import ProviderEndpointError, require_secret_destination
+    from itsm.config import Settings
+
+    try:
+        require_secret_destination(
+            settings or Settings(_env_file=None), spec["secretRef"], spec["url"]
+        )
+    except ProviderEndpointError:
+        return {
+            "verified": False,
+            "checks": [
+                {
+                    "name": "mcp.destination",
+                    "status": "fail",
+                    "detail": "credential destination is not authorized",
+                }
+            ],
             "toolCount": 0,
         }
     secret = os.environ.get(spec["secretRef"])
@@ -2122,8 +2146,16 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
         from fastmcp import Client
         from fastmcp.client.transports import StreamableHttpTransport
 
+        def client_factory(**kwargs: Any) -> Any:
+            import httpx2
+
+            kwargs["follow_redirects"] = False
+            return httpx2.AsyncClient(trust_env=False, **kwargs)
+
         transport = StreamableHttpTransport(
-            spec["url"], headers={"Authorization": f"Bearer {secret}"}
+            spec["url"],
+            headers={"Authorization": f"Bearer {secret}"},
+            httpx_client_factory=client_factory,
         )
         async with Client(transport, timeout=15.0) as client:
             checks.append({"name": "mcp.handshake", "status": "pass", "detail": "initialized"})
@@ -2156,8 +2188,10 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
                 }
             )
             return {"verified": True, "checks": checks, "toolCount": len(names)}
-    except Exception as exc:
-        detail = _public_error(exc, secret)
+    except Exception:
+        # Remote MCP exception text is untrusted, even when the selected token
+        # was redacted. Keep a useful stable diagnostic, never the remote body.
+        detail = "mcp_connection_failed"
         existing = {check["name"] for check in checks}
         if "mcp.handshake" not in existing:
             checks.append({"name": "mcp.handshake", "status": "fail", "detail": detail})
@@ -2176,8 +2210,9 @@ async def verify_connection(mcp: Mapping[str, Any]) -> dict[str, Any]:
 class IntegrationInstaller:
     """Apply, verify, repair, disable, or remove ITSM resources for one target."""
 
-    def __init__(self, catalog: Any | None = None) -> None:
+    def __init__(self, catalog: Any | None = None, *, settings: Any = None) -> None:
         self.catalog = _CatalogView(catalog)
+        self.settings = settings
 
     async def detect_target(self, target: IntegrationTarget) -> dict[str, Any]:
         state = _target_state(target)
@@ -2618,7 +2653,7 @@ class IntegrationInstaller:
         *,
         verify_only: bool = False,
     ) -> dict[str, Any]:
-        mcp_result = await verify_connection(mcp)
+        mcp_result = await verify_connection(mcp, settings=self.settings)
         mcp_verified = bool(mcp_result["verified"])
         config_digest = sha256_text(config_text)
         config_ok, config_detail = _profile_config_check(state, config_text, mcp, skill_names, True)

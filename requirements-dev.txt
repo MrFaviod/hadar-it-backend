@@ -18,7 +18,7 @@ defusedxml==0.7.1
 
 apprise==2.0.1
 Markdown==3.11.2
-oauthlib==4.0.0
+oauthlib==4.0.1
 requests-oauthlib==2.0.0
 
 # Installed document rendering closure, matching requirements.txt.

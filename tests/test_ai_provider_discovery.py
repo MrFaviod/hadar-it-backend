@@ -410,7 +410,7 @@ def test_update_refreshes_discovery_only_when_the_endpoint_or_key_changes(
         other.server.body = json.dumps({"data": [{"id": "model-new"}]}).encode()
         moved = environment.client.patch(
             f"{API}/agent/providers/{provider_id}",
-            json={"baseUrl": other.base_url},
+            json={"baseUrl": other.base_url, "apiKey": "sk-explicit-destination-key"},
             headers=headers,
         )
         assert moved.status_code == 200, moved.text

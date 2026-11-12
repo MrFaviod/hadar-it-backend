@@ -623,6 +623,7 @@ def test_broker_launches_one_hardened_worker_and_relays_tools(tmp_path: Path) ->
 
 def test_isolated_calls_settle_then_deny_next_call_without_dispatch(
     settings_factory: Callable[..., Settings],
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     from itsm.agents.usage import measured_usage
 
@@ -663,7 +664,22 @@ def test_isolated_calls_settle_then_deny_next_call_without_dispatch(
     try:
         reader = catalog.add_user(*READER)
         usage = client.app.state.agent_usage
-        usage.update_policy(catalog.admin(), company_daily_limit=settings.agent_max_output_tokens)
+        # Derive the exact first bound at the trusted public reserve boundary;
+        # allow one call, then measured consumption makes its retry unaffordable.
+        original_reserve = type(usage).reserve
+        first_bound = []
+
+        def reserve(service, *args, **kwargs):
+            if kwargs.get("parent_reservation_id") and not first_bound:
+                first_bound.append(kwargs["reserved_tokens"])
+                usage.update_policy(catalog.admin(), company_daily_limit=first_bound[0])
+            return original_reserve(service, *args, **kwargs)
+
+        monkeypatch.setattr(type(usage), "reserve", reserve)
+        # Full trusted request/tool schema bytes now participate in admission.
+        # One measured call fits; retaining its input and a capped prior output
+        # makes the second reservation fail without dispatch.
+        usage.update_policy(catalog.admin(), company_daily_limit=90_000)
         headers = sign_in_as(client, settings, READER[0], MACHINE_PASSWORD)
         response = chat(client, headers, "buscá switches")
         assert response.status_code == 429, response.text
@@ -672,7 +688,7 @@ def test_isolated_calls_settle_then_deny_next_call_without_dispatch(
         balance = usage.me(reader.actor_id)["funding"]["company"]
         assert balance["consumedTokens"] == 6
         assert balance["reservedTokens"] == 0
-        assert balance["availableTokens"] == settings.agent_max_output_tokens - 6
+        assert balance["availableTokens"] == first_bound[0] - 6
         assert broker.errors == []
     finally:
         broker.close()

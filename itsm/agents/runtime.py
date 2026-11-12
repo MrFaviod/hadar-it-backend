@@ -1917,13 +1917,13 @@ def resolve_model(
         from pydantic_ai.models.openai import OpenAIChatModel
         from pydantic_ai.providers.openai import OpenAIProvider
 
-        provider = OpenAIProvider(base_url=settings.agent_openai_base_url)
+        provider = OpenAIProvider(base_url=settings.agent_openai_base_url, http_client=http_client)
         return OpenAIChatModel(model_name, provider=provider)
     if provider_name == "anthropic":
         from pydantic_ai.models.anthropic import AnthropicModel
         from pydantic_ai.providers.anthropic import AnthropicProvider
 
-        return AnthropicModel(model_name, provider=AnthropicProvider())
+        return AnthropicModel(model_name, provider=AnthropicProvider(http_client=http_client))
     raise AgentUnavailable()
 
 
@@ -2092,7 +2092,12 @@ class AgentRuntime:
                 raise AgentUnavailable()
             else:
                 try:
-                    model = resolve_model(self._settings, selection)
+                    client = self._provider_http_client
+                    if client is None:
+                        client = build_provider_http_client(allow_private=True)
+                        self._provider_http_client = client
+                        self._owns_provider_client = True
+                    model = resolve_model(self._settings, selection, http_client=client)
                 except AgentUnavailable:
                     raise
                 except Exception as exc:  # provider construction must stay explicit
@@ -2160,7 +2165,9 @@ class AgentRuntime:
     ) -> tuple[ChatReply, AgentUsage]:
         """Shared run that also returns real usage, including on failure."""
         turn_client = None
-        if provider_selection is not None and self._provider_http_client is None:
+        if provider_selection is not None and (
+            self._provider_http_client is None or self._owns_provider_client
+        ):
             # A guarded client is scoped to this turn: a global provider's
             # unrestricted pool must never be reused for a personal one.
             turn_client = build_provider_http_client(allow_private=provider_selection.allow_private)

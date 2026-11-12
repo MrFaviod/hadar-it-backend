@@ -175,8 +175,8 @@ def catalog() -> CatalogDouble:
 
 
 @pytest.fixture
-def installer(catalog: CatalogDouble) -> IntegrationInstaller:
-    return IntegrationInstaller(catalog=catalog)
+def installer(catalog: CatalogDouble, mcp_server: dict[str, Any]) -> IntegrationInstaller:
+    return IntegrationInstaller(catalog=catalog, settings=mcp_server["settings"])
 
 
 @pytest.fixture(scope="module")
@@ -206,6 +206,7 @@ def mcp_server(tmp_path_factory: pytest.TempPathFactory) -> Iterator[dict[str, A
     with socket.socket() as probe:
         probe.bind(("127.0.0.1", 0))
         port = probe.getsockname()[1]
+    settings.ai_secret_destinations = {TOKEN_ENV: [f"http://127.0.0.1:{port}/api/v1/mcp"]}
     app = create_app(settings)
     server = uvicorn.Server(uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning"))
     thread = threading.Thread(target=server.run, daemon=True)
@@ -1665,6 +1666,9 @@ def test_remote_request_helper_round_trip_and_receipt_validation(
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ITSM_")}
     environment["PYTHONPATH"] = str(helper_root)
     environment[TOKEN_ENV] = mcp_server["token"]
+    environment["ITSM_AI_SECRET_DESTINATIONS"] = json.dumps(
+        mcp_server["settings"].ai_secret_destinations
+    )
     process = subprocess.run(
         [sys.executable, "-m", "itsm.agent_integrations", "--request", str(request_path)],
         cwd=helper_root,
@@ -1695,7 +1699,7 @@ def test_remote_request_helper_round_trip_and_receipt_validation(
     tampered = json.loads(json.dumps(receipt))
     tampered["configDigest"] = "sha256:" + "0" * 64
     assert validate_receipt(tampered, request=request)["valid"] is False
-    connection = run(verify_connection(mcp_spec(mcp_server)))
+    connection = run(verify_connection(mcp_spec(mcp_server), settings=mcp_server["settings"]))
     assert connection["verified"] is True
     assert connection["toolCount"] and connection["toolCount"] > 1
 
@@ -1727,6 +1731,9 @@ def test_remote_helper_rejects_request_tamper_and_expected_manifest_mismatch(
     environment = {key: value for key, value in os.environ.items() if not key.startswith("ITSM_")}
     environment["PYTHONPATH"] = str(helper_root)
     environment[TOKEN_ENV] = mcp_server["token"]
+    environment["ITSM_AI_SECRET_DESTINATIONS"] = json.dumps(
+        mcp_server["settings"].ai_secret_destinations
+    )
     process = subprocess.run(
         [sys.executable, "-m", "itsm.agent_integrations", "--request", str(request_path)],
         cwd=helper_root,

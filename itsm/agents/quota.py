@@ -1,16 +1,23 @@
 """ITSM-owned paid-call admission; provider adapters only supply usage evidence.
 
-A declared context bound is an operator contract, not a token estimate. Without
-one the wrapper exposes admission-only enforcement and reserves the output cap.
+Admission reserves serialized non-binary input plus existing attachment estimates
+and the output cap. This is an admission estimate, not a tokenizer or billing bound.
 Unknown outcomes retain their reservation for explicit reconciliation.
 """
 
 from __future__ import annotations
 
 from collections.abc import Mapping
+from dataclasses import replace
 from typing import Any, Protocol
 
-from pydantic_ai.messages import ModelMessage, ModelResponse
+from pydantic_ai.messages import (
+    BinaryContent,
+    ModelMessage,
+    ModelRequest,
+    ModelResponse,
+    UserPromptPart,
+)
 from pydantic_ai.models import Model, ModelRequestParameters
 from pydantic_ai.models.wrapper import WrapperModel
 from pydantic_ai.settings import ModelSettings
@@ -49,7 +56,7 @@ class BudgetedModel(WrapperModel):
         self._budget = budget
         self._context_tokens = context_tokens
         self._output_tokens = output_tokens
-        self.quota_enforcement = "bounded" if context_tokens is not None else "admission_only"
+        self.quota_enforcement = "bounded"
 
     async def request(
         self,
@@ -61,7 +68,40 @@ class BudgetedModel(WrapperModel):
         settings["max_tokens"] = min(
             settings.get("max_tokens") or self._output_tokens, self._output_tokens
         )
-        bound = (self._context_tokens or 0) + settings["max_tokens"]
+        from itsm.agent_integrations.attachments import binary_input_estimate
+        from pydantic_core import to_json
+
+        # Only typed binary user content is estimated. Text, history and schemas
+        # retain the serialized floor; a dict with binary-looking keys cannot hide it.
+        accounted = []
+        attachment_tokens = 0
+        for message in messages:
+            if not isinstance(message, ModelRequest):
+                accounted.append(message)
+                continue
+            parts = []
+            for part in message.parts:
+                if isinstance(part, UserPromptPart) and not isinstance(part.content, str):
+                    content = []
+                    for item in part.content:
+                        if isinstance(item, BinaryContent) and (
+                            item.media_type.startswith("image/")
+                            or item.media_type == "application/pdf"
+                        ):
+                            attachment_tokens += binary_input_estimate(
+                                item.data,
+                                "image" if item.media_type.startswith("image/") else "file",
+                            )
+                            item = replace(item, data=b"")
+                        content.append(item)
+                    part = replace(part, content=content)
+                parts.append(part)
+            accounted.append(replace(message, parts=parts))
+        input_estimate = (
+            len(to_json([accounted, model_request_parameters], bytes_mode="base64"))
+            + attachment_tokens
+        )
+        bound = max(self._context_tokens or 0, input_estimate) + settings["max_tokens"]
         call_id = self._budget.before_call(bound)
         try:
             response = await self.wrapped.request(messages, settings, model_request_parameters)

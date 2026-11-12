@@ -348,8 +348,8 @@ def test_company_quota_is_attributed_and_enforced_per_person(environment, monkey
         monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", True)
         http_client = use_admin_runtime(env, lambda request: chat_completions(GLOBAL_MODEL))
         try:
-            set_policy(env, company_limit=1000)
-            set_override(env, env.ada.actor_id, 68)
+            set_policy(env, company_limit=1_000_000)
+            set_override(env, env.ada.actor_id, 100_000)
             provider = create_provider(
                 env.superadmin, scope="global", name="Company provider", api_key=GLOBAL_KEY
             )
@@ -358,10 +358,12 @@ def test_company_quota_is_attributed_and_enforced_per_person(environment, monkey
             turn_reply(_send(env.ada.client, env.ada.headers, session["id"]))
             ada_usage = _usage_funding(env.ada.client, env.ada.headers)
             assert ada_usage["company"]["consumedTokens"] == 5
-            assert ada_usage["company"]["limitTokens"] == 68
+            assert ada_usage["company"]["limitTokens"] == 100_000
             assert ada_usage["company"]["limitSource"] == "override"
             assert ada_usage["personal"]["consumedTokens"] == 0
 
+            # Explicit exhaustion after legitimate conservative admission.
+            set_override(env, env.ada.actor_id, 6)
             denied = post_message(env.ada, session["id"])
             assert stream_error(denied)["code"] == "quota_exceeded"
             assert _usage_funding(env.ada.client, env.ada.headers)["company"]["consumedTokens"] == 5
@@ -370,8 +372,8 @@ def test_company_quota_is_attributed_and_enforced_per_person(environment, monkey
             turn_reply(_send(env.ugo.client, env.ugo.headers, ugo_session["id"]))
             ugo_usage = _usage_funding(env.ugo.client, env.ugo.headers)
             assert ugo_usage["company"]["consumedTokens"] == 6
-            assert ugo_usage["company"]["limitTokens"] == 1000
-            assert ugo_usage["company"]["availableTokens"] == 994
+            assert ugo_usage["company"]["limitTokens"] == 1_000_000
+            assert ugo_usage["company"]["availableTokens"] == 999_994
 
             ada_report = env.superadmin.get(
                 f"{API}/agent/usage/report", params={"userId": env.ada.actor_id}
@@ -409,8 +411,8 @@ def test_personal_provider_is_record_only_and_ignores_the_company_quota(
         monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", True)
         http_client = use_admin_runtime(env, lambda request: chat_completions(PERSONAL_MODEL))
         try:
-            set_policy(env, company_limit=1000)
-            set_override(env, env.ada.actor_id, 68)
+            set_policy(env, company_limit=1_000_000)
+            set_override(env, env.ada.actor_id, 100_000)
             global_provider = create_provider(
                 env.superadmin, scope="global", name="Company provider", api_key=GLOBAL_KEY
             )
@@ -430,6 +432,8 @@ def test_personal_provider_is_record_only_and_ignores_the_company_quota(
             turn_reply(_send(env.ada.client, env.ada.headers, global_session["id"]))
             assert _usage_funding(env.ada.client, env.ada.headers)["company"]["consumedTokens"] == 5
 
+            # Explicit exhaustion after legitimate conservative admission.
+            set_override(env, env.ada.actor_id, 6)
             denied = post_message(env.ada, global_session["id"])
             assert stream_error(denied)["code"] == "quota_exceeded"
 
@@ -468,7 +472,7 @@ def test_switching_provider_mid_session_attributes_each_turn_correctly(
             env, lambda request: chat_completions(json.loads(request.content)["model"])
         )
         try:
-            set_policy(env, company_limit=1000)
+            set_policy(env, company_limit=1_000_000)
             global_provider = create_provider(
                 env.superadmin, scope="global", name="Company provider", api_key=GLOBAL_KEY
             )
@@ -761,7 +765,7 @@ def test_agent_tool_outputs_never_contain_personal_credentials(environment) -> N
     from pydantic_ai.models.function import FunctionModel
 
     env = environment()
-    set_policy(env, company_limit=1000)
+    set_policy(env, company_limit=1_000_000)
     create_provider(env.ada, scope="personal", name="Ada personal", api_key=ADA_KEY)
     create_provider(env.ugo, scope="personal", name="Ugo personal", api_key=UGO_KEY)
 

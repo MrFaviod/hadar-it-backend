@@ -560,13 +560,33 @@ def _attachment_kind(media_type: str) -> str:
     return "file"
 
 
+def _engine_diagnostic(code: str) -> tuple[str, str]:
+    messages = {
+        "unauthorized": "engine authentication failed",
+        "authentication": "engine authentication failed",
+        "not_found": "engine resource was not found",
+        "protocol": "engine protocol failed",
+        "unsupported": "engine operation is unsupported",
+        "unreachable": "engine is unreachable",
+        "timeout": "engine request timed out",
+        "upstream": "engine upstream request failed",
+        "model_unavailable": "engine model is unavailable",
+        "unavailable": "engine is unavailable",
+        "misconfigured": "engine configuration is invalid",
+    }
+    return (code, messages[code]) if code in messages else ("engine_error", "engine request failed")
+
+
 def _engine_error(exc: BaseException) -> tuple[str, str, bool] | None:
     """Read the public EngineError shape without importing the adapter package."""
     code = getattr(exc, "code", None)
     message = getattr(exc, "message", None)
     retryable = getattr(exc, "retryable", None)
     if isinstance(code, str) and isinstance(message, str) and isinstance(retryable, bool):
-        return code, message, retryable
+        # Engine adapters and remote engines can include arbitrary upstream
+        # bodies. Public diagnostics are a closed vocabulary, not regex cleaning.
+        safe_code, safe_message = _engine_diagnostic(code)
+        return safe_code, safe_message, retryable
     return None
 
 
@@ -740,9 +760,17 @@ class AgentIntegrationService:
             managed_context_tokens=row.managed_context_tokens,
         )
 
-    def _secret(self, row: AgentInstance) -> str | None:
+    def _secret(self, row: AgentInstance | InstanceSnapshot) -> str | None:
         if not row.secret_ref:
             return None
+        from itsm.agent_integrations.providers import require_secret_destination
+
+        try:
+            require_secret_destination(self._settings, row.secret_ref, row.base_url or "")
+        except ProviderEndpointError:
+            raise IntegrationUnavailable(
+                "engine credential destination is not authorized"
+            ) from None
         value = os.environ.get(row.secret_ref)
         if not value:
             raise IntegrationUnavailable("the engine credential is not configured")
@@ -1094,9 +1122,7 @@ class AgentIntegrationService:
 
     # ------------------------------------------------------------------ discovery
     def _build_engine(self, row: InstanceSnapshot) -> Any:
-        secret = os.environ.get(row.secret_ref) if row.secret_ref else None
-        if row.secret_ref and not secret:
-            raise IntegrationUnavailable("the engine credential is not configured")
+        secret = self._secret(row)
         if self._engine_factory is not None:
             return self._engine_factory(row, secret)
         try:
@@ -1610,6 +1636,11 @@ class AgentIntegrationService:
             capability_values = _capability_values(payload)
             scope = row.scope
             base_url = str(values.get("base_url", row.base_url))
+            if base_url != row.base_url and api_key is None and row.api_key_ciphertext:
+                raise ValidationFailed(
+                    "changing provider destination requires an explicit apiKey",
+                    key="api.agent_integrations.destination_change_requires_api_key",
+                )
             credential: str | None = None
             if "baseUrl" in payload or api_key is not None:
                 try:
@@ -1875,6 +1906,17 @@ class AgentIntegrationService:
                         key="api.agent_integrations.machine_admin_role",
                     )
                 values["integration_identity_id"] = identity_id
+        reference = values.get("secret_ref", existing.secret_ref if existing else None)
+        destination = values.get("base_url", existing.base_url if existing else "")
+        if reference:
+            from itsm.agent_integrations.providers import require_secret_destination
+
+            try:
+                require_secret_destination(self._settings, reference, destination)
+            except ProviderEndpointError as exc:
+                raise ValidationFailed(
+                    str(exc), key="api.agent_integrations.secret_destination_denied"
+                ) from None
         return values
 
     def create_instance(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
@@ -3058,7 +3100,7 @@ class AgentIntegrationService:
             if installation is None:
                 raise IntegrationUnavailable("the managed profile is not verified")
             receipt = installation.receipt or {}
-            mcp = receipt.get("mcp") or {}
+            mcp = self._mcp(receipt.get("mcp") or {})
             token = os.environ.get(mcp.get("secretRef", ""))
             if not token:
                 raise IntegrationUnavailable("the integration credential is unavailable")
@@ -3277,10 +3319,8 @@ class AgentIntegrationService:
                 return None
         if kind == "error":
             code = _label(raw.get("code"), limit=64) or "engine_error"
-            message = _clean(raw.get("message"), 1000)
-            if message is None:
-                message = "the engine reported an error"
-            message = self._redact(message, turn.instance, secret=self._turn_secret(turn))
+            code, message = _engine_diagnostic(code)
+
             retryable = raw.get("retryable")
             return {
                 "type": "error",
@@ -3441,7 +3481,9 @@ class AgentIntegrationService:
         try:
             from itsm.agent_integrations.installer import IntegrationInstaller
 
-            self._installer = IntegrationInstaller(catalog=self._catalog_instance())
+            self._installer = IntegrationInstaller(
+                catalog=self._catalog_instance(), settings=self._settings
+            )
         except ImportError:
             raise IntegrationUnavailable("the integration installer is not available") from None
         return self._installer
@@ -3526,6 +3568,14 @@ class AgentIntegrationService:
                 key="api.validation.field_required",
                 params={"field": "mcp.identityId"},
             )
+        from itsm.agent_integrations.providers import require_secret_destination
+
+        try:
+            require_secret_destination(self._settings, reference, url)
+        except ProviderEndpointError as exc:
+            raise ValidationFailed(
+                str(exc), key="api.agent_integrations.secret_destination_denied"
+            ) from None
         return {"url": url, "secretRef": reference, "identityId": identity_id}
 
     def _skills(self, payload: Any) -> list[str]:
@@ -4075,7 +4125,7 @@ class AgentIntegrationService:
 
         try:
             async with asyncio.timeout(self._settings.agent_install_timeout_seconds):
-                result = await verify_connection(dict(mcp))
+                result = await verify_connection(dict(mcp), settings=self._settings)
         except TimeoutError:
             return {"verified": False, "checks": [{"name": "control.mcp", "status": "fail"}]}
         except Exception as exc:
@@ -4107,9 +4157,8 @@ class AgentIntegrationService:
         receipt: Mapping[str, Any],
     ) -> dict[str, Any] | None:
         """Bind a live native inspection to an independently owned host launch."""
-        import httpx
-
         from itsm.agent_integrations.installer import _hermes_runtime_safety
+        from itsm.agent_integrations.providers import provider_http_client
 
         digest = receipt.get("configDigest")
         inspector_url = self._settings.hermes_inspector_url
@@ -4119,13 +4168,10 @@ class AgentIntegrationService:
         if not isinstance(digest, str) or not digest or not inspector_url or not inspector_token:
             return None
         try:
-            async with httpx.AsyncClient(
-                timeout=30,
-                follow_redirects=False,
-                headers={"Authorization": "Bearer " + inspector_token.get_secret_value()},
-            ) as client:
+            async with provider_http_client(allow_private=True, timeout=30) as client:
                 response = await client.post(
                     inspector_url + "/profile-proof",
+                    headers={"Authorization": "Bearer " + inspector_token.get_secret_value()},
                     json={"profileHome": home, "endpoint": endpoint, "configDigest": digest},
                 )
             if response.status_code != 200 or len(response.content) > 8192:
@@ -4190,20 +4236,22 @@ class AgentIntegrationService:
         if not isinstance(digest, str) or not digest:
             return None
         base_url = getattr(instance, "base_url", None) or ""
-        secret_ref = getattr(instance, "secret_ref", None)
-        token = os.environ.get(secret_ref) if isinstance(secret_ref, str) else None
-        if not token or not base_url:
-            return None
         username = getattr(instance, "username", None) or "opencode"
         params = {"location[directory]": target.path}
         try:
             import httpx
 
-            async with httpx.AsyncClient(
-                base_url=base_url.rstrip("/"),
-                auth=(username, token),
+            from itsm.agent_integrations.providers import provider_http_client
+
+            token = self._secret(instance)
+            if not token or not base_url:
+                return None
+            async with provider_http_client(
+                allow_private=True,
                 timeout=min(self._settings.agent_engine_timeout_seconds, 30),
             ) as client:
+                client.base_url = base_url.rstrip("/")
+                client.auth = httpx.BasicAuth(username, token)
                 config_response = await client.get("/api/config", params=params)
                 agent_response = await client.get("/api/agent/itsm", params=params)
                 if agent_response.status_code == 404:

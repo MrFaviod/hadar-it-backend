@@ -19,16 +19,21 @@ synchronous and already runs in a worker thread.
 from __future__ import annotations
 
 import asyncio
+import base64
 import json
 import logging
 import os
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
+from time import monotonic
 from typing import Any, Final, Literal
 from uuid import UUID
 
-from itsm.agent_integrations.attachments import ChatAttachmentInput
+from itsm.agent_integrations.attachments import (
+    ChatAttachmentInput,
+    binary_input_estimate,
+)
 from itsm.agent_integrations.providers import ProviderModelSelection
 from itsm.agents import locales as agent_locales
 from itsm.agents.runtime import (
@@ -446,7 +451,25 @@ class IsolatedRuntime:
         token = self._settings.ai_broker_token
         if url is None or token is None:
             raise IsolationUnavailable(_UNAVAILABLE)
-        deadline = _run_timeout(self._settings) + 10
+        duration = _run_timeout(self._settings)
+        deadline = monotonic() + duration
+        tool_calls = 0
+        # Trusted input floor: exclude provider credentials, include schemas,
+        # attachments/history and accumulated trusted tool results. Worker claims
+        # never lower admission. Prior outputs are reserved at their full cap.
+        known_input = 0
+        if quota is not None:
+            accounting = dict(start.model_dump(mode="json", by_alias=True, exclude={"provider"}))
+            # Only trusted attachment bodies are removed, never arbitrary nested
+            # keys in prompts/history/schemas. Text attachments keep their floor.
+            accounting["attachments"] = [dict(item) for item in accounting.get("attachments", [])]
+            for attachment in accounting["attachments"]:
+                if attachment["kind"] in {"image", "file"}:
+                    known_input += binary_input_estimate(
+                        base64.b64decode(attachment["data"]), attachment["kind"]
+                    )
+                    attachment["data"] = ""
+            known_input += len(json.dumps(accounting, ensure_ascii=False).encode("utf-8"))
         input_tokens = 0
         output_tokens = 0
         quota_calls: dict[str, str] = {}
@@ -454,7 +477,7 @@ class IsolatedRuntime:
             with connector(
                 url,
                 additional_headers={"Authorization": f"Bearer {token.get_secret_value()}"},
-                open_timeout=min(10, deadline),
+                open_timeout=min(10, duration),
                 close_timeout=2,
                 max_size=_MAX_MESSAGE_BYTES,
                 compression=None,
@@ -462,7 +485,12 @@ class IsolatedRuntime:
             ) as socket:
                 socket.send(_json_line(start))
                 while True:
-                    raw = socket.recv(timeout=deadline)
+                    remaining = deadline - monotonic()
+                    if remaining <= 0:
+                        raise IsolationUnavailable(_UNAVAILABLE)
+                    raw = socket.recv(timeout=remaining)
+                    if monotonic() >= deadline:
+                        raise IsolationUnavailable(_UNAVAILABLE)
                     if isinstance(raw, bytes):
                         raise IsolationUnavailable(_UNAVAILABLE)
                     if len(raw.encode("utf-8")) > _MAX_MESSAGE_BYTES:
@@ -485,7 +513,7 @@ class IsolatedRuntime:
                                 raise IsolationUnavailable(_UNAVAILABLE)
                             try:
                                 identifier = quota.before_call(
-                                    (self._settings.agent_context_token_bound or 0)
+                                    max(self._settings.agent_context_token_bound or 0, known_input)
                                     + self._settings.agent_max_output_tokens
                                 )
                             except Exception as exc:
@@ -496,6 +524,7 @@ class IsolatedRuntime:
                                 )
                                 raise
                             quota_calls[message.call_id] = identifier
+                            known_input += self._settings.agent_max_output_tokens
                         else:
                             identifier = quota_calls.get(message.call_id)
                             if identifier is None or message.evidence is None:
@@ -504,7 +533,16 @@ class IsolatedRuntime:
                         socket.send(_json_line(QuotaResult(call_id=message.call_id, ok=True)))
                         continue
                     if isinstance(message, WorkerToolCall):
-                        socket.send(_json_line(self._tool_result(message, prepared)))
+                        tool_calls += 1
+                        if tool_calls > start.max_steps * 4:
+                            raise IsolationUnavailable(_UNAVAILABLE)
+                        result = self._tool_result(message, prepared)
+                        # Synchronous trusted tools cannot be forcibly interrupted
+                        # safely. Refuse continuation once an overdue tool returns.
+                        if monotonic() >= deadline:
+                            raise IsolationUnavailable(_UNAVAILABLE)
+                        known_input += len(_json_line(result).encode("utf-8"))
+                        socket.send(_json_line(result))
                         continue
                     if isinstance(message, WorkerFinal):
                         return input_tokens, output_tokens, message.message

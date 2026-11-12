@@ -670,7 +670,7 @@ def test_nonstream_forwards_pinned_request_and_settles_measured_once(harness: An
     row = child_row(harness)
     assert row["status"] == "settled"
     assert row["settled_tokens"] == 15
-    assert row["reserved_tokens"] == 85
+    assert row["reserved_tokens"] >= 85
     assert row["parent_reservation_id"].startswith("parent-")
     evidence = harness.ledger.settlements[0][1]
     assert evidence["totalTokens"] == 15
@@ -679,7 +679,7 @@ def test_nonstream_forwards_pinned_request_and_settles_measured_once(harness: An
     assert evidence["cacheIncludedInInput"] is True
     assert evidence["reasoningIncludedInOutput"] is True
     assert harness.ledger.settle_counts == {harness.ledger.settlements[0][0]: 1}
-    assert harness.ledger.remaining["company"] == 100_000 - 1 - 85 + 70
+    assert harness.ledger.remaining["company"] == 100_000 - 1 - 15
 
     assert harness.service.revoke(lease.lease_id) is True
     response = harness.client.post(CHAT, json=payload(), headers=bearer(lease))
@@ -702,7 +702,7 @@ def test_upstream_error_status_keeps_hold_and_forwards_provider_error(
     assert response.json() == provider_error
     row = child_row(harness)
     assert row["status"] == "unresolved"
-    assert harness.ledger.remaining["company"] == 100_000 - 1 - 100
+    assert harness.ledger.remaining["company"] == 100_000 - 1 - row["reserved_tokens"]
     assert harness.ledger.releases == []
 
 
@@ -933,7 +933,7 @@ def test_oversized_upstream_response_keeps_hold(harness: Any) -> None:
 
 def test_two_concurrent_calls_reserve_before_dispatch_and_only_one_admitted(harness: Any) -> None:
     lease, _ = issue(harness)
-    harness.ledger.remaining["company"] = 100
+    harness.ledger.remaining["company"] = 121
 
     async def slow(request: httpx.Request) -> httpx.Response:
         await asyncio.sleep(0.05)
@@ -1277,3 +1277,98 @@ def test_lease_admits_inline_pdf_only_when_file_is_declared(harness: Any) -> Non
     )
     assert refused.status_code == 400
     assert refused.json()["error"]["code"] == "unsupported_content"
+
+
+def test_m3_large_submitted_context_reserves_before_dispatch(harness):
+    lease, _ = issue(harness, context_tokens=1)
+    response = harness.client.post(
+        CHAT,
+        json=payload(messages=[{"role": "user", "content": "é" * 1000}]),
+        headers=bearer(lease),
+    )
+    assert response.status_code == 200
+    assert child_row(harness)["reserved_tokens"] >= 2040
+    assert len(harness.upstream.requests) == 1
+
+
+def test_m3_large_prompt_quota_denial_leaves_no_call_or_upstream(harness):
+    lease, _ = issue(harness, context_tokens=1)
+    harness.ledger.remaining["company"] = 500
+    before = dict(harness.ledger.remaining)
+    response = harness.client.post(
+        CHAT,
+        json=payload(messages=[{"role": "user", "content": "é" * 1000}]),
+        headers=bearer(lease),
+    )
+    assert response.status_code == 429
+    assert harness.ledger.remaining == before
+    assert call_rows(harness) == []
+    assert harness.upstream.requests == []
+
+
+@pytest.mark.parametrize("kind", ["image", "file"])
+def test_m3_large_binary_keeps_original_body_without_base64_token_charge(harness, kind):
+    raw = (
+        (b"\x89PNG\r\n\x1a\n" if kind == "image" else b"%PDF-1.7\n")
+        + b"\x00" * (1024 * 1024)
+        + (b"" if kind == "image" else b"\n%%EOF")
+    )
+    data = base64.b64encode(raw).decode()
+    body = (
+        image_message("data:image/png;base64," + data)
+        if kind == "image"
+        else file_message("data:application/pdf;base64," + data)
+    )
+    lease, _ = issue(
+        harness, input_modalities=(kind,), attachment_bytes=len(data), context_tokens=128000
+    )
+    harness.ledger.remaining["company"] = 1000000
+    response = harness.client.post(CHAT, json=body, headers=bearer(lease))
+    assert response.status_code == 200, response.text
+    assert child_row(harness)["reserved_tokens"] == 128040
+    assert json.loads(harness.upstream.requests[0].content) == body
+
+
+def test_m3_gateway_text_file_history_and_schema_cannot_hide_behind_binary(harness):
+    data = base64.b64encode(("é" * 10000).encode()).decode()
+    body = file_message("data:text/plain;base64," + data)
+    body["messages"].insert(0, {"role": "system", "content": "history" * 1000})
+    body["tools"] = [
+        {
+            "type": "function",
+            "function": {
+                "name": "lookup",
+                "parameters": {"type": "object", "description": "schema" * 1000},
+            },
+        }
+    ]
+    lease, _ = issue(
+        harness, input_modalities=("file",), attachment_bytes=len(data), context_tokens=1
+    )
+    harness.ledger.remaining["company"] = 20000
+    before = dict(harness.ledger.remaining)
+    response = harness.client.post(CHAT, json=body, headers=bearer(lease))
+    assert response.status_code == 429, response.text
+    assert harness.ledger.remaining == before
+    assert call_rows(harness) == [] and harness.upstream.requests == []
+
+
+@pytest.mark.parametrize("kind", ["bare_pdf", "pdf_url", "png_url"])
+@pytest.mark.parametrize("suffix", [b"", b"\x00", b"\xff"])
+def test_m3_mislabeled_text_cannot_lower_admission(harness, kind, suffix):
+    raw = b"A" * 100000 + suffix
+    encoded = base64.b64encode(raw).decode()
+    body = (
+        image_message("data:image/png;base64," + encoded)
+        if kind == "png_url"
+        else file_message(("data:application/pdf;base64," if kind == "pdf_url" else "") + encoded)
+    )
+    lease, _ = issue(
+        harness, input_modalities=("image", "file"), attachment_bytes=len(encoded), context_tokens=1
+    )
+    harness.ledger.remaining["company"] = 20000
+    before = dict(harness.ledger.remaining)
+    result = harness.client.post(CHAT, json=body, headers=bearer(lease))
+    assert result.status_code == 429, result.text
+    assert harness.ledger.remaining == before
+    assert call_rows(harness) == [] and harness.upstream.requests == []

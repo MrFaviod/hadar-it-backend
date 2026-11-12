@@ -13,6 +13,7 @@ import contextlib
 import hashlib
 import hmac
 import http.client
+import ipaddress
 import json
 import os
 import re
@@ -401,6 +402,13 @@ class RemoteContainerValidator:
                 "validator broker URL must be an HTTP(S) server base URL "
                 "without credentials, path, query or fragment"
             )
+        if parts.scheme == "http":
+            try:
+                local = ipaddress.ip_address(parts.hostname).is_loopback
+            except ValueError:
+                local = False
+            if not local:
+                raise ValueError("validator broker requires HTTPS except literal loopback")
         if (
             not isinstance(timeout, (int, float))
             or isinstance(timeout, bool)

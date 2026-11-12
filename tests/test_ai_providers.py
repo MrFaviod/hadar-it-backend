@@ -1017,6 +1017,9 @@ def test_instance_only_patch_uses_external_instance_default_model(
     )
 
     catalog, client = provider_env
+    catalog.settings.ai_secret_destinations = {
+        "ITSM_TEST_MCP_TOKEN": ["http://127.0.0.1:18080/api/v1/mcp"]
+    }
     machine, machine_token = catalog.add_machine("opencode-client", "OpenCode Client")
     monkeypatch.setenv("ITSM_TEST_MCP_TOKEN", machine_token)
     engine = FakeEngine(models=("fake/model-a", "fake/model-b"))
@@ -1369,3 +1372,37 @@ def test_global_provider_selection_keeps_owner_trusted_private_access(
         selection = service._provider_selection(session, principal, row, "model-a")
 
     assert selection.allow_private is True
+
+
+def test_m3_fallback_owned_transport_is_not_reused_for_personal_turn(settings_factory, monkeypatch):
+    from itsm.system.providers import ProviderSelection
+
+    policies = []
+    real_factory = runtime_module.build_provider_http_client
+
+    def factory(*, allow_private):
+        policies.append(allow_private)
+        return real_factory(allow_private=allow_private)
+
+    monkeypatch.setattr(runtime_module, "build_provider_http_client", factory)
+    monkeypatch.setattr(
+        runtime_module,
+        "resolve_model",
+        lambda *a, **kw: FunctionModel(
+            lambda messages, info: ModelResponse(parts=[TextPart("ok")])
+        ),
+    )
+    runtime = AgentRuntime(settings_factory(), None)
+    runtime._build(ProviderSelection(provider="openai", model="fake", source="environment"))
+    runtime.chat_with_usage(
+        SimpleNamespace(actor_id="user-1", kind="human"),
+        ChatRequest(message="hola"),
+        provider_selection=ProviderModelSelection(
+            base_url="https://provider.example/v1",
+            model="fake",
+            api_key="fictitious",
+            allow_private=False,
+        ),
+    )
+    assert policies == [True, False]
+    asyncio.run(runtime.aclose())

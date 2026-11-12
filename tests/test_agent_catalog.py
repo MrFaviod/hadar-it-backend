@@ -11,6 +11,7 @@ import asyncio
 import hashlib
 import re
 from collections.abc import Callable
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -296,6 +297,8 @@ def test_authorized_inventory_workflow_runs_through_real_mcp_server(
     settings_factory: Callable[..., Settings], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     harness = make_harness(settings_factory)
+    # Public MCP and extension services use the real clock, including token expiry.
+    harness.clock = datetime.now(UTC)
     try:
         with harness.service() as service:
             service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
@@ -695,6 +698,8 @@ def test_extension_invocation_enforces_real_machine_identity_permissions(
     settings_factory: Callable[..., Settings], tmp_path: Path
 ) -> None:
     harness = make_harness(settings_factory)
+    # Public MCP and extension services use the real clock, including token expiry.
+    harness.clock = datetime.now(UTC)
     try:
         with harness.service() as service:
             service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)

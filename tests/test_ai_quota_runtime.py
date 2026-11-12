@@ -65,7 +65,7 @@ def test_each_model_request_is_admitted_before_provider_and_cache_is_not_added_t
     with pytest.raises(PermissionError, match="quota_exceeded"):
         invoke(model)
     assert len(upstream_calls) == 1
-    assert budget.started == [300]
+    assert budget.started[0] >= 300
     evidence = budget.finished[0][1]
     assert evidence["totalTokens"] == 40
     assert evidence["cacheReadTokens"] == 20
@@ -83,7 +83,7 @@ def test_failed_upstream_keeps_unresolved_call_and_does_not_report_zero() -> Non
     model = BudgetedModel(FunctionModel(provider), budget, context_tokens=200, output_tokens=100)
     with pytest.raises(TimeoutError):
         invoke(model)
-    assert budget.started == [300]
+    assert budget.started[0] >= 300
     evidence = budget.finished[0][1]
     assert evidence["precision"] == "unavailable"
     assert evidence["totalTokens"] is None
@@ -121,8 +121,8 @@ def test_output_cap_is_enforced_before_provider_even_without_input_counter() -> 
     model = BudgetedModel(FunctionModel(provider), budget, context_tokens=None, output_tokens=20)
     invoke(model)
     assert limits == [20]
-    assert budget.started == [20]
-    assert model.quota_enforcement == "admission_only"
+    assert budget.started[0] > 20
+    assert model.quota_enforcement == "bounded"
 
 
 def _runtime_owner(catalog: Any) -> Any:
@@ -242,3 +242,114 @@ def test_switching_runs_between_global_and_personal_provider_keeps_attribution(
     funding = service.me(owner.actor_id)["funding"]
     assert funding["company"]["reservedTokens"] == 0
     assert funding["personal"]["reservedTokens"] == 0
+
+
+def test_m3_submitted_context_not_operator_declaration_drives_reservation():
+    budget = CallBudget()
+    dispatched = []
+    model = BudgetedModel(
+        FunctionModel(
+            lambda messages, info: (
+                dispatched.append(messages)
+                or ModelResponse(
+                    parts=[TextPart("ok")], usage=RequestUsage(input_tokens=300, output_tokens=1)
+                )
+            )
+        ),
+        budget,
+        context_tokens=1,
+        output_tokens=20,
+    )
+    asyncio.run(
+        model.request(
+            [ModelRequest(parts=[UserPromptPart("é" * 1000)])], {}, ModelRequestParameters()
+        )
+    )
+    assert len(dispatched) == 1
+    assert budget.started[0] >= 2020
+    assert budget.finished[0][1]["totalTokens"] == 301
+
+
+def test_m3_unused_sentinel_and_consumed_call_reconcile_without_blind_free(settings_factory):
+    catalog = prepare(settings_factory, agent_daily_token_budget=10000)
+    owner = _runtime_owner(catalog)
+    service = AiUsageService(catalog.settings, catalog.factory())
+    unused = reserve_run(catalog.settings, catalog.factory(), owner, run_id="m3-unused")
+    unused.finish_without_dispatch()
+    unused.finish_without_dispatch()
+    assert service.me(owner.actor_id)["funding"]["company"]["reservedTokens"] == 0
+    used = reserve_run(catalog.settings, catalog.factory(), owner, run_id="m3-used")
+    call = used.before_call(200)
+    used.after_call(call, {"precision": "unavailable", "source": "none"})
+    used.finish_without_dispatch()
+    assert service.me(owner.actor_id)["funding"]["company"]["reservedTokens"] == 200
+    evidence = {"totalTokens": 120, "precision": "measured", "source": "provider"}
+    used.after_call(call, evidence)
+    used.after_call(call, evidence)
+    used.finish_without_dispatch()
+    balance = service.me(owner.actor_id)["funding"]["company"]
+    assert balance["reservedTokens"] == 0
+    assert balance["consumedTokens"] == 120
+    catalog.engine.dispose()
+
+
+@pytest.mark.parametrize("media_type, estimate", [("image/png", 2048), ("application/pdf", 4096)])
+def test_m3_binary_reservation_excludes_base64_but_keeps_text_and_schemas(media_type, estimate):
+    from pydantic_ai.messages import BinaryContent, ModelResponse, TextPart
+    from pydantic_ai.tools import ToolDefinition
+
+    budget = CallBudget()
+    seen = []
+    raw = (
+        (b"\x89PNG\r\n\x1a\n" if media_type == "image/png" else b"%PDF-1.7\n")
+        + b"\x00" * (1024 * 1024)
+        + (b"" if media_type == "image/png" else b"\n%%EOF")
+    )
+    binary = BinaryContent(data=raw, media_type=media_type)
+
+    def provider(messages, info):
+        seen.append(messages)
+        return ModelResponse(
+            parts=[TextPart("ok")], usage=RequestUsage(input_tokens=30, output_tokens=1)
+        )
+
+    model = BudgetedModel(
+        FunctionModel(provider), budget, context_tokens=128000, output_tokens=1024
+    )
+    params = ModelRequestParameters(
+        function_tools=[
+            ToolDefinition(name="lookup", parameters_json_schema={"description": "schema" * 1000})
+        ]
+    )
+    messages = [ModelRequest(parts=[UserPromptPart([binary, "é" * 10000])])]
+    asyncio.run(model.request(messages, {}, params))
+    assert budget.started[0] == 129024
+    assert seen[0][0].parts[0].content[0].data == binary.data
+    # A tiny declaration cannot suppress history/text or tool definitions.
+    low = CallBudget()
+    wrapped = BudgetedModel(FunctionModel(provider), low, context_tokens=1, output_tokens=20)
+    asyncio.run(wrapped.request(messages, {}, params))
+    assert 20000 + 6000 + estimate + 20 <= low.started[0] < 50000
+    assert messages[0].parts[0].content[0].data == binary.data
+
+
+@pytest.mark.parametrize("suffix", [b"", b"\x00", b"\xff"])
+def test_m3_typed_binary_text_retains_floor(suffix):
+    from pydantic_ai.messages import BinaryContent
+
+    budget = CallBudget()
+    model = BudgetedModel(
+        FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart("ok")])),
+        budget,
+        context_tokens=1,
+        output_tokens=20,
+    )
+    raw = b"A" * 100000 + suffix
+    messages = [
+        ModelRequest(
+            parts=[UserPromptPart([BinaryContent(data=raw, media_type="application/pdf")])]
+        )
+    ]
+    asyncio.run(model.request(messages, {}, ModelRequestParameters()))
+    assert budget.started[0] >= 100020
+    assert messages[0].parts[0].content[0].data == raw

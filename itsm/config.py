@@ -264,6 +264,8 @@ class Settings(BaseSettings):
     # public-HTTPS-only default. CIDRs, single addresses or exact
     # hostname[:port] values, matched against the resolved address.
     ai_personal_private_endpoints: str = ""
+    # Operator-owned exact credential reference -> destination pairs. No secret values.
+    ai_secret_destinations: dict[str, list[str]] = Field(default_factory=dict)
 
     # Operator-configured external executor. ITSM never receives host, shell or
     # container authority; it only calls fixed actions on this trusted endpoint.
@@ -465,6 +467,13 @@ class Settings(BaseSettings):
             or re.search(r"\s", normalized)
         ):
             raise ValueError("extension_validator_url must be an http(s) URL without credentials")
+        if parsed.scheme == "http":
+            try:
+                local = ipaddress.ip_address(parsed.hostname).is_loopback
+            except ValueError:
+                local = False
+            if not local:
+                raise ValueError("extension_validator_url requires HTTPS except literal loopback")
         return normalized
 
     @field_validator("extension_validator_token", mode="before")
