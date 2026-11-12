@@ -113,7 +113,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "query_relationships",
     "list_saved_views",
     *SYSTEM_TOOL_NAMES,
-) + EXTENSION_TOOL_NAMES
+    *EXTENSION_TOOL_NAMES,
+)
 
 INSTRUCTIONS = """\
 These tools operate on the ITSM asset inventory with the permissions of the

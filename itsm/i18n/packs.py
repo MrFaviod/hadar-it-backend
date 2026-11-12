@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Iterator, Mapping, Sequence
+from collections.abc import Mapping, Sequence
 from typing import Any, Final
 
 LOCALE_TAG: Final = re.compile(r"^[A-Za-z]{2,3}(?:-[A-Za-z0-9]{2,8})*$")
@@ -501,60 +501,6 @@ def compatibility_errors(
         elif not compatibility_matches(str(range_text), installed):
             problems.append(f"package requires {extension_id} {range_text}, installed {installed}")
     return problems
-
-
-def localization_gaps(manifest: Mapping[str, Any]) -> tuple[str, ...]:
-    """Visible manifest labels that are still a single string (S10 detector)."""
-    return tuple(path for path, value in _visible_labels(manifest) if isinstance(value, str))
-
-
-def catalog_gaps(
-    source_locale: str, catalogs: Mapping[str, Mapping[str, str]]
-) -> dict[str, tuple[str, ...]]:
-    """Keys a locale catalog still misses relative to the source locale."""
-    source = catalogs.get(source_locale, {})
-    return {
-        locale: tuple(sorted(set(source) - set(catalog)))
-        for locale, catalog in sorted(catalogs.items())
-        if locale != source_locale and set(source) - set(catalog)
-    }
-
-
-def _visible_labels(manifest: Mapping[str, Any]) -> Iterator[tuple[str, Any]]:
-    for index, permission in enumerate(manifest.get("permissions") or ()):
-        if isinstance(permission, Mapping):
-            yield f"permissions[{index}].label", permission.get("label")
-    frontend = manifest.get("frontend") or {}
-    if not isinstance(frontend, Mapping):
-        return
-    for group in ("pages", "assetPanels", "widgets"):
-        for index, view in enumerate(frontend.get(group) or ()):
-            if not isinstance(view, Mapping):
-                continue
-            yield f"frontend.{group}[{index}].label", view.get("label")
-            declaration = view.get("view") or {}
-            if not isinstance(declaration, Mapping):
-                continue
-            table = declaration.get("table") or {}
-            for column_index, column in enumerate(table.get("columns") or ()):
-                if isinstance(column, Mapping):
-                    yield (
-                        f"frontend.{group}[{index}].view.table.columns[{column_index}].label",
-                        column.get("label"),
-                    )
-            form = declaration.get("form") or {}
-            for field_index, field in enumerate(form.get("fields") or ()):
-                if isinstance(field, Mapping):
-                    yield (
-                        f"frontend.{group}[{index}].view.form.fields[{field_index}].label",
-                        field.get("label"),
-                    )
-    for index, action in enumerate(frontend.get("actions") or ()):
-        if isinstance(action, Mapping):
-            yield f"frontend.actions[{index}].label", action.get("label")
-    for index, contribution in enumerate(frontend.get("contributions") or ()):
-        if isinstance(contribution, Mapping):
-            yield f"frontend.contributions[{index}].label", contribution.get("label")
 
 
 def label_text(value: Any, fallback_locale: str = "es") -> str:

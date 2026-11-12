@@ -41,6 +41,7 @@ from itsm.identity.service import (
     ValidationFailed,
     audit_event_payload,
 )
+from itsm.limits import client_key
 
 COOKIE_PATH = "/"
 CSRF_HEADER = "X-CSRF-Token"
@@ -433,7 +434,13 @@ def create_identity_router() -> APIRouter:
         demo_mode: DemoModeDependency,
     ) -> JSONResponse:
         _require_origin(request)
-        grant = service.login(payload.username, payload.password)
+        settings = request.app.state.settings
+        client_ip = client_key(
+            trusted_proxy=settings.trusted_proxy,
+            headers=request.headers,
+            client_host=request.client.host if request.client else "",
+        )
+        grant = service.login(payload.username, payload.password, client_ip=client_ip)
         body = session_envelope(
             service.me(grant),
             installation=service.installation_settings(),

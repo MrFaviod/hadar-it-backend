@@ -21,9 +21,7 @@ def normalize_status(context):
             if not data.get("status"):
                 updated = dict(data)
                 updated["status"] = "open"
-                context.store.put(
-                    "records", row["id"], updated, expected_version=row["version"]
-                )
+                context.store.put("records", row["id"], updated, expected_version=row["version"])
                 migrated += 1
         offset += len(page["items"])
         if offset >= page["total"]:

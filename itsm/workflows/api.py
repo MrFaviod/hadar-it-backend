@@ -7,6 +7,7 @@ from typing import Annotated, Any
 
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from itsm.identity.api import authenticated_actor, mutation_guard
 from itsm.identity.service import ValidationFailed
@@ -89,7 +90,7 @@ def create_workflow_router():
             raise ValidationFailed(
                 "invalid import options JSON", key="api.workflows.invalid_import_options_json"
             ) from None
-        service._auth(context.principal)
+        await run_in_threadpool(service._auth, context.principal)
         data = bytearray()
         async for chunk in request.stream():
             if len(data) + len(chunk) > MAX_BYTES:
@@ -97,7 +98,9 @@ def create_workflow_router():
                     "import exceeds 10 MiB", key="api.workflows.import_exceeds_10_mib"
                 )
             data.extend(chunk)
-        return service.analyze(context.principal, bytes(data), filename, parsed)
+        return await run_in_threadpool(
+            service.analyze, context.principal, bytes(data), filename, parsed
+        )
 
     @router.get("/import-profiles")
     def profiles(service: Service, context: Auth):

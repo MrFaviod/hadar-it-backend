@@ -6,7 +6,6 @@ import asyncio
 import base64
 import math
 from collections.abc import AsyncIterator, Mapping, Sequence
-from contextlib import suppress
 from decimal import Decimal
 from typing import Any
 
@@ -692,8 +691,12 @@ class OpenCodeEngine(_HTTPEngine):
                 await self._interrupt_quietly(session_id)
             if post_task is not None and not post_task.done():
                 post_task.cancel()
-                with suppress(BaseException):
+                try:
                     await post_task
+                except asyncio.CancelledError:
+                    # Swallow only the cancelled helper, never a cancellation of this turn.
+                    if asyncio.current_task().cancelling():
+                        raise
             cancelled = session_id in self._cancel_requested or cancelled_by_engine
             self._cancel_requested.discard(session_id)
         messages = list(usage_messages.values()) if usage_messages else list(usage_steps.values())

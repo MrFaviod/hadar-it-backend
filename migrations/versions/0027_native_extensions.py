@@ -39,9 +39,7 @@ def upgrade() -> None:
         sa.Column("installed_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("extension_id", "version", name="uq_extension_version"),
     )
-    op.create_index(
-        "ix_extension_versions_extension", "extension_versions", ["extension_id"]
-    )
+    op.create_index("ix_extension_versions_extension", "extension_versions", ["extension_id"])
     op.create_table(
         "extension_candidates",
         sa.Column("id", sa.String(36), primary_key=True),
@@ -69,9 +67,7 @@ def upgrade() -> None:
         "extension_candidates",
         ["extension_id", "state"],
     )
-    op.create_index(
-        "ix_extension_candidates_submitted", "extension_candidates", ["submitted_at"]
-    )
+    op.create_index("ix_extension_candidates_submitted", "extension_candidates", ["submitted_at"])
     op.create_table(
         "extension_collection_records",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -103,9 +99,7 @@ def upgrade() -> None:
         sa.Column("description", sa.Text(), nullable=False),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
     )
-    op.create_index(
-        "ix_extension_permissions_extension", "extension_permissions", ["extension_id"]
-    )
+    op.create_index("ix_extension_permissions_extension", "extension_permissions", ["extension_id"])
     op.create_table(
         "extension_events",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -137,9 +131,7 @@ def upgrade() -> None:
             name="uq_extension_migration_step",
         ),
     )
-    op.create_index(
-        "ix_extension_migrations_extension", "extension_migrations", ["extension_id"]
-    )
+    op.create_index("ix_extension_migrations_extension", "extension_migrations", ["extension_id"])
     op.create_table(
         "extension_schedule_state",
         sa.Column("id", sa.Integer(), primary_key=True, autoincrement=True),
@@ -153,9 +145,7 @@ def upgrade() -> None:
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
         sa.UniqueConstraint("extension_id", "name", name="uq_extension_schedule"),
     )
-    op.create_index(
-        "ix_extension_schedule_due", "extension_schedule_state", ["next_due_at"]
-    )
+    op.create_index("ix_extension_schedule_due", "extension_schedule_state", ["next_due_at"])
     op.add_column(
         "notification_inbox",
         sa.Column("extension_id", sa.String(64), nullable=True),
@@ -175,20 +165,12 @@ def downgrade() -> None:
     op.drop_table("extension_migrations")
     op.drop_index("ix_extension_events_extension", table_name="extension_events")
     op.drop_table("extension_events")
-    op.drop_index(
-        "ix_extension_permissions_extension", table_name="extension_permissions"
-    )
+    op.drop_index("ix_extension_permissions_extension", table_name="extension_permissions")
     op.drop_table("extension_permissions")
-    op.drop_index(
-        "ix_extension_collection_lookup", table_name="extension_collection_records"
-    )
+    op.drop_index("ix_extension_collection_lookup", table_name="extension_collection_records")
     op.drop_table("extension_collection_records")
-    op.drop_index(
-        "ix_extension_candidates_submitted", table_name="extension_candidates"
-    )
-    op.drop_index(
-        "ix_extension_candidates_extension_state", table_name="extension_candidates"
-    )
+    op.drop_index("ix_extension_candidates_submitted", table_name="extension_candidates")
+    op.drop_index("ix_extension_candidates_extension_state", table_name="extension_candidates")
     op.drop_table("extension_candidates")
     op.drop_index("ix_extension_versions_extension", table_name="extension_versions")
     op.drop_table("extension_versions")

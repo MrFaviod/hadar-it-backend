@@ -621,6 +621,8 @@ def _normalize_base_url(value: str) -> str:
         raise ValueError("baseUrl must not contain a query string or fragment")
     if "\\" in raw:
         raise ValueError("baseUrl must not contain backslashes")
+    if any(character in raw for character in '<>"'):
+        raise ValueError("baseUrl must not contain markup characters")
     try:
         parts = urlsplit(raw)
         _ = parts.port

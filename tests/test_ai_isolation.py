@@ -684,7 +684,7 @@ def test_worker_accepts_only_the_allowlisted_private_provider() -> None:
     from itsm.agents.isolated_worker import WorkerProtocolError, _model
 
     start = _worker_start("http://127.0.0.1:18081/v1", private_allowlist=["127.0.0.0/8"])
-    model, client = _model(start)
+    model, client = asyncio.run(_model(start))
     try:
         assert model is not None
         assert client is not None
@@ -694,7 +694,41 @@ def test_worker_accepts_only_the_allowlisted_private_provider() -> None:
         asyncio.run(client.aclose())
 
     with pytest.raises(WorkerProtocolError):
-        _model(_worker_start("http://127.0.0.1:18081/v1"))
+        asyncio.run(_model(_worker_start("http://127.0.0.1:18081/v1")))
+
+
+def test_worker_closes_its_client_when_the_model_cannot_be_built(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from itsm.agents import isolated_worker
+
+    closed: list[bool] = []
+    real_client = isolated_worker.provider_http_client
+
+    def tracking_client(**kwargs: Any):
+        client = real_client(**kwargs)
+        original = client.aclose
+
+        async def aclose() -> None:
+            closed.append(True)
+            await original()
+
+        client.aclose = aclose  # type: ignore[method-assign]
+        return client
+
+    def broken_model(*args: Any, **kwargs: Any) -> Any:
+        raise RuntimeError("model construction failed")
+
+    monkeypatch.setattr(isolated_worker, "provider_http_client", tracking_client)
+    monkeypatch.setattr(isolated_worker, "build_provider_model", broken_model)
+    start = _worker_start("http://127.0.0.1:18081/v1", private_allowlist=["127.0.0.0/8"])
+
+    async def build_inside_running_loop() -> None:  # the real caller is a coroutine
+        with pytest.raises(RuntimeError, match="model construction failed"):
+            await isolated_worker._model(start)
+
+    asyncio.run(build_inside_running_loop())
+    assert closed == [True]
 
 
 def test_worker_refuses_metadata_even_for_an_allowlisted_hostname(
@@ -704,10 +738,12 @@ def test_worker_refuses_metadata_even_for_an_allowlisted_hostname(
 
     monkeypatch.setattr(isolated_worker, "ensure_endpoint_allowed", _raises_blocked_address)
     with pytest.raises(isolated_worker.WorkerProtocolError):
-        isolated_worker._model(
-            _worker_start(
-                "http://metadata.internal:80/v1",
-                private_allowlist=["metadata.internal:80"],
+        asyncio.run(
+            isolated_worker._model(
+                _worker_start(
+                    "http://metadata.internal:80/v1",
+                    private_allowlist=["metadata.internal:80"],
+                )
             )
         )
 

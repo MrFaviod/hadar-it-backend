@@ -42,13 +42,9 @@ def upgrade() -> None:
         sa.PrimaryKeyConstraint("id"),
         sa.UniqueConstraint("token_hash", name="uq_ai_gateway_leases_token_hash"),
     )
-    op.create_index(
-        "ix_ai_gateway_leases_actor_id", "ai_gateway_leases", ["actor_id"]
-    )
+    op.create_index("ix_ai_gateway_leases_actor_id", "ai_gateway_leases", ["actor_id"])
     op.create_index("ix_ai_gateway_leases_run_id", "ai_gateway_leases", ["run_id"])
-    op.create_index(
-        "ix_ai_gateway_leases_expires_at", "ai_gateway_leases", ["expires_at"]
-    )
+    op.create_index("ix_ai_gateway_leases_expires_at", "ai_gateway_leases", ["expires_at"])
 
     op.create_table(
         "ai_gateway_calls",
@@ -75,17 +71,13 @@ def upgrade() -> None:
     op.create_index("ix_ai_gateway_calls_lease_id", "ai_gateway_calls", ["lease_id"])
     op.create_index("ix_ai_gateway_calls_actor_id", "ai_gateway_calls", ["actor_id"])
     op.create_index("ix_ai_gateway_calls_run_id", "ai_gateway_calls", ["run_id"])
-    op.create_index(
-        "ix_ai_gateway_calls_reservation_id", "ai_gateway_calls", ["reservation_id"]
-    )
+    op.create_index("ix_ai_gateway_calls_reservation_id", "ai_gateway_calls", ["reservation_id"])
     op.create_index("ix_ai_gateway_calls_state", "ai_gateway_calls", ["state"])
 
 
 def downgrade() -> None:
     op.drop_index("ix_ai_gateway_calls_state", table_name="ai_gateway_calls")
-    op.drop_index(
-        "ix_ai_gateway_calls_reservation_id", table_name="ai_gateway_calls"
-    )
+    op.drop_index("ix_ai_gateway_calls_reservation_id", table_name="ai_gateway_calls")
     op.drop_index("ix_ai_gateway_calls_run_id", table_name="ai_gateway_calls")
     op.drop_index("ix_ai_gateway_calls_actor_id", table_name="ai_gateway_calls")
     op.drop_index("ix_ai_gateway_calls_lease_id", table_name="ai_gateway_calls")

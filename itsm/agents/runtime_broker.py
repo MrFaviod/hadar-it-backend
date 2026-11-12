@@ -177,7 +177,9 @@ class Broker:
         scheme, _, token = header.partition(" ")
         if path != self._config.path or scheme.lower() != "bearer" or not token:
             return connection.respond(401, "unauthorized\n")
-        if not hmac.compare_digest(token, self._config.token):
+        if not hmac.compare_digest(
+            token.encode("utf-8", "surrogatepass"), self._config.token.encode("utf-8")
+        ):
             return connection.respond(401, "unauthorized\n")
         return None
 

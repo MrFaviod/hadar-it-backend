@@ -609,6 +609,37 @@ def test_provider_selection_is_persisted_and_used_by_the_runtime(
         assert (row.provider, row.model) == ("anthropic", "claude-sonnet-4-5")
 
 
+def test_executor_actions_do_not_inherit_the_host_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from itsm.system.executor import ActionCommand, ExecutorConfig, run_action
+
+    leaked = "host-only-value-" + uuid4().hex
+    monkeypatch.setenv("ITSM_DATABASE_URL_TEST_LEAK", leaked)
+    config = ExecutorConfig(
+        secret="executor-secret-" + uuid4().hex,
+        host="127.0.0.1",
+        port=1,
+        timeout_seconds=10,
+        workdir=None,
+        redactions=(),
+        actions={
+            "probe": ActionCommand(
+                argv=(
+                    sys.executable,
+                    "-c",
+                    "import json, os; print(json.dumps({'status': 'ok', 'message': "
+                    "os.environ.get('ITSM_DATABASE_URL_TEST_LEAK', 'absent')}))",
+                )
+            )
+        },
+    )
+
+    result = run_action(config, "probe")
+
+    assert leaked not in json.dumps(result, default=str)
+
+
 def test_executor_runs_real_backup_and_status_with_bounded_result(
     evidence: Path,
     settings_factory: Callable[..., Settings],

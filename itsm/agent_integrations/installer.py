@@ -660,9 +660,7 @@ def _block_end(lines: list[str], start: int, indent: int) -> int:
             break
         if line_indent < indent:
             break
-        if line_indent == indent and not (
-            stripped == "-" or stripped.startswith("- ")
-        ):
+        if line_indent == indent and not (stripped == "-" or stripped.startswith("- ")):
             break
         # A YAML sequence may be indentless: ``cli:`` followed by ``- itsm``
         # at the key's own indentation.  Those items belong to the block.
@@ -1399,11 +1397,7 @@ def _preflight_hermes(
     if toolsets is not None and not isinstance(toolsets, Mapping):
         raise InstallerError("config_invalid", "platform_toolsets section must be a mapping")
     expected = ["itsm"] + (["skills"] if skills else [])
-    if (
-        isinstance(toolsets, Mapping)
-        and "cli" in toolsets
-        and toolsets["cli"] != expected
-    ):
+    if isinstance(toolsets, Mapping) and "cli" in toolsets and toolsets["cli"] != expected:
         conflicts.append(
             _conflict(
                 "platform_toolsets.cli",
@@ -1614,9 +1608,7 @@ def _hermes_uninstall_text(state: _TargetState, manifest: Mapping[str, Any]) -> 
     created_keys = set(manifest.get("config", {}).get("createdKeys", []))
     text, _ = _hermes_remove_entry(text, remove_parent="mcp_servers" in created_keys)
     if {"platform_toolsets", "platform_toolsets.cli"} & created_keys:
-        text = _hermes_remove_cli_toolset(
-            text, remove_parent="platform_toolsets" in created_keys
-        )
+        text = _hermes_remove_cli_toolset(text, remove_parent="platform_toolsets" in created_keys)
     prior = (manifest.get("config") or {}).get("disabledSkillsBefore")
     if isinstance(prior, list) and all(isinstance(name, str) for name in prior):
         if "skills" in created_keys:
@@ -1775,15 +1767,13 @@ def _opencode_runtime_safety(
         if kind == "directory":
             if selected_directory or not _same_runtime_path(path, state.root / ".opencode"):
                 return False, (
-                    "runtime configuration includes a directory source outside the selected "
-                    "profile"
+                    "runtime configuration includes a directory source outside the selected profile"
                 )
             selected_directory = True
         elif kind == "document":
             if not _same_runtime_path(path, state.config_path):
                 return False, (
-                    "runtime configuration includes a document source outside the selected "
-                    "profile"
+                    "runtime configuration includes a document source outside the selected profile"
                 )
             info = entry.get("info")
             if not isinstance(info, Mapping) or info.get("default_agent") != DEFAULT_AGENT:
@@ -2375,9 +2365,7 @@ class IntegrationInstaller:
             enabled=True,
             disabled_skills_before=disabled_before,
         )
-        if isinstance(prior_config, Mapping) and isinstance(
-            prior_config.get("existsBefore"), bool
-        ):
+        if isinstance(prior_config, Mapping) and isinstance(prior_config.get("existsBefore"), bool):
             manifest_payload["config"]["existsBefore"] = prior_config["existsBefore"]
         transaction = _Transaction(state.root)
         try:

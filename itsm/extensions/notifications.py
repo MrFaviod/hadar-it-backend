@@ -115,7 +115,9 @@ def enqueue_extension_notice(
         if recipient is None or not recipient.active or recipient.actor_kind != "human":
             skipped += 1
             continue
-        granted = identity_service.effective_permissions(identity_service.resolve_actor(recipient.id))
+        granted = identity_service.effective_permissions(
+            identity_service.resolve_actor(recipient.id)
+        )
         if permission not in granted or "assets.view" not in granted:
             skipped += 1
             continue
