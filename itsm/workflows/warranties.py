@@ -8,8 +8,10 @@ from datetime import date, timedelta
 from sqlalchemy import select
 
 from itsm.attachments.models import Attachment
+from itsm.identity.clock import utcnow
 from itsm.identity.service import IdentityService, NotFound, ValidationFailed
 from itsm.inventory.codes import serialized
+from itsm.inventory.models import Asset
 from itsm.inventory.service import InventoryService
 from itsm.workflows.models import Warranty, WarrantyPreference
 
@@ -44,7 +46,7 @@ class WarrantyService:
     def _view(self, row, days):
         payload = dict(row.payload)
         expiry = date.fromisoformat(payload["expiresOn"]) if payload.get("expiresOn") else None
-        today = date.today()
+        today = utcnow().date()
         payload["coverage"] = (
             "unknown"
             if expiry is None
@@ -79,7 +81,13 @@ class WarrantyService:
         # The portable JSON payload is projected in bounded pages. Stop when
         # enough matching rows exist; never materialize all warranties.
         items, matched = [], 0
-        query = select(Warranty).order_by(Warranty.asset_id).execution_options(yield_per=100)
+        query = (
+            select(Warranty)
+            .join(Asset, Asset.id == Warranty.asset_id)
+            .where(Asset.archived_at.is_(None))
+            .order_by(Warranty.asset_id)
+            .execution_options(yield_per=100)
+        )
         for row in self._session.scalars(query):
             view = self._view(row, days)
             if coverage and view["coverage"] != coverage:

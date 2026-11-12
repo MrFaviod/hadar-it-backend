@@ -291,6 +291,22 @@ def test_archive_and_restore_reject_an_inconsistent_lifecycle(catalog: Catalog) 
         assets.archive(catalog.admin(), created.id)
 
 
+def test_archived_asset_organization_is_frozen_for_update_and_batch(catalog: Catalog) -> None:
+    created = create(catalog, quick_code="ARCH-4", location="Rack 2")
+    with inventory(catalog) as assets:
+        assets.archive(catalog.admin(), created.id)
+
+    with pytest.raises(Conflict), inventory(catalog) as assets:
+        assets.update(catalog.admin(), created.id, {"location": "Rack 3"})
+    with pytest.raises(Conflict), inventory(catalog) as assets:
+        assets.batch(catalog.admin(), update=[{"id": created.id, "location": "Rack 3"}])
+
+    with inventory(catalog) as assets:
+        assert assets.get(catalog.admin(), created.id).location == "Rack 2"
+        renamed = assets.update(catalog.admin(), created.id, {"name": "Renombrado"})
+    assert renamed.name == "Renombrado"
+
+
 def test_archiving_does_not_require_the_assign_permission(catalog: Catalog) -> None:
     created = create(catalog, quick_code="ARCH-3", responsible="Matriz NOC")
 
@@ -362,7 +378,7 @@ def test_history_captures_old_new_code_lifecycle_actor_and_time(catalog: Catalog
     assert updated.changes["status"] == {"old": "in_use", "new": "maintenance"}
 
     with inventory(catalog) as assets:
-        assets.update(catalog.admin(), created.id, {"location": "Rack 9"})
+        assets.update(catalog.admin(), created.id, {"name": "Guardado renombrado"})
     assert history(catalog, created.id)[1] == updated
     assert [entry.action for entry in history(catalog, created.id)] == [
         "created",

@@ -32,7 +32,7 @@ def prepare_reminders(settings: Settings, *, as_of: date | None = None) -> dict[
     """Prepare each due-date stage once, including after retries or competing scans."""
     from itsm.maintenance.service import iter_due_plans
 
-    today = as_of or date.today()
+    today = as_of or utcnow().date()
     engine = create_engine_from_settings(settings)
     created = 0
     scanned = 0
@@ -92,6 +92,8 @@ def prepare_reminders(settings: Settings, *, as_of: date | None = None) -> dict[
                     else:
                         created += 1
                 offset += len(plans)
+                # Release the domain write mutex after each page, not after the whole scan.
+                session.commit()
             session.commit()
         return {"created": created, "scanned": scanned}
     finally:

@@ -1006,6 +1006,8 @@ class InventoryService:
         """Apply an explicit field patch; the asset id never changes."""
         asset = self._asset(asset_id)
         self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
+        if any(field in changes for field in organization.RESOLVED_FIELDS):
+            _assert_not_archived(asset)
         prepared = self._prepare_changes(asset, changes, principal=principal)
         self._catalog_changes(asset, prepared)
         if "quick_code" in prepared:
@@ -1410,6 +1412,8 @@ class InventoryService:
             self._identity.authorize(principal, "assets.edit", resource=f"asset:{asset.id}")
             if "responsible" in changes or "responsible_person_id" in changes:
                 self._identity.authorize(principal, "assets.assign", resource=f"asset:{asset.id}")
+            if any(field in changes for field in organization.RESOLVED_FIELDS):
+                _assert_not_archived(asset)
 
         prepared_creates: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
