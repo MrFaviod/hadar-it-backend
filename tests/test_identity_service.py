@@ -76,7 +76,7 @@ def test_bootstrap_superadmin_creates_the_first_human_owner(harness: Harness) ->
     audit = harness.sql(
         "SELECT action, outcome, actor_kind FROM identity_audit_events ORDER BY id DESC LIMIT 1"
     )[0]
-    assert tuple(audit) == ("identity.bootstrap", "success", "system")
+    assert tuple(audit) == ("identity.bootstrap", "success", "local_operator")
     assert harness.scalar("SELECT COUNT(*) FROM identity_login_attempts") == 0
 
 
@@ -724,7 +724,7 @@ def test_adopt_superadmin_claims_an_existing_installation_once(harness: Harness)
         "SELECT outcome, actor_kind FROM identity_audit_events "
         "WHERE action = 'identity.superadmin_adopted' ORDER BY id DESC LIMIT 1"
     )[0]
-    assert tuple(audit) == ("success", "system")
+    assert tuple(audit) == ("success", "local_operator")
 
 
 def test_adopt_superadmin_rejects_unknown_inactive_and_machine_identities(

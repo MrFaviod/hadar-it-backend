@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import pytest
 from fastapi.testclient import TestClient
-from itsm.identity.service import Conflict
+from itsm.identity.service import Conflict, IdentityService
 from itsm.main import create_app
 from itsm.workflows.service import WorkflowService
 from tests.test_inventory_api import create_asset
@@ -21,7 +21,8 @@ def test_projection_revalidates_midrow_assignment_revocation(
     first = create_asset(admin, auth, quick_code="FIRST-MANUAL", name="First original")
     second = create_asset(admin, auth, quick_code="SECOND-MANUAL", name="Second original")
     roles = {}
-    for who in ("executor", "approver"):
+    users = {}
+    for who in ("approver", "executor"):
         role = admin.post(
             "/api/v1/identity/roles",
             json={
@@ -38,15 +39,30 @@ def test_projection_revalidates_midrow_assignment_revocation(
                 "username": "midrow." + who,
                 "name": who,
                 "roleId": roles[who],
-                "password": "midrow-password-2026",
+                **(
+                    {"password": "midrow-password-2026"}
+                    if who == "approver"
+                    else {"actorKind": "external_agent", "delegatedById": users["approver"]}
+                ),
             },
             headers=auth,
         )
         assert user.status_code == 201, user.text
+        users[who] = user.json()["id"]
 
     with TestClient(create_app(settings)) as executor, TestClient(create_app(settings)) as approver:
         headers = {}
         for who, client in (("executor", executor), ("approver", approver)):
+            if who == "executor":
+                with admin.app.state.session_factory() as session:
+                    token = (
+                        IdentityService(session, settings)
+                        .issue_machine_credential("midrow.executor")
+                        .token
+                    )
+                client.headers["Authorization"] = "Bearer " + token
+                headers[who] = {"Origin": settings.auth_origin}
+                continue
             login = client.post(
                 "/api/v1/auth/login",
                 json={"username": "midrow." + who, "password": "midrow-password-2026"},
@@ -67,6 +83,9 @@ def test_projection_revalidates_midrow_assignment_revocation(
         path = "/api/v1/operations/" + operation["id"]
         assert "responsible" in operation["rows"][0]["values"]
         assert "responsible" not in operation["rows"][1]["values"]
+        # An unrelated administrator cannot acquire the private machine proposal.
+        denied = admin.post(path + "/approve", headers=auth)
+        assert denied.status_code == 404, denied.text
         approved = approver.post(path + "/approve", headers=headers["approver"])
         assert approved.status_code == 200, approved.text
         original = WorkflowService._apply_row
@@ -76,7 +95,7 @@ def test_projection_revalidates_midrow_assignment_revocation(
                 raise Conflict("independent row failure after revocation")
             result = original(service, principal, operation_id, index, permissions)
             if index == 0:
-                frozen = admin.post(
+                frozen = approver.post(
                     path + "/resolve",
                     json={
                         "row": 1,
@@ -84,7 +103,7 @@ def test_projection_revalidates_midrow_assignment_revocation(
                         "assetId": second["id"],
                         "values": {"name": "Sneaked"},
                     },
-                    headers=auth,
+                    headers=headers["approver"],
                 )
                 assert frozen.status_code == 409, frozen.text
                 changed = admin.put(
@@ -98,7 +117,7 @@ def test_projection_revalidates_midrow_assignment_revocation(
         monkeypatch.setattr(WorkflowService, "_apply_row", apply_then_revoke)
         response = executor.post(path + "/execute", headers=headers["executor"])
         assert response.status_code == 403, response.text
-        page = admin.get(path).json()
+        page = approver.get(path).json()
         assert page["processed"] == 1
         assert page["summary"] == {"created": 0, "modified": 1, "omitted": 0, "failed": 0}
         assert page["state"] == "running"

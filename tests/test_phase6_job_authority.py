@@ -74,6 +74,7 @@ def create_machine_token(settings: Settings) -> str:
             name="Jobs agent",
             role_id="operator",
             actor_kind="external_agent",
+            delegated_by_id=admin.principal.actor_id,
         )
         return service.issue_machine_credential(MACHINE_USERNAME, label="queued jobs").token
     finally:
@@ -168,9 +169,12 @@ def test_queued_job_denies_when_the_approver_loses_authority(signed_in_client, s
         ),
         "Origin": settings.auth_origin,
     }
+    # The approver must own the preview; another human's UUID is not authority.
+    operation = analyze(client, approver_auth, b"name,serial\nApprover job,AP-1\n").json()
+    path = f"/api/v1/operations/{operation['id']}"
     assert client.post(f"{path}/approve", headers=approver_auth).status_code == 200, "approval"
+    queued = client.post(f"{path}/enqueue", headers=approver_auth)
     auth = sign_in(client, settings)
-    queued = client.post(f"{path}/enqueue", headers=auth)
     assert queued.status_code == 202, queued.text
 
     deactivated = client.patch(
@@ -182,6 +186,19 @@ def test_queued_job_denies_when_the_approver_loses_authority(signed_in_client, s
 
     assert client.get(f"/api/v1/assets/{original['id']}").json() == original
     assert client.get("/api/v1/assets/search").json()["total"] == 1
+    # Reactivation restores the owner's read, not the revoked queued session.
+    assert (
+        client.patch(
+            f"/api/v1/identity/users/{approver.id}/active", json={"active": True}, headers=auth
+        ).status_code
+        == 200
+    )
+    response = client.post(
+        "/api/v1/auth/login",
+        json={"username": APPROVER_USERNAME, "password": APPROVER_PASSWORD},
+        headers={"Origin": settings.auth_origin},
+    )
+    assert response.status_code == 200
     operation = client.get(path).json()
     assert operation["state"] == "error"
     assert operation["processed"] == 0

@@ -125,6 +125,7 @@ def test_a_failed_sqlite_revision_rolls_back_its_ddl(
     settings = settings_factory()
     applied = run_migrations(settings)
     assert applied.returncode == 0, applied.stderr
+    original_revision = sqlite_state(settings.database_url)[1]
     ini = probe_migrations_ini(tmp_path)
     write_probe_revision(
         tmp_path,
@@ -140,7 +141,7 @@ def test_a_failed_sqlite_revision_rolls_back_its_ddl(
     tables, revision = sqlite_state(settings.database_url)
     assert "probe_partial" not in tables
     assert "itsm_infrastructure" in tables
-    assert revision == "0043_conversation_locale"
+    assert revision == original_revision
 
 
 def test_a_successful_sqlite_revision_commits_its_ddl(
@@ -182,6 +183,7 @@ def test_business_routes_are_refused_while_migrations_are_pending(
     settings = settings_factory()
     applied = run_migrations(settings)
     assert applied.returncode == 0, applied.stderr
+    original_revision = sqlite_state(settings.database_url)[1]
     set_recorded_revision(settings.database_url, "0035_extension_isolation")
 
     test_client = client(settings)
@@ -194,7 +196,7 @@ def test_business_routes_are_refused_while_migrations_are_pending(
     assert ready.status_code == 503
     assert ready.json()["checks"]["migrations"] == "pending"
 
-    set_recorded_revision(settings.database_url, "0043_conversation_locale")
+    set_recorded_revision(settings.database_url, original_revision)
 
     served = test_client.get("/api/v1/assets")
     assert served.status_code in {401, 403}

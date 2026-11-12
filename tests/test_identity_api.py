@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Iterator
+from datetime import UTC, datetime
 
 import pytest
 from fastapi.testclient import TestClient
@@ -23,7 +24,10 @@ def env(settings_factory: Callable[..., Settings]) -> Iterator[tuple[TestClient,
     settings = settings_factory()
     applied = run_migrations(settings)
     assert applied.returncode == 0, applied.stderr
-    harness = Harness(settings=settings, engine=create_engine_from_settings(settings))
+    # HTTP services use real UTC; issue fixture credentials on the same clock.
+    harness = Harness(
+        settings=settings, engine=create_engine_from_settings(settings), clock=datetime.now(UTC)
+    )
     with harness.service() as service:
         service.bootstrap_superadmin("ana.admin", "Ana Admin", PASSWORD)
     with TestClient(create_app(settings)) as client:

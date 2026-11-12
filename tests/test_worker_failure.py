@@ -17,6 +17,7 @@ from tests.conftest import (
     run_cli,
     run_migrations,
     running_worker,
+    sign_in,
     wait_for_status,
     worker_environment,
 )
@@ -44,8 +45,44 @@ def test_failing_job_retries_bounded_and_reports_a_safe_error(
     settings_factory: Callable[..., Settings],
 ) -> None:
     settings = settings_factory(task_retries=2, task_retry_delay_seconds=2.0)
-    test_client, _ = signed_in_client(settings)
-    task_id = submit_failure(settings, "fallo controlado")
+    test_client, auth = signed_in_client(settings)
+    # Exercise the authenticated submit path: it records the actual caller's
+    # durable owner. Only the bounded test task implementation is substituted.
+    queue = test_client.app.state.task_queue
+    original = queue.submit_demo
+    queue.submit_demo = lambda message, delay_seconds=0: queue.submit_demo_failure(message)
+    try:
+        accepted = test_client.post(
+            "/api/v1/tasks/demo", json={"message": "fallo controlado"}, headers=auth
+        )
+    finally:
+        queue.submit_demo = original
+    assert accepted.status_code == 202, accepted.text
+    task_id = accepted.json()["task_id"]
+    assert task_state(test_client, task_id)["state"] == "pending"
+    other_password = "other-worker-reader-2026"
+    created = test_client.post(
+        "/api/v1/identity/users",
+        json={
+            "username": "worker.other",
+            "name": "Other reader",
+            "roleId": "user",
+            "password": other_password,
+        },
+        headers=auth,
+    )
+    assert created.status_code == 201, created.text
+    login = test_client.post(
+        "/api/v1/auth/login",
+        json={"username": "worker.other", "password": other_password},
+        headers={"Origin": settings.auth_origin},
+    )
+    assert login.status_code == 200, login.text
+    denied = test_client.get(f"/api/v1/tasks/{task_id}")
+    assert denied.status_code == 404
+    assert denied.json()["error"]["key"] == "api.tasks.not_found"
+    sign_in(test_client, settings)
+    assert task_state(test_client, task_id)["state"] == "pending"
 
     observed: list[str] = []
     with running_worker(settings):
@@ -71,8 +108,18 @@ def test_cli_reports_persisted_status_for_the_failed_job(
     test_client, _ = signed_in_client(settings)
     task_id = submit_failure(settings, "sin reintentos")
 
+    # A local CLI submission has no authenticated HTTP owner. Never invent one.
+    assert test_client.get(f"/api/v1/tasks/{task_id}").status_code == 404
     with running_worker(settings):
-        wait_for_status(test_client, task_id, {"error"})
+        deadline = time.monotonic() + 20
+        while True:
+            status = run_cli(["-m", "itsm.tasks.cli", "status", task_id], settings)
+            assert status.returncode == 0, status.stderr
+            if json.loads(status.stdout)["state"] == "error":
+                break
+            assert time.monotonic() < deadline, status.stdout
+            time.sleep(0.1)
+    assert test_client.get(f"/api/v1/tasks/{task_id}").status_code == 404
 
     status = run_cli(["-m", "itsm.tasks.cli", "status", task_id], settings)
 
@@ -158,20 +205,27 @@ def test_the_worker_reconciles_a_task_a_crashed_worker_left_running(
     """R4-F7: a task whose worker died must not stay "running" forever."""
     import subprocess
     import sys
-    import uuid
 
     from itsm.tasks.adapter import INTERRUPTED_ERROR, record_task_owner
     from itsm.tasks.runtime import build_runtime
 
     settings = settings_factory()
-    test_client, _ = signed_in_client(settings)
+    test_client, auth = signed_in_client(settings)
 
     finished = subprocess.Popen([sys.executable, "-c", "pass"])
     finished.wait(timeout=30)
     crashed_pid = finished.pid
 
     runtime = build_runtime(settings)
-    task_id = uuid.uuid4().hex
+    accepted = test_client.post(
+        "/api/v1/tasks/demo", json={"message": "Interrupted owned task"}, headers=auth
+    )
+    assert accepted.status_code == 202, accepted.text
+    task_id = accepted.json()["task_id"]
+    # Simulate the worker claiming this real API-created job before dying.
+    claimed = runtime.huey.dequeue()
+    assert claimed is not None
+    assert claimed.id == task_id
     # Exactly what a worker writes when it starts a task and then dies.
     runtime.huey.put_result(task_id, {"state": "running"})
     record_task_owner(runtime.huey, task_id, pid=crashed_pid)
