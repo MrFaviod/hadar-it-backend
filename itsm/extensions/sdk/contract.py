@@ -13,6 +13,7 @@ the same bounded, actionable error list.
 from __future__ import annotations
 
 import json
+import math
 import re
 from collections.abc import Collection, Mapping
 from datetime import date, datetime
@@ -161,6 +162,9 @@ def _validate_parameters(parameters: Mapping[str, Any], operation: str) -> None:
         raise ValueError(f"operation {operation}: properties must be an object")
     if not isinstance(required, list):
         raise ValueError(f"operation {operation}: required must be an array")
+    for name, declaration in properties.items():
+        if "items" in declaration and declaration.get("type") != "array":
+            raise ValueError(f"operation {operation}: items only applies to array argument {name}")
     for name in required:
         if name not in properties:
             raise ValueError(f"operation {operation}: required argument {name!r} is not declared")
@@ -220,15 +224,29 @@ def collection_schema_errors(name: str, schema: Any) -> list[str]:
                         errors.append(f"{field_label}: enum value {value!r} must be {kind}")
         if "maxLength" in declaration and kind != "string":
             errors.append(f"{field_label}: maxLength applies to strings")
-        if (
-            kind == "string"
-            and isinstance(declaration.get("maxLength"), int)
-            and not 1 <= declaration["maxLength"] <= 4000
+        if "maxLength" in declaration and (
+            not isinstance(declaration["maxLength"], int)
+            or isinstance(declaration["maxLength"], bool)
+            or not 1 <= declaration["maxLength"] <= 4000
         ):
             errors.append(f"{field_label}: maxLength must be between 1 and 4000")
+        bounds_valid = True
         for bound in ("minimum", "maximum"):
-            if bound in declaration and kind not in ("number", "integer"):
+            if bound not in declaration:
+                continue
+            value = declaration[bound]
+            if kind not in ("number", "integer"):
                 errors.append(f"{field_label}: {bound} applies to numbers")
+            if not _matches("number", value):
+                bounds_valid = False
+                errors.append(f"{field_label}: {bound} must be a finite number")
+        if (
+            bounds_valid
+            and "minimum" in declaration
+            and "maximum" in declaration
+            and declaration["minimum"] > declaration["maximum"]
+        ):
+            errors.append(f"{field_label}: minimum must not exceed maximum")
     required = schema.get("required", [])
     if not isinstance(required, list):
         errors.append(f"{label}: required must be an array")
@@ -244,7 +262,7 @@ def validate_collection_value(name: str, schema: Any, value: Any) -> dict[str, A
     """Validate one declarative record against the accepted schema subset."""
     if not isinstance(value, Mapping):
         raise CollectionError("record must be an object")
-    if not isinstance(schema, Mapping) or not schema.get("properties"):
+    if not isinstance(schema, Mapping):
         return dict(value)
     properties = schema.get("properties") or {}
     required = schema.get("required") or []
@@ -752,7 +770,11 @@ def _matches(kind: str, value: Any) -> bool:
     if kind == "integer":
         return isinstance(value, int) and not isinstance(value, bool)
     if kind == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
+        return (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and (not isinstance(value, float) or math.isfinite(value))
+        )
     if kind == "null":
         return value is None
     if kind == "array":
@@ -784,3 +806,8 @@ def validate_arguments(
         kind = declaration.get("type")
         if not _matches(str(kind), value):
             raise ArgumentError(f"argument {name} must be {kind}")
+        items = declaration.get("items")
+        if kind == "array" and isinstance(items, Mapping):
+            for index, item in enumerate(value):
+                if not _matches(str(items.get("type")), item):
+                    raise ArgumentError(f"argument {name}[{index}] must be {items.get('type')}")

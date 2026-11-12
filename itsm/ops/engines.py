@@ -391,7 +391,8 @@ def mssql_backup_command(target: DatabaseTarget, dump_path: Path) -> ToolCommand
     """Build a full ``BACKUP DATABASE ... TO DISK`` with checksum."""
     _require(target, "mssql")
     statement = (
-        f"BACKUP DATABASE [{target.database}] TO DISK = N'{_sql_literal(str(dump_path))}' "
+        f"BACKUP DATABASE [{target.database.replace(']', ']]')}] "
+        f"TO DISK = N'{_sql_literal(str(dump_path))}' "
         "WITH INIT, COMPRESSION, CHECKSUM, STATS = 10;"
     )
     return _sqlcmd_command(target, statement)
@@ -428,7 +429,8 @@ def mssql_restore_command(
         for logical, physical in moves
     ]
     statement = (
-        f"RESTORE DATABASE [{target_database}] FROM DISK = N'{_sql_literal(str(dump_path))}' "
+        f"RESTORE DATABASE [{target_database.replace(']', ']]')}] "
+        f"FROM DISK = N'{_sql_literal(str(dump_path))}' "
         f"WITH {', '.join(clauses)};"
     )
     return _sqlcmd_command(target, statement)

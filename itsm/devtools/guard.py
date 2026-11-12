@@ -14,8 +14,8 @@ Gate order, applied by :mod:`itsm.devtools.operations`:
    even when it is local.
 4. The explicit ``--yes-reset-dev-database`` flag and a ``--confirm`` value that
    matches the redacted target name.
-5. Attachment and task state may only be cleared inside a data directory whose
-   name contains ``dev`` or inside ``ITSM_DEV_DATA_DIR``.
+5. Existing attachment and task state may only be cleared strictly inside the
+   explicitly selected ``ITSM_DEV_DATA_DIR``.
 """
 
 from __future__ import annotations
@@ -55,9 +55,6 @@ PASSWORD_ENV = "ITSM_DEV_ADMIN_PASSWORD"
 
 #: The destructive confirmation flag.
 RESET_FLAG = "--yes-reset-dev-database"
-
-_DEV_NAME = "dev"
-_DATA_DIR_LEVELS = 3
 
 
 class DevToolsRefused(RuntimeError):
@@ -258,13 +255,13 @@ def dev_data_dir(environ: Mapping[str, str] | None = None) -> Path | None:
 def require_dev_data_paths(settings: Settings, data_dir: Path | None) -> tuple[Path, ...]:
     """Return the existing attachment and task paths a reset may clear.
 
-    A path is allowed when it lives inside ``ITSM_DEV_DATA_DIR`` or when its own
-    name, or one of its two nearest parent directories, contains ``dev``. Paths
-    that do not exist are skipped: there is nothing to clear and no directory to
-    police. Symlinks are resolved first, so a link cannot redirect a reset into a
-    non-development directory.
+    Existing paths must resolve strictly inside the explicitly selected root;
+    a directory name is never authority to delete it. Missing paths have nothing
+    to clear. This preflight rejects existing symlink escapes, not concurrent
+    filesystem replacement by another local writer.
     """
     allowed: list[Path] = []
+    root = _resolve(data_dir) if data_dir is not None else None
     candidates = (
         ("attachments", Path(settings.attachment_storage_path)),
         ("tasks", Path(settings.task_sqlite_path)),
@@ -273,12 +270,12 @@ def require_dev_data_paths(settings: Settings, data_dir: Path | None) -> tuple[P
         resolved = _resolve(candidate)
         if not resolved.exists():
             continue
-        inside = data_dir is not None and (resolved == data_dir or data_dir in resolved.parents)
-        if not inside and not _has_dev_name(resolved):
+        inside = root is not None and root in resolved.parents
+        if not inside:
             raise DevToolsRefused(
                 f"{label} path {resolved} is outside the development data directory; "
-                f"next: keep it under a directory whose name contains 'dev' or set "
-                f"{DATA_DIR_ENV} to its parent (nothing was changed)"
+                f"next: set {DATA_DIR_ENV} to the explicit parent root and keep state "
+                "strictly inside it (nothing was changed)"
             )
         allowed.append(resolved)
     return tuple(allowed)
@@ -292,10 +289,6 @@ def engine_for(settings: Settings) -> Iterator[Engine]:
         yield engine
     finally:
         engine.dispose()
-
-
-def _has_dev_name(path: Path) -> bool:
-    return any(_DEV_NAME in part.lower() for part in path.parts[-_DATA_DIR_LEVELS:])
 
 
 def _resolve(path: Path) -> Path:

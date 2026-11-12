@@ -574,7 +574,10 @@ def test_provider_selection_is_persisted_and_used_by_the_runtime(
 
     calls: list[Any] = []
 
-    def fake_resolve(settings_arg: Settings, selection: Any = None) -> Any:
+    def fake_resolve(
+        settings_arg: Settings, selection: Any = None, *, http_client: Any = None
+    ) -> Any:
+        assert http_client is not None  # The runtime must keep the guarded transport.
         calls.append(selection)
         return FunctionModel(lambda messages, info: ModelResponse(parts=[TextPart(content="ok")]))
 

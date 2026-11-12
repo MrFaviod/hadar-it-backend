@@ -22,7 +22,7 @@ import pytest
 
 ROOT = Path(__file__).resolve().parent.parent
 DOCKERFILE = ROOT / "Dockerfile.ops"
-DOCUMENTATION = ROOT / "docs" / "deployment-preparation.md"
+DOCUMENTATION = ROOT.parent / "docs" / "backend" / "deployment-preparation.md"
 
 # Same digest as the `postgres` service in the root Compose file.
 PG16_IMAGE = (

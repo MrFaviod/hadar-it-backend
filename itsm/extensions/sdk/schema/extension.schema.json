@@ -525,7 +525,14 @@
                 ]
               },
               "items": {
-                "type": "object"
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["type"],
+                "properties": {
+                  "type": {
+                    "enum": ["string", "number", "integer", "boolean", "array", "object"]
+                  }
+                }
               }
             }
           }

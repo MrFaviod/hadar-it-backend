@@ -391,7 +391,13 @@ def _page_counter(document: DocumentLocale) -> str:
         elif part == "total":
             pieces.append("counter(pages)")
         elif part:
-            pieces.append('"' + part.replace("\\", "\\\\").replace('"', '\\"') + '"')
+            literal = "".join(
+                f"\\{ord(char):x} "
+                if ord(char) < 32 or ord(char) == 127 or char in '<>"\\'
+                else char
+                for char in part
+            )
+            pieces.append('"' + literal + '"')
     return " ".join(pieces) or '""'
 
 

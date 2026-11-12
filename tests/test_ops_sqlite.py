@@ -393,7 +393,14 @@ def test_failing_external_backup_never_prints_the_password(
     combined = result.stdout + result.stderr
     assert result.returncode == 1
     assert LIVE_PASSWORD not in combined
-    assert "127.0.0.1:1" in combined
+    if shutil.which("pg_dump") is None:
+        assert result.stdout == ""
+        assert json.loads(result.stderr) == {
+            "error": "pg_dump is not available on this host",
+            "status": "failed",
+        }
+    else:
+        assert "127.0.0.1:1" in combined
     assert not list(backup_root.glob("*-*-*"))
 
 

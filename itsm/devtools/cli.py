@@ -9,9 +9,9 @@ interface.
 from __future__ import annotations
 
 import argparse
+import getpass
 import json
 import os
-import secrets
 import sys
 import traceback
 from typing import Any
@@ -21,7 +21,6 @@ from itsm.devtools import operations
 from itsm.devtools.guard import PASSWORD_ENV, DevToolsRefused, dev_data_dir
 
 DEFAULT_ADMIN_USERNAME = "dev.admin"
-GENERATED_PASSWORD_BYTES = 24
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -35,7 +34,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser = argparse.ArgumentParser(
         prog="python -m itsm.devtools",
-        description="Create, inspect and safely reset a development database (RELEASE_MODE=dev).",
+        description=(
+            "Create, inspect and safely reset a development database (RELEASE_MODE=dev). "
+            "Init/reset require ITSM_DEV_ADMIN_PASSWORD or a hidden terminal prompt; "
+            "reset paths must be strictly inside ITSM_DEV_DATA_DIR."
+        ),
     )
     parser.add_argument(
         "--verbose",
@@ -87,7 +90,14 @@ def _password() -> tuple[str, str]:
     provided = os.environ.get(PASSWORD_ENV, "").strip()
     if provided:
         return provided, "environment"
-    return secrets.token_urlsafe(GENERATED_PASSWORD_BYTES), "generated"
+    if not sys.stdin.isatty():
+        raise DevToolsRefused(
+            f"set {PASSWORD_ENV} or use an interactive terminal; nothing was changed"
+        )
+    password = getpass.getpass("Dev administrator password: ")
+    if password != getpass.getpass("Repeat password: "):
+        raise DevToolsRefused("passwords do not match; nothing was changed")
+    return password, "interactive"
 
 
 def main(argv: list[str] | None = None) -> int:

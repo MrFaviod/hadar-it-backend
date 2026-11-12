@@ -346,6 +346,59 @@ def _restore_file(source: Path, destination: Path) -> None:
     os.chmod(destination, _FILE_MODE)
 
 
+def preflight_restore(
+    artifact_dir: Path,
+    entries: Sequence[store.ExtensionBackupEntry],
+    *,
+    destination: Path,
+) -> None:
+    """Validate the complete layout before creating or replacing any file.
+
+    Reject existing symlink ancestors, including parents of a new target. This
+    bounds an operator-controlled restore; it is not a concurrent-writer sandbox.
+    """
+    root = artifact_dir / DATA_ROOT_DIR
+    for entry in entries:
+        if not _EXTENSION_ID.fullmatch(entry.id):
+            raise OpsError("extension restore layout has an invalid module id")
+        paths = {item.path for item in entry.files}
+        for item in entry.files:
+            relative = store._archive_relative_path(item.path)
+            parts = relative.split("/")
+            valid = (
+                relative == MODULE_DATABASE
+                or (
+                    len(parts) == 2
+                    and parts[0] == SNAPSHOTS_DIR
+                    and parts[1].endswith(SNAPSHOT_SUFFIX)
+                )
+                or (len(parts) >= 2 and parts[0] == FILES_DIR)
+            )
+            if not valid or "\x00" in relative:
+                raise OpsError(f"extension {entry.id}: unsupported restore layout: {relative}")
+            if any("/".join(parts[:index]) in paths for index in range(1, len(parts))):
+                raise OpsError(f"extension {entry.id}: conflicting restore layout: {relative}")
+            source = root / entry.id / relative
+            target = destination / entry.id / relative
+            for path in (source, target):
+                for ancestor in (path, *path.parents):
+                    if ancestor.is_symlink():
+                        raise OpsError("extension restore path traverses a symlink")
+                    if ancestor != path and ancestor.exists() and not ancestor.is_dir():
+                        raise OpsError("extension restore parent is not a directory")
+            if not source.is_file():
+                raise OpsError(f"extension {entry.id}: archived file is missing: {relative}")
+            if target.exists() and not target.is_file():
+                raise OpsError("extension restore target is not a regular file")
+    # Empty modules must obey the same directory boundary as populated modules.
+    for path in (destination, *(destination / entry.id for entry in entries)):
+        for ancestor in (path, *path.parents):
+            if ancestor.is_symlink():
+                raise OpsError("extension restore path traverses a symlink")
+            if ancestor.exists() and not ancestor.is_dir():
+                raise OpsError("extension restore target is not a directory")
+
+
 def restore(
     artifact_dir: Path,
     entries: Sequence[store.ExtensionBackupEntry],
@@ -360,6 +413,7 @@ def restore(
     directories are private (0700) and files are 0600; module directories that
     the artifact does not contain are preserved and reported.
     """
+    preflight_restore(artifact_dir, entries, destination=destination)
     root = artifact_dir / DATA_ROOT_DIR
     ids = {entry.id for entry in entries}
     preserved: list[str] = []

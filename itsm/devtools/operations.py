@@ -54,9 +54,8 @@ def initialize(
     Args:
         settings: Runtime settings read from the process environment.
         username: Explicit username of the dev superadmin.
-        password: Administrator password (environment value or generated).
-        password_source: ``environment`` or ``generated``; a generated password
-            is reported once so it can be used to sign in.
+        password: Administrator password supplied securely by the caller.
+        password_source: ``environment`` or ``interactive``; never returned.
         environ: Environment holding ``RELEASE_MODE``; defaults to the process.
 
     Returns:
@@ -180,8 +179,8 @@ def reset(
     Args:
         settings: Runtime settings read from the process environment.
         username: Username of the dev superadmin recreated by the seed.
-        password: Administrator password (environment value or generated).
-        password_source: ``environment`` or ``generated``.
+        password: Administrator password supplied securely by the caller.
+        password_source: ``environment`` or ``interactive``; never returned.
         confirm: Value the operator passed to ``--confirm``; must match the target.
         regenerate: Delete the SQLite file (or drop reflected tables) instead of
             clearing rows.
@@ -302,10 +301,7 @@ def _admin(
     password_source: str,
     status: str,
 ) -> dict[str, Any]:
-    admin: dict[str, Any] = {"username": username, "passwordSource": password_source}
-    if password_source == "generated" and status != "unchanged":
-        admin["password"] = password
-    return admin
+    return {"username": username, "passwordSource": password_source}
 
 
 def _identity_count(session: Session) -> int:

@@ -244,6 +244,21 @@ class InventoryCatalog:
                 return item
         return None
 
+    def validate_category_assignment(
+        self, value: str | None, *, previous: str | None = None
+    ) -> None:
+        """Reject new inactive assignments, retaining the same historical category."""
+        category = self.category(value)
+        if category is None or category.get("active", True):
+            return
+        historical = self.category(previous)
+        if historical is not None and historical["id"] == category["id"]:
+            return
+        raise ValidationFailed(
+            "category is not active in the inventory catalog",
+            key="api.inventory.category_inactive",
+        )
+
     def validate_status(self, value: str) -> str:
         entry = self._entry("statuses", value)
         if entry is None or not entry.payload["active"]:

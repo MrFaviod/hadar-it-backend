@@ -553,7 +553,9 @@ def _composition_manifest(mode="replace", target="page.inventory"):
 
 
 COMPOSITION_FRONTEND = """
-window.ITSMExtension.register({components: {RecordList: {template: "<div>records</div>"}}});
+window.ITSMExtension.register({components: {RecordList: {
+  render: function () { return Vue.h("div", "records"); }
+}}});
 """
 
 
@@ -1596,7 +1598,8 @@ def test_generated_asset_panel_is_a_declarative_filtered_view() -> None:
     files = dict(generated.files)
     files["extension.json"] = json.dumps(isolated)
     files["frontend.js"] = (
-        'window.ITSMExtension.register({components: {RecordSummary: {template: "<div/>"}}});'
+        'window.ITSMExtension.register({components: {RecordSummary: '
+        '{render: function () { return Vue.h("div"); }}}});'
     )
     packed = build_package(files, known_core_permissions=())
     decoded = parse_package(packed.data, known_core_permissions=()).manifest

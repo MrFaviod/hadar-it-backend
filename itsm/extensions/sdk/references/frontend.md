@@ -89,6 +89,25 @@ window.ITSMExtension.register({
 });
 ```
 
+Registered components must provide a render function, authored or already precompiled
+for the shipped Vue 3.5.13 runtime. For example:
+
+```js
+const RecordBoard = { render() { return Vue.h('p', 'Records'); } };
+window.ITSMExtension.register({ components: { RecordBoard } });
+```
+
+Raw `template` options are unsupported, even alongside `render`. Before mounting,
+the frame checks all registered siblings and local components, including `mixins`
+and `extends`; unsupported definitions produce a visible localized alert, not an
+empty mount. Option-only mixins/extends need no render; registered/local components
+do. Functional components are supported. This replaces the previously documented
+raw-template example, which CSP already blocked at runtime. Migrate all template
+options to render functions and omit `template` from delivered bundles. The host
+adds no compiler/build pipeline, never evaluates modules in its privileged context,
+and does not relax enforcing frame CSP. `itsm:ready` means bridge readiness, not
+successful mount. Declarative views and the rest of the extension remain available.
+
 The frame talks to the host only through `postMessage`:
 
 | Direction | Messages |

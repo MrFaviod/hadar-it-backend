@@ -896,6 +896,14 @@ def restore(
     # restore payload instead of blocking a disaster recovery.
     if not verification["integrityVerified"]:
         raise OpsError(f"backup {identifier} failed verification: {verification['error']}")
+    if target_extensions is not None:
+        extension_destination = Path(target_extensions).expanduser().absolute()
+        _extension_target(
+            extension_destination, artifact, replace_live=replace_live, confirm=confirm
+        )
+        extensions.preflight_restore(
+            artifact.directory, artifact.manifest.extensions, destination=extension_destination
+        )
     payload: dict[str, Any] = {}
     core_requested = target_file is not None or target_database is not None
     if core_requested:

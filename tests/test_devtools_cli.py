@@ -218,20 +218,15 @@ def test_second_init_is_idempotent(tmp_path: Path) -> None:
     assert "password" not in second["admin"]
 
 
-def test_init_generates_and_prints_a_password_once(tmp_path: Path) -> None:
-    first = payload(run(tmp_path, "init", ITSM_DEV_ADMIN_PASSWORD=None))
-
-    admin = first["admin"]
-    assert admin["passwordSource"] == "generated"
-    generated = admin["password"]
-    assert len(generated) >= 12
-    assets, _ = login_and_count(dev_settings(tmp_path), "dev.admin", generated)
-    assert assets == INVENTORY_ASSETS
-
-    second = payload(run(tmp_path, "init", ITSM_DEV_ADMIN_PASSWORD=None))
-    assert second["status"] == "unchanged"
-    assert "password" not in second["admin"]
-    assert generated not in second["admin"].get("password", "")
+def test_init_requires_secure_password_input_before_any_effect(tmp_path: Path) -> None:
+    result = run(tmp_path, "init", ITSM_DEV_ADMIN_PASSWORD=None)
+    assert result.returncode == 1
+    assert result.stdout == ""
+    assert result.stderr == (
+        "error: set ITSM_DEV_ADMIN_PASSWORD or use an interactive terminal; nothing was changed\n"
+    )
+    assert not (tmp_path / "dev.db").exists()
+    assert not (tmp_path / "dev-data").exists()
 
 
 def test_status_reports_redacted_database_and_reset_decision(tmp_path: Path) -> None:
@@ -294,6 +289,8 @@ def test_reset_reseeds_and_keeps_the_schema(tmp_path: Path) -> None:
 def test_regenerate_recreates_the_sqlite_file(tmp_path: Path) -> None:
     initialise(tmp_path)
     database = tmp_path / "dev.db"
+    # Keep the unlinked original open: filesystems may otherwise reuse its inode.
+    original = database.open("rb")
     before_inode = database.stat().st_ino
 
     result = payload(
@@ -308,7 +305,10 @@ def test_regenerate_recreates_the_sqlite_file(tmp_path: Path) -> None:
     )
 
     assert result["status"] == "regenerated"
-    assert database.stat().st_ino != before_inode
+    try:
+        assert database.stat().st_ino != before_inode
+    finally:
+        original.close()
     settings = dev_settings(tmp_path)
     assert schema_state(settings).is_current
     assets, _ = login_and_count(settings, "dev.admin", PASSWORD)
