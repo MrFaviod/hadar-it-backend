@@ -1005,3 +1005,32 @@ def stub_server():
         yield server
     finally:
         server.stop()
+
+
+def test_m3_normalized_asset_candidate_is_persisted_with_null_inheritance(harness):
+    asset = harness.add_asset("M3 switch", category="switches", ip="10.0.0.1")
+    with harness.catalog.session() as session:
+        service = harness.service(session)
+        result = service.update_asset(
+            harness.admin,
+            asset,
+            {
+                "checkType": "icmp",
+                "metrics": ["latency", "latency"],
+                "thresholds": {"latency": {"warning": 0.1234567}},
+                "target": " 10.0.0.1 ",
+            },
+        )
+        assert result["config"]["metrics"] == ["latency"]
+        assert result["config"]["thresholds"]["latency"]["warning"] == 0.1235
+        assert result["config"]["target"] == "10.0.0.1"
+    with harness.catalog.session() as session:
+        service = harness.service(session)
+        result = service.get_device(harness.admin, asset)
+        assert result["config"]["metrics"] == ["latency"]
+        cleared = service.update_asset(
+            harness.admin, asset, {"metrics": None, "thresholds": None, "target": None}
+        )
+        assert "metrics" not in cleared["config"]["overridden"]
+        assert "thresholds" not in cleared["config"]["overridden"]
+        assert "target" not in cleared["config"]["overridden"]

@@ -864,7 +864,7 @@ class MonitoringService:
             ("snmpAuthRef", "snmp_auth_ref"),
         ):
             if key in values:
-                setattr(row, attribute, values[key])
+                setattr(row, attribute, None if values[key] is None else candidate[key])
         row.updated_by = principal.actor_id
         row.updated_at = self._now()
         if all(
