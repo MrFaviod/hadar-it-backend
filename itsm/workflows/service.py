@@ -323,23 +323,51 @@ class WorkflowService:
                 "matchFields supports quick_code, serial, ip",
                 key="api.workflows.matchfields_supports_quick_code_serial_ip",
             )
+        # One lookup per batch instead of one query per row: permanent ids and
+        # match-field candidates are preloaded, then each row reads its own bucket.
+        permanent_ids = {row["values"]["id"] for row in rows if row["values"].get("id")}
+        found = {}
+        if permanent_ids:
+            found = {
+                asset.id: asset
+                for asset in self._session.scalars(select(Asset).where(Asset.id.in_(permanent_ids)))
+            }
+        wanted = {field: set() for field in match_fields}
+        for row in rows:
+            if not row["values"].get("id"):
+                for field in match_fields:
+                    if row["values"].get(field):
+                        wanted[field].add(row["values"][field])
+        buckets = {field: {} for field in match_fields}
+        for field in match_fields:
+            if wanted[field]:
+                column = getattr(Asset, field)
+                for asset_id, value in self._session.execute(
+                    select(Asset.id, column).where(column.in_(wanted[field]))
+                ):
+                    buckets[field].setdefault(value, []).append(asset_id)
         for row in rows:
             values = row["values"]
             permanent_id = values.pop("id", None)
-            asset = self._session.get(Asset, permanent_id) if permanent_id else None
+            asset = found.get(permanent_id) if permanent_id else None
+            if permanent_id and asset is None:
+                # Exact-key misses (e.g. collation-equal ids) keep the per-row lookup semantics.
+                asset = self._session.get(Asset, permanent_id)
             candidates = []
             if permanent_id and asset is None:
                 row["errors"].append("permanent id does not exist; resolve as new explicitly")
             if not permanent_id:
                 for field in match_fields:
                     if values.get(field):
-                        candidates.extend(
-                            self._session.scalars(
+                        matched = buckets[field].get(values[field])
+                        if matched is None:
+                            # Same SQL equality as before for values the preload missed.
+                            matched = self._session.scalars(
                                 select(Asset.id)
                                 .where(getattr(Asset, field) == values[field])
                                 .limit(21)
-                            )
-                        )
+                            ).all()
+                        candidates.extend(matched[:21])
             row.update(
                 {
                     "assetId": asset.id if asset else None,
