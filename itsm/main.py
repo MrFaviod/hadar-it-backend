@@ -526,7 +526,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         identity: IdentityService = Depends(get_identity_service),
     ) -> TaskAcceptedResponse:
         """Queue the bounded echo demo task; no caller-defined task names."""
-        identity.authorize(context.principal, "assets.view", resource="tasks:demo")
+        identity.authorize(context.principal, "system.configure", resource="tasks:demo")
         if len(payload.message) > settings.demo_message_max_length:
             raise HTTPException(
                 status_code=422,
