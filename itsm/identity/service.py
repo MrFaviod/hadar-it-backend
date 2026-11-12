@@ -66,6 +66,7 @@ ATTEMPT_RETENTION = timedelta(hours=24)
 MACHINE_TOKEN_PREFIX = "itsm_mk_"
 PERSONAL_TOKEN_PREFIX = "itsm_pk_"
 API_KEY_DEFAULT_LIFETIME = timedelta(days=90)
+MACHINE_CREDENTIAL_LIFETIME = timedelta(days=90)
 SESSION_MINUTES_MIN = 5
 SESSION_MINUTES_MAX = 1440
 AUDIT_PAGE_MAX = 200
@@ -218,6 +219,7 @@ class SessionGrant:
 @dataclass(frozen=True)
 class MachineCredential:
     credential_id: str
+    expires_at: datetime
     token: str = field(repr=False)
 
 
@@ -974,7 +976,10 @@ class IdentityService:
             or session.revoked_at is not None
             or as_utc(session.expires_at) <= self._now()
         ):
-            raise PermissionDenied("API key management requires a live human cookie session")
+            raise PermissionDenied(
+                "API key management requires a live human cookie session",
+                key="api.identity.api_key_live_session_required",
+            )
         return identity
 
     @staticmethod
@@ -1000,20 +1005,32 @@ class IdentityService:
         identity = self._require_key_owner(principal)
         label = label.strip()
         if not label or len(label) > 64:
-            raise ValidationFailed("API key label must contain 1 to 64 characters")
+            raise ValidationFailed(
+                "API key label must contain 1 to 64 characters",
+                key="api.identity.api_key_label_invalid",
+            )
         now = self._now()
         if expires_at is not None:
             if expires_at.tzinfo is None or expires_at.utcoffset() is None:
-                raise ValidationFailed("API key expiry must include a timezone")
+                raise ValidationFailed(
+                    "API key expiry must include a timezone",
+                    key="api.identity.api_key_expiry_timezone_required",
+                )
             expires_at = as_utc(expires_at)
             if expires_at <= now:
-                raise ValidationFailed("API key expiry must be in the future")
+                raise ValidationFailed(
+                    "API key expiry must be in the future",
+                    key="api.identity.api_key_expiry_future_required",
+                )
         current = self._persisted_permissions(principal)
         ceiling = (
             current if permissions is None else frozenset(self._validate_permissions(permissions))
         )
         if not ceiling <= current:
-            raise PermissionDenied("API key permissions exceed your current permissions")
+            raise PermissionDenied(
+                "API key permissions exceed your current permissions",
+                key="api.identity.api_key_permissions_exceeded",
+            )
         token = PERSONAL_TOKEN_PREFIX + secrets.token_urlsafe(32)
         key = IdentityApiKey(
             id=str(uuid4()),
@@ -1048,7 +1065,7 @@ class IdentityService:
             .execution_options(populate_existing=True)
         )
         if key is None:
-            raise NotFound("API key not found")
+            raise NotFound("API key not found", key="api.identity.api_key_not_found")
         if key.revoked_at is None:
             key.revoked_at = self._now()
             self.record_operation(
@@ -1122,12 +1139,14 @@ class IdentityService:
                 "authentication required", key="api.identity.authentication_required"
             )
         credential = self._session.execute(
-            select(IdentityCredential).where(
+            select(IdentityCredential)
+            .where(
                 IdentityCredential.token_digest == hash_token(token),
                 IdentityCredential.revoked_at.is_(None),
             )
+            .execution_options(populate_existing=True)
         ).scalar_one_or_none()
-        if credential is None:
+        if credential is None or as_utc(credential.expires_at) <= self._now():
             raise AuthenticationFailed(
                 "authentication required", key="api.identity.authentication_required"
             )
@@ -1197,9 +1216,9 @@ class IdentityService:
         )
 
     def issue_machine_credential(
-        self, username: str, label: str | None = None
+        self, username: str, label: str | None = None, *, rotate: bool = False
     ) -> MachineCredential:
-        """Issue a one-time visible static token; only its digest is stored."""
+        """Trusted local DB operator: issue a bounded token, optionally replacing all old ones."""
         normalized = self._normalize_username(username)
         identity = self._identity_by_username(normalized)
         if identity is None:
@@ -1215,6 +1234,17 @@ class IdentityService:
             )
         if not identity.active:
             raise Conflict("identity is inactive", key="api.identity.identity_inactive")
+        now = self._now()
+        expires_at = now + MACHINE_CREDENTIAL_LIFETIME
+        if rotate:
+            self._session.execute(
+                update(IdentityCredential)
+                .where(
+                    IdentityCredential.identity_id == identity.id,
+                    IdentityCredential.revoked_at.is_(None),
+                )
+                .values(revoked_at=now)
+            )
         token = MACHINE_TOKEN_PREFIX + secrets.token_urlsafe(32)
         credential_id = str(uuid4())
         self._session.add(
@@ -1223,17 +1253,18 @@ class IdentityService:
                 identity_id=identity.id,
                 token_digest=hash_token(token),
                 label=None if label is None else _clip(label.strip(), 64) or None,
-                created_at=self._now(),
+                created_at=now,
+                expires_at=expires_at,
             )
         )
         self._audit(
-            actor_kind="system",
-            action="identity.credential_issued",
+            actor_kind="local_operator",
+            action="identity.credential_rotated" if rotate else "identity.credential_issued",
             resource=f"identity:{identity.id}",
             outcome="success",
         )
         self._session.commit()
-        return MachineCredential(credential_id=credential_id, token=token)
+        return MachineCredential(credential_id=credential_id, expires_at=expires_at, token=token)
 
     def revoke_machine_credentials(self, username: str) -> int:
         normalized = self._normalize_username(username)
@@ -1261,9 +1292,7 @@ class IdentityService:
             credential.revoked_at = now
             revoked += 1
         self._audit(
-            actor_id=identity.id,
-            actor_kind=identity.actor_kind,
-            actor_username=identity.username,
+            actor_kind="local_operator",
             action="identity.credential_revoked",
             resource=f"identity:{identity.id}",
             outcome="success" if revoked else "noop",
@@ -1311,11 +1340,10 @@ class IdentityService:
         self._session.flush()
         view = self._user_view(identity)
         self._audit(
-            actor_kind="system",
+            actor_kind="local_operator",
             action="identity.bootstrap",
             resource=f"identity:{identity.id}",
             outcome="success",
-            actor_username=normalized,
         )
         self._session.commit()
         return view
@@ -1359,11 +1387,10 @@ class IdentityService:
         self._revoke_sessions(target.id)
         view = self._user_view(target)
         self._audit(
-            actor_kind="system",
+            actor_kind="local_operator",
             action="identity.superadmin_adopted",
             resource=f"identity:{target.id}",
             outcome="success",
-            actor_username=target.username,
         )
         self._session.commit()
         return view
@@ -1440,11 +1467,11 @@ class IdentityService:
         self._session.flush()
         view = self._user_view(identity)
         self._audit(
-            actor_kind="system",
+            actor_kind="local_operator",
             action="identity.bootstrap_machine",
             resource=f"identity:{identity.id}",
             outcome="success",
-            actor_username=normalized,
+            delegated_by=delegated_by_id,
         )
         self._session.commit()
         return view

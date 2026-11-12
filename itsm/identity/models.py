@@ -112,7 +112,7 @@ class IdentitySession(IdentityBase):
 
 
 class IdentityCredential(IdentityBase):
-    """Static machine credential; only the token digest is stored."""
+    """Expiring machine credential; only the token digest is stored."""
 
     __tablename__ = "identity_credentials"
 
@@ -128,6 +128,7 @@ class IdentityCredential(IdentityBase):
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 

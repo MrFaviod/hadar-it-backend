@@ -866,6 +866,7 @@ class InventoryService:
             )
         if principal is not None:
             self._organize(prepared, stored={}, principal=principal)
+        self._catalog.validate_category_assignment(prepared.get("category"))
         requested = prepared.get("quick_code")
         prepared["quick_code"] = (
             allocate(self, prepared, requested=requested) or self._generate_quick_code()
@@ -2033,6 +2034,8 @@ class InventoryService:
 
     def _catalog_changes(self, asset: Asset, prepared: dict[str, Any]) -> None:
         category = prepared.get("category", asset.category)
+        if "category" in prepared:
+            self._catalog.validate_category_assignment(category, previous=asset.category)
         if "status" in prepared:
             self._catalog.validate_transition(category, asset.status, prepared["status"])
         if self._catalog.category(category) is not None and (

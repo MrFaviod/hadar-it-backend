@@ -150,8 +150,31 @@ def _command_create_machine(args: argparse.Namespace, settings: Settings) -> int
                 "roleId": identity.role_id,
                 "actorKind": identity.actor_kind,
             },
+            "credentialId": credential.credential_id,
+            "expiresAt": credential.expires_at.isoformat(),
             "token": credential.token,
             "tokenNotice": "store this token now; it is not recoverable",
+        },
+        ok=True,
+    )
+    return EXIT_OK
+
+
+def _command_rotate_machine(args: argparse.Namespace, settings: Settings) -> int:
+    session, service = _open_service(settings)
+    try:
+        credential = service.issue_machine_credential(args.username, args.label, rotate=True)
+    finally:
+        session.close()
+    _emit(
+        {
+            "status": "rotated",
+            "action": "rotate-machine-token",
+            "username": args.username,
+            "credentialId": credential.credential_id,
+            "expiresAt": credential.expires_at.isoformat(),
+            "token": credential.token,
+            "tokenNotice": "store this token now; it is not recoverable; old tokens are revoked",
         },
         ok=True,
     )
@@ -180,7 +203,10 @@ def _command_revoke_machine(args: argparse.Namespace, settings: Settings) -> int
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="python -m itsm.identity.cli",
-        description="Identity installation commands (they never store plaintext secrets).",
+        description=(
+            "Trusted local database-operator commands; not human session authentication. "
+            "They never store plaintext secrets."
+        ),
     )
     commands = parser.add_subparsers(dest="command", required=True)
 
@@ -204,7 +230,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     machine = commands.add_parser(
         "create-machine-identity",
-        help="create a machine identity and print its bearer token exactly once",
+        help="create a machine identity and print its bearer token once (valid for 90 days)",
     )
     machine.add_argument("--username", required=True)
     machine.add_argument("--name", required=True)
@@ -213,10 +239,21 @@ def build_parser() -> argparse.ArgumentParser:
     machine.add_argument(
         "--delegated-by",
         default=None,
-        help="username of the active human superadmin delegating reserved grants",
+        help=(
+            "persisted human delegator (active superadmin for reserved grants); "
+            "an operator assertion, not proof of that human's authentication"
+        ),
     )
     machine.add_argument("--label", default="installation")
     machine.set_defaults(handler=_command_create_machine)
+
+    rotate = commands.add_parser(
+        "rotate-machine-token",
+        help="atomically revoke old machine tokens and print one replacement (valid for 90 days)",
+    )
+    rotate.add_argument("--username", required=True)
+    rotate.add_argument("--label", default="rotation")
+    rotate.set_defaults(handler=_command_rotate_machine)
 
     revoke = commands.add_parser(
         "revoke-machine-token",

@@ -1153,6 +1153,7 @@ class ReportService:
                     IdentityCredential.identity_id == principal.actor_id,
                     IdentityCredential.token_digest == digest,
                     IdentityCredential.revoked_at.is_(None),
+                    IdentityCredential.expires_at > utcnow(),
                 )
             ).scalar_one_or_none()
             if credential is None:

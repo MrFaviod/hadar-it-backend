@@ -160,6 +160,7 @@ def _assert_executor_authority(session: Any, principal: Any, executor: dict[str,
                 IdentityCredential.identity_id == principal.actor_id,
                 IdentityCredential.token_digest == executor.get("credentialDigest"),
                 IdentityCredential.revoked_at.is_(None),
+                IdentityCredential.expires_at > utcnow(),
             )
         )
         if credential is None:

@@ -309,7 +309,7 @@ def authenticated_actor(
     token = _bearer_token(request)
     try:
         if "authorization" in request.headers and token is None:
-            raise AuthenticationFailed()
+            raise AuthenticationFailed(key="api.auth.authentication_required")
         if token is not None:
             return service.authenticate_token(
                 token,

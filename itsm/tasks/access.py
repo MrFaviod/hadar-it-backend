@@ -43,4 +43,4 @@ def authorize_task_read(
         actor = identity.resolve_actor(principal.actor_id)
         if actor.role_id in {ROLE_ADMIN, ROLE_SUPERADMIN}:
             return
-    raise NotFound("task not found")
+    raise NotFound("task not found", key="api.tasks.not_found")

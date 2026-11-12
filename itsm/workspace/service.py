@@ -544,6 +544,11 @@ class WorkspaceService:
         target_scope = _scope(payload.get("scope"), default=row.scope)
         if row.scope == "shared" or target_scope == "shared":
             self._require_shared(principal)
+        if row.owner_id != principal.actor_id:
+            raise PermissionDenied(
+                "only the owner can modify a shortcut",
+                key="api.workspace.only_owner_can_modify_shortcut",
+            )
         if "name" in payload:
             row.name = (
                 _text(payload["name"], "name", max_length=MAX_NAME, required=True) or row.name
@@ -565,6 +570,11 @@ class WorkspaceService:
         row = self._shortcut(principal, shortcut_id)
         if row.scope == "shared":
             self._require_shared(principal)
+        if row.owner_id != principal.actor_id:
+            raise PermissionDenied(
+                "only the owner can delete a shortcut",
+                key="api.workspace.only_owner_can_delete_shortcut",
+            )
         identifier = row.id
         self._session.delete(row)
         self._session.flush()
