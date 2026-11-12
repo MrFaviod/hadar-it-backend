@@ -120,7 +120,6 @@ from itsm.identity.permissions import (
     PERMISSION_CODES,
     ROLE_SUPERADMIN,
 )
-from itsm.identity.policy import invalidate_session_policy_engine
 from itsm.identity.service import IdentityService, PermissionDenied, Principal
 
 logger = logging.getLogger(__name__)
@@ -3146,7 +3145,6 @@ class ExtensionHostService:
                         IdentityRolePolicy.operation == operation,
                     )
                 )
-            invalidate_session_policy_engine(session)
             session.delete(module)
             i18n_removed = i18n_registry.delete_provider(session, extension_id)
             storage.record_event(

@@ -59,10 +59,7 @@ from itsm.identity.permissions import (
     SYSTEM_PERMISSIONS,
     is_known_permission,
 )
-from itsm.identity.policy import (
-    invalidate_session_policy_engine,
-    session_policy_engine,
-)
+from itsm.identity.policy import PolicyEngine
 
 USERNAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._-]{2,63}$")
 ATTEMPT_RETENTION = timedelta(hours=24)
@@ -496,7 +493,7 @@ class IdentityService:
 
     # ---------------------------------------------------------- authorization
     def _effective_permissions(self, identity: Identity, scopes: frozenset[str]) -> frozenset[str]:
-        engine = session_policy_engine(self._session)
+        engine = PolicyEngine.load(self._session)
         if identity.actor_kind == HUMAN_ACTOR_KIND:
             effective = engine.permissions(identity.role_id)
             # Reserved installation authority belongs to the persisted owner
@@ -567,7 +564,7 @@ class IdentityService:
         the whole catalog, never because of a bypass.
         """
         ceiling = self._persisted_permissions(principal)
-        engine = session_policy_engine(self._session)
+        engine = PolicyEngine.load(self._session)
         needed: set[str] = set()
         for role_id in role_ids:
             if role_id:
@@ -1502,7 +1499,7 @@ class IdentityService:
         superadmin delegates them, and the delegator's role is persisted as the
         machine's role owner so a later change cannot silently broaden it.
         """
-        permissions = session_policy_engine(self._session).permissions(role.id)
+        permissions = PolicyEngine.load(self._session).permissions(role.id)
         if actor_kind == HUMAN_ACTOR_KIND:
             if role.id != ROLE_SUPERADMIN and permissions & SYSTEM_PERMISSIONS:
                 raise ValidationFailed(
@@ -1776,7 +1773,6 @@ class IdentityService:
                 IdentityRolePolicy(role_id=role.id, resource=resource, operation=operation)
             )
         self._session.flush()
-        invalidate_session_policy_engine(self._session)
         view = self._role_view(role)
         self._audit(
             actor_id=principal.actor_id,
@@ -1841,7 +1837,6 @@ class IdentityService:
                     IdentityRolePolicy(role_id=role.id, resource=resource, operation=operation)
                 )
         self._session.flush()
-        invalidate_session_policy_engine(self._session)
         view = self._role_view(role)
         self._audit(
             actor_id=principal.actor_id,
@@ -1989,7 +1984,6 @@ class IdentityService:
             )
             added.append(code)
         self._session.flush()
-        invalidate_session_policy_engine(self._session)
         self._audit(
             actor_id=identity.id,
             actor_kind=identity.actor_kind,
