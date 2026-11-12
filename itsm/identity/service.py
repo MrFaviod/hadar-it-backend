@@ -261,6 +261,13 @@ def _clip(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit]
 
 
+# Holding any of these makes an account an identity administrator: only a
+# Superadmin may reset its password or take over its credentials.
+IDENTITY_ADMIN_PERMISSIONS: frozenset[str] = frozenset(
+    {"users.create", "users.edit", "roles.manage"}
+)
+
+
 class IdentityService:
     """Domain service for identity, sessions and authorization."""
 
@@ -546,6 +553,32 @@ class IdentityService:
             # Empty means no grants, unlike legacy machine/internal scopes.
             effective &= frozenset(json.loads(key.permissions_json))
         return effective
+
+    def _assert_superadmin_for_administrator_credentials(
+        self, principal: Principal, target: Identity
+    ) -> None:
+        """Only a persisted human Superadmin may reset another identity administrator.
+
+        The permission ceiling alone lets an administrator reset a peer, since both
+        hold the same grants. Self-service changes are never administrator resets.
+        """
+        if target.id == principal.actor_id or target.actor_kind != HUMAN_ACTOR_KIND:
+            return
+        if not self._effective_permissions(target, frozenset()) & IDENTITY_ADMIN_PERMISSIONS:
+            return
+        caller = self._session.get(Identity, principal.actor_id)
+        if (
+            caller is not None
+            and caller.actor_kind == HUMAN_ACTOR_KIND
+            and caller.role_id == ROLE_SUPERADMIN
+            and not principal.api_key_id
+            and not principal.scopes
+        ):
+            return
+        raise PermissionDenied(
+            "only a superadministrator can change the credentials of an identity administrator",
+            key="api.identity.superadmin_required_for_administrator_credentials",
+        )
 
     def _assert_permission_ceiling(
         self,
@@ -1628,6 +1661,8 @@ class IdentityService:
             resource=f"identity:{identity_id}",
             role_ids=[target.role_id, role_id],
         )
+        if password is not None:
+            self._assert_superadmin_for_administrator_credentials(principal, target)
         if role_id is not None and role_id != target.role_id:
             if target.id == principal.actor_id:
                 raise PermissionDenied(

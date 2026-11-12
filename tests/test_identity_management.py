@@ -590,3 +590,50 @@ def test_limited_role_manager_cannot_grant_or_edit_beyond_its_own_permissions(
         assert service.update_role(
             manager.principal, allowed.id, permissions=["assets.view", "roles.manage"]
         ).permissions == ("assets.view", "roles.manage")
+
+
+def test_only_superadmin_resets_the_password_of_an_identity_administrator(
+    harness: Harness,
+) -> None:
+    grant = admin_grant(harness)
+    with harness.service() as service:
+        for username, role_id in (("admin.dos", "admin"), ("admin.tres", "admin")):
+            service.create_user(
+                grant.principal,
+                username=username,
+                name=username,
+                role_id=role_id,
+                password=PASSWORD,
+            )
+        service.create_user(
+            grant.principal,
+            username="usuario.uno",
+            name="Usuario Uno",
+            role_id="user",
+            password=PASSWORD,
+        )
+        second_admin = service.login("admin.dos", PASSWORD)
+
+        def identity_id(username: str) -> str:
+            return str(
+                harness.sql(f"SELECT id FROM identity_identities WHERE username = '{username}'")[0][
+                    0
+                ]
+            )
+
+        with pytest.raises(PermissionDenied):
+            service.update_user(
+                second_admin.principal, identity_id("admin.tres"), password="otra-clave-2026"
+            )
+        # Resetting an ordinary user stays with the administrator.
+        service.update_user(
+            second_admin.principal, identity_id("usuario.uno"), password="clave-usuario-2026"
+        )
+        # The superadmin may reset another administrator.
+        service.update_user(grant.principal, identity_id("admin.tres"), password="clave-admin-2026")
+        assert service.login("admin.tres", "clave-admin-2026").permissions
+        # An administrator may still change its own password.
+        service.update_user(
+            second_admin.principal, identity_id("admin.dos"), password="clave-propia-2026"
+        )
+        assert service.login("admin.dos", "clave-propia-2026").permissions
