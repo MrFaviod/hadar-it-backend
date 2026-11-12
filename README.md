@@ -1,34 +1,38 @@
 # Hadar IT · Backend
 
-API, domain services and background jobs for
-[Hadar IT](https://github.com/MrFaviod/hadar-it).
-REST, the assistant and MCP clients share server-enforced permissions.
+The API, domain services and background worker of [Hadar IT](https://github.com/MrFaviod/hadar-it). The browser, the built-in assistant (Pydantic AI) and MCP clients (FastMCP) all call the same domain services, and identity and permissions are enforced here, on the server.
 
-Alpha software. Not ready for production. AI and external integrations need
-configuration; queued work requires a running worker.
+> **Alpha.** Not ready for production. To run the whole application, follow the [installation guide](https://github.com/MrFaviod/hadar-it/blob/master/INSTALL.md). AI and external integrations need their own configuration, and queued work needs a running worker.
 
-## Development
+## Develop
 
-Python 3.14+, FastAPI, SQLAlchemy, Alembic and Huey.
-From this repository:
+Python 3.14 or later, FastAPI, SQLAlchemy, Alembic and Huey. From this repository:
 
 ```bash
 python3.14 -m venv .venv
 .venv/bin/python -m pip install -r requirements.txt -r requirements-dev.txt
 ```
 
-Follow the central development guide to initialize disposable storage and start
-the API and worker. Installing dependencies does not initialize a database or
-create an account. The running API serves OpenAPI at `/docs`.
+Installing dependencies does not create a database or an account. The [backend development guide](https://github.com/MrFaviod/hadar-it/blob/master/docs/backend/development.md) walks through a disposable local workspace: initialize storage, start the API on port 8000 and run the worker. The running API serves its OpenAPI reference at `/docs`.
+
+## Check
+
+```bash
+.venv/bin/python -m pytest
+.venv/bin/python -m ruff check itsm tests migrations
+```
+
+Never point tests or migrations at a database you want to keep.
 
 ## Documentation
 
-- [Install Hadar](https://github.com/MrFaviod/hadar-it/blob/master/INSTALL.md)
+Maintained guides live in the main repository:
+
 - [Backend development](https://github.com/MrFaviod/hadar-it/blob/master/docs/backend/development.md)
 - [Personal API keys and MCP](https://github.com/MrFaviod/hadar-it/blob/master/docs/backend/personal-api-keys.md)
 - [Extension SDK](https://github.com/MrFaviod/hadar-it/blob/master/docs/backend/extensions-sdk.md)
+- [All documentation](https://github.com/MrFaviod/hadar-it/blob/master/docs/README.md)
 
-Maintained guides live in the main repository. Local `docs/` and agent instructions
-are internal and ignored. Packaged SDK references and agent skills under `itsm/`
-remain part of the product.
-[Report an issue](https://github.com/MrFaviod/hadar-it-backend/issues).
+Local `docs/` and agent instructions in this repository are internal working files and are not published. The SDK references and agent skills packaged under `itsm/` are part of the product.
+
+[Report an issue](https://github.com/MrFaviod/hadar-it-backend/issues)

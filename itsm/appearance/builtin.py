@@ -14,24 +14,29 @@ GENERIC_ID: Final[str] = "generic"
 BUILTIN_IDS: Final[tuple[str, ...]] = ("generic", "blue", "forest")
 
 _LOGO_SVG: Final[bytes] = (
-    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img" '
-    b'aria-labelledby="title">\n'
-    b'  <title id="title">Hadar IT</title>\n'
-    b'  <path d="M24 4 43 14.5 24 25 5 14.5 24 4Z" fill="#7bd3ca"/>\n'
-    b'  <path d="m5 22 19 10.5L43 22v6L24 38.5 5 28v-6Z" fill="#2e9e97"/>\n'
-    b'  <path d="m5 33 19 10.5L43 33v5.5L24 49 5 38.5V33Z" fill="#b8e5df"/>\n'
-    b'  <path d="M24 4v21m0 0v21" stroke="#0b2331" stroke-width="1.2" opacity=".35"/>\n'
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 48 48" role="img"'
+    b' aria-labelledby="hadar-logo-title">\n'
+    b'  <title id="hadar-logo-title">Hadar IT</title>\n'
+    b'  <rect x="4.14" y="4" width="9.39" height="40" fill="#0d766e"/>\n'
+    b'  <rect x="34.47" y="4" width="9.39" height="40" fill="#0d766e"/>\n'
+    b'  <path d="M39.63 24C34.92 22.7 28.32 22.08 26.66 21.07C25.74 19.23 25.17 11.93 24'
+    b" 6.73C22.83 11.93 22.26 19.23 21.34 21.07C19.68 22.08 13.08 22.7 8.37 24C13.08 25.3"
+    b" 19.68 25.92 21.34 26.93C22.26 28.77 22.83 36.07 24 41.27C25.17 36.07 25.74 28.77"
+    b' 26.66 26.93C28.32 25.92 34.92 25.3 39.63 24Z" fill="#7bd3ca"/>\n'
     b"</svg>\n"
 )
 
 _FAVICON_SVG: Final[bytes] = (
-    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img" '
-    b'aria-labelledby="title">\n'
-    b'  <title id="title">Hadar IT</title>\n'
-    b'  <rect width="64" height="64" rx="15" fill="#0c2333"/>\n'
-    b'  <path d="M32 12 52 23 32 34 12 23l20-11Z" fill="#7bd3ca"/>\n'
-    b'  <path d="m12 31 20 11 20-11v6L32 48 12 37v-6Z" fill="#2e9e97"/>\n'
-    b'  <path d="m12 42 20 11 20-11v4L32 57 12 46v-4Z" fill="#b8e5df"/>\n'
+    b'<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" role="img"'
+    b' aria-labelledby="hadar-favicon-title">\n'
+    b'  <title id="hadar-favicon-title">Hadar IT</title>\n'
+    b'  <rect width="64" height="64" rx="14" fill="#0c2333"/>\n'
+    b'  <rect x="12.14" y="12" width="9.39" height="40" fill="#14958a"/>\n'
+    b'  <rect x="42.47" y="12" width="9.39" height="40" fill="#14958a"/>\n'
+    b'  <path d="M47.63 32C41.69 29.93 36.69 28.2 36.06 27.51C35.44 26.82 33.88 21.29 32'
+    b" 14.73C30.12 21.29 28.56 26.82 27.94 27.51C27.31 28.2 22.31 29.93 16.37 32C22.31"
+    b" 34.07 27.31 35.8 27.94 36.49C28.56 37.18 30.12 42.71 32 49.27C33.88 42.71 35.44"
+    b' 37.18 36.06 36.49C36.69 35.8 41.69 34.07 47.63 32Z" fill="#b5ece5"/>\n'
     b"</svg>\n"
 )
 
