@@ -25,6 +25,17 @@ def sanitize_text(value: str, secrets: Iterable[str] = ()) -> str:
     return sanitized
 
 
+def _redact(value: Any) -> Any:
+    """Redact text before JSON escaping, so secrets with quotes or control characters match."""
+    if value is None or isinstance(value, bool | int | float):
+        return value
+    if isinstance(value, dict):
+        return {sanitize_text(str(key), _SECRETS): _redact(item) for key, item in value.items()}
+    if isinstance(value, list | tuple | set | frozenset):
+        return [_redact(item) for item in value]
+    return sanitize_text(str(value), _SECRETS)
+
+
 class JsonFormatter(logging.Formatter):
     """Render one log record as a single JSON object."""
 
@@ -41,7 +52,7 @@ class JsonFormatter(logging.Formatter):
             payload.update(data)
         if record.exc_info:
             payload["exception"] = self.formatException(record.exc_info)
-        return sanitize_text(json.dumps(payload, default=str), _SECRETS)
+        return json.dumps(_redact(payload), default=str)
 
 
 def configure_logging(

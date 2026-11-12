@@ -130,7 +130,8 @@ TOOL_NAMES: tuple[str, ...] = (
     "query_relationships",
     "list_saved_views",
     *SYSTEM_TOOL_NAMES,
-) + EXTENSION_TOOL_NAMES
+    *EXTENSION_TOOL_NAMES,
+)
 
 MAX_RESULTS = 50
 

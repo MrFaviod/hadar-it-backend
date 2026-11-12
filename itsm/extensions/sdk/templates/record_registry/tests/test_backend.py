@@ -23,9 +23,8 @@ class MemoryStore:
         rows = []
         for record_id in sorted(self.records):
             data = self.records[record_id]
-            if filters:
-                if any(data.get(key) != value for key, value in filters.items()):
-                    continue
+            if filters and any(data.get(key) != value for key, value in filters.items()):
+                continue
             rows.append(
                 {
                     "id": record_id,
@@ -50,9 +49,8 @@ class MemoryStore:
         assert isinstance(data, dict)
         if expected_version == 0 and record_id in self.records:
             raise RuntimeError("record already exists")
-        if expected_version not in (None, 0):
-            if self.versions.get(record_id) != expected_version:
-                raise RuntimeError("record version conflict")
+        if expected_version not in (None, 0) and self.versions.get(record_id) != expected_version:
+            raise RuntimeError("record version conflict")
         self.records[record_id] = dict(data)
         self.versions[record_id] = self.versions.get(record_id, 0) + 1
         return self.get(collection, record_id)
@@ -74,7 +72,6 @@ class Context:
     def authorize(self, permission):
         if permission not in self.allowed:
             raise PermissionError(permission)
-
 
 
 class SDK:
@@ -103,9 +100,7 @@ class BackendTests(unittest.TestCase):
         self.assertEqual(set(self.sdk.migrations), {"normalize_status"})
 
     def test_create_then_list_round_trip(self):
-        created = backend.create_record(
-            self.context, title="Router principal", notes="Armario B"
-        )
+        created = backend.create_record(self.context, title="Router principal", notes="Armario B")
         record = created["record"]
         self.assertEqual(record["title"], "Router principal")
         self.assertEqual(record["status"], "open")
@@ -144,13 +139,15 @@ class BackendTests(unittest.TestCase):
     def test_migration_normalizes_records_beyond_one_store_page(self):
         for index in range(201):
             self.context.store.put(
-                "records", "legacy-%03d" % index,
-                {"title": "Legacy %d" % index, "notes": ""}, expected_version=0,
+                "records",
+                f"legacy-{index:03d}",
+                {"title": f"Legacy {index}", "notes": ""},
+                expected_version=0,
             )
         result = backend.normalize_status(self.context)
         self.assertEqual(result, {"migrated": 201})
         for index in range(201):
-            stored = self.context.store.get("records", "legacy-%03d" % index)
+            stored = self.context.store.get("records", f"legacy-{index:03d}")
             self.assertEqual(stored["data"]["status"], "open")
             self.assertEqual(stored["version"], 2)
         self.assertEqual(backend.normalize_status(self.context), {"migrated": 0})

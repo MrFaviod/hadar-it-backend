@@ -2645,13 +2645,13 @@ class ExtensionHostService:
                 resource=f"extension:{extension_id}",
                 commit=False,
             )
-            session.commit()
             if restore_snapshot:
                 restored = sqlite_store.restore(
                     self.storage_root(), extension_id, int(target_manifest["schemaVersion"])
                 )
                 if not restored:  # pragma: no cover - checked before the update
                     raise ExtensionMigrationFailed("rollback data restore failed")
+            session.commit()  # metadata commits only once the data it describes is restored
             self._drop_cache(extension_id)
             session.expire_all()
             refreshed = session.get(ExtensionModule, extension_id)
@@ -2795,10 +2795,11 @@ class ExtensionHostService:
                     if parsed > current:
                         counts["skipped"] += 1
                         continue
-                principal = self._event_principal(session, version_row)
-                loaded = self._load_module(version_row) if subscriptions else None
-                connection = self._connect(module.id) if has_references else None
+                connection = None
                 try:
+                    principal = self._event_principal(session, version_row)
+                    loaded = self._load_module(version_row) if subscriptions else None
+                    connection = self._connect(module.id) if has_references else None
                     for event in feed.poll(consumer, EVENT_BATCH):
                         try:
                             payload = {
@@ -2840,6 +2841,13 @@ class ExtensionHostService:
                             )
                             counts["failed"] += 1
                             break
+                except Exception as exc:  # one broken module must not stop the others
+                    counts["failed"] += 1
+                    logger.warning(
+                        "extension event delivery stopped: module=%s code=%s",
+                        module.id,
+                        event_failure_code(exc),
+                    )
                 finally:
                     if connection is not None:
                         connection.close()

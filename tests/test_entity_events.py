@@ -408,6 +408,18 @@ def test_prune_never_deletes_events_an_active_consumer_has_not_acked(catalog: Ca
     assert stream.prune(utcnow() - timedelta(days=1)) == 0
 
 
+def test_prune_without_any_consumer_deletes_nothing(catalog: Catalog) -> None:
+    for index in range(2):
+        with catalog.session() as session:
+            inventory(catalog, session).create(
+                catalog.admin(), asset_values(quick_code=f"NC-{index}", name=f"No consumer {index}")
+            )
+    stream = feed(catalog)
+
+    assert stream.prune(utcnow() + timedelta(minutes=1)) == 0
+    assert [event["sequence"] for event in events(catalog)] == [1, 2]
+
+
 # ---------------------------------------------------------------- references
 
 

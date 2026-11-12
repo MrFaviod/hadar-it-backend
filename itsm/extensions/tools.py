@@ -88,7 +88,11 @@ def dispatch_extension_tool(
                 key="api.extensions.tool_invoke_arguments",
                 params={},
             )
-        return {"result": host.invoke(principal, arguments["id"], arguments["operation"], arguments["arguments"])}
+        return {
+            "result": host.invoke(
+                principal, arguments["id"], arguments["operation"], arguments["arguments"]
+            )
+        }
     raise ValidationFailed(
         "unknown extension tool",
         key="api.extensions.tool_unknown",
@@ -118,9 +122,15 @@ def register_agent_extension_tools(
         return execute(ctx.deps, "extension_sdk_reference", {"name": name})
 
     @toolset.tool
-    def extension_workspace_create(ctx: RunContext[Any], id: str, name: str, description: str) -> dict[str, Any]:
+    def extension_workspace_create(
+        ctx: RunContext[Any], id: str, name: str, description: str
+    ) -> dict[str, Any]:
         """Generate an owned, independent native extension workspace from the working example."""
-        return execute(ctx.deps, "extension_workspace_create", {"id": id, "name": name, "description": description})
+        return execute(
+            ctx.deps,
+            "extension_workspace_create",
+            {"id": id, "name": name, "description": description},
+        )
 
     @toolset.tool
     def extension_workspace_files(ctx: RunContext[Any], workspace_id: str) -> dict[str, Any]:
@@ -128,14 +138,24 @@ def register_agent_extension_tools(
         return execute(ctx.deps, "extension_workspace_files", {"workspace_id": workspace_id})
 
     @toolset.tool
-    def extension_workspace_read(ctx: RunContext[Any], workspace_id: str, path: str) -> dict[str, Any]:
+    def extension_workspace_read(
+        ctx: RunContext[Any], workspace_id: str, path: str
+    ) -> dict[str, Any]:
         """Read one relative package file in your owned workspace, not the core repository."""
-        return execute(ctx.deps, "extension_workspace_read", {"workspace_id": workspace_id, "path": path})
+        return execute(
+            ctx.deps, "extension_workspace_read", {"workspace_id": workspace_id, "path": path}
+        )
 
     @toolset.tool
-    def extension_workspace_write(ctx: RunContext[Any], workspace_id: str, path: str, content: str) -> dict[str, Any]:
+    def extension_workspace_write(
+        ctx: RunContext[Any], workspace_id: str, path: str, content: str
+    ) -> dict[str, Any]:
         """Write bounded source in your workspace; editing invalidates previous validation."""
-        return execute(ctx.deps, "extension_workspace_write", {"workspace_id": workspace_id, "path": path, "content": content})
+        return execute(
+            ctx.deps,
+            "extension_workspace_write",
+            {"workspace_id": workspace_id, "path": path, "content": content},
+        )
 
     @toolset.tool
     def extension_workspace_validate(ctx: RunContext[Any], workspace_id: str) -> dict[str, Any]:
@@ -153,7 +173,7 @@ def register_agent_extension_tools(
         capability: str,
         reason: str,
         example: str,
-        extensionId: str | None = None,  # noqa: N803 - public tool argument name
+        extensionId: str | None = None,
     ) -> dict[str, Any]:
         """Record a missing public SDK contract; never alter core or private structures."""
         arguments: dict[str, Any] = {
@@ -228,7 +248,7 @@ def register_agent_extension_tools(
 
     @toolset.tool
     def extension_operations(ctx: RunContext[Any], id: str) -> dict[str, Any]:
-        """Read parameter schemas and permissions for an installed module's authorized operations."""
+        """Read parameter schemas and permissions for an installed module."""
         return execute(ctx.deps, "extension_operations", {"id": id})
 
     @toolset.tool
@@ -237,9 +257,13 @@ def register_agent_extension_tools(
         return execute(ctx.deps, "extension_skill", {"id": id, "name": name})
 
     @toolset.tool
-    def extension_invoke(ctx: RunContext[Any], id: str, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
-        """Invoke one installed declared operation through live host authorization, never raw code."""
-        return execute(ctx.deps, "extension_invoke", {"id": id, "operation": operation, "arguments": arguments})
+    def extension_invoke(
+        ctx: RunContext[Any], id: str, operation: str, arguments: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Invoke one installed declared operation through live host authorization only."""
+        return execute(
+            ctx.deps, "extension_invoke", {"id": id, "operation": operation, "arguments": arguments}
+        )
 
 
 def register_mcp_extension_tools(
@@ -261,7 +285,9 @@ def register_mcp_extension_tools(
     @server.tool
     def extension_workspace_create(id: str, name: str, description: str) -> dict[str, Any]:
         """Generate an actor-owned independent extension workspace."""
-        return execute("extension_workspace_create", {"id": id, "name": name, "description": description})
+        return execute(
+            "extension_workspace_create", {"id": id, "name": name, "description": description}
+        )
 
     @server.tool
     def extension_workspace_files(workspace_id: str) -> dict[str, Any]:
@@ -276,7 +302,10 @@ def register_mcp_extension_tools(
     @server.tool
     def extension_workspace_write(workspace_id: str, path: str, content: str) -> dict[str, Any]:
         """Write bounded module source; any edit invalidates the previous validation."""
-        return execute("extension_workspace_write", {"workspace_id": workspace_id, "path": path, "content": content})
+        return execute(
+            "extension_workspace_write",
+            {"workspace_id": workspace_id, "path": path, "content": content},
+        )
 
     @server.tool
     def extension_workspace_validate(workspace_id: str) -> dict[str, Any]:
@@ -375,4 +404,6 @@ def register_mcp_extension_tools(
     @server.tool
     def extension_invoke(id: str, operation: str, arguments: dict[str, Any]) -> dict[str, Any]:
         """Invoke a declared module operation through the canonical live permission boundary."""
-        return execute("extension_invoke", {"id": id, "operation": operation, "arguments": arguments})
+        return execute(
+            "extension_invoke", {"id": id, "operation": operation, "arguments": arguments}
+        )

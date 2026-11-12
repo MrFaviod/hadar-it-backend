@@ -14,6 +14,7 @@ from typing import Annotated, Any
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict, Field
+from starlette.concurrency import run_in_threadpool
 
 from itsm.extensions.host import (
     ExtensionConflict,
@@ -220,8 +221,11 @@ def create_extension_router() -> APIRouter:
             len(digest) != 64 or any(ch not in "0123456789abcdef" for ch in digest.lower())
         ):
             raise ExtensionDigestMismatch("package digest must be SHA-256 hex")
-        return host.submit_candidate(
-            context.principal, bytes(body), expected_digest=digest.lower() if digest else None
+        return await run_in_threadpool(
+            host.submit_candidate,
+            context.principal,
+            bytes(body),
+            expected_digest=digest.lower() if digest else None,
         )
 
     @router.post("/candidates/{candidate_id}/approve")

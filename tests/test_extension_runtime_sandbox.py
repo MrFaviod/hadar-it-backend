@@ -230,3 +230,17 @@ def test_installed_module_package_is_never_written_by_the_sandbox(env) -> None:
         assert path.stat().st_mode & 0o777 in {0o400, 0o500}
     env.invoke("echo", {"value": "read only"})
     assert sorted(path for path in package_root.rglob("*") if path.is_file()) == files
+
+
+def test_x86_64_seccomp_filter_kills_the_x32_syscall_range() -> None:
+    """x32 calls carry bit 30 in the number and would skip the x86_64 deny-list."""
+    import struct
+
+    from itsm.extensions.runtime import sandbox
+
+    raw, _count = sandbox.build_seccomp_program("x86_64")
+    instructions = [struct.unpack("<HBBI", raw[i : i + 8]) for i in range(0, len(raw), 8)]
+    guard = (0x35, 0, 1, 0x40000000)  # JGE syscall number, 0x40000000 -> next (KILL)
+    assert guard in instructions
+    position = instructions.index(guard)
+    assert instructions[position + 1] == (0x06, 0, 0, sandbox.SECCOMP_RET_KILL_PROCESS)

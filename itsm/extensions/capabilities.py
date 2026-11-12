@@ -242,32 +242,36 @@ class CapabilityBroker:
                 return self._replay(concurrent, digest, capability)
         try:
             result = self._call(capability, request)
-        except BaseException:
-            self._release(extension_id, principal_id, key)
-            raise
-        with self._host._session_factory() as session:
-            session.execute(
-                delete(ExtensionCoreCall).where(
-                    ExtensionCoreCall.extension_id == extension_id,
-                    ExtensionCoreCall.principal_id == principal_id,
-                    ExtensionCoreCall.call_key == key,
-                    ExtensionCoreCall.response_json == "",
-                )
-            )
             serialized = json.dumps(result, sort_keys=True, default=str)
             if len(serialized) > MAX_LEDGER_RESPONSE_BYTES:
                 raise ExtensionValidationFailed("capability response is too large to replay")
-            session.add(
-                ExtensionCoreCall(
-                    extension_id=extension_id,
-                    principal_id=principal_id,
-                    call_key=key,
-                    capability=capability,
-                    request_hash=digest,
-                    response_json=serialized,
+        except BaseException:
+            self._release(extension_id, principal_id, key)
+            raise
+        try:
+            with self._host._session_factory() as session:
+                session.execute(
+                    delete(ExtensionCoreCall).where(
+                        ExtensionCoreCall.extension_id == extension_id,
+                        ExtensionCoreCall.principal_id == principal_id,
+                        ExtensionCoreCall.call_key == key,
+                        ExtensionCoreCall.response_json == "",
+                    )
                 )
-            )
-            session.commit()
+                session.add(
+                    ExtensionCoreCall(
+                        extension_id=extension_id,
+                        principal_id=principal_id,
+                        call_key=key,
+                        capability=capability,
+                        request_hash=digest,
+                        response_json=serialized,
+                    )
+                )
+                session.commit()
+        except BaseException:
+            self._release(extension_id, principal_id, key)
+            raise
         return result
 
     @staticmethod

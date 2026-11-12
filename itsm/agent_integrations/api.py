@@ -8,6 +8,7 @@ from typing import Any, Literal
 from fastapi import APIRouter, HTTPException, Query, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ConfigDict, Field, SecretStr, model_validator
+from starlette.concurrency import run_in_threadpool
 
 from itsm.agent_integrations.attachments import ChatAttachmentService
 from itsm.agent_integrations.service import (
@@ -235,7 +236,8 @@ def create_agent_integrations_router() -> APIRouter:
                     },
                 )
             data.extend(chunk)
-        try:
+
+        def store() -> Any:
             with request.app.state.session_factory() as db:
                 service = ChatAttachmentService(db, settings)
                 payload = service.upload(
@@ -243,6 +245,9 @@ def create_agent_integrations_router() -> APIRouter:
                 )
                 db.commit()
                 return payload
+
+        try:
+            return await run_in_threadpool(store)
         except StorageUnavailable:
             raise HTTPException(status_code=503, detail="attachment storage unavailable") from None
 

@@ -346,10 +346,9 @@ class EntityEventFeed:
         with self._sessions() as session:
             lowest = session.execute(select(func.min(EntityEventConsumer.last_sequence))).scalar()
             if lowest is None:
-                highest = session.execute(select(func.max(EntityChangeEvent.sequence))).scalar()
-                ceiling = 0 if highest is None else int(highest)
-            else:
-                ceiling = int(lowest)
+                # Without a registered consumer nothing has been acknowledged.
+                return 0
+            ceiling = int(lowest)
             if floor is not None:
                 ceiling = min(ceiling, floor)
             result = session.execute(

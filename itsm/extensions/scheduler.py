@@ -11,7 +11,9 @@ from itsm.extensions.host import ExtensionHostService
 from itsm.extensions.notifications import enqueue_extension_notice
 
 
-def process_extension_schedules(settings: Settings, as_of: datetime | None = None) -> dict[str, int]:
+def process_extension_schedules(
+    settings: Settings, as_of: datetime | None = None
+) -> dict[str, int]:
     """Run due work through the same host transactions and live permission checks."""
     engine = create_engine_from_settings(settings)
     try:

@@ -195,6 +195,24 @@ def test_repeated_failures_throttle_login_durably_and_expire_with_the_window(
     assert harness.scalar("SELECT COUNT(*) FROM identity_login_attempts WHERE successful = 0") == 0
 
 
+def test_throttle_is_scoped_to_the_client_address_not_only_the_username(
+    harness: Harness,
+) -> None:
+    bootstrap_superadmin(harness)
+
+    with harness.service() as service:
+        for _ in range(5):
+            with pytest.raises(AuthenticationFailed):
+                service.login("ana.admin", "wrong-password-value", client_ip="198.51.100.9")
+
+    with harness.service() as service:  # an attacker from one address cannot lock the owner out
+        grant = service.login("ana.admin", PASSWORD, client_ip="203.0.113.7")
+    assert grant.principal.username == "ana.admin"
+
+    with harness.service() as service, pytest.raises(AccountThrottled):
+        service.login("ana.admin", PASSWORD, client_ip="198.51.100.9")
+
+
 def test_successful_login_resets_the_failure_budget(harness: Harness) -> None:
     bootstrap_superadmin(harness)
 

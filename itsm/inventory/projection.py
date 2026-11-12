@@ -44,6 +44,7 @@ PUBLIC_FIELDS -= {
     "responsible_label",
     "position_x",
     "position_y",
+    "status_label",
 }
 
 

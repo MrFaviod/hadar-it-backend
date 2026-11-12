@@ -148,3 +148,20 @@ def test_export_is_real_csv_with_uuid_and_formula_neutralization(signed_in_clien
     assert response.status_code == 200, response.text
     assert asset["id"] in response.text and "'=DANGEROUS()" in response.text
     assert response.headers["content-type"].startswith("text/csv")
+
+
+def test_unexpected_row_error_fails_the_row_and_completes_the_operation(
+    signed_in_client, monkeypatch
+):
+    from itsm.inventory.service import InventoryService
+
+    client, auth = signed_in_client()
+    preview = analyze(client, auth, b"id,name\n,Broken row\n").json()
+
+    def unexpected(self, principal, values):
+        raise RuntimeError("driver failure")
+
+    monkeypatch.setattr(InventoryService, "create", unexpected)
+    result = approve_execute(client, auth, preview)
+    assert result["summary"]["failed"] == 1
+    assert result["state"] == "complete"

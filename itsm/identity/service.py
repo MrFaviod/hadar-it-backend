@@ -8,6 +8,7 @@ subsystem (API, Pydantic AI, FastMCP) never asserts its own role or identity.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import secrets
@@ -258,6 +259,13 @@ class AuditView:
 
 def _clip(value: str, limit: int) -> str:
     return value if len(value) <= limit else value[:limit]
+
+
+# Holding any of these makes an account an identity administrator: only a
+# Superadmin may reset its password or take over its credentials.
+IDENTITY_ADMIN_PERMISSIONS: frozenset[str] = frozenset(
+    {"users.create", "users.edit", "roles.manage"}
+)
 
 
 class IdentityService:
@@ -546,6 +554,32 @@ class IdentityService:
             effective &= frozenset(json.loads(key.permissions_json))
         return effective
 
+    def _assert_superadmin_for_administrator_credentials(
+        self, principal: Principal, target: Identity
+    ) -> None:
+        """Only a persisted human Superadmin may reset another identity administrator.
+
+        The permission ceiling alone lets an administrator reset a peer, since both
+        hold the same grants. Self-service changes are never administrator resets.
+        """
+        if target.id == principal.actor_id or target.actor_kind != HUMAN_ACTOR_KIND:
+            return
+        if not self._effective_permissions(target, frozenset()) & IDENTITY_ADMIN_PERMISSIONS:
+            return
+        caller = self._session.get(Identity, principal.actor_id)
+        if (
+            caller is not None
+            and caller.actor_kind == HUMAN_ACTOR_KIND
+            and caller.role_id == ROLE_SUPERADMIN
+            and not principal.api_key_id
+            and not principal.scopes
+        ):
+            return
+        raise PermissionDenied(
+            "only a superadministrator can change the credentials of an identity administrator",
+            key="api.identity.superadmin_required_for_administrator_credentials",
+        )
+
     def _assert_permission_ceiling(
         self,
         principal: Principal,
@@ -649,6 +683,11 @@ class IdentityService:
     def _login_key(self, username: str) -> str:
         return _clip(username.strip().lower() if isinstance(username, str) else "", 64)
 
+    @staticmethod
+    def _throttle_key(username_key: str, client_ip: str) -> str:
+        """Scope failures to (username, client address) so one source cannot lock out others."""
+        return hashlib.sha256(f"{username_key}\0{client_ip}".encode()).hexdigest()
+
     def _prune_attempts(self) -> None:
         threshold = self._now() - ATTEMPT_RETENTION
         self._session.execute(
@@ -668,7 +707,7 @@ class IdentityService:
         if int(failures) >= self._settings.auth_login_max_attempts:
             raise AccountThrottled(int(window.total_seconds()))
 
-    def _record_login_failure(self, key: str, identity: Identity | None) -> None:
+    def _record_login_failure(self, key: str, username_key: str, identity: Identity | None) -> None:
         self._session.add(
             IdentityLoginAttempt(
                 username_key=key,
@@ -679,20 +718,21 @@ class IdentityService:
         self._audit(
             actor_id=None if identity is None else identity.id,
             actor_kind="anonymous" if identity is None else identity.actor_kind,
-            actor_username=key,
+            actor_username=username_key,
             action="auth.login",
             resource="identity" if identity is None else f"identity:{identity.id}",
             outcome="denied",
         )
         self._session.commit()
 
-    def login(self, username: str, password: str) -> SessionGrant:
+    def login(self, username: str, password: str, client_ip: str = "unknown") -> SessionGrant:
         """Human login: generic rejection, durable throttling, opaque session."""
-        key = self._login_key(username)
+        username_key = self._login_key(username)
+        key = self._throttle_key(username_key, client_ip)
         self._prune_attempts()
         self._assert_not_throttled(key)
 
-        identity = self._identity_by_username(key) if key else None
+        identity = self._identity_by_username(username_key) if username_key else None
         if identity is None or not identity.password_hash:
             burn_password_check()
             verified = False
@@ -707,7 +747,7 @@ class IdentityService:
             or not verified
         )
         if invalid:
-            self._record_login_failure(key, identity)
+            self._record_login_failure(key, username_key, identity)
             raise AuthenticationFailed(key="api.auth.invalid_credentials")
 
         now = self._now()
@@ -1621,6 +1661,8 @@ class IdentityService:
             resource=f"identity:{identity_id}",
             role_ids=[target.role_id, role_id],
         )
+        if password is not None:
+            self._assert_superadmin_for_administrator_credentials(principal, target)
         if role_id is not None and role_id != target.role_id:
             if target.id == principal.actor_id:
                 raise PermissionDenied(

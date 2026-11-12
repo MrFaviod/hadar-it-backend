@@ -441,6 +441,7 @@
   "api.identity.role_name_already_exists": "Ya existe un rol con ese nombre.",
   "api.identity.role_not_found": "No se encontró el rol.",
   "api.identity.sessionminutes_minimum_maximum": "sessionMinutes debe estar entre {minimum} y {maximum}.",
+  "api.identity.superadmin_required_for_administrator_credentials": "Solo un superadministrador puede cambiar las credenciales de un administrador de identidades.",
   "api.identity.system_permissions_reserved_installation_owner": "Los permisos de sistema están reservados al propietario de la instalación.",
   "api.identity.username_3_64_characters_using_z_0_9": "El nombre de usuario debe tener entre 3 y 64 caracteres y usar a-z, 0-9, punto, guion bajo o guion.",
   "api.identity.username_already_in_use": "El nombre de usuario ya está en uso.",

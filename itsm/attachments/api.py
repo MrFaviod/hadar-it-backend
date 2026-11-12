@@ -5,6 +5,7 @@ from urllib.parse import quote
 from fastapi import APIRouter, Depends, HTTPException, Query, Request, Response
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, select
+from starlette.concurrency import run_in_threadpool
 
 from itsm.attachments.models import Attachment
 from itsm.attachments.service import AttachmentService, StorageUnavailable
@@ -64,7 +65,7 @@ def create_attachment_router():
         context=Depends(mutation_guard),
         documents=Depends(service),
     ):
-        documents._authorize(context.principal, asset_id, "assets.edit")
+        await run_in_threadpool(documents._authorize, context.principal, asset_id, "assets.edit")
         # The public demo tightens the attachment ceiling and keeps one shared
         # storage quota; every other mode keeps the plain production path.
         limits = getattr(request.app.state, "demo_limits", None)
@@ -86,8 +87,13 @@ def create_attachment_router():
                 60,
             )
         try:
-            return documents.upload(
-                context.principal, asset_id, filename=filename, category=category, data=bytes(data)
+            return await run_in_threadpool(
+                documents.upload,
+                context.principal,
+                asset_id,
+                filename=filename,
+                category=category,
+                data=bytes(data),
             )
         except StorageUnavailable:
             raise unavailable() from None

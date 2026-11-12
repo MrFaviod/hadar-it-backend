@@ -134,7 +134,7 @@ def test_demo_task_mutations_require_origin_and_csrf(
     assert accepted.status_code == 202, accepted.text
 
 
-def test_machine_bearer_can_submit_tasks_without_origin_or_csrf(
+def test_machine_bearer_without_system_configure_cannot_submit_tasks(
     client: Callable[..., TestClient],
     settings_factory: Callable[..., Settings],
 ) -> None:
@@ -171,7 +171,8 @@ def test_machine_bearer_can_submit_tasks_without_origin_or_csrf(
         json={"message": "ping"},
         headers={"Authorization": f"Bearer {token}"},
     )
-    assert response.status_code == 202, response.text
+    # Machines hold no system.configure without a superadmin delegation.
+    assert response.status_code == 403, response.text
 
 
 def test_an_unusable_queue_reports_service_unavailable(
@@ -209,3 +210,34 @@ def test_probe_rejects_a_corrupt_queue_file(
 
     with pytest.raises(TaskStorageUnavailable):
         create_task_queue(settings).probe()
+
+
+def test_demo_submission_requires_system_configure(
+    signed_in_client: Callable[..., tuple[TestClient, dict[str, str]]],
+    settings_factory: Callable[..., Settings],
+) -> None:
+    """The echo task is queue-wide work: viewing assets is not enough to enqueue it."""
+    from tests.conftest import sign_in
+    from tests.inventory_support import sign_in_as
+
+    settings = settings_factory()
+    test_client, auth = signed_in_client(settings)
+    usernames = ("ops.usuario", "ops.admin")
+    for username, role_id in zip(usernames, ("user", "admin"), strict=True):
+        created = test_client.post(
+            f"{settings.api_prefix}/identity/users",
+            json={
+                "username": username,
+                "name": username,
+                "roleId": role_id,
+                "password": "ops-clave-larga-2026",
+            },
+            headers=auth,
+        )
+        assert created.status_code == 201, created.text
+    for username in usernames:
+        other = sign_in_as(test_client, settings, username, "ops-clave-larga-2026")
+        denied = test_client.post("/api/v1/tasks/demo", json={"message": "ping"}, headers=other)
+        assert denied.status_code == 403, denied.text
+    admin = sign_in(test_client, settings)
+    submit_demo(test_client, "ping", admin)

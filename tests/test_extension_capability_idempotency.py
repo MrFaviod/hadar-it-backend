@@ -107,6 +107,25 @@ def test_idempotency_replay_reauthorizes_the_caller(env) -> None:
         )
 
 
+def test_an_oversized_capability_response_does_not_leave_a_stuck_reservation(
+    env, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """A response too large to replay must release its reservation, not block the key."""
+    from itsm.extensions import capabilities
+    from itsm.extensions.errors import ExtensionValidationFailed
+
+    env.install(build_package(probe_manifest(capabilities=["assets.write"])))
+    monkeypatch.setattr(capabilities, "MAX_LEDGER_RESPONSE_BYTES", 10)
+    values = asset_values(quick_code="EXT-REPLAY-005", serial="EXT-REPLAY-005")
+    with pytest.raises(ExtensionValidationFailed):
+        env.invoke("probe_asset_create", {"values": values, "idempotency_key": "big-key"})
+    with env.factory() as session:
+        stuck = session.execute(
+            text("SELECT COUNT(*) FROM extension_core_calls WHERE response_json = ''")
+        ).scalar_one()
+    assert stuck == 0
+
+
 def test_a_second_principal_gets_its_own_ledger_row(env) -> None:
     """Triangulation: scoping the key must not break a legitimate second caller.
 

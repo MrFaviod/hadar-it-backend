@@ -1,4 +1,5 @@
 """External consumers cannot race an in-process demo reset."""
+
 from itsm.tasks.runtime import WORKER_REFUSED_EXIT_CODE
 from tests.conftest import read_worker_log, run_migrations, running_worker, worker_events
 

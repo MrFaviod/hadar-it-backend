@@ -11,7 +11,8 @@ api = _api
 def test_demo_tasks_require_grants_and_cannot_be_read_by_another_owner(api, monkeypatch):
     catalog, client, headers = api
     empty = issue(client, headers, permissions=[])
-    reader = issue(client, headers, permissions=["assets.view"])
+    viewer = issue(client, headers, permissions=["assets.view"])
+    reader = issue(client, headers, permissions=["system.configure", "assets.view"])
     calls = []
     queue = client.app.state.task_queue
     original = queue.submit_demo
@@ -24,6 +25,12 @@ def test_demo_tasks_require_grants_and_cannot_be_read_by_another_owner(api, monk
     assert (
         client.post(
             "/api/v1/tasks/demo", json={"message": "Denied"}, headers=bearer(empty)
+        ).status_code
+        == 403
+    )
+    assert (
+        client.post(
+            "/api/v1/tasks/demo", json={"message": "View only"}, headers=bearer(viewer)
         ).status_code
         == 403
     )

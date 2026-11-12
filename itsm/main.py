@@ -15,6 +15,7 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse, Response
 from pydantic import BaseModel, ConfigDict, Field
 from sqlalchemy.orm import Session
+from starlette.concurrency import run_in_threadpool
 from starlette.exceptions import HTTPException as StarletteHTTPException
 
 from itsm import __version__
@@ -372,7 +373,8 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         )
         if identity_due and request.url.path != (settings.api_prefix + "/health/live"):
             try:
-                verified = enforce_startup(
+                verified = await run_in_threadpool(
+                    enforce_startup,
                     settings,
                     engine=app.state.engine,
                     environ={"RELEASE_MODE": app.state.release_mode},
@@ -524,7 +526,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         identity: IdentityService = Depends(get_identity_service),
     ) -> TaskAcceptedResponse:
         """Queue the bounded echo demo task; no caller-defined task names."""
-        identity.authorize(context.principal, "assets.view", resource="tasks:demo")
+        identity.authorize(context.principal, "system.configure", resource="tasks:demo")
         if len(payload.message) > settings.demo_message_max_length:
             raise HTTPException(
                 status_code=422,

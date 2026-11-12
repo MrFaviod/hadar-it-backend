@@ -277,9 +277,14 @@ def package(
     members: dict[str, bytes] = {
         "extension.json": json.dumps(declaration).encode(),
         "backend.py": (backend_prefix + source).encode(),
-        "frontend.js": b'window.ITSMExtensions.register("record-book", {components: {Records: {template: "<p>Registros</p>"}}});',
+        "frontend.js": (
+            b'window.ITSMExtensions.register("record-book", '
+            b'{components: {Records: {template: "<p>Registros</p>"}}});'
+        ),
         "skills/record-guide/SKILL.md": b"# Record guide\nUse only authorized operations.\n",
-        "tests/test_package.py": b"def test_operation_names():\n    assert 'read_records' != 'put_record'\n",
+        "tests/test_package.py": (
+            b"def test_operation_names():\n    assert 'read_records' != 'put_record'\n"
+        ),
     }
     members.update(extra or {})
     output = BytesIO()
@@ -400,7 +405,7 @@ def test_inspection_has_no_candidate_import_and_rejects_unsafe_members(tmp_path)
     ):
         with pytest.raises(PackageError):
             inspect_package(package(extra={unsafe: b"bad"}))
-    with pytest.raises(PackageError, match="large|limit|size"):
+    with pytest.raises(PackageError, match=r"large|limit|size"):
         inspect_package(package(extra={"tests/huge.py": b"x" * (MAX_MEMBER_BYTES + 1)}))
     duplicate = BytesIO(payload)
     with zipfile.ZipFile(duplicate, "a") as archive:
@@ -419,7 +424,7 @@ def test_inspection_has_no_candidate_import_and_rejects_unsafe_members(tmp_path)
     bad["unknown"] = True
     with pytest.raises(PackageError):
         inspect_package(package(bad))
-    with pytest.raises(PackageError, match="dependenc|import|stdlib"):
+    with pytest.raises(PackageError, match=r"dependenc|import|stdlib"):
         inspect_package(package(backend_prefix="import requests\n"))
 
 
@@ -506,7 +511,7 @@ def test_handler_and_readonly_failures_leave_all_records_unchanged(env):
     env.install()
     env.invoke("put_record", {"record_id": "kept", "label": "Keep"})
     before = env.records()
-    with pytest.raises(ExtensionHandlerFailed, match="^extension operation failed$"):
+    with pytest.raises(ExtensionHandlerFailed, match=r"^extension operation failed$"):
         env.invoke("fail_write")
     assert env.records() == before
     with pytest.raises(ExtensionStoreValidation, match="read-only"):
@@ -541,7 +546,7 @@ def test_write_then_denial_rolls_back_without_secondary_writer(env, boundary):
                 "asset_id": asset.id,
             },
         )
-    with pytest.raises(PermissionDenied, match="^permission denied$"):
+    with pytest.raises(PermissionDenied, match=r"^permission denied$"):
         env.invoke(operation, arguments, actor=actor)
     assert env.records() == before
     assert callbacks == []
@@ -568,7 +573,7 @@ def test_write_then_sensitive_machine_authority_keeps_reference_and_scope_ceilin
         actor = identity.resolve_actor(machine.id)
     before = env.records()
     arguments = {"permission": "assets.remote"}
-    with pytest.raises(PermissionDenied, match="^permission denied$"):
+    with pytest.raises(PermissionDenied, match=r"^permission denied$"):
         env.invoke("write_then_authorize", arguments, actor=actor)
     assert env.records() == before
     approved = replace(actor, authorization_ref="human-approved-remote-operation")
@@ -579,7 +584,7 @@ def test_write_then_sensitive_machine_authority_keeps_reference_and_scope_ceilin
     }
     before = env.records()
     scoped = replace(approved, scopes=frozenset({WRITE}))
-    with pytest.raises(PermissionDenied, match="^permission denied$"):
+    with pytest.raises(PermissionDenied, match=r"^permission denied$"):
         env.invoke("write_then_authorize", arguments, actor=scoped)
     assert env.records() == before
 
@@ -812,7 +817,8 @@ def test_schedules_persist_owner_due_claim_disable_revoke_and_failure_atomicity(
     with env.factory() as session:
         session.execute(
             text(
-                "DELETE FROM identity_role_policies WHERE role_id='superadmin' AND resource='ext_record_book' AND operation='write'"
+                "DELETE FROM identity_role_policies WHERE role_id='superadmin' "
+                "AND resource='ext_record_book' AND operation='write'"
             )
         )
         session.commit()

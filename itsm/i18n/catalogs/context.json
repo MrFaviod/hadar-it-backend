@@ -441,6 +441,7 @@
   "api.identity.role_name_already_exists": "Conflict domain error from the identity module: a role with that name already exists",
   "api.identity.role_not_found": "NotFound domain error from the identity module: role not found",
   "api.identity.sessionminutes_minimum_maximum": "ValidationFailed domain error from the identity module: sessionMinutes must be {minimum}-{maximum}",
+  "api.identity.superadmin_required_for_administrator_credentials": "PermissionDenied domain error from the identity module: only a superadministrator can change the credentials of an identity administrator",
   "api.identity.system_permissions_reserved_installation_owner": "ValidationFailed domain error from the identity module: system permissions are reserved to the installation owner",
   "api.identity.username_3_64_characters_using_z_0_9": "ValidationFailed domain error from the identity module: username must be 3-64 characters using a-z, 0-9, dot, underscore or hyphen",
   "api.identity.username_already_in_use": "Conflict domain error from the identity module: username is already in use",

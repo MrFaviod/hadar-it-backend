@@ -441,6 +441,7 @@
   "api.identity.role_name_already_exists": "a role with that name already exists",
   "api.identity.role_not_found": "role not found",
   "api.identity.sessionminutes_minimum_maximum": "sessionMinutes must be {minimum}-{maximum}",
+  "api.identity.superadmin_required_for_administrator_credentials": "only a superadministrator can change the credentials of an identity administrator",
   "api.identity.system_permissions_reserved_installation_owner": "system permissions are reserved to the installation owner",
   "api.identity.username_3_64_characters_using_z_0_9": "username must be 3-64 characters using a-z, 0-9, dot, underscore or hyphen",
   "api.identity.username_already_in_use": "username is already in use",

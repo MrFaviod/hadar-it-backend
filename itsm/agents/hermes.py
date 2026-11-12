@@ -236,8 +236,6 @@ class HermesEngine(_HTTPEngine):
                     )
                 )
         self._models = models
-        self._model_refs = {(model.provider, model.id): model.id for model in models}
-        self._model_refs.update({model.id: model.id for model in models})
         capabilities = {
             "streaming": True,
             "sessions": True,
