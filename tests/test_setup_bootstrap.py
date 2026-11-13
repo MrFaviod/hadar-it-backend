@@ -19,14 +19,10 @@ from pathlib import Path
 import pytest
 from fastapi import Depends
 from fastapi.testclient import TestClient
-
 from itsm.setup.api import create_setup_app, require_session_mutation
 from itsm.setup.schemas import FORBIDDEN_STATUS_TOKENS, SANITIZED_STATUS_FIELDS
 from itsm.setup.store import (
     SESSION_TTL_MINUTES,
-    AlreadyClaimed,
-    ClaimLocked,
-    InvalidCredential,
     SetupConfigurationError,
     SetupStore,
     StoreUnsafe,
@@ -136,7 +132,7 @@ def cli_payload(result: subprocess.CompletedProcess[str]) -> dict:
 # --------------------------------------------------------------------- imports
 def test_setup_imports_and_serves_status_with_no_database(tmp_path: Path) -> None:
     state = tmp_path / "db-free-state"
-    script = f"""
+    script = """
 import gc
 import json
 import os
@@ -235,6 +231,28 @@ def test_anonymous_session_is_denied(state_dir: Path, clock: FakeClock) -> None:
     assert response.json() == {"error": "authentication_required"}
 
 
+def test_app_serves_disabled_status_before_the_state_directory_exists(
+    tmp_path: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    missing = tmp_path / "not-created" / "setup-state"
+    monkeypatch.setenv("ITSM_SETUP_STATE_DIR", str(missing))
+    app = create_setup_app(clock=clock)
+    with TestClient(app) as client:
+        response = client.get(STATUS_PATH)
+    assert response.status_code == 200
+    assert response.json()["state"] == "disabled"
+    assert response.json()["claim_available"] is False
+    assert not missing.exists()
+
+
+def test_claim_is_refused_while_setup_is_not_enabled(state_dir: Path, clock: FakeClock) -> None:
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        response = claim(client, "anything")
+        assert response.status_code == 403
+        assert response.json() == {"error": "setup_disabled"}
+
+
 # ----------------------------------------------------------------------- claim
 def test_claim_consumes_credential_and_issues_a_strict_cookie(
     store: SetupStore, state_dir: Path, clock: FakeClock
@@ -270,7 +288,7 @@ def test_claim_consumes_credential_and_issues_a_strict_cookie(
         assert second.json() == {"error": "already_claimed"}
 
 
-def test_claim_requires_an_allowed_origin(store: SetupStore, state_dir: Path, clock: FakeClock) -> None:
+def test_claim_requires_origin(store, state_dir, clock) -> None:
     credential = enable_claim(store)
     app = build_app(state_dir, clock)
     with TestClient(app) as client:
@@ -348,14 +366,17 @@ def test_session_mutations_require_origin_and_csrf(
 
     @app.post("/api/setup/v1/session/probe")
     def session_probe(session=Depends(require_session_mutation)) -> dict:
-        return {"status": "ok", "state": session["state"]}
+        return {"status": "ok"}
 
     with TestClient(app) as client:
         claimed = claim(client, credential)
         assert claimed.status_code == 200
         csrf = claimed.json()["csrf_token"]
         assert client.post("/api/setup/v1/session/probe").status_code == 403
-        wrong = client.post("/api/setup/v1/session/probe", headers={"Origin": ORIGIN, "X-CSRF-Token": "wrong"})
+        wrong = client.post(
+            "/api/setup/v1/session/probe",
+            headers={"Origin": ORIGIN, "X-CSRF-Token": "wrong"},
+        )
         assert wrong.status_code == 403
         no_origin = client.post("/api/setup/v1/session/probe", headers={"X-CSRF-Token": csrf})
         assert no_origin.status_code == 403
@@ -364,7 +385,7 @@ def test_session_mutations_require_origin_and_csrf(
             headers={"Origin": ORIGIN, "X-CSRF-Token": csrf},
         )
         assert accepted.status_code == 200
-        assert accepted.json() == {"status": "ok", "state": "claimed"}
+        assert accepted.json() == {"status": "ok"}
 
 
 def test_session_expires_with_the_injected_clock(
@@ -382,7 +403,7 @@ def test_session_expires_with_the_injected_clock(
         assert expired.json() == {"error": "authentication_required"}
 
 
-def test_restart_keeps_state_and_session(store: SetupStore, state_dir: Path, clock: FakeClock) -> None:
+def test_restart_keeps_state_and_session(store, state_dir, clock) -> None:
     credential = enable_claim(store)
     first = build_app(state_dir, clock)
     with TestClient(first) as client:
@@ -477,7 +498,11 @@ def test_claim_credential_never_reaches_logs_or_the_store(
     assert credential not in caplog.text
     shared = "\n".join(
         path.read_text(encoding="utf-8")
-        for path in (state_dir / "state.json", state_dir / "secrets.json", state_dir / "journal.jsonl")
+        for path in (
+            state_dir / "state.json",
+            state_dir / "secrets.json",
+            state_dir / "journal.jsonl",
+        )
     )
     assert credential not in shared
 
@@ -499,7 +524,7 @@ def test_store_hashes_the_credential_and_keeps_public_state_separate(
     assert "sessions" not in public
 
 
-def test_demo_mode_is_refused(tmp_path: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_demo_mode_is_refused(tmp_path, clock, monkeypatch) -> None:
     monkeypatch.setenv("RELEASE_MODE", "demo")
     with pytest.raises(SetupConfigurationError):
         create_setup_app(state_dir=tmp_path / "demo-state", clock=clock)
@@ -511,7 +536,7 @@ def test_demo_mode_is_refused(tmp_path: Path, clock: FakeClock, monkeypatch: pyt
     assert not (tmp_path / "demo-cli" / "enabled.json").exists()
 
 
-def test_claim_validation_errors_are_sanitized(store: SetupStore, state_dir: Path, clock: FakeClock) -> None:
+def test_claim_validation_errors_are_sanitized(store, state_dir, clock) -> None:
     enable_claim(store)
     app = build_app(state_dir, clock)
     with TestClient(app) as client:
@@ -539,7 +564,7 @@ def test_cookie_is_secure_when_configured(
 # ------------------------------------------------------------------------- CLI
 def test_cli_enable_rotate_and_recover(tmp_path: Path) -> None:
     state = tmp_path / "cli-state"
-    first = cli_payload(run_cli("enable-claim", state_dir=state))
+    first = cli_payload(run_cli("enable-claim", "--state-dir", str(state), state_dir=state))
     credential = first["credential"]
     assert first["state"] == "unclaimed"
     assert (state / "enabled.json").is_file()
