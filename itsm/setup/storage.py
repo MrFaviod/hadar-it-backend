@@ -183,6 +183,30 @@ def _read_installation_values(path: Path) -> dict[str, Any]:
         ) from exc
 
 
+def _existing_installation_values(path: Path) -> dict[str, Any]:
+    """Read the current neighbours only from a regular file, never a planted link.
+
+    ``os.replace`` swaps the destination itself, so a symbolic link left at the
+    path would be replaced instead of written through and setup would only fail
+    later in the reader; refuse it here with one clear message.
+    """
+
+    try:
+        info = os.lstat(path)
+    except FileNotFoundError:
+        return {}
+    except OSError as exc:
+        raise SetupConfigurationError(
+            "the installation path cannot be inspected; fix or remove it before retrying"
+        ) from exc
+    if not stat.S_ISREG(info.st_mode):
+        detail = "a symbolic link" if stat.S_ISLNK(info.st_mode) else "not a regular file"
+        raise SetupConfigurationError(
+            f"the installation path is {detail}; remove it and let setup create a regular file"
+        )
+    return _read_installation_values(path)
+
+
 def _validate_candidate_file(path: Path) -> None:
     from itsm.config import InstallationConfigError, resolve_settings_sources
 
@@ -207,7 +231,7 @@ def write_installation_database_url(path: Path, database_url: str) -> None:
         raise InstallationConfigUnavailable(
             "the installation directory cannot be created or secured"
         ) from exc
-    values = _read_installation_values(path) if path.exists() else {}
+    values = _existing_installation_values(path)
     values["database_url"] = database_url
     encoded = json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
     descriptor, temporary = tempfile.mkstemp(prefix=".installation-", dir=parent)
