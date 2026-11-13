@@ -659,6 +659,54 @@ def apply_section(
 
 
 # -------------------------------------------------------------- verification
+WORKER_PROBE_TIMEOUT_SECONDS = 20.0
+WORKER_PROBE_POLL_SECONDS = 0.25
+
+
+def _worker_observation(settings: Any, *, queue_ok: bool) -> dict[str, Any]:
+    """Observe a real worker completing one harmless job.
+
+    A pid marker only proves a process once existed; on redis or postgres there
+    is no marker at all. Setup therefore enqueues ``setup_ping`` and waits a
+    bounded time for a worker to report it complete. A timeout stays ``unknown``
+    and blocks completion instead of assuming a worker is alive.
+    """
+
+    from itsm.tasks.adapter import HueyTaskQueue, TaskState, TaskStorageUnavailable
+
+    if not queue_ok:
+        return {"status": "pending", "evidence": f"{settings.task_storage} queue did not answer"}
+
+    queue = HueyTaskQueue(settings)
+    try:
+        submitted = queue.submit_setup_ping()
+    except TaskStorageUnavailable:
+        return {"status": "pending", "evidence": "the queue refused the setup ping"}
+
+    deadline = time.monotonic() + WORKER_PROBE_TIMEOUT_SECONDS
+    last = "the setup ping stayed pending"
+    while time.monotonic() < deadline:
+        try:
+            status = queue.get_status(submitted.task_id)
+        except TaskStorageUnavailable:
+            return {"status": "unknown", "evidence": "queue storage stopped answering"}
+        if status is not None:
+            if status.state is TaskState.COMPLETE:
+                return {"status": "passed", "evidence": "a worker completed the setup ping"}
+            if status.state is TaskState.ERROR:
+                return {"status": "pending", "evidence": "the worker failed the setup ping"}
+            if status.state is TaskState.RUNNING:
+                last = "a worker started the setup ping but did not finish it"
+        time.sleep(WORKER_PROBE_POLL_SECONDS)
+    return {
+        "status": "unknown",
+        "evidence": (
+            f"{last} within {int(WORKER_PROBE_TIMEOUT_SECONDS)} s; "
+            "check the worker and verify again"
+        ),
+    }
+
+
 def _observe(
     store: SetupStore,
     mode: str,
@@ -670,7 +718,6 @@ def _observe(
     """Collect the operational evidence without claiming what is not observed."""
 
     from itsm.database import check_readiness
-    from itsm.ops import quiesce
     from itsm.tasks.adapter import HueyTaskQueue
 
     observations: dict[str, dict[str, Any]] = {}
@@ -700,9 +747,8 @@ def _observe(
     try:
         HueyTaskQueue(settings).probe()
         task_ok = True
-        queue_evidence = f"{settings.task_storage} queue answered its probe"
     except Exception:
-        queue_evidence = f"{settings.task_storage} queue did not answer"
+        pass
 
     try:
         readiness = check_readiness(engine, settings, task_storage_ok=task_ok)
@@ -727,28 +773,7 @@ def _observe(
                 "evidence": f"revision {current or 'none'} is not the head {head or 'unknown'}",
             }
 
-    worker_evidence: dict[str, Any]
-    if settings.task_storage != "sqlite":
-        worker_evidence = {
-            "status": "unknown",
-            "evidence": "worker liveness has no heartbeat for this queue backend",
-        }
-    else:
-        try:
-            holders = quiesce.holders(settings)
-        except Exception:
-            holders = []
-        alive = any(str(item.get("role")) == "worker" for item in holders)
-        if alive and task_ok:
-            worker_evidence = {
-                "status": "passed",
-                "evidence": "worker marker alive and the queue answered",
-            }
-        elif alive:
-            worker_evidence = {"status": "pending", "evidence": queue_evidence}
-        else:
-            worker_evidence = {"status": "pending", "evidence": "no live worker marker"}
-    observations["worker_ready"] = worker_evidence
+    observations["worker_ready"] = _worker_observation(settings, queue_ok=task_ok)
     observations["storage_ready"] = _storage_observation(settings)
     observations["origin_valid"] = _origin_observation(settings.auth_origin)
     observations["session_valid"] = _session_observation(settings, mode)
@@ -863,6 +888,23 @@ def verify(
     }
     store.record_verification(summary=summary)
     return {"state": "verifying", **result}
+
+
+def recheck(
+    store: SetupStore, mode: str, *, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Re-run the observations from scratch, trusting no stored receipt.
+
+    ``/complete`` uses this so a stale green checklist cannot finish setup after
+    the worker, database or backup policy changed since ``/verify``.
+    """
+
+    with _domain(environ) as (settings, engine, factory):
+        principal = _owner_principal(settings, factory)
+        observations = _observe(store, mode, settings, engine, factory, principal)
+    return checklist_module.build_checklist(
+        mode, configuration=store.configuration_record(), observations=observations
+    )
 
 
 def overview(store: SetupStore, mode: str) -> dict[str, Any]:

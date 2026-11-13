@@ -66,6 +66,10 @@ class TaskQueue(Protocol):
     def submit_demo_failure(self, message: str) -> TaskStatus:
         """Enqueue the bounded failing demo task (dev diagnostics)."""
 
+    def submit_setup_ping(self) -> TaskStatus:
+        """Enqueue the harmless round-trip that proves a worker is alive."""
+        ...
+
     def submit_operation(self, operation_id: str, task_id: str) -> TaskStatus:
         """Enqueue one approved durable inventory operation."""
 
@@ -260,6 +264,12 @@ class HueyTaskQueue:
         delay = delay_seconds if delay_seconds > 0 else None
         return self._enqueue(
             lambda runtime: runtime.demo.echo.s(message, delay=delay, id=task_id), task_id, state
+        )
+
+    def submit_setup_ping(self) -> TaskStatus:
+        task_id = uuid.uuid4().hex
+        return self._enqueue(
+            lambda runtime: runtime.setup_ping.s(id=task_id), task_id, TaskState.PENDING
         )
 
     def submit_demo_failure(self, message: str) -> TaskStatus:

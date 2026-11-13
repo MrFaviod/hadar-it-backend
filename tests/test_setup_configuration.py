@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
+from contextlib import contextmanager
 from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -20,11 +21,12 @@ from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
-from itsm.config import resolve_settings_sources
+from itsm.config import Settings
 from itsm.setup.api import create_setup_app
 from itsm.setup.store import SetupStore
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
+from tests.conftest import running_worker
 
 ORIGIN = "http://testserver"
 COOKIE_NAME = "itsm_setup_session"
@@ -340,20 +342,23 @@ def apply_section(
     )
 
 
-def mark_worker(database_url: str) -> None:
-    """Register a live worker marker next to the SQLite installation database."""
+@contextmanager
+def worker(database_url: str, *, origin: str = ORIGIN) -> Iterator[None]:
+    """Run one real consumer so the setup ping is observed, not assumed."""
 
-    from itsm.ops import quiesce
-
-    settings = resolve_settings_sources(
-        {
-            "ITSM_DATABASE_URL": database_url,
-            "RELEASE_MODE": os.environ.get("RELEASE_MODE", "dev"),
-            "ITSM_TASK_SQLITE_PATH": os.environ["ITSM_TASK_SQLITE_PATH"],
-            "ITSM_ATTACHMENT_STORAGE_PATH": os.environ["ITSM_ATTACHMENT_STORAGE_PATH"],
-        }
+    task_path = Path(os.environ["ITSM_TASK_SQLITE_PATH"])
+    task_path.parent.mkdir(parents=True, exist_ok=True)
+    settings = Settings(
+        _env_file=None,
+        environment="test",
+        database_url=database_url,
+        task_sqlite_path=os.environ["ITSM_TASK_SQLITE_PATH"],
+        attachment_storage_path=os.environ["ITSM_ATTACHMENT_STORAGE_PATH"],
+        auth_origin=origin,
+        auth_cookie_secure=origin.startswith("https"),
     )
-    quiesce.register(settings, "worker")
+    with running_worker(settings):
+        yield
 
 
 def public_state(state_dir: Path) -> dict[str, Any]:
@@ -547,7 +552,6 @@ def prepare_green_configuration(
     for section in ("notifications", "monitoring"):
         postponed = apply_section(client, csrf, section, {}, action="postpone", origin=origin)
         assert postponed.status_code == 200, postponed.text
-    mark_worker(database_url)
 
 
 def test_verify_blocks_while_required_items_are_missing(app, store, tmp_path: Path) -> None:
@@ -577,7 +581,8 @@ def test_verify_passes_with_every_required_item_green(
         csrf, database_url = reach_owner_ready(client, store, tmp_path, provider=provider)
         prepare_green_configuration(client, csrf, database_url)
 
-        response = post(client, VERIFY_PATH, {}, csrf)
+        with worker(database_url):
+            response = post(client, VERIFY_PATH, {}, csrf)
         body = section_body(response)
         assert body["state"] == "verifying"
         items = checklist_by_id(body)
@@ -638,7 +643,8 @@ def test_prod_backup_must_be_declared_or_accepted_as_risk(
             body = section_body(risk)
             assert body["status"] == "risk"
 
-            verified = post(client, VERIFY_PATH, {}, csrf, origin=origin)
+            with worker(database_url, origin=origin):
+                verified = post(client, VERIFY_PATH, {}, csrf, origin=origin)
             body = section_body(verified)
             items = checklist_by_id(body)
             assert body["state"] == "verifying"

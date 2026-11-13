@@ -68,6 +68,7 @@ class TaskRuntime:
     report: Any
     search_sync: Any
     search_rebuild: Any
+    setup_ping: Any
 
 
 def build_huey(settings: Settings) -> Huey:
@@ -467,7 +468,23 @@ def build_runtime(settings: Settings) -> TaskRuntime:
         report=register_report_task(huey, settings),
         search_sync=search_sync,
         search_rebuild=search_rebuild,
+        setup_ping=register_setup_ping_task(huey),
     )
+
+
+def register_setup_ping_task(huey: Huey) -> Any:
+    """A harmless job the worker must actually complete for setup to pass.
+
+    Setup uses it as an observed round-trip instead of assuming a worker is
+    alive from a pid marker, which cannot work for redis or postgres queues.
+    """
+
+    @huey.task(context=True, retries=0)
+    def setup_ping(task: Any = None) -> dict[str, Any]:
+        write_task_state(huey, task.id, TaskState.RUNNING)
+        return {"state": TaskState.COMPLETE.value, "task": "setup_ping"}
+
+    return setup_ping
 
 
 # Consumer entrypoint: huey_consumer itsm.tasks.runtime.huey -w 1 -k thread
@@ -486,6 +503,7 @@ def _consumer_huey() -> Huey:
     register_extension_events_task(huey_instance, settings)
     register_report_task(huey_instance, settings)
     register_search_tasks(huey_instance, settings)
+    register_setup_ping_task(huey_instance)
     return huey_instance
 
 
