@@ -212,6 +212,7 @@ def setup_environment(monkeypatch: pytest.MonkeyPatch, state_dir: Path) -> None:
     monkeypatch.setenv("ITSM_SETUP_STATE_DIR", str(state_dir))
     monkeypatch.setenv("RELEASE_MODE", "dev")
     monkeypatch.setenv("ITSM_AUTH_COOKIE_SECURE", "false")
+    monkeypatch.setenv("ITSM_AUTH_ORIGIN", ORIGIN)
     monkeypatch.delenv("ITSM_SETUP_ALLOWED_ORIGINS", raising=False)
     monkeypatch.delenv("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", raising=False)
     monkeypatch.setenv("ITSM_AI_CREDENTIAL_KEYS", TEST_KEY)

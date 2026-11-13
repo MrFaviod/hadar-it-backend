@@ -180,11 +180,18 @@ class SetupSettings:
             )
         mode: ReleaseMode = "dev" if raw_mode == "dev" else "prod"
         state_dir = source.get("ITSM_SETUP_STATE_DIR") or str(DEFAULT_STATE_DIR)
-        origins = tuple(
+        explicit_origins = tuple(
             part.strip()
             for part in source.get("ITSM_SETUP_ALLOWED_ORIGINS", "").split(",")
             if part.strip()
         )
+        if explicit_origins:
+            origins = explicit_origins
+        else:
+            # The API already pins the browser origin; setup reuses it instead
+            # of trusting the Host of whichever request arrives.
+            auth_origin = source.get("ITSM_AUTH_ORIGIN", "").strip().rstrip("/")
+            origins = (auth_origin,) if auth_origin else ()
         cookie_secure = _parse_bool(source.get("ITSM_AUTH_COOKIE_SECURE", "true"))
         ring = source.get("ITSM_AI_CREDENTIAL_KEYS")
         legacy = source.get("ITSM_AI_CREDENTIAL_KEY")

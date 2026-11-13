@@ -66,6 +66,7 @@ def setup_environment(monkeypatch: pytest.MonkeyPatch, state_dir: Path) -> None:
     monkeypatch.setenv("ITSM_SETUP_STATE_DIR", str(state_dir))
     monkeypatch.setenv("RELEASE_MODE", "dev")
     monkeypatch.setenv("ITSM_AUTH_COOKIE_SECURE", "false")
+    monkeypatch.setenv("ITSM_AUTH_ORIGIN", "http://testserver")
     monkeypatch.delenv("ITSM_SETUP_ALLOWED_ORIGINS", raising=False)
 
 
@@ -312,6 +313,49 @@ def test_configured_origin_allowlist_is_exact(
     app = build_app(state_dir, clock)
     with TestClient(app) as client:
         assert claim(client, credential, origin="https://evil.example").status_code == 403
+        accepted = claim(client, credential, origin="https://setup.example")
+        assert accepted.status_code == 200
+
+
+def test_the_api_origin_is_the_default_claim_origin(
+    store: SetupStore, state_dir: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ITSM_SETUP_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.setenv("ITSM_AUTH_ORIGIN", "https://itsm.example/")
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app, base_url="https://spoofed.example") as client:
+        wrong = claim(client, credential, origin="https://spoofed.example")
+        assert wrong.status_code == 403
+        assert wrong.json() == {"error": "origin_not_allowed"}
+        accepted = claim(client, credential, origin="https://itsm.example")
+        assert accepted.status_code == 200
+
+
+def test_a_claim_without_any_configured_origin_is_refused(
+    store: SetupStore, state_dir: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("ITSM_SETUP_ALLOWED_ORIGINS", raising=False)
+    monkeypatch.delenv("ITSM_AUTH_ORIGIN", raising=False)
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        response = claim(client, credential)
+        assert response.status_code == 403
+        assert response.json() == {"error": "origin_not_configured"}
+        assert "set-cookie" not in {name.lower() for name in response.headers}
+        assert client.get(STATUS_PATH).json()["state"] == "unclaimed"
+
+
+def test_the_explicit_setup_origin_list_wins_over_the_api_origin(
+    store: SetupStore, state_dir: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv("ITSM_AUTH_ORIGIN", "https://itsm.example")
+    monkeypatch.setenv("ITSM_SETUP_ALLOWED_ORIGINS", "https://setup.example")
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        assert claim(client, credential, origin="https://itsm.example").status_code == 403
         accepted = claim(client, credential, origin="https://setup.example")
         assert accepted.status_code == 200
 
@@ -748,6 +792,7 @@ def test_cookie_is_secure_when_configured(
 ) -> None:
     credential = enable_claim(store)
     monkeypatch.setenv("ITSM_AUTH_COOKIE_SECURE", "true")
+    monkeypatch.setenv("ITSM_AUTH_ORIGIN", "https://testserver")
     app = build_app(state_dir, clock)
     with TestClient(app, base_url="https://testserver") as client:
         response = client.post(

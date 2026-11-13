@@ -95,15 +95,11 @@ def _setup_error_response(exc: SetupError) -> JSONResponse:
 def require_origin(request: Request) -> None:
     """Reject a non-GET request whose ``Origin`` is not explicitly allowed."""
 
-    origin = request.headers.get(ORIGIN_HEADER)
-    if not origin:
-        raise ApiError(403, "origin_not_allowed")
     settings: SetupSettings = request.app.state.setup_settings
-    if settings.allowed_origins:
-        allowed = origin in settings.allowed_origins
-    else:
-        allowed = origin == str(request.base_url).rstrip("/")
-    if not allowed:
+    if not settings.allowed_origins:
+        raise ApiError(403, "origin_not_configured")
+    origin = request.headers.get(ORIGIN_HEADER)
+    if not origin or origin not in settings.allowed_origins:
         raise ApiError(403, "origin_not_allowed")
 
 
