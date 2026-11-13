@@ -398,6 +398,24 @@ def test_configuration_requires_owner_ready_and_is_idempotent(app, store, tmp_pa
         assert public_state(store.state_dir)["state"] == "configuring"
 
 
+def test_configuration_reads_require_a_claimed_setup_session(app, store, tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        csrf, _database_url = reach_owner_ready(client, store, tmp_path)
+        assert start_configuration(client, csrf).status_code == 200
+        assert client.get(CONFIGURATION_PATH).status_code == 200
+
+        anonymous = TestClient(app)
+        try:
+            overview = anonymous.get(CONFIGURATION_PATH)
+            section = anonymous.get(f"{CONFIGURATION_PATH}/appearance")
+        finally:
+            anonymous.close()
+
+    assert overview.status_code == 401
+    assert overview.json()["error"] == "authentication_required"
+    assert section.status_code == 401
+
+
 # ----------------------------------------------------------------- appearance
 def test_appearance_preview_does_not_write_and_apply_reads_back(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:

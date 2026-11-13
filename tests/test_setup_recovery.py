@@ -203,6 +203,21 @@ def test_complete_writes_the_marker_and_disables_the_bootstrap(app, store, tmp_p
     assert payload["installation_state"] == "complete"
 
 
+def test_configuration_reads_are_closed_after_completion(app, store, tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        csrf, database_url = reach_verifying(client, store, tmp_path)
+        with worker(database_url):
+            assert post(client, COMPLETE_PATH, {}, csrf).status_code == 200
+        assert client.get(STATUS_PATH).json()["state"] == "complete"
+
+        for path in (CONFIGURATION_PATH, f"{CONFIGURATION_PATH}/notifications"):
+            denied = client.get(path)
+            assert denied.status_code == 409, denied.text
+            assert denied.json() == {"error": "setup_complete"}
+            for leaked in ("channels", "secretRef", "chatId", "subjectPrefix", "profiles"):
+                assert leaked not in denied.text
+
+
 def test_complete_requires_a_green_verification(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:
         csrf, database_url = reach_verifying(client, store, tmp_path)

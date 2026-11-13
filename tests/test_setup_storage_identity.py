@@ -331,6 +331,36 @@ def test_apply_writes_a_private_file_migrates_and_claims(
     assert str(tmp_path) not in journal
 
 
+def test_a_planted_symlink_at_the_installation_file_is_refused(
+    installation_path: Path, tmp_path: Path
+) -> None:
+    from itsm.setup.storage import write_installation_database_url
+    from itsm.setup.store import SetupConfigurationError
+
+    target = tmp_path / "elsewhere.json"
+    target.write_text('{"database_url": "sqlite:///planted.db"}\n', encoding="utf-8")
+    os.chmod(target, 0o600)
+    installation_path.symlink_to(target)
+
+    with pytest.raises(SetupConfigurationError):
+        write_installation_database_url(installation_path, "sqlite:///candidate.db")
+
+    assert installation_path.is_symlink()
+    assert json.loads(target.read_text(encoding="utf-8")) == {
+        "database_url": "sqlite:///planted.db"
+    }
+
+    # A dangling link is still a link: it must be refused, never replaced.
+    installation_path.unlink()
+    missing = tmp_path / "missing.json"
+    installation_path.symlink_to(missing)
+    with pytest.raises(SetupConfigurationError):
+        write_installation_database_url(installation_path, "sqlite:///candidate.db")
+
+    assert installation_path.is_symlink()
+    assert not missing.exists()
+
+
 def test_apply_is_idempotent_and_a_restart_keeps_the_state(
     app, store, state_dir: Path, clock: FakeClock, tmp_path: Path
 ) -> None:
