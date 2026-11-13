@@ -2101,12 +2101,10 @@ async def verify_connection(mcp: Mapping[str, Any], *, settings: Any = None) -> 
             "toolCount": 0,
         }
     from itsm.agent_integrations.providers import ProviderEndpointError, require_secret_destination
-    from itsm.config import Settings
+    from itsm.config import get_settings
 
     try:
-        require_secret_destination(
-            settings or Settings(_env_file=None), spec["secretRef"], spec["url"]
-        )
+        require_secret_destination(settings or get_settings(), spec["secretRef"], spec["url"])
     except ProviderEndpointError:
         return {
             "verified": False,

@@ -107,11 +107,11 @@ def _serve(args: argparse.Namespace) -> int:
 
 def _relocate(args: argparse.Namespace) -> int:
     """Copy SDK v1 collection rows into module SQLite files (dry run by default)."""
-    from itsm.config import Settings
+    from itsm.config import get_settings
     from itsm.database import create_engine_from_settings, create_session_factory
     from itsm.extensions.host import ExtensionHostService
 
-    settings = Settings(_env_file=None)
+    settings = get_settings()
     engine = create_engine_from_settings(settings)
     try:
         host = ExtensionHostService(settings, create_session_factory(engine))
