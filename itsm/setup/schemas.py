@@ -73,6 +73,9 @@ class SessionResponse(BaseModel):
     mode: Literal["dev", "prod"]
     release_mode: Literal["dev", "prod"]
     checks: list[str] = Field(default_factory=list)
+    # Returned only to a valid session cookie so a reloaded wizard can resume;
+    # it is never part of the anonymous status or the journal.
+    csrf_token: str = ""
 
 
 class ErrorResponse(BaseModel):

@@ -284,6 +284,7 @@ def create_setup_router() -> APIRouter:
             mode=settings.release_mode,
             release_mode=settings.release_mode,
             checks=[],
+            csrf_token=str(record.get("csrf_token", "")),
         )
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
 

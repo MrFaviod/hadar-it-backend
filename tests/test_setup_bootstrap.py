@@ -284,6 +284,7 @@ def test_claim_consumes_credential_and_issues_a_strict_cookie(
             "mode": "dev",
             "release_mode": "dev",
             "checks": [],
+            "csrf_token": body["csrf_token"],
         }
 
         second = claim(client, credential)
@@ -557,6 +558,30 @@ def test_session_mutations_require_origin_and_csrf(
         )
         assert accepted.status_code == 200
         assert accepted.json() == {"status": "ok"}
+
+
+def test_a_resumed_session_returns_its_csrf_token(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        claimed = claim(client, credential)
+        assert claimed.status_code == 200
+        token = claimed.json()["csrf_token"]
+        resumed = client.get(SESSION_PATH)
+        assert resumed.status_code == 200, resumed.text
+        assert resumed.json()["csrf_token"] == token
+        defer = client.post(
+            "/api/setup/v1/ai/defer",
+            headers={"Origin": ORIGIN, "X-CSRF-Token": resumed.json()["csrf_token"]},
+        )
+        assert defer.status_code == 200, defer.text
+        assert defer.json()["state"] == "ai_deferred"
+    with TestClient(app) as anonymous:
+        denied = anonymous.get(SESSION_PATH)
+        assert denied.status_code == 401
+        assert "csrf_token" not in denied.json()
 
 
 def test_session_expires_with_the_injected_clock(
