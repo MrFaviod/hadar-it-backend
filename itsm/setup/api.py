@@ -18,17 +18,21 @@ from pathlib import Path
 from typing import Any
 
 from fastapi import APIRouter, Depends, FastAPI, Request, Response
+from fastapi.concurrency import run_in_threadpool
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from itsm import __version__
 from itsm.agent_integrations.providers import ProviderEndpointError, require_secret_destination
+from itsm.setup import completion
+from itsm.setup.completion import CompletionBlocked, CompletionUnavailable
 from itsm.setup.configuration import (
     ConfigurationInvalid,
     ConfigurationUnavailable,
     ConfirmationRequired,
     PermissionRefused,
 )
+from itsm.setup.gate import InstallationGate
 from itsm.setup.schemas import (
     AiConfigureRequest,
     AiConfigureResponse,
@@ -118,6 +122,8 @@ _ERROR_STATUS: tuple[tuple[type[SetupError], int], ...] = (
     (ConfigurationUnavailable, 503),
     (ConfirmationRequired, 422),
     (PermissionRefused, 403),
+    (CompletionBlocked, 409),
+    (CompletionUnavailable, 503),
 )
 
 _GUIDED_ERRORS = (
@@ -290,7 +296,11 @@ def create_setup_router() -> APIRouter:
     @router.get("/status")
     def status(request: Request) -> JSONResponse:
         settings: SetupSettings = request.app.state.setup_settings
-        snapshot = get_store(request).status_snapshot()
+        installation = request.app.state.installation_gate.current()
+        snapshot = get_store(request).status_snapshot(
+            installation_complete=installation.complete,
+            installation_installed=installation.installed,
+        )
         payload = SanitizedStatus(
             state=snapshot["state"],
             mode=settings.release_mode,
@@ -304,10 +314,49 @@ def create_setup_router() -> APIRouter:
         )
         return JSONResponse(payload.model_dump(mode="json"), headers=NO_STORE)
 
+    @router.post("/complete")
+    def complete(
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        report = completion.complete(get_store(request), settings.release_mode)
+        body = {
+            "state": "complete",
+            "completed_at": report.get("completed_at"),
+            "completed_by": report.get("completed_by"),
+            "instance_id": report.get("instance_id"),
+            "setup_contract_version": report.get("setup_contract_version"),
+            "report_digest": report.get("report_digest"),
+        }
+        response = JSONResponse(body, headers=NO_STORE)
+        _clear_session_cookie(response, settings)
+        return response
+
+    @router.get("/report")
+    def report(
+        request: Request,
+        session: dict[str, Any] = Depends(current_session),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        if request.app.state.installation_gate.current().complete:
+            return _error_response(409, "setup_complete")
+        return JSONResponse(
+            completion.exported_report(get_store(request), settings.release_mode),
+            headers=NO_STORE,
+        )
+
     @router.post("/claim")
     def claim(payload: ClaimRequest, request: Request) -> JSONResponse:
         require_origin(request)
         settings: SetupSettings = request.app.state.setup_settings
+        installation = request.app.state.installation_gate.current()
+        if installation.complete:
+            return _error_response(409, "setup_complete")
+        if installation.installed:
+            return _error_response(409, "already_claimed")
         grant = get_store(request).claim(payload.credential.get_secret_value())
         body = ClaimResponse(
             state=grant.state,
@@ -648,6 +697,20 @@ def create_setup_app(
     )
     app.state.setup_settings = resolved
     app.state.setup_store = store
+    app.state.installation_gate = InstallationGate(environ)
+
+    @app.middleware("http")
+    async def refuse_after_completion(request: Request, call_next):
+        """Once complete, every non-GET setup call answers 409 setup_complete."""
+
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith(
+            SETUP_PREFIX
+        ):
+            installation = await run_in_threadpool(app.state.installation_gate.current)
+            if installation.complete:
+                return _error_response(409, "setup_complete")
+        return await call_next(request)
+
     app.include_router(create_setup_router())
 
     @app.exception_handler(ApiError)

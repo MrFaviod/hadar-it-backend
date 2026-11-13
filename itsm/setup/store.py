@@ -536,6 +536,7 @@ class SetupStore:
             "owner": None,
             "owner_attempt": None,
             "configuration": None,
+            "completion": None,
             "created_at": now,
             "updated_at": now,
             "claimed_at": None,
@@ -567,6 +568,7 @@ class SetupStore:
                 "owner": raw.get("owner"),
                 "owner_attempt": raw.get("owner_attempt"),
                 "configuration": raw.get("configuration"),
+                "completion": raw.get("completion"),
                 "created_at": raw.get("created_at"),
                 "updated_at": raw.get("updated_at"),
                 "claimed_at": raw.get("claimed_at"),
@@ -604,14 +606,36 @@ class SetupStore:
             return False
         return bool(marker.get("enabled")) and marker.get("mode") == self.release_mode
 
-    def status_snapshot(self) -> dict[str, Any]:
-        """Compute the anonymous status fields from the private state."""
+    def status_snapshot(
+        self,
+        *,
+        installation_complete: bool = False,
+        installation_installed: bool = False,
+    ) -> dict[str, Any]:
+        """Compute the anonymous status fields from the private state.
+
+        The database marker wins: a completed installation reports ``complete``
+        even when a restored local snapshot still says something else. A database
+        that already holds identities but has no marker is an existing install
+        and is never claimable.
+        """
 
         enabled = self.operator_enabled()
         private = self._read_private()
         diverged = self._diverged(private)
-        state = private["state"] if enabled else "disabled"
-        setup_enabled = enabled and state != "complete"
+        checks: dict[str, str] = {}
+        if installation_complete:
+            state = "complete"
+        elif not enabled:
+            state = "disabled"
+        elif installation_installed and private["state"] == "unclaimed" and not diverged:
+            state = "installed"
+            checks["installation_existing"] = "passed"
+        else:
+            state = private["state"]
+        if diverged:
+            checks["state_diverged"] = "failed"
+        setup_enabled = enabled and state not in {"complete", "disabled", "installed"}
         claim_available = (
             setup_enabled
             and state == "unclaimed"
@@ -625,7 +649,7 @@ class SetupStore:
             "setup_enabled": setup_enabled,
             "claim_available": claim_available,
             "locked": private["locked"],
-            "checks": {"state_diverged": "failed"} if diverged else {},
+            "checks": checks,
         }
 
     def _persist(
@@ -1212,3 +1236,58 @@ class SetupStore:
                 receipt=receipt,
             )
             return dict(receipt)
+
+    def completion_record(self) -> dict[str, Any]:
+        """Read the stored completion record, including its report preview."""
+
+        private = self._read_private()
+        record = private.get("completion")
+        return dict(record) if isinstance(record, dict) else {}
+
+    def mark_complete(
+        self,
+        *,
+        completed_at: str,
+        completed_by: str | None,
+        instance_id: str | None,
+        setup_contract_version: str,
+        report_digest: str,
+        report: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Close the wizard once: no claim, recovery or session survives."""
+
+        with self._locked():
+            private = self._read_private()
+            existing = private.get("completion")
+            if isinstance(existing, dict) and private["state"] == "complete":
+                return dict(existing)
+            if private["state"] != "verifying":
+                raise StateRefused("completion requires a green verification")
+            record = {
+                "state": "complete",
+                "completed_at": completed_at,
+                "completed_by": completed_by,
+                "instance_id": instance_id,
+                "setup_contract_version": setup_contract_version,
+                "report_digest": report_digest,
+                "report": dict(report),
+            }
+            private["state"] = "complete"
+            private["completion"] = record
+            private["claim"] = None
+            private["recovery"] = None
+            private["sessions"] = {}
+            private["owner_attempt"] = None
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="complete",
+                receipt={
+                    "state": "complete",
+                    "completed_at": completed_at,
+                    "completed_by": completed_by,
+                    "instance_id": instance_id,
+                    "report_digest": report_digest,
+                },
+            )
+            return dict(record)

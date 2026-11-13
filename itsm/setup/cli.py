@@ -18,6 +18,7 @@ import json
 import sys
 from typing import Any
 
+from itsm.installation import state_from_environ
 from itsm.setup.store import (
     AlreadyClaimed,
     NotClaimed,
@@ -30,6 +31,16 @@ from itsm.setup.store import (
 EXIT_OK = 0
 EXIT_FAILED = 1
 EXIT_USAGE = 2
+COMPLETE_GUIDANCE = (
+    "the installation is complete; use normal admin identity management "
+    "(python -m itsm.identity.cli) to reset access, never the setup wizard"
+)
+
+
+def _refuse_complete() -> int | None:
+    if state_from_environ().complete:
+        return _error("installation_complete", COMPLETE_GUIDANCE)
+    return None
 
 
 def _emit(payload: dict[str, Any], *, ok: bool) -> None:
@@ -51,6 +62,9 @@ def _store(args: argparse.Namespace, settings: SetupSettings) -> SetupStore:
 
 
 def _command_enable_claim(args: argparse.Namespace, settings: SetupSettings) -> int:
+    refused = _refuse_complete()
+    if refused is not None:
+        return refused
     credential = _store(args, settings).enable_claim()
     _emit(
         {"status": "ok", "action": "enable-claim", "state": "unclaimed", "credential": credential},
@@ -60,6 +74,9 @@ def _command_enable_claim(args: argparse.Namespace, settings: SetupSettings) -> 
 
 
 def _command_rotate_claim(args: argparse.Namespace, settings: SetupSettings) -> int:
+    refused = _refuse_complete()
+    if refused is not None:
+        return refused
     credential = _store(args, settings).rotate_claim()
     _emit(
         {"status": "ok", "action": "rotate-claim", "state": "unclaimed", "credential": credential},
@@ -69,11 +86,23 @@ def _command_rotate_claim(args: argparse.Namespace, settings: SetupSettings) -> 
 
 
 def _command_recover(args: argparse.Namespace, settings: SetupSettings) -> int:
+    refused = _refuse_complete()
+    if refused is not None:
+        return refused
     credential = _store(args, settings).issue_recovery()
     _emit(
         {"status": "ok", "action": "recover", "state": "claimed", "credential": credential},
         ok=True,
     )
+    return EXIT_OK
+
+
+def _command_report(args: argparse.Namespace, settings: SetupSettings) -> int:
+    from itsm.setup import completion
+
+    store = _store(args, settings)
+    report = completion.exported_report(store, settings.release_mode)
+    _emit({"status": "ok", "action": "report", "report": report}, ok=True)
     return EXIT_OK
 
 
@@ -89,6 +118,7 @@ def _build_parser() -> argparse.ArgumentParser:
         "enable-claim": "enable setup and print a one-time claim credential",
         "rotate-claim": "invalidate the claim credential and print a new one",
         "recover": "re-authorize a claimed setup without resetting it",
+        "report": "print the sanitized installation completion report",
     }
     for name, help_text in helps.items():
         command = commands.add_parser(name, help=help_text)
@@ -111,6 +141,8 @@ def main(argv: list[str] | None = None) -> int:
             return _command_rotate_claim(args, settings)
         if args.command == "recover":
             return _command_recover(args, settings)
+        if args.command == "report":
+            return _command_report(args, settings)
         return _error("unknown_command", "the requested command does not exist", EXIT_USAGE)
     except SetupConfigurationError as exc:
         return _error(exc.code, str(exc), EXIT_USAGE)

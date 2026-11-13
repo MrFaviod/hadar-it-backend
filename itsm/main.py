@@ -63,6 +63,7 @@ from itsm.identity.api import (
     mutation_guard,
 )
 from itsm.identity.service import AuthContext, IdentityService
+from itsm.installation import safe_state_from_session
 from itsm.interventions.api import create_intervention_router
 from itsm.inventory.api import create_inventory_router
 from itsm.inventory.catalog_api import create_catalog_router
@@ -606,6 +607,10 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         payload = readiness.as_dict()
         payload["optional_services"] = _optional_services(settings)
         payload["releaseMode"] = request.app.state.release_mode
+        with request.app.state.session_factory() as session:
+            installation = safe_state_from_session(session)
+        payload["installation_complete"] = installation.complete
+        payload["installation_state"] = installation.label
         return JSONResponse(status_code=200 if readiness.is_ready else 503, content=payload)
 
     api.include_router(create_workflow_router())
