@@ -23,6 +23,12 @@ from fastapi.responses import JSONResponse
 
 from itsm import __version__
 from itsm.agent_integrations.providers import ProviderEndpointError, require_secret_destination
+from itsm.setup.configuration import (
+    ConfigurationInvalid,
+    ConfigurationUnavailable,
+    ConfirmationRequired,
+    PermissionRefused,
+)
 from itsm.setup.schemas import (
     AiConfigureRequest,
     AiConfigureResponse,
@@ -31,6 +37,10 @@ from itsm.setup.schemas import (
     AssistantAskRequest,
     ClaimRequest,
     ClaimResponse,
+    ConfigurationOverview,
+    ConfigurationSectionRequest,
+    ConfigurationSectionResponse,
+    ConfigurationStartResponse,
     OwnerReceipt,
     OwnerRequest,
     OwnerResponse,
@@ -40,6 +50,7 @@ from itsm.setup.schemas import (
     StorageCheckRequest,
     StorageProbe,
     StorageSummary,
+    VerificationResponse,
 )
 from itsm.setup.store import (
     SESSION_TTL_MINUTES,
@@ -103,6 +114,10 @@ _ERROR_STATUS: tuple[tuple[type[SetupError], int], ...] = (
     (OwnerExists, 409),
     (OwnerInputInvalid, 422),
     (ProviderTransferFailed, 502),
+    (ConfigurationInvalid, 422),
+    (ConfigurationUnavailable, 503),
+    (ConfirmationRequired, 422),
+    (PermissionRefused, 403),
 )
 
 _GUIDED_ERRORS = (
@@ -505,6 +520,102 @@ def create_setup_router() -> APIRouter:
             ai=receipt.get("ai", "pending"),
         )
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.post("/configuration")
+    def start_configuration(
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        get_store(request).begin_configuration()
+        body = ConfigurationStartResponse(state="configuring", mode=settings.release_mode)
+        return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.get("/configuration")
+    def configuration_overview(request: Request) -> JSONResponse:
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] not in {"configuring", "verifying", "complete"}:
+            return _error_response(409, "state_refused")
+        from itsm.setup import configuration
+
+        body = configuration.overview(store, settings.release_mode)
+        return JSONResponse(ConfigurationOverview(**body).model_dump(mode="json"), headers=NO_STORE)
+
+    @router.get("/configuration/{section}")
+    def read_configuration_section(section: str, request: Request) -> JSONResponse:
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] not in {"configuring", "verifying", "complete"}:
+            return _error_response(409, "state_refused")
+        from itsm.setup import configuration
+
+        body = configuration.read_section(store, settings.release_mode, section)
+        return JSONResponse(
+            ConfigurationSectionResponse(**body).model_dump(mode="json"), headers=NO_STORE
+        )
+
+    @router.post("/configuration/{section}")
+    def preview_configuration_section(
+        section: str,
+        payload: ConfigurationSectionRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] != "configuring":
+            return _error_response(409, "state_refused")
+        from itsm.setup import configuration
+
+        body = configuration.preview(store, settings.release_mode, section, payload.values)
+        return JSONResponse(
+            ConfigurationSectionResponse(**body).model_dump(mode="json"), headers=NO_STORE
+        )
+
+    @router.post("/configuration/{section}/apply")
+    def apply_configuration_section(
+        section: str,
+        payload: ConfigurationSectionRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] != "configuring":
+            return _error_response(409, "state_refused")
+        from itsm.setup import configuration
+
+        body = configuration.apply_section(
+            store,
+            settings.release_mode,
+            section,
+            payload.values,
+            action=payload.action,
+            confirm=payload.confirm,
+        )
+        return JSONResponse(
+            ConfigurationSectionResponse(**body).model_dump(mode="json"), headers=NO_STORE
+        )
+
+    @router.post("/verify")
+    def verify_configuration(
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        from itsm.setup import configuration
+
+        body = configuration.verify(store, settings.release_mode)
+        if body.get("state") != "verifying":
+            payload = {"error": "verification_blocked", **body}
+            return JSONResponse(payload, status_code=409, headers=NO_STORE)
+        return JSONResponse(VerificationResponse(**body).model_dump(mode="json"), headers=NO_STORE)
 
     return router
 

@@ -7,7 +7,7 @@ database URL or any other secret.
 
 from __future__ import annotations
 
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
 
@@ -204,3 +204,56 @@ class OwnerResponse(BaseModel):
     state: str
     owner: OwnerReceipt
     ai: Literal["transferred", "pending"]
+
+
+class ConfigurationStartResponse(BaseModel):
+    """Result of ``POST /api/setup/v1/configuration``."""
+
+    state: str
+    mode: str
+
+
+class ConfigurationSectionRequest(BaseModel):
+    """One section proposal; ``confirm`` is the human confirmation bit."""
+
+    values: dict[str, Any] = Field(default_factory=dict)
+    action: Literal["apply", "postpone", "accept_risk"] = "apply"
+    confirm: bool = False
+
+
+class ConfigurationSectionResponse(BaseModel):
+    """Effective value, diff preview or applied receipt for one section."""
+
+    section: str
+    status: str
+    required: bool
+    postponable: bool
+    current: dict[str, Any] | None = None
+    proposed: dict[str, Any] | None = None
+    changes: list[dict[str, Any]] | None = None
+    receipt: dict[str, Any] | None = None
+    actions: list[str] | None = None
+    preview_only: bool | None = None
+    currentUnavailable: bool | None = None
+
+
+class ConfigurationOverview(BaseModel):
+    """Every section plus the contract checklist built from stored receipts."""
+
+    state: str
+    mode: str
+    sections: list[dict[str, Any]]
+    checklist: list[dict[str, Any]]
+    blocking: list[str]
+    acceptedRisk: list[str]
+
+
+class VerificationResponse(BaseModel):
+    """The observed checklist that decides ``configuring`` -> ``verifying``."""
+
+    state: str
+    ready: bool
+    mode: str
+    checklist: list[dict[str, Any]]
+    blocking: list[str]
+    acceptedRisk: list[str]

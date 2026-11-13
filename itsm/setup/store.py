@@ -535,6 +535,7 @@ class SetupStore:
             "storage": None,
             "owner": None,
             "owner_attempt": None,
+            "configuration": None,
             "created_at": now,
             "updated_at": now,
             "claimed_at": None,
@@ -565,6 +566,7 @@ class SetupStore:
                 "storage": raw.get("storage"),
                 "owner": raw.get("owner"),
                 "owner_attempt": raw.get("owner_attempt"),
+                "configuration": raw.get("configuration"),
                 "created_at": raw.get("created_at"),
                 "updated_at": raw.get("updated_at"),
                 "claimed_at": raw.get("claimed_at"),
@@ -1120,3 +1122,93 @@ class SetupStore:
                 receipt=public,
             )
             return dict(public)
+
+    # --------------------------------------------------------- configuration
+    def configuration_record(self) -> dict[str, Any]:
+        """Read the stored configuration record; never a credential or a session."""
+
+        private = self._read_private()
+        record = private.get("configuration")
+        return dict(record) if isinstance(record, dict) else {}
+
+    def begin_configuration(self) -> dict[str, Any]:
+        """Move ``owner_ready`` to ``configuring`` once; replay is idempotent."""
+
+        with self._locked():
+            private = self._read_private()
+            record = private.get("configuration")
+            if private["state"] in {"configuring", "verifying", "complete"} and isinstance(
+                record, dict
+            ):
+                return dict(record)
+            if private["state"] != "owner_ready":
+                raise StateRefused("configuration requires the first owner")
+            record = {
+                "sections": {},
+                "verification": None,
+                "started_at": _iso(self._clock()),
+            }
+            private["state"] = "configuring"
+            private["configuration"] = record
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="start-configuration",
+                receipt={"state": "configuring", "sections": []},
+            )
+            return dict(record)
+
+    def record_configuration_section(
+        self, section: str, *, status: str, receipt: dict[str, Any]
+    ) -> dict[str, Any]:
+        """Record one section result; only the ``configuring`` state may change."""
+
+        with self._locked():
+            private = self._read_private()
+            if private["state"] != "configuring":
+                raise StateRefused("configuration changes require the configuring state")
+            record = private.get("configuration")
+            record = dict(record) if isinstance(record, dict) else {"sections": {}}
+            sections = dict(record.get("sections") or {})
+            entry = {
+                "status": status,
+                "receipt": dict(receipt),
+                "updated_at": _iso(self._clock()),
+            }
+            sections[section] = entry
+            record["sections"] = sections
+            private["configuration"] = record
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action=f"configure-{section}",
+                receipt={"section": section, **dict(receipt)},
+            )
+            return dict(entry)
+
+    def record_verification(self, *, summary: dict[str, Any]) -> dict[str, Any]:
+        """Store the verification result and move ``configuring`` to ``verifying``."""
+
+        with self._locked():
+            private = self._read_private()
+            state = private["state"]
+            if state not in {"configuring", "verifying"}:
+                raise StateRefused("verification requires the configuring state")
+            record = private.get("configuration")
+            record = dict(record) if isinstance(record, dict) else {"sections": {}}
+            receipt = {
+                "state": "verifying",
+                "checked_at": _iso(self._clock()),
+                "blocking": list(summary.get("blocking") or []),
+                "acceptedRisk": list(summary.get("acceptedRisk") or []),
+            }
+            record["verification"] = {**receipt, "items": list(summary.get("items") or [])}
+            private["configuration"] = record
+            private["state"] = "verifying"
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="verify",
+                receipt=receipt,
+            )
+            return dict(receipt)

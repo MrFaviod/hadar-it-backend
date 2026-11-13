@@ -1,0 +1,906 @@
+"""Assisted configuration for the setup wizard.
+
+Every change is a three-step conversation with the operator: read the current
+effective value through the owning domain service, preview the diff, and apply
+only after an explicit confirmation. The apply call runs in process and builds
+the principal of the owner created moments earlier, so the domain service still
+re-checks its own permission and audit trail; the setup process never writes
+domain settings directly.
+
+Nothing here trusts intent. An applied section is recorded with a sanitized
+receipt built from what was read back, and a capability is only green when it
+was observed: a provider row, a configured credential and a model that really
+called a tool.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import ipaddress
+import os
+import re
+import time
+from collections.abc import Callable, Iterator, Mapping
+from contextlib import contextmanager, suppress
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlsplit
+
+from itsm.setup import checklist as checklist_module
+from itsm.setup.store import SetupError, SetupStore, StateRefused
+
+PROBE_CATEGORY = "default"
+_SAFE_REASON = re.compile(r"[^a-z0-9_]+")
+_MAX_REASON = 80
+
+
+class ConfigurationUnavailable(SetupError):
+    """The installation database or a domain service could not answer."""
+
+    code = "configuration_unavailable"
+
+
+class ConfigurationInvalid(SetupError):
+    """The proposed values cannot be applied by the owning service."""
+
+    code = "configuration_invalid"
+
+
+class PermissionRefused(SetupError):
+    """The owner principal is not allowed to change this section."""
+
+    code = "permission_denied"
+
+
+class ConfirmationRequired(SetupError):
+    """A write was proposed without the human confirmation flag."""
+
+    code = "confirmation_required"
+
+
+def _iso(moment: datetime) -> str:
+    return moment.astimezone(UTC).isoformat()
+
+
+def _now() -> datetime:
+    return datetime.now(UTC)
+
+
+def _clean_reason(value: Any) -> str:
+    text = str(value or "").strip().lower().replace(" ", "_")
+    text = _SAFE_REASON.sub("", text)[:_MAX_REASON].strip("_")
+    return text or "unspecified"
+
+
+def _runtime_settings(environ: Mapping[str, str] | None = None) -> Any:
+    """Resolve the installation settings; secrets stay inside the runtime."""
+
+    from itsm.config import (
+        InstallationConfigError,
+        resolve_settings_sources,
+    )
+
+    source = dict(os.environ) if environ is None else dict(environ)
+    try:
+        return resolve_settings_sources(source)
+    except InstallationConfigError as exc:
+        raise ConfigurationUnavailable("the installation settings could not be read") from exc
+
+
+def _database(environ: Mapping[str, str] | None = None):
+    from itsm.database import create_engine_from_settings, create_session_factory
+
+    settings = _runtime_settings(environ)
+    try:
+        engine = create_engine_from_settings(settings)
+    except Exception as exc:  # pragma: no cover - defensive translation
+        raise ConfigurationUnavailable("the installation database is not usable") from exc
+    return settings, engine, create_session_factory(engine)
+
+
+@contextmanager
+def _domain(environ: Mapping[str, str] | None = None) -> Iterator[tuple[Any, Any, Any]]:
+    settings, engine, factory = _database(environ)
+    try:
+        yield settings, engine, factory
+    finally:
+        engine.dispose()
+
+
+def _owner_principal(settings: Any, factory: Any):
+    """Rebuild the owner principal from the database, once per service call."""
+
+    from sqlalchemy import select
+
+    from itsm.identity.models import Identity, IdentityRole
+    from itsm.identity.service import HUMAN_ACTOR_KIND, IdentityService
+
+    with factory() as session:
+        identity = session.scalars(
+            select(Identity)
+            .join(IdentityRole, IdentityRole.id == Identity.role_id)
+            .where(Identity.actor_kind == HUMAN_ACTOR_KIND, Identity.active.is_(True))
+            .where(IdentityRole.id == "superadmin")
+        ).first()
+        if identity is None:
+            raise ConfigurationUnavailable("the first owner is missing")
+        identity_service = IdentityService(session, settings)
+        return identity_service._principal(identity)
+
+
+def _translate(function: Callable[[], Any]) -> Any:
+    """Run a domain call and translate its refusals into setup errors."""
+
+    from itsm.identity.service import Conflict, NotFound, PermissionDenied, ValidationFailed
+
+    try:
+        return function()
+    except PermissionDenied as exc:
+        raise PermissionRefused("the installation owner may not change this section") from exc
+    except (ValidationFailed, Conflict, NotFound) as exc:
+        raise ConfigurationInvalid("the proposed values were refused") from exc
+
+
+@dataclass(frozen=True)
+class SectionPlan:
+    """A section's shape: what it is called and whether it may be postponed."""
+
+    id: str
+    required: bool
+    postponable: bool
+    actions: tuple[str, ...]
+
+
+def section_plan(mode: str, section: str) -> SectionPlan:
+    if section not in checklist_module.SECTIONS:
+        raise ConfigurationInvalid("unknown configuration section")
+    return SectionPlan(
+        id=section,
+        required=checklist_module.section_required(mode, section),
+        postponable=checklist_module.section_postponable(section),
+        actions=("apply", "postpone")
+        if checklist_module.section_postponable(section)
+        else ("apply",),
+    )
+
+
+# --------------------------------------------------------------------- read
+def _appearance_current(settings: Any, factory: Any, principal: Any) -> dict[str, Any]:
+    from itsm.appearance.service import AppearanceService
+
+    service = AppearanceService(factory, settings=settings)
+    active = service.active()
+    return {
+        "preset": active.get("activeId"),
+        "previous": active.get("previousId"),
+        "builtinIds": list(active.get("builtinIds") or []),
+    }
+
+
+def _appearance_apply(
+    settings: Any, factory: Any, principal: Any, values: dict[str, Any]
+) -> dict[str, Any]:
+    from itsm.appearance.service import AppearanceService
+
+    service = AppearanceService(factory, settings=settings)
+    preset = str(values.get("preset") or "").strip()
+    if not preset:
+        raise ConfigurationInvalid("a preset is required")
+    catalog = _translate(lambda: service.presets(principal))
+    known = {str(item.get("id")) for item in catalog.get("presets") or []}
+    if preset not in known:
+        raise ConfigurationInvalid("unknown appearance preset")
+    _translate(lambda: service.apply_preset(principal, preset))
+    current = _appearance_current(settings, factory, principal)
+    if current["preset"] != preset:
+        raise ConfigurationUnavailable("the appearance change did not persist")
+    return {
+        "status": checklist_module.GREEN,
+        "receipt": {
+            "source": "apply_preset",
+            "active_id": current["preset"],
+            "previous_id": current["previous"],
+        },
+    }
+
+
+def _agent_current(settings: Any, factory: Any) -> dict[str, Any]:
+    from itsm.system.providers import (
+        credential_configured,
+        effective_selection,
+        persisted_selection,
+    )
+
+    with factory() as session:
+        persisted = persisted_selection(session)
+        effective = persisted or effective_selection(session, settings)
+    return {
+        "provider": effective.provider if effective else None,
+        "model": effective.model if effective else None,
+        "source": effective.source if effective else None,
+        "persisted": persisted is not None,
+        "credential_configured": bool(effective and credential_configured(effective.provider)),
+    }
+
+
+def _agent_apply(
+    store: SetupStore,
+    mode: str,
+    settings: Any,
+    factory: Any,
+    principal: Any,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    from itsm.system.providers import (
+        ProviderSelectionError,
+        credential_configured,
+        persisted_selection,
+        validate_selection,
+    )
+    from itsm.system.service import SystemService
+
+    provider = str(values.get("provider") or "").strip()
+    model = str(values.get("model") or "").strip()
+    try:
+        validate_selection(provider, model)
+    except ProviderSelectionError as exc:
+        raise ConfigurationInvalid("the provider selection is not valid") from exc
+
+    _translate(
+        lambda: SystemService(settings, factory).set_provider(
+            principal, {"provider": provider, "model": model}
+        )
+    )
+    with factory() as session:
+        persisted = persisted_selection(session)
+    if persisted is None or persisted.provider != provider or persisted.model != model:
+        raise ConfigurationUnavailable("the provider selection did not persist")
+
+    credential = credential_configured(provider)
+    ai = store.public_state().get("ai") or {}
+    probe = {
+        "capability": "unverified",
+        "tool": None,
+        "latency_ms": None,
+        "reason": "credential_missing",
+    }
+    if credential:
+        probe = _probe_agent(settings, provider, model, mode)
+    reason = probe.get("reason")
+    ai_deferred = bool(ai.get("pending"))
+    if ai_deferred:
+        status = "pending"
+        reason = "ai_deferred"
+    elif probe.get("capability") == "verified":
+        status = checklist_module.GREEN
+    else:
+        status = "pending"
+
+    receipt = {
+        "status": status,
+        "provider": provider,
+        "model": model,
+        "credential_configured": credential,
+        "capability": probe.get("capability"),
+        "tool": probe.get("tool"),
+        "latency_ms": probe.get("latency_ms"),
+        "reason": _clean_reason(reason) if reason else None,
+    }
+    return {"status": status, "receipt": receipt}
+
+
+def _unverified(reason: str) -> dict[str, Any]:
+    return {"capability": "unverified", "tool": None, "latency_ms": None, "reason": reason}
+
+
+def _probe_agent(settings: Any, provider: str, model_name: str, mode: str) -> dict[str, Any]:
+    """Ask the configured model to call a read-only tool; observation only."""
+
+    from types import SimpleNamespace
+
+    from itsm.agents.runtime import AgentUnavailable, resolve_model
+    from itsm.setup import assistant as bootstrap
+
+    started = time.monotonic()
+    try:
+        model = resolve_model(settings, SimpleNamespace(provider=provider, model=model_name))
+    except AgentUnavailable, Exception:
+        return _unverified("model_unavailable")
+
+    reader = lambda: {"state": "configuring", "mode": mode}  # noqa: E731 - tiny closure
+    instance = bootstrap.BootstrapAssistant(
+        model,
+        status_reader=reader,
+        timeout=bootstrap.PROBE_TIMEOUT_SECONDS,
+        request_limit=bootstrap.PROBE_REQUEST_LIMIT,
+        tool_calls_limit=bootstrap.PROBE_TOOL_CALLS_LIMIT,
+        output_tokens=bootstrap.PROBE_OUTPUT_TOKENS,
+        system_prompt=bootstrap._PROBE_SYSTEM_PROMPT,
+    )
+    try:
+        answer = asyncio.run(
+            asyncio.wait_for(
+                instance.run(bootstrap.PROBE_QUESTION),
+                timeout=bootstrap.PROBE_TIMEOUT_SECONDS + 5.0,
+            )
+        )
+    except Exception as exc:  # transport, provider and timeout failures
+        return {
+            "capability": "unverified",
+            "tool": None,
+            "latency_ms": int((time.monotonic() - started) * 1000),
+            "reason": bootstrap.diagnostic_for(exc) or "probe_failed",
+        }
+    latency = int((time.monotonic() - started) * 1000)
+    called = bootstrap.TOOL_GET_SETUP_STATUS in answer.tools
+    return {
+        "capability": "verified" if called else "unverified",
+        "tool": bootstrap.TOOL_GET_SETUP_STATUS if called else None,
+        "latency_ms": latency,
+        "reason": None if called else "tool_not_called",
+    }
+
+
+def _notification_current(settings: Any, factory: Any, principal: Any) -> dict[str, Any]:
+    from itsm.notifications.service import NotificationService
+
+    with factory() as session:
+        service = NotificationService(session, settings)
+        config = _translate(lambda: service.get_config(principal))
+    channels = list(config.get("channels") or [])
+    return {"channels": channels, "count": len(channels)}
+
+
+def _notification_apply(
+    settings: Any, factory: Any, principal: Any, values: dict[str, Any]
+) -> dict[str, Any]:
+    from itsm.notifications.service import NotificationService
+
+    payload = {
+        "kind": str(values.get("kind") or "").strip(),
+        "name": str(values.get("name") or "").strip(),
+        "enabled": bool(values.get("enabled", True)),
+        "config": dict(values.get("config") or {}),
+    }
+    if values.get("secretRef"):
+        payload["secretRef"] = str(values["secretRef"])
+    with factory() as session:
+        service = NotificationService(session, settings)
+        saved = _translate(lambda: service.save_channel(principal, payload))
+    return {
+        "status": checklist_module.GREEN,
+        "receipt": {
+            "source": "save_channel",
+            "kind": saved.get("kind"),
+            "name": saved.get("name"),
+            "enabled": bool(saved.get("enabled")),
+        },
+    }
+
+
+def _monitoring_current(settings: Any, factory: Any, principal: Any) -> dict[str, Any]:
+    from itsm.monitoring.service import MonitoringService
+
+    with factory() as session:
+        service = MonitoringService(session, settings)
+        config = _translate(lambda: service.get_config(principal))
+    profiles = list(config.get("profiles") or [])
+    profile = next(
+        (item for item in profiles if item.get("category") == PROBE_CATEGORY),
+        profiles[0] if profiles else None,
+    )
+    return {"category": PROBE_CATEGORY, "profile": profile}
+
+
+def _monitoring_apply(
+    settings: Any, factory: Any, principal: Any, values: dict[str, Any]
+) -> dict[str, Any]:
+    from itsm.monitoring.service import MonitoringService
+
+    category = str(values.get("category") or PROBE_CATEGORY)
+    updates = {key: value for key, value in values.items() if key != "category"}
+    with factory() as session:
+        service = MonitoringService(session, settings)
+        saved = _translate(lambda: service.update_profile(principal, category, updates))
+    return {
+        "status": checklist_module.GREEN,
+        "receipt": {
+            "source": "update_profile",
+            "category": saved.get("category"),
+            "enabled": bool(saved.get("enabled")),
+            "checkType": saved.get("checkType"),
+        },
+    }
+
+
+# ---------------------------------------------------------------- sections
+_APPLIERS: dict[str, Callable[..., dict[str, Any]]] = {
+    "appearance": _appearance_apply,
+    "agent": _agent_apply,
+    "notifications": _notification_apply,
+    "monitoring": _monitoring_apply,
+}
+
+
+def _stored_sections(store: SetupStore) -> dict[str, Any]:
+    record = store.configuration_record()
+    sections = record.get("sections")
+    return dict(sections) if isinstance(sections, dict) else {}
+
+
+def _section_status(store: SetupStore, section: str) -> str:
+    entry = _stored_sections(store).get(section)
+    return str(entry.get("status")) if isinstance(entry, dict) else "pending"
+
+
+def _apply_values(
+    store: SetupStore,
+    mode: str,
+    section: str,
+    values: dict[str, Any],
+    environ: Mapping[str, str] | None,
+) -> dict[str, Any]:
+    if section == "operational":
+        raise ConfigurationInvalid("operational items are observed, not configured")
+    applier = _APPLIERS.get(section)
+    if applier is None:
+        raise ConfigurationInvalid("unknown configuration section")
+    with _domain(environ) as (settings, _engine, factory):
+        principal = _owner_principal(settings, factory)
+        if section == "agent":
+            result = applier(store, mode, settings, factory, principal, values)
+        else:
+            result = applier(settings, factory, principal, values)
+    entry = store.record_configuration_section(
+        section, status=str(result["status"]), receipt=dict(result["receipt"])
+    )
+    plan = section_plan(mode, section)
+    return {
+        "section": section,
+        "required": plan.required,
+        "postponable": plan.postponable,
+        "status": entry["status"],
+        "receipt": entry["receipt"],
+    }
+
+
+def read_section(
+    store: SetupStore,
+    mode: str,
+    section: str,
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return the section's stored decision and, where possible, its live value."""
+
+    plan = section_plan(mode, section)
+    stored = _stored_sections(store).get(section)
+    entry = stored if isinstance(stored, dict) else {}
+    body: dict[str, Any] = {
+        "section": section,
+        "required": plan.required,
+        "postponable": plan.postponable,
+        "status": entry.get("status", "pending"),
+        "receipt": entry.get("receipt"),
+        "current": None,
+        "proposed": None,
+        "actions": list(plan.actions),
+    }
+    try:
+        if section == "operational":
+            body["current"] = _operational_current(store)
+        elif section == "agent":
+            with _domain(environ) as (settings, _engine, factory):
+                body["current"] = _agent_current(settings, factory)
+        elif section in _APPLIERS:
+            with _domain(environ) as (settings, _engine, factory):
+                principal = _owner_principal(settings, factory)
+                if section == "appearance":
+                    body["current"] = _appearance_current(settings, factory, principal)
+                elif section == "notifications":
+                    body["current"] = _notification_current(settings, factory, principal)
+                elif section == "monitoring":
+                    body["current"] = _monitoring_current(settings, factory, principal)
+    except ConfigurationUnavailable, SetupError:
+        body["current"] = None
+        body["currentUnavailable"] = True
+    return body
+
+
+def _operational_current(store: SetupStore) -> dict[str, Any]:
+    settings = _runtime_settings()
+    origin = settings.auth_origin
+    return {
+        "origin": origin,
+        "cookie_secure": bool(settings.auth_cookie_secure),
+        "worker": "unknown",
+        "notes": "operational items are observed by verify, not configured here",
+    }
+
+
+def preview(
+    store: SetupStore,
+    mode: str,
+    section: str,
+    values: dict[str, Any],
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Return a diff preview; never calls an applying service."""
+
+    plan = section_plan(mode, section)
+    if section == "operational":
+        raise ConfigurationInvalid("operational items are observed, not configured")
+    if section not in _APPLIERS:
+        raise ConfigurationInvalid("unknown configuration section")
+
+    current_now = read_section(store, mode, section, environ=environ)
+    current = current_now.get("current") or {}
+    if section == "appearance":
+        current_value = {"preset": current.get("preset", "generic")}
+        proposed = {"preset": str(values.get("preset") or "").strip()}
+    elif section == "agent":
+        current_value = {
+            "provider": current.get("provider"),
+            "model": current.get("model"),
+        }
+        proposed = {
+            "provider": str(values.get("provider") or "").strip(),
+            "model": str(values.get("model") or "").strip(),
+        }
+        from itsm.system.providers import ProviderSelectionError, validate_selection
+
+        try:
+            validate_selection(proposed["provider"], proposed["model"])
+        except ProviderSelectionError as exc:
+            raise ConfigurationInvalid("the provider selection is not valid") from exc
+    elif section == "notifications":
+        channels = list(current.get("channels") or [])
+        chosen = channels[0] if channels else {}
+        current_value = {
+            "kind": chosen.get("kind"),
+            "name": chosen.get("name"),
+            "enabled": chosen.get("enabled"),
+        }
+        proposed = {
+            "kind": str(values.get("kind") or "").strip(),
+            "name": str(values.get("name") or "").strip(),
+            "enabled": bool(values.get("enabled", True)),
+        }
+    else:
+        profile = current.get("profile") or {}
+        current_value = {key: profile.get(key) for key in ("category", "enabled", "checkType")}
+        proposed = {
+            "category": str(values.get("category") or PROBE_CATEGORY),
+            "enabled": bool(values.get("enabled", True)),
+            "checkType": values.get("checkType"),
+        }
+
+    changes = [
+        {"field": key, "from": current_value.get(key), "to": proposed[key]}
+        for key in sorted(proposed)
+        if current_value.get(key) != proposed.get(key)
+    ]
+    return {
+        "section": section,
+        "status": "preview",
+        "required": plan.required,
+        "postponable": plan.postponable,
+        "current": current_value,
+        "proposed": proposed,
+        "changes": changes,
+        "preview_only": True,
+    }
+
+
+def apply_section(
+    store: SetupStore,
+    mode: str,
+    section: str,
+    values: dict[str, Any],
+    *,
+    action: str = "apply",
+    confirm: bool = False,
+    environ: Mapping[str, str] | None = None,
+) -> dict[str, Any]:
+    """Apply one section after the human confirmation; never a silent write."""
+
+    plan = section_plan(mode, section)
+    if action not in {"apply", "postpone", "accept_risk"}:
+        raise ConfigurationInvalid("unknown configuration action")
+    if action == "postpone":
+        if not plan.postponable:
+            raise ConfigurationInvalid("this section cannot be postponed")
+        if not confirm:
+            raise ConfirmationRequired("postponing a section needs the operator's confirmation")
+        receipt = {
+            "status": "postponed",
+            "reason": _clean_reason(values.get("reason")),
+            "postponed_at": _iso(_now()),
+        }
+        entry = store.record_configuration_section(section, status="postponed", receipt=receipt)
+        return {
+            "section": section,
+            "required": plan.required,
+            "postponable": plan.postponable,
+            "status": "postponed",
+            "receipt": entry["receipt"],
+        }
+    if action == "accept_risk":
+        if section != "operational" or str(values.get("item")) != "backup_policy_declared":
+            raise ConfigurationInvalid("only the production backup can be accepted as a risk")
+        if (
+            store.public_state().get("mode") != "prod"
+            and _runtime_settings(environ).release_mode != "prod"
+        ):
+            raise ConfigurationInvalid("a backup risk only exists in production")
+        if not confirm:
+            raise ConfirmationRequired("accepting a risk needs the operator's confirmation")
+        receipt = {
+            "status": "risk",
+            "item": "backup_policy_declared",
+            "reason": _clean_reason(values.get("reason")),
+            "accepted_at": _iso(_now()),
+        }
+        entry = store.record_configuration_section(section, status="risk", receipt=receipt)
+        return {
+            "section": section,
+            "required": plan.required,
+            "postponable": plan.postponable,
+            "status": "risk",
+            "receipt": entry["receipt"],
+        }
+
+    if not confirm:
+        raise ConfirmationRequired("applying a configuration needs explicit confirmation")
+    return _apply_values(store, mode, section, values, environ)
+
+
+# -------------------------------------------------------------- verification
+def _observe(
+    store: SetupStore,
+    mode: str,
+    settings: Any,
+    engine: Any,
+    factory: Any,
+    principal: Any,
+) -> dict[str, dict[str, Any]]:
+    """Collect the operational evidence without claiming what is not observed."""
+
+    from itsm.database import check_readiness
+    from itsm.ops import quiesce
+    from itsm.tasks.adapter import HueyTaskQueue
+
+    observations: dict[str, dict[str, Any]] = {}
+    snapshot = store.status_snapshot()
+    observations["setup_enabled"] = {
+        "status": "passed" if snapshot.get("setup_enabled") else "pending",
+        "evidence": "setup answers while enabled"
+        if snapshot.get("setup_enabled")
+        else "setup disabled by the operator",
+    }
+    public = store.public_state()
+    observations["claim_completed"] = {
+        "status": "passed" if store.configuration_record() else "pending",
+        "evidence": "claim completed before configuration"
+        if store.configuration_record()
+        else "no claim recorded",
+    }
+    owner = store.owner_record() or {}
+    observations["owner_present"] = {
+        "status": "passed" if owner.get("username") else "pending",
+        "evidence": f"owner {owner.get('username')} recorded"
+        if owner.get("username")
+        else "no owner recorded",
+    }
+
+    task_ok = False
+    try:
+        HueyTaskQueue(settings).probe()
+        task_ok = True
+        queue_evidence = f"{settings.task_storage} queue answered its probe"
+    except Exception:
+        queue_evidence = f"{settings.task_storage} queue did not answer"
+
+    try:
+        readiness = check_readiness(engine, settings, task_storage_ok=task_ok)
+    except Exception:
+        readiness = None
+    if readiness is None or readiness.database != "ok":
+        observations["database_ready"] = {"status": "pending", "evidence": "database unavailable"}
+        observations["migrated"] = {"status": "pending", "evidence": "database unavailable"}
+    else:
+        observations["database_ready"] = {"status": "passed", "evidence": "database answered"}
+        migrations = readiness.migrations
+        if migrations is not None and getattr(migrations, "is_current", False):
+            observations["migrated"] = {
+                "status": "passed",
+                "evidence": f"migration head {migrations.head} installed",
+            }
+        else:
+            current = getattr(migrations, "current", None)
+            head = getattr(migrations, "head", None)
+            observations["migrated"] = {
+                "status": "pending",
+                "evidence": f"revision {current or 'none'} is not the head {head or 'unknown'}",
+            }
+
+    worker_evidence: dict[str, Any]
+    if settings.task_storage != "sqlite":
+        worker_evidence = {
+            "status": "unknown",
+            "evidence": "worker liveness has no heartbeat for this queue backend",
+        }
+    else:
+        try:
+            holders = quiesce.holders(settings)
+        except Exception:
+            holders = []
+        alive = any(str(item.get("role")) == "worker" for item in holders)
+        if alive and task_ok:
+            worker_evidence = {
+                "status": "passed",
+                "evidence": "worker marker alive and the queue answered",
+            }
+        elif alive:
+            worker_evidence = {"status": "pending", "evidence": queue_evidence}
+        else:
+            worker_evidence = {"status": "pending", "evidence": "no live worker marker"}
+    observations["worker_ready"] = worker_evidence
+    observations["storage_ready"] = _storage_observation(settings)
+    observations["origin_valid"] = _origin_observation(settings.auth_origin)
+    observations["session_valid"] = _session_observation(settings, mode)
+
+    from itsm.system.service import SystemService
+
+    try:
+        status = _translate(lambda: SystemService(settings, factory).backup_status(principal))
+    except SetupError:
+        status = {"available": False, "reason": "unreadable"}
+    if status.get("available"):
+        observations["backup_policy_declared"] = {
+            "status": "passed",
+            "evidence": str(status.get("summary") or "published backup status")[:120],
+        }
+    else:
+        observations["backup_policy_declared"] = {
+            "status": "pending",
+            "evidence": str(status.get("reason") or "no backup policy declared"),
+        }
+
+    observations["ai"] = {
+        "pending": bool((public.get("ai") or {}).get("pending")),
+    }
+    return observations
+
+
+def _storage_observation(settings: Any) -> dict[str, Any]:
+    path: Path = settings.attachment_storage_path
+    probe = path / f".setup-probe-{os.getpid()}"
+    try:
+        path.mkdir(parents=True, exist_ok=True)
+        probe.write_bytes(b"probe")
+        probe.unlink()
+    except OSError:
+        return {"status": "pending", "evidence": f"{path} is not writable"}
+    return {"status": "passed", "evidence": f"{path} is writable"}
+
+
+def _origin_observation(origin: str) -> dict[str, Any]:
+    parsed = urlsplit(str(origin or ""))
+    bare = parsed.scheme in {"http", "https"} and bool(parsed.hostname)
+    bare = bare and not parsed.path.strip("/") and not parsed.query and not parsed.fragment
+    bare = bare and "@" not in parsed.netloc
+    return {
+        "status": "passed" if bare else "pending",
+        "evidence": f"origin {parsed.scheme}://{parsed.netloc}"
+        if bare
+        else "origin is not a bare http(s) origin",
+    }
+
+
+def _session_observation(settings: Any, mode: str) -> dict[str, Any]:
+    if mode != "prod":
+        return {"status": "not_required", "evidence": "not required in dev"}
+    host = urlsplit(str(settings.auth_origin)).hostname or ""
+    loopback = host == "localhost"
+    with suppress(ValueError):
+        loopback = loopback or ipaddress.ip_address(host).is_loopback
+    secure = bool(settings.auth_cookie_secure) and host not in {"localhost", "127.0.0.1", "::1"}
+    return {
+        "status": "passed" if secure and not loopback else "pending",
+        "evidence": (
+            "secure cookies and a public origin"
+            if secure and not loopback
+            else "production needs Secure session cookies on a public origin"
+        ),
+    }
+
+
+def verify(
+    store: SetupStore, mode: str, *, environ: Mapping[str, str] | None = None
+) -> dict[str, Any]:
+    """Evaluate the contract checklist and open ``verifying`` only when green."""
+
+    state = store.public_state().get("state")
+    record = store.configuration_record()
+    if state == "verifying":
+        stored = record.get("verification") or {}
+        return {
+            "state": "verifying",
+            "ready": True,
+            "mode": mode,
+            "checklist": list(stored.get("items") or []),
+            "blocking": list(stored.get("blocking") or []),
+            "acceptedRisk": list(stored.get("acceptedRisk") or []),
+        }
+    if state != "configuring":
+        raise StateRefused("verification requires the configuring state")
+
+    with _domain(environ) as (settings, engine, factory):
+        principal = _owner_principal(settings, factory)
+        observations = _observe(store, mode, settings, engine, factory, principal)
+
+    result = checklist_module.build_checklist(mode, configuration=record, observations=observations)
+    if not result["ready"]:
+        return {"state": "configuring", **result}
+    summary = {
+        "blocking": result["blocking"],
+        "acceptedRisk": result["acceptedRisk"],
+        "items": [
+            {
+                "id": item["id"],
+                "status": item["status"],
+                "evidence": item["evidence"],
+                "required": item["required"],
+                "postponable": item["postponable"],
+                "acceptedRisk": item["acceptedRisk"],
+            }
+            for item in result["checklist"]
+        ],
+    }
+    store.record_verification(summary=summary)
+    return {"state": "verifying", **result}
+
+
+def overview(store: SetupStore, mode: str) -> dict[str, Any]:
+    """Read the section overview plus the checklist built from stored receipts."""
+
+    record = store.configuration_record()
+    sections = []
+    for section in checklist_module.SECTIONS:
+        plan = section_plan(mode, section)
+        sections.append(
+            {
+                "section": section,
+                "required": plan.required,
+                "postponable": plan.postponable,
+                "status": _section_status(store, section),
+                "actions": list(plan.actions),
+            }
+        )
+    built = checklist_module.build_checklist(mode, configuration=record)
+    return {
+        "state": store.public_state().get("state"),
+        "mode": mode,
+        "sections": sections,
+        "checklist": built["checklist"],
+        "blocking": built["blocking"],
+        "acceptedRisk": built["acceptedRisk"],
+    }
+
+
+__all__ = [
+    "ConfigurationInvalid",
+    "ConfigurationUnavailable",
+    "ConfirmationRequired",
+    "PermissionRefused",
+    "apply_section",
+    "overview",
+    "preview",
+    "read_section",
+    "section_plan",
+    "verify",
+]

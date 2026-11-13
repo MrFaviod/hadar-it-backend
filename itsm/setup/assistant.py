@@ -55,7 +55,18 @@ from itsm.project_context import ProjectContextError, ProjectContextService
 from itsm.setup.store import SetupSettings
 
 TOOL_GET_SETUP_STATUS = "get_setup_status"
+TOOL_GET_SETUP_CHECKLIST = "get_setup_checklist"
 TOOL_SEARCH_PROJECT_DOCS = "search_project_docs"
+TOOL_PROPOSE_CONFIGURATION = "propose_configuration"
+
+#: Every tool the bootstrap assistant may call. These are read-only: a proposal
+#: is a preview, and applying it always needs the human confirmation call.
+ASSISTANT_TOOLS: tuple[str, ...] = (
+    TOOL_GET_SETUP_STATUS,
+    TOOL_GET_SETUP_CHECKLIST,
+    TOOL_SEARCH_PROJECT_DOCS,
+    TOOL_PROPOSE_CONFIGURATION,
+)
 
 PROBE_QUESTION = (
     "Call get_setup_status now and answer with the installation state it returns, in one "
@@ -241,9 +252,11 @@ class BootstrapAssistant:
         tool_calls_limit: int,
         output_tokens: int,
         system_prompt: str,
+        checklist_reader: Callable[[], Mapping[str, Any]] | None = None,
     ) -> None:
         self._model = model
         self._status_reader = status_reader
+        self._checklist_reader = checklist_reader
         self._timeout = timeout
         self._request_limit = request_limit
         self._tool_calls_limit = tool_calls_limit
@@ -257,16 +270,44 @@ class BootstrapAssistant:
             called.append(TOOL_GET_SETUP_STATUS)
             return json.dumps(dict(self._status_reader()), sort_keys=True)[:MAX_TOOL_RESULT]
 
+        def get_setup_checklist() -> str:
+            """Read the pending setup checklist; it never contains a secret."""
+
+            called.append(TOOL_GET_SETUP_CHECKLIST)
+            if self._checklist_reader is not None:
+                payload = dict(self._checklist_reader())
+            else:
+                payload = dict(self._status_reader())
+            return json.dumps(payload, sort_keys=True)[:MAX_TOOL_RESULT]
+
         def search_project_docs(query: str) -> str:
             """Search the bundled product documentation for setup and operations facts."""
 
             called.append(TOOL_SEARCH_PROJECT_DOCS)
             return _search_project_docs(query)
 
+        def propose_configuration(section: str, values: dict[str, object]) -> str:
+            """Preview a configuration change; only the human can apply it."""
+
+            called.append(TOOL_PROPOSE_CONFIGURATION)
+            status = dict(self._status_reader())
+            proposal = preview_proposal(
+                section,
+                dict(values),
+                mode=str(status.get("mode") or "dev"),
+                state=str(status.get("state") or ""),
+            )
+            return json.dumps(proposal, sort_keys=True)[:MAX_TOOL_RESULT]
+
         return Agent(
             self._model,
             output_type=str,
-            tools=[get_setup_status, search_project_docs],
+            tools=[
+                get_setup_status,
+                get_setup_checklist,
+                search_project_docs,
+                propose_configuration,
+            ],
             system_prompt=self._system_prompt,
         )
 
@@ -458,7 +499,29 @@ async def ask_provider(
     return await _with_client(selection, policy, timeout, run)
 
 
+def preview_proposal(
+    section: str,
+    values: Mapping[str, Any],
+    *,
+    mode: str,
+    state: str,
+) -> dict[str, Any]:
+    """Build a read-only proposal envelope for the assistant, never a write."""
+
+    proposed = {str(key): value for key, value in values.items()}
+    return {
+        "section": str(section),
+        "mode": str(mode),
+        "state": str(state),
+        "proposed": proposed,
+        "changes": [{"field": key, "from": None, "to": value} for key, value in proposed.items()],
+        "preview_only": True,
+        "requires_human_confirmation": True,
+    }
+
+
 __all__ = [
+    "ASSISTANT_TOOLS",
     "DIAGNOSTIC_AUTH_FAILED",
     "DIAGNOSTIC_CREDENTIAL_KEY_MISSING",
     "DIAGNOSTIC_CREDENTIAL_MISSING",
@@ -466,7 +529,9 @@ __all__ = [
     "DIAGNOSTIC_MODEL_WITHOUT_TOOLS",
     "DIAGNOSTIC_PROVIDER_UNREACHABLE",
     "DIAGNOSTIC_TOOL_NOT_CALLED",
+    "TOOL_GET_SETUP_CHECKLIST",
     "TOOL_GET_SETUP_STATUS",
+    "TOOL_PROPOSE_CONFIGURATION",
     "TOOL_SEARCH_PROJECT_DOCS",
     "AssistantAnswer",
     "AssistantError",
@@ -477,6 +542,7 @@ __all__ = [
     "endpoint_policy",
     "key_fingerprint",
     "normalize_endpoint",
+    "preview_proposal",
     "probe_provider",
     "provider_host",
     "provider_settings",
