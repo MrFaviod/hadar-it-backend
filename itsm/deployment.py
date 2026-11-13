@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import json
+import logging
 import os
 import secrets
 import time
@@ -17,6 +18,7 @@ from itsm.config import get_settings
 from itsm.database import create_engine_from_settings
 from itsm.devtools.database import migrate_to_head
 from itsm.identity.models import Identity
+from itsm.logging import log_event
 from itsm.ops import service, upgrade
 from itsm.ops.engines import OpsError
 from itsm.release_identity import (
@@ -24,6 +26,8 @@ from itsm.release_identity import (
     enforce_startup,
 )
 from itsm.release_mode import read_release_mode
+
+logger = logging.getLogger(__name__)
 
 
 def prepare() -> dict:
@@ -38,11 +42,21 @@ def prepare() -> dict:
             from itsm.devtools.operations import initialize
 
             password = os.environ.get("ITSM_DEV_ADMIN_PASSWORD", "")
-            if not password:
-                raise DeploymentIdentityError(
-                    "ITSM_DEV_ADMIN_PASSWORD is required for dev preparation"
+            if password:
+                initialize(settings, "dev.admin", password, password_source="environment")
+            else:
+                # No seed password: migrate and claim the empty database only. The
+                # instance stays ownerless so the setup wizard can create its owner.
+                migrate_to_head(settings)
+                log_event(
+                    logger,
+                    "deployment.dev.ownerless_setup_wizard",
+                    level=logging.WARNING,
+                    hint=(
+                        "instance is unclaimed; finish onboarding in the setup wizard "
+                        "(set ITSM_DEV_ADMIN_PASSWORD only for headless seeding)"
+                    ),
                 )
-            initialize(settings, "dev.admin", password, password_source="environment")
         else:
             tables = inspect(engine).get_table_names()
             if tables:

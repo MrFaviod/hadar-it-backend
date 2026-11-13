@@ -8,7 +8,7 @@ import sys
 import pytest
 
 
-def prepare(tmp_path, mode):
+def prepare(tmp_path, mode, *, password: str | None = "test-only-administrator-password"):
     root = tmp_path / mode
     root.mkdir(exist_ok=True)
     env = {k: v for k, v in os.environ.items() if not k.startswith("ITSM_")}
@@ -18,10 +18,11 @@ def prepare(tmp_path, mode):
         ITSM_TASK_SQLITE_PATH=str(root / "tasks.db"),
         ITSM_ATTACHMENT_STORAGE_PATH=str(root / "attachments"),
         ITSM_DEMO_DATA_DIRECTORY=str(root),
-        ITSM_DEV_ADMIN_PASSWORD="test-only-administrator-password",
         ITSM_OPS_BACKUP_ROOT=str(root / "backups"),
         ITSM_ENVIRONMENT="test",
     )
+    if password is not None:
+        env["ITSM_DEV_ADMIN_PASSWORD"] = password
     return subprocess.run(
         [sys.executable, "-m", "itsm.deployment", "prepare"],
         env=env,
@@ -48,6 +49,19 @@ def test_prepare_initializes_only_mode_owned_data_and_is_repeatable(tmp_path, mo
     assert again.returncode == 0, (again.stdout, again.stderr)
     with sqlite3.connect(root / "app.db") as db:
         assert db.execute("SELECT count(*) FROM identity_identities").fetchone()[0] == count
+
+
+def test_prepare_dev_without_a_seed_password_leaves_the_instance_ownerless(tmp_path):
+    import sqlite3
+
+    result, root = prepare(tmp_path, "dev", password=None)
+    assert result.returncode == 0, (result.stdout, result.stderr)
+    payload = json.loads(result.stdout.splitlines()[-1])
+    assert payload == {"status": "ready", "mode": "dev"}
+    assert "ownerless_setup_wizard" in result.stderr
+    with sqlite3.connect(root / "app.db") as db:
+        assert db.execute("SELECT release_mode FROM deployment_identity").fetchone()[0] == "dev"
+        assert db.execute("SELECT count(*) FROM identity_identities").fetchone()[0] == 0
 
 
 def test_scheduled_backup_is_verified_before_retention(tmp_path, monkeypatch):
