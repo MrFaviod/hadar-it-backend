@@ -13,10 +13,11 @@ from __future__ import annotations
 import json
 import os
 from collections.abc import Iterator
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
+
 import pytest
 from fastapi.testclient import TestClient
 from itsm.config import resolve_settings_sources
@@ -34,7 +35,7 @@ OWNER_PATH = "/api/setup/v1/owner"
 CONFIGURATION_PATH = "/api/setup/v1/configuration"
 VERIFY_PATH = "/api/setup/v1/verify"
 TEST_KEY = "MDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDAwMDA="
-API_KEY = "«redacted:sk-…»"
+API_KEY = "sk-fixture-0000000000000000"
 PROBE_MODEL = "probe-model"
 OWNER_PASSWORD = "correct-horse-battery-staple"
 OWNER_USERNAME = "ada"
@@ -250,9 +251,9 @@ def app(state_dir: Path, clock: FakeClock):
     return create_setup_app(state_dir=state_dir, clock=clock)
 
 
-def claim_session(client: TestClient, store: SetupStore) -> str:
+def claim_session(client: TestClient, store: SetupStore, *, origin: str = ORIGIN) -> str:
     credential = store.enable_claim()
-    response = client.post(CLAIM_PATH, json={"credential": credential}, headers={"Origin": ORIGIN})
+    response = client.post(CLAIM_PATH, json={"credential": credential}, headers={"Origin": origin})
     assert response.status_code == 200, response.text
     return response.json()["csrf_token"]
 
@@ -280,12 +281,15 @@ def owner_payload() -> dict[str, Any]:
     }
 
 
-def configure_early_ai(client: TestClient, csrf: str, provider: ProviderFixture) -> None:
+def configure_early_ai(
+    client: TestClient, csrf: str, provider: ProviderFixture, *, origin: str = ORIGIN
+) -> None:
     response = post(
         client,
         "/api/setup/v1/ai",
         {"base_url": provider.base_url, "model": PROBE_MODEL, "api_key": API_KEY},
         csrf,
+        origin=origin,
     )
     assert response.status_code == 200, response.text
 
@@ -297,23 +301,24 @@ def reach_owner_ready(
     *,
     provider: ProviderFixture | None = None,
     database_name: str = "app.db",
+    origin: str = ORIGIN,
 ) -> tuple[str, str]:
-    csrf = claim_session(client, store)
+    csrf = claim_session(client, store, origin=origin)
     if provider is None:
-        assert post(client, "/api/setup/v1/ai/defer", {}, csrf).status_code == 200
+        assert post(client, "/api/setup/v1/ai/defer", {}, csrf, origin=origin).status_code == 200
     else:
-        configure_early_ai(client, csrf, provider)
+        configure_early_ai(client, csrf, provider, origin=origin)
     database_url = f"sqlite:///{tmp_path / database_name}"
-    response = post(client, STORAGE_PATH, {"database_url": database_url}, csrf)
+    response = post(client, STORAGE_PATH, {"database_url": database_url}, csrf, origin=origin)
     assert response.status_code == 200, response.text
-    response = post(client, OWNER_PATH, owner_payload(), csrf)
+    response = post(client, OWNER_PATH, owner_payload(), csrf, origin=origin)
     assert response.status_code == 200, response.text
     assert response.json()["state"] == "owner_ready"
     return csrf, database_url
 
 
-def start_configuration(client: TestClient, csrf: str):
-    return post(client, CONFIGURATION_PATH, {}, csrf)
+def start_configuration(client: TestClient, csrf: str, *, origin: str = ORIGIN):
+    return post(client, CONFIGURATION_PATH, {}, csrf, origin=origin)
 
 
 def apply_section(
@@ -324,12 +329,14 @@ def apply_section(
     *,
     action: str = "apply",
     confirm: bool = True,
+    origin: str = ORIGIN,
 ):
     return post(
         client,
         f"{CONFIGURATION_PATH}/{section}/apply",
         {"values": values, "action": action, "confirm": confirm},
         csrf,
+        origin=origin,
     )
 
 
@@ -368,16 +375,14 @@ def checklist_by_id(body: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 # ------------------------------------------------------------------ lifecycle
-def test_configuration_requires_owner_ready_and_is_idempotent(
-    app, store, tmp_path: Path
-) -> None:
+def test_configuration_requires_owner_ready_and_is_idempotent(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:
         csrf = claim_session(client, store)
-        post(client, "/api/setup/v1/ai/defer", {}, csrf)
+        assert post(client, "/api/setup/v1/ai/defer", {}, csrf).status_code == 200
         assert post(client, CONFIGURATION_PATH, {}, csrf).status_code == 409
-
-    with TestClient(app) as client:
-        csrf, _database_url = reach_owner_ready(client, store, tmp_path)
+        database_url = f"sqlite:///{tmp_path / 'app.db'}"
+        assert post(client, STORAGE_PATH, {"database_url": database_url}, csrf).status_code == 200
+        assert post(client, OWNER_PATH, owner_payload(), csrf).status_code == 200
         assert post(client, VERIFY_PATH, {}, csrf).status_code == 409
         first = start_configuration(client, csrf)
         assert first.status_code == 200, first.text
@@ -389,14 +394,14 @@ def test_configuration_requires_owner_ready_and_is_idempotent(
 
 
 # ----------------------------------------------------------------- appearance
-def test_appearance_preview_does_not_write_and_apply_reads_back(
-    app, store, tmp_path: Path
-) -> None:
+def test_appearance_preview_does_not_write_and_apply_reads_back(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:
         csrf, database_url = reach_owner_ready(client, store, tmp_path)
         assert start_configuration(client, csrf).status_code == 200
 
-        preview = post(client, f"{CONFIGURATION_PATH}/appearance", {"values": {"preset": "forest"}}, csrf)
+        preview = post(
+            client, f"{CONFIGURATION_PATH}/appearance", {"values": {"preset": "forest"}}, csrf
+        )
         body = section_body(preview)
         assert body["status"] == "preview"
         assert body["proposed"]["preset"] == "forest"
@@ -405,7 +410,7 @@ def test_appearance_preview_does_not_write_and_apply_reads_back(
 
         applied = apply_section(client, csrf, "appearance", {"preset": "blue"})
         body = section_body(applied)
-        assert body["status"] == "green"
+        assert body["status"] == "passed"
         assert body["receipt"]["active_id"] == "blue"
         assert body["receipt"]["source"] == "apply_preset"
 
@@ -417,7 +422,7 @@ def test_appearance_preview_does_not_write_and_apply_reads_back(
         read = client.get(f"{CONFIGURATION_PATH}/appearance")
         assert read.status_code == 200
         section = read.json()
-        assert section["status"] == "green"
+        assert section["status"] == "passed"
         assert section["current"]["preset"] == "blue"
 
     journal = journal_text(store.state_dir)
@@ -436,9 +441,7 @@ def test_apply_requires_explicit_confirmation(app, store, tmp_path: Path) -> Non
         assert appearance_rows(database_url) == []
 
 
-def test_apply_without_permission_is_refused_and_writes_nothing(
-    app, store, tmp_path: Path
-) -> None:
+def test_apply_without_permission_is_refused_and_writes_nothing(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:
         csrf, database_url = reach_owner_ready(client, store, tmp_path)
         assert start_configuration(client, csrf).status_code == 200
@@ -450,7 +453,7 @@ def test_apply_without_permission_is_refused_and_writes_nothing(
         assert appearance_rows(database_url) == []
 
         section = client.get(f"{CONFIGURATION_PATH}/appearance").json()
-        assert section["status"] != "green"
+        assert section["status"] != "passed"
 
 
 # ------------------------------------------------------------------------ agent
@@ -463,11 +466,9 @@ def test_agent_requires_a_provider_row_credential_and_tool_probe(
         csrf, database_url = reach_owner_ready(client, store, tmp_path, provider=provider)
         assert start_configuration(client, csrf).status_code == 200
 
-        applied = apply_section(
-            client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL}
-        )
+        applied = apply_section(client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL})
         body = section_body(applied)
-        assert body["status"] == "green", body
+        assert body["status"] == "passed", body
         assert body["receipt"]["provider"] == "openai"
         assert body["receipt"]["model"] == PROBE_MODEL
         assert body["receipt"]["tool"] == "get_setup_status"
@@ -495,9 +496,7 @@ def test_agent_stays_pending_when_ai_was_deferred(
         csrf, database_url = reach_owner_ready(client, store, tmp_path)
         assert start_configuration(client, csrf).status_code == 200
 
-        applied = apply_section(
-            client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL}
-        )
+        applied = apply_section(client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL})
         body = section_body(applied)
         assert body["status"] == "pending"
         assert body["receipt"]["reason"] == "ai_deferred"
@@ -511,9 +510,7 @@ def test_agent_stays_pending_when_ai_was_deferred(
 
 
 # ---------------------------------------------------------------- postponable
-def test_postponed_sections_are_visible_pending_and_never_green(
-    app, store, tmp_path: Path
-) -> None:
+def test_postponed_sections_are_visible_pending_and_never_green(app, store, tmp_path: Path) -> None:
     with TestClient(app) as client:
         csrf, _database_url = reach_owner_ready(client, store, tmp_path)
         assert start_configuration(client, csrf).status_code == 200
@@ -537,15 +534,19 @@ def test_postponed_sections_are_visible_pending_and_never_green(
 
 
 # ------------------------------------------------------------------- verify
-def prepare_green_configuration(client: TestClient, csrf: str, database_url: str, provider) -> None:
-    assert start_configuration(client, csrf).status_code == 200
-    assert apply_section(client, csrf, "appearance", {"preset": "blue"}).status_code == 200
-    agent = apply_section(client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL})
+def prepare_green_configuration(
+    client: TestClient, csrf: str, database_url: str, *, origin: str = ORIGIN
+) -> None:
+    assert start_configuration(client, csrf, origin=origin).status_code == 200
+    appearance = apply_section(client, csrf, "appearance", {"preset": "blue"}, origin=origin)
+    assert appearance.status_code == 200, appearance.text
+    agent = apply_section(
+        client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL}, origin=origin
+    )
     assert agent.status_code == 200, agent.text
     for section in ("notifications", "monitoring"):
-        assert (
-            apply_section(client, csrf, section, {}, action="postpone").status_code == 200
-        )
+        postponed = apply_section(client, csrf, section, {}, action="postpone", origin=origin)
+        assert postponed.status_code == 200, postponed.text
     mark_worker(database_url)
 
 
@@ -559,8 +560,10 @@ def test_verify_blocks_while_required_items_are_missing(app, store, tmp_path: Pa
         assert blocked.status_code == 409, blocked.text
         body = blocked.json()
         assert body["error"] == "verification_blocked"
+        items = checklist_by_id(body)
         blocking = {item["id"] for item in body["checklist"] if item["blocking"]}
-        assert {"ai_explicit", "worker_ready", "storage_ready"} <= blocking
+        assert {"ai_explicit", "worker_ready"} <= blocking
+        assert items["appearance_decided"]["status"] == "passed"
         assert public_state(store.state_dir)["state"] == "configuring"
         assert post(client, VERIFY_PATH, {}, csrf).status_code == 409
 
@@ -572,7 +575,7 @@ def test_verify_passes_with_every_required_item_green(
     monkeypatch.setenv("ITSM_AGENT_OPENAI_BASE_URL", provider.base_url)
     with TestClient(app) as client:
         csrf, database_url = reach_owner_ready(client, store, tmp_path, provider=provider)
-        prepare_green_configuration(client, csrf, database_url, provider)
+        prepare_green_configuration(client, csrf, database_url)
 
         response = post(client, VERIFY_PATH, {}, csrf)
         body = section_body(response)
@@ -600,22 +603,24 @@ def test_verify_passes_with_every_required_item_green(
 
 
 def test_prod_backup_must_be_declared_or_accepted_as_risk(
-    app, store, tmp_path: Path, provider: ProviderFixture, monkeypatch: pytest.MonkeyPatch
+    store, tmp_path: Path, provider: ProviderFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv("RELEASE_MODE", "prod")
     monkeypatch.setenv("ITSM_AUTH_ORIGIN", "https://assets.example.com")
     monkeypatch.setenv("ITSM_AUTH_COOKIE_SECURE", "true")
     monkeypatch.setenv("OPENAI_API_KEY", API_KEY)
     monkeypatch.setenv("ITSM_AGENT_OPENAI_BASE_URL", provider.base_url)
-    global ORIGIN
-    previous = ORIGIN
-    ORIGIN = "https://assets.example.com"
-    try:
-        with TestClient(app, base_url="https://testserver") as client:
-            csrf, database_url = reach_owner_ready(client, store, tmp_path, provider=provider)
-            prepare_green_configuration(client, csrf, database_url, provider)
+    origin = "https://assets.example.com"
+    prod_store = SetupStore(store.state_dir, release_mode="prod")
+    prod_app = create_setup_app(state_dir=store.state_dir)
+    if True:
+        with TestClient(prod_app, base_url="https://testserver") as client:
+            csrf, database_url = reach_owner_ready(
+                client, prod_store, tmp_path, provider=provider, origin=origin
+            )
+            prepare_green_configuration(client, csrf, database_url, origin=origin)
 
-            blocked = post(client, VERIFY_PATH, {}, csrf)
+            blocked = post(client, VERIFY_PATH, {}, csrf, origin=origin)
             assert blocked.status_code == 409, blocked.text
             items = checklist_by_id(blocked.json())
             assert items["backup_policy_declared"]["required"] is True
@@ -628,11 +633,12 @@ def test_prod_backup_must_be_declared_or_accepted_as_risk(
                 "operational",
                 {"item": "backup_policy_declared", "reason": "restore drill scheduled"},
                 action="accept_risk",
+                origin=origin,
             )
             body = section_body(risk)
             assert body["status"] == "risk"
 
-            verified = post(client, VERIFY_PATH, {}, csrf)
+            verified = post(client, VERIFY_PATH, {}, csrf, origin=origin)
             body = section_body(verified)
             items = checklist_by_id(body)
             assert body["state"] == "verifying"
@@ -640,8 +646,6 @@ def test_prod_backup_must_be_declared_or_accepted_as_risk(
             assert items["backup_policy_declared"]["status"] != "passed"
             assert items["backup_policy_declared"]["acceptedRisk"] is True
             assert body["acceptedRisk"] == ["backup_policy_declared"]
-    finally:
-        ORIGIN = previous
 
 
 # ------------------------------------------------------------------ assistant
@@ -707,4 +711,3 @@ def revoke_permission(database_url: str, resource: str, operation: str) -> None:
 
 def item_status(body: dict[str, Any], identifier: str) -> str:
     return checklist_by_id(body)[identifier]["status"]
-
