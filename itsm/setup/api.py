@@ -291,6 +291,18 @@ def create_setup_router() -> APIRouter:
         )
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
 
+    @router.post("/session/logout")
+    def logout(
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        get_store(request).end_session(request.cookies.get(COOKIE_NAME))
+        response = JSONResponse({"status": "signed_out"}, headers=NO_STORE)
+        _clear_session_cookie(response, settings)
+        return response
+
     @router.post("/ai")
     async def configure_ai(
         payload: AiConfigureRequest,

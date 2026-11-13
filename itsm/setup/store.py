@@ -749,11 +749,13 @@ class SetupStore:
     # --------------------------------------------------------------- sessions
     def _new_session(self, private: dict[str, Any], *, recovered: bool) -> SessionGrant:
         now = self._clock()
-        sessions = {
-            digest: record
-            for digest, record in private["sessions"].items()
-            if isinstance(record, dict) and _parse_iso(record["expires_at"]) > _as_utc(now)
-        }
+        sessions: dict[str, Any] = {}
+        if not recovered:
+            sessions = {
+                digest: record
+                for digest, record in private["sessions"].items()
+                if isinstance(record, dict) and _parse_iso(record["expires_at"]) > _as_utc(now)
+            }
         token = secrets.token_urlsafe(32)
         csrf_token = secrets.token_urlsafe(32)
         sessions[hash_token(token)] = {
@@ -776,15 +778,62 @@ class SetupStore:
             return None
         private = self._read_private()
         record = private["sessions"].get(hash_token(token))
-        if not isinstance(record, dict):
-            return None
-        try:
-            expires_at = _parse_iso(record["expires_at"])
-        except KeyError, TypeError, ValueError:
-            return None
-        if expires_at <= _as_utc(self._clock()):
-            return None
-        return record
+        if isinstance(record, dict):
+            try:
+                expires_at = _parse_iso(record["expires_at"])
+            except KeyError, TypeError, ValueError:
+                expires_at = None
+            if expires_at is not None and expires_at > _as_utc(self._clock()):
+                return record
+        if private["sessions"]:
+            self._prune_sessions()
+        return None
+
+    def _prune_sessions(self) -> None:
+        """Delete expired or malformed session rows instead of keeping them."""
+
+        with self._locked():
+            private = self._read_private()
+            now = _as_utc(self._clock())
+            sessions: dict[str, Any] = {}
+            for digest, record in private["sessions"].items():
+                if not isinstance(record, dict):
+                    continue
+                try:
+                    expires_at = _parse_iso(record["expires_at"])
+                except KeyError, TypeError, ValueError:
+                    continue
+                if expires_at > now:
+                    sessions[digest] = record
+            removed = len(private["sessions"]) - len(sessions)
+            if removed <= 0:
+                return
+            private["sessions"] = sessions
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="prune-sessions",
+                receipt={"state": private["state"], "removed": removed},
+            )
+
+    def end_session(self, token: str | None) -> bool:
+        """Delete the hashed row for a raw cookie token; True when it existed."""
+
+        if not token:
+            return False
+        with self._locked():
+            private = self._read_private()
+            digest = hash_token(token)
+            if not isinstance(private["sessions"].get(digest), dict):
+                return False
+            del private["sessions"][digest]
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="logout",
+                receipt={"state": private["state"], "signed_out": True},
+            )
+            return True
 
     # ---------------------------------------------------------------------- ai
     def ai_private_record(self) -> dict[str, Any] | None:

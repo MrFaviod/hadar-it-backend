@@ -35,6 +35,7 @@ COOKIE_NAME = "itsm_setup_session"
 STATUS_PATH = "/api/setup/v1/status"
 CLAIM_PATH = "/api/setup/v1/claim"
 SESSION_PATH = "/api/setup/v1/session"
+LOGOUT_PATH = "/api/setup/v1/session/logout"
 
 
 class FakeClock:
@@ -543,6 +544,70 @@ def test_restart_keeps_state_and_session(store, state_dir, clock) -> None:
         assert client.get(STATUS_PATH).json()["state"] == "claimed"
     secrets_file = (state_dir / "secrets.json").read_text(encoding="utf-8")
     assert token not in secrets_file
+
+
+def test_logout_ends_the_session_and_clears_the_cookie(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        claimed = claim(client, credential)
+        assert claimed.status_code == 200
+        csrf = claimed.json()["csrf_token"]
+        token = client.cookies.get(COOKIE_NAME)
+        assert token
+
+        assert client.post(LOGOUT_PATH).status_code == 403
+        wrong_csrf = client.post(LOGOUT_PATH, headers={"Origin": ORIGIN, "X-CSRF-Token": "no"})
+        assert wrong_csrf.status_code == 403
+        assert wrong_csrf.json() == {"error": "csrf_invalid"}
+
+        response = client.post(LOGOUT_PATH, headers={"Origin": ORIGIN, "X-CSRF-Token": csrf})
+        assert response.status_code == 200
+        assert response.json() == {"status": "signed_out"}
+        cookie = response.headers["set-cookie"].lower()
+        assert f"{COOKIE_NAME}=" in cookie
+        assert "max-age=0" in cookie
+        assert client.get(SESSION_PATH).status_code == 401
+
+    assert token
+    with TestClient(build_app(state_dir, clock), cookies={COOKIE_NAME: token}) as stale:
+        assert stale.get(SESSION_PATH).status_code == 401
+    private = json.loads((state_dir / "secrets.json").read_text(encoding="utf-8"))
+    assert private["sessions"] == {}
+
+
+def test_recovery_drops_the_sessions_of_the_previous_owner(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as first:
+        assert claim(first, credential).status_code == 200
+        first_token = first.cookies.get(COOKIE_NAME)
+        recovery = store.issue_recovery()
+        with TestClient(app) as second:
+            assert claim(second, recovery).status_code == 200
+            assert second.get(SESSION_PATH).status_code == 200
+    assert first_token
+    with TestClient(app, cookies={COOKIE_NAME: first_token}) as stale:
+        assert stale.get(SESSION_PATH).status_code == 401
+
+
+def test_expired_sessions_are_pruned_when_the_table_is_read(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    with TestClient(build_app(state_dir, clock)) as client:
+        assert claim(client, credential).status_code == 200
+        token = client.cookies.get(COOKIE_NAME)
+    assert token
+    clock.advance(minutes=SESSION_TTL_MINUTES + 1)
+    with TestClient(build_app(state_dir, clock), cookies={COOKIE_NAME: token}) as client:
+        assert client.get(SESSION_PATH).status_code == 401
+    private = json.loads((state_dir / "secrets.json").read_text(encoding="utf-8"))
+    assert private["sessions"] == {}
 
 
 # ------------------------------------------------------------------ persistence
