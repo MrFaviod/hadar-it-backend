@@ -359,6 +359,47 @@ def test_recovery_reauthorizes_without_resetting_state_or_instance(
         assert claim(client, recovery).status_code == 409
 
 
+def test_a_wrong_recovery_credential_is_reported_as_invalid(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        assert claim(client, credential).status_code == 200
+        recovery = store.issue_recovery()
+        wrong = claim(client, "not-the-recovery-credential")
+        assert wrong.status_code == 401
+        assert wrong.json() == {"error": "claim_invalid"}
+        assert "set-cookie" not in {name.lower() for name in wrong.headers}
+        private = json.loads((state_dir / "secrets.json").read_text(encoding="utf-8"))
+        assert private["attempts"] == 1
+        assert claim(client, recovery).status_code == 200
+        # With no recovery credential left there is nothing to present but the
+        # installation is still owned, so the answer is already_claimed.
+        assert claim(client, "anything").status_code == 409
+
+
+def test_a_recovery_lockout_surfaces_as_429(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    app = build_app(state_dir, clock)
+    with TestClient(app) as client:
+        assert claim(client, credential).status_code == 200
+        recovery = store.issue_recovery()
+        for _ in range(4):
+            assert claim(client, "not-the-recovery-credential").status_code == 401
+        fifth = claim(client, "not-the-recovery-credential")
+        assert fifth.status_code == 401
+        assert fifth.json() == {"error": "claim_invalid"}
+        locked = claim(client, recovery)
+        assert locked.status_code == 429
+        assert locked.json() == {"error": "claim_locked"}
+
+    with TestClient(build_app(state_dir, clock)) as client:
+        assert claim(client, recovery).status_code == 429
+
+
 def snapshot_bootstrap_files(state_dir: Path, target: Path) -> Path:
     """Copy the restorable pair exactly as a volume snapshot would."""
 

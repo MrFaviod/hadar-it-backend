@@ -707,6 +707,7 @@ class SetupStore:
                         )
                         return grant
                     self._record_failure(private, action="recover-denied")
+                    raise InvalidCredential("the claim credential is not valid")
                 raise AlreadyClaimed("this installation already has a setup owner")
             if state != "unclaimed":
                 raise AlreadyClaimed("this installation already has a setup owner")
