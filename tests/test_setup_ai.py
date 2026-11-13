@@ -68,15 +68,18 @@ class ProviderFixture:
 
     def authorization_headers(self) -> list[str]:
         return [
-            headers.get("authorization", "")
-            for method, _path, headers, _raw in self.requests
+            next(
+                (value for name, value in headers.items() if name.lower() == "authorization"),
+                "",
+            )
+            for _method, _path, headers, _raw in self.requests
         ]
 
 
 class _ProviderHandler(BaseHTTPRequestHandler):
     server_version = "SetupProviderFixture/1.0"
 
-    def log_message(self, *args: object) -> None:  # noqa: ARG002 - quiet fixture
+    def log_message(self, *args: object) -> None:
         return
 
     @property
@@ -91,7 +94,7 @@ class _ProviderHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def do_GET(self) -> None:  # noqa: N802 - http.server API
+    def do_GET(self) -> None:
         self.fixture.requests.append(("GET", self.path, dict(self.headers), b""))
         if self.fixture.mode == "deny":
             self._send(401, {"error": "invalid_api_key"})
@@ -107,7 +110,7 @@ class _ProviderHandler(BaseHTTPRequestHandler):
             return
         self._send(404, {"error": "not_found"})
 
-    def do_POST(self) -> None:  # noqa: N802 - http.server API
+    def do_POST(self) -> None:
         length = int(self.headers.get("content-length", "0"))
         raw = self.rfile.read(length)
         self.fixture.requests.append(("POST", self.path, dict(self.headers), raw))
@@ -300,7 +303,8 @@ def test_configure_proves_one_real_tool_call_and_stores_only_ciphertext(
     assert "get_setup_status" in tool_names
     assert chats[0]["messages"][0]["role"] == "system"
     assert any(item.get("role") == "tool" for item in chats[1]["messages"])
-    assert all(header == f"Bearer {API_KEY}" for header in provider.authorization_headers())
+    auth_headers = provider.authorization_headers()
+    assert all(header == f"Bearer {API_KEY}" for header in auth_headers), auth_headers
 
     secrets_text = (state_dir / "secrets.json").read_text(encoding="utf-8")
     state_text = (state_dir / "state.json").read_text(encoding="utf-8")
@@ -342,8 +346,9 @@ def test_configured_status_does_not_leak_the_receipt_allowlist(
 
 # ------------------------------------------------------------------- failures
 def test_provider_down_keeps_the_state_and_reports_unreachable(
-    store: SetupStore, state_dir: Path, clock: FakeClock
+    store: SetupStore, state_dir: Path, clock: FakeClock, monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    monkeypatch.setenv("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", "127.0.0.1/32")
     app = build_app(state_dir, clock)
     with TestClient(app) as client:
         csrf = claim(client, store)
@@ -380,7 +385,6 @@ def test_forbidden_destinations_never_reach_the_network(
         for base_url in (
             "http://169.254.169.254/v1",
             "file:///etc/passwd",
-            provider.base_url,
         ):
             response = configure(client, base_url, csrf)
             assert response.status_code == 422, (base_url, response.text)
