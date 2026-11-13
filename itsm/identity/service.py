@@ -1301,7 +1301,14 @@ class IdentityService:
         return revoked
 
     # ------------------------------------------------------------- bootstrap
-    def bootstrap_superadmin(self, username: str, name: str, password: str) -> UserView:
+    def bootstrap_superadmin(
+        self,
+        username: str,
+        name: str,
+        password: str,
+        *,
+        email: str | None = None,
+    ) -> UserView:
         """Installation-only creation of the first human installation owner.
 
         The reserved owner role row is write-locked first so concurrent
@@ -1327,7 +1334,7 @@ class IdentityService:
             id=str(uuid4()),
             username=normalized,
             name=display_name,
-            email=None,
+            email=self._normalize_email(email),
             actor_kind=HUMAN_ACTOR_KIND,
             person_id=None,
             active=True,
