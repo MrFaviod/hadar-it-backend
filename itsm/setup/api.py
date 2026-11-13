@@ -83,6 +83,7 @@ from itsm.setup.store import (
 )
 
 SETUP_PREFIX = "/api/setup/v1"
+CONFIGURATION_PATH = f"{SETUP_PREFIX}/configuration"
 COOKIE_NAME = "itsm_setup_session"
 ORIGIN_HEADER = "Origin"
 CSRF_HEADER = "X-CSRF-Token"
@@ -582,9 +583,15 @@ def create_setup_router() -> APIRouter:
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
 
     @router.get("/configuration")
-    def configuration_overview(request: Request) -> JSONResponse:
+    def configuration_overview(
+        request: Request,
+        session: dict[str, Any] = Depends(current_session),
+    ) -> JSONResponse:
+        _ = session
         settings: SetupSettings = request.app.state.setup_settings
         store = get_store(request)
+        if request.app.state.installation_gate.current().complete:
+            return _error_response(409, "setup_complete")
         if store.public_state()["state"] not in {"configuring", "verifying", "complete"}:
             return _error_response(409, "state_refused")
         from itsm.setup import configuration
@@ -593,9 +600,16 @@ def create_setup_router() -> APIRouter:
         return JSONResponse(ConfigurationOverview(**body).model_dump(mode="json"), headers=NO_STORE)
 
     @router.get("/configuration/{section}")
-    def read_configuration_section(section: str, request: Request) -> JSONResponse:
+    def read_configuration_section(
+        section: str,
+        request: Request,
+        session: dict[str, Any] = Depends(current_session),
+    ) -> JSONResponse:
+        _ = session
         settings: SetupSettings = request.app.state.setup_settings
         store = get_store(request)
+        if request.app.state.installation_gate.current().complete:
+            return _error_response(409, "setup_complete")
         if store.public_state()["state"] not in {"configuring", "verifying", "complete"}:
             return _error_response(409, "state_refused")
         from itsm.setup import configuration
@@ -701,10 +715,19 @@ def create_setup_app(
 
     @app.middleware("http")
     async def refuse_after_completion(request: Request, call_next):
-        """Once complete, every non-GET setup call answers 409 setup_complete."""
+        """Once complete, setup answers 409 instead of writing or leaking config.
 
-        if request.method not in {"GET", "HEAD", "OPTIONS"} and request.url.path.startswith(
-            SETUP_PREFIX
+        Mutations are refused until now; the configuration reads are included
+        because they return the live domain values (notification channels,
+        monitoring profiles) and must not outlive the wizard.
+        """
+
+        path = request.url.path.rstrip("/")
+        leaks_configuration = path == CONFIGURATION_PATH or path.startswith(
+            f"{CONFIGURATION_PATH}/"
+        )
+        if path.startswith(SETUP_PREFIX) and (
+            request.method not in {"GET", "HEAD", "OPTIONS"} or leaks_configuration
         ):
             installation = await run_in_threadpool(app.state.installation_gate.current)
             if installation.complete:
