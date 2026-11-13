@@ -8,15 +8,25 @@ container environment or a secret manager.
 from __future__ import annotations
 
 import ipaddress
+import json
 import os
 import re
+import stat
+from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import urlsplit
 
 from cryptography.fernet import Fernet
-from pydantic import Field, SecretStr, ValidationInfo, field_validator, model_validator
+from pydantic import (
+    Field,
+    SecretStr,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from sqlalchemy.engine import URL, make_url
 from sqlalchemy.exc import ArgumentError
@@ -749,9 +759,215 @@ def _url_password(raw: str) -> str | None:
     return url.password
 
 
+INSTALLATION_CONFIG_ENV = "ITSM_INSTALLATION_CONFIG"
+
+
+class InstallationConfigError(RuntimeError):
+    """An installation settings file is unsafe or invalid; messages carry no values."""
+
+
+@dataclass(frozen=True)
+class SettingsSourceSpec:
+    """One row of the onboarding contract's settings table."""
+
+    key: str
+    env: str
+    owner: Literal["installation", "env", "domain_service"]
+    secret: bool = False
+
+
+SETTINGS_SOURCES: tuple[SettingsSourceSpec, ...] = (
+    SettingsSourceSpec("database_url", "ITSM_DATABASE_URL", "installation", secret=True),
+    SettingsSourceSpec("auth_origin", "ITSM_AUTH_ORIGIN", "installation"),
+    SettingsSourceSpec("auth_cookie_secure", "ITSM_AUTH_COOKIE_SECURE", "installation"),
+    SettingsSourceSpec("auth_cookie_name", "ITSM_AUTH_COOKIE_NAME", "installation"),
+    SettingsSourceSpec(
+        "auth_session_minutes_default", "ITSM_AUTH_SESSION_MINUTES_DEFAULT", "installation"
+    ),
+    SettingsSourceSpec("task_storage", "ITSM_TASK_STORAGE", "installation"),
+    SettingsSourceSpec("agent_model", "ITSM_AGENT_MODEL", "installation"),
+    SettingsSourceSpec("ai_credential_keys", "ITSM_AI_CREDENTIAL_KEYS", "env", secret=True),
+    SettingsSourceSpec("dev_admin_password", "ITSM_DEV_ADMIN_PASSWORD", "env", secret=True),
+    SettingsSourceSpec("release_mode", "RELEASE_MODE", "env"),
+    SettingsSourceSpec("monitoring_public_url", "ITSM_MONITORING_PUBLIC_URL", "env"),
+    SettingsSourceSpec(
+        "appearance_default_theme", "ITSM_APPEARANCE_DEFAULT_THEME", "domain_service"
+    ),
+    SettingsSourceSpec("smtp_host", "ITSM_SMTP_HOST", "domain_service"),
+    SettingsSourceSpec("backup_policy", "ITSM_BACKUP_POLICY", "domain_service"),
+)
+
+
+def installation_config_path(environ: Mapping[str, str] | None = None) -> Path | None:
+    """Return the absolute installation file named by the environment, if any."""
+    source = os.environ if environ is None else environ
+    raw = source.get(INSTALLATION_CONFIG_ENV)
+    if raw is None or raw == "":
+        return None
+    path = Path(raw)
+    if not path.is_absolute():
+        raise InstallationConfigError(f"{INSTALLATION_CONFIG_ENV} must be an absolute path")
+    return path
+
+
+def _read_installation_payload(path: Path) -> Any:
+    """Read one JSON document from a private regular file; ``None`` when absent."""
+    try:
+        link_info = path.lstat()
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise InstallationConfigError(
+            f"installation settings file cannot be inspected: {path}"
+        ) from None
+    if stat.S_ISLNK(link_info.st_mode):
+        raise InstallationConfigError(
+            f"installation settings file must not be a symbolic link: {path}"
+        )
+    if not stat.S_ISREG(link_info.st_mode):
+        raise InstallationConfigError(f"installation settings file must be a regular file: {path}")
+    try:
+        directory_info = path.parent.stat()
+    except OSError:
+        raise InstallationConfigError(
+            f"installation settings directory cannot be inspected: {path.parent}"
+        ) from None
+    if not stat.S_ISDIR(directory_info.st_mode) or stat.S_IMODE(directory_info.st_mode) & 0o077:
+        raise InstallationConfigError(
+            f"installation settings directory must be private (mode 0700): {path.parent}"
+        )
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+    except OSError:
+        raise InstallationConfigError(
+            f"installation settings file cannot be opened: {path}"
+        ) from None
+    with os.fdopen(descriptor, encoding="utf-8") as handle:
+        file_info = os.fstat(handle.fileno())
+        if not stat.S_ISREG(file_info.st_mode):
+            raise InstallationConfigError(
+                f"installation settings file must be a regular file: {path}"
+            )
+        if stat.S_IMODE(file_info.st_mode) & 0o077:
+            raise InstallationConfigError(
+                f"installation settings file must not be group or world accessible: {path}"
+            )
+        try:
+            raw = handle.read()
+        except OSError, UnicodeDecodeError:
+            raise InstallationConfigError(
+                f"installation settings file cannot be read as UTF-8: {path}"
+            ) from None
+    try:
+        return json.loads(raw)
+    except json.JSONDecodeError as exc:
+        raise InstallationConfigError(
+            f"installation settings file is not valid JSON (line {exc.lineno}): {path}"
+        ) from None
+
+
+def _load_installation_values(path: Path) -> dict[str, Any]:
+    """Validate one installation document and normalize it to setting keys."""
+    payload = _read_installation_payload(path)
+    if payload is None:
+        return {}
+    if not isinstance(payload, dict):
+        raise InstallationConfigError("installation settings file must contain one JSON object")
+    lookup: dict[str, SettingsSourceSpec] = {}
+    for spec in SETTINGS_SOURCES:
+        lookup[spec.key.lower()] = spec
+        lookup[spec.env.lower()] = spec
+    values: dict[str, Any] = {}
+    seen: set[str] = set()
+    for raw_key, value in payload.items():
+        spec = lookup.get(raw_key.strip().lower())
+        if spec is None:
+            raise InstallationConfigError(f"unknown installation setting: {raw_key}")
+        if spec.owner != "installation":
+            raise InstallationConfigError(
+                f"installation setting {spec.key} is not owned by the installation"
+            )
+        if spec.key in seen:
+            raise InstallationConfigError(f"duplicate installation setting: {spec.key}")
+        seen.add(spec.key)
+        if value is not None:
+            values[spec.key] = value
+    return values
+
+
+def _environment_setting_values(environ: Mapping[str, str]) -> dict[str, Any]:
+    """Environment values for contract settings, including explicitly empty ones."""
+    values: dict[str, Any] = {}
+    for spec in SETTINGS_SOURCES:
+        if spec.key in Settings.model_fields and spec.env in environ:
+            values[spec.key] = environ[spec.env]
+    return values
+
+
+def _validation_summary(exc: ValidationError) -> str:
+    """Render field locations and messages only: never inputs or values."""
+    parts: list[str] = []
+    for error in exc.errors(include_url=False, include_input=False, include_context=False):
+        location = ".".join(str(item) for item in error["loc"]) or "settings"
+        parts.append(f"{location}: {error['msg']}")
+    return "; ".join(parts) or "invalid value"
+
+
+def resolve_settings_sources(
+    environ: Mapping[str, str] | None = None,
+    *,
+    installation_path: Path | str | None = None,
+) -> Settings:
+    """Build settings from operator environment, then installation file, then defaults."""
+    source_environment = os.environ if environ is None else environ
+    values = _environment_setting_values(source_environment)
+    path = (
+        Path(installation_path)
+        if installation_path is not None
+        else installation_config_path(source_environment)
+    )
+    installation_values: dict[str, Any] = {}
+    if path is not None:
+        installation_values = _load_installation_values(path)
+        for key, value in installation_values.items():
+            values.setdefault(key, value)
+    try:
+        return Settings(_env_file=None, **values)
+    except ValidationError as exc:
+        if not installation_values:
+            raise
+        raise InstallationConfigError(
+            f"installation settings are invalid: {_validation_summary(exc)}"
+        ) from None
+
+
 def get_settings() -> Settings:
-    """Build settings from the current process environment."""
-    return Settings(_env_file=None)
+    """Build settings from the process environment and an optional installation file."""
+    return resolve_settings_sources(os.environ)
+
+
+def describe_settings_sources(
+    settings: Settings | None = None,
+) -> dict[str, dict[str, object]]:
+    """Describe each exposed setting's source and tri-state without its value."""
+    del settings  # A Settings object carries no provenance.
+    source_environment = os.environ
+    path = installation_config_path(source_environment)
+    file_values = _load_installation_values(path) if path is not None else {}
+    described: dict[str, dict[str, object]] = {}
+    for spec in SETTINGS_SOURCES:
+        if spec.owner == "domain_service":
+            continue
+        if spec.env in source_environment:
+            source, raw = "env", source_environment[spec.env]
+        elif spec.key in file_values:
+            source, raw = "installation", file_values[spec.key]
+        else:
+            source, raw = "default", None
+        state = "unset" if source == "default" else ("empty" if raw == "" else "applied")
+        described[spec.key] = {"source": source, "state": state, "secret": spec.secret}
+    return described
 
 
 def settings_for(**overrides: Any) -> Settings:
