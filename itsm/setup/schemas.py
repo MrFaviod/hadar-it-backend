@@ -22,6 +22,7 @@ SANITIZED_STATUS_FIELDS: tuple[str, ...] = (
     "backend",
     "version",
     "instance_id",
+    "checks",
 )
 
 #: Substrings that must never appear in the anonymous status payload.
@@ -47,6 +48,7 @@ class SanitizedStatus(BaseModel):
     backend: Literal["unknown"]
     version: str
     instance_id: str | None = None
+    checks: dict[str, str] = Field(default_factory=dict)
 
 
 class ClaimRequest(BaseModel):

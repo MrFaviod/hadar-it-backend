@@ -40,6 +40,7 @@ ReleaseMode = Literal["dev", "prod"]
 _STATE_FILE = "state.json"
 _SECRETS_FILE = "secrets.json"
 _JOURNAL_FILE = "journal.jsonl"
+_ANCHOR_FILE = "anchor.json"
 _ENABLED_FILE = "enabled.json"
 _LOCK_FILE = "lock"
 _CLAIM_STATES = (
@@ -227,6 +228,7 @@ class SetupStore:
         self.state_path = self.state_dir / _STATE_FILE
         self.secrets_path = self.state_dir / _SECRETS_FILE
         self.journal_path = self.state_dir / _JOURNAL_FILE
+        self.anchor_path = self.state_dir / _ANCHOR_FILE
         self.enabled_path = self.state_dir / _ENABLED_FILE
         self.lock_path = self.state_dir / _LOCK_FILE
 
@@ -339,6 +341,99 @@ class SetupStore:
         finally:
             os.close(descriptor)
 
+    def _read_journal(self) -> list[dict[str, Any]]:
+        """Read the append-only journal; a trailing partial append is ignored."""
+
+        self._assert_secure_file(self.journal_path)
+        try:
+            descriptor = os.open(self.journal_path, os.O_RDONLY | os.O_NOFOLLOW)
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            raise StoreUnsafe("the setup journal cannot be opened safely") from exc
+        with os.fdopen(descriptor, "rb") as handle:
+            raw = handle.read()
+        complete = raw if raw.endswith(b"\n") else raw.rsplit(b"\n", 1)[0]
+        entries: list[dict[str, Any]] = []
+        for line in complete.splitlines():
+            if not line.strip():
+                continue
+            try:
+                entry = json.loads(line)
+            except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+                raise StoreUnsafe("the setup journal is not valid JSON") from exc
+            if not isinstance(entry, dict):
+                raise StoreUnsafe("the setup journal entry is invalid")
+            entries.append(entry)
+        return entries
+
+    def _claim_high_water(self) -> int:
+        """Highest claim revision on record, from the anchor and the journal.
+
+        Neither source is part of the restorable ``state.json``/``secrets.json``
+        pair, so a restored snapshot cannot rewind the mark. The anchor is
+        written once with ``O_EXCL``; the journal is append-only.
+        """
+
+        high = 0
+        anchor = self._read_json(self.anchor_path, None)
+        if anchor is not None:
+            try:
+                high = int(anchor["revision"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreUnsafe("the setup claim anchor is invalid") from exc
+            if high < 1:
+                raise StoreUnsafe("the setup claim anchor revision is invalid")
+        for entry in self._read_journal():
+            if entry.get("action") != "claim":
+                continue
+            try:
+                revision = int(entry["revision"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise StoreUnsafe("the setup journal revision is invalid") from exc
+            high = max(high, revision)
+        return high
+
+    def _diverged(self, private: dict[str, Any]) -> bool:
+        """A durable claim exists but the restorable state no longer agrees."""
+
+        high = self._claim_high_water()
+        if high <= 0:
+            return False
+        return private["state"] == "unclaimed" or private["revision"] < high
+
+    def _write_claim_anchor(self, revision: int, instance_id: str | None) -> None:
+        """Write the claim anchor once; it is never rewritten or restored."""
+
+        payload = {
+            "revision": revision,
+            "instance_id": instance_id,
+            "claimed_at": _iso(self._clock()),
+        }
+        encoded = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
+        self._assert_secure_file(self.anchor_path)
+        try:
+            descriptor = os.open(
+                self.anchor_path,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                SETUP_FILE_MODE,
+            )
+        except FileExistsError as exc:
+            raise AlreadyClaimed("this installation already has a setup owner") from exc
+        except OSError as exc:
+            raise StoreUnsafe("the setup claim anchor cannot be opened safely") from exc
+        try:
+            os.fchmod(descriptor, SETUP_FILE_MODE)
+            os.write(descriptor, encoded)
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        directory = os.open(self.state_dir, os.O_RDONLY | os.O_DIRECTORY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
     @contextmanager
     def _locked(self) -> Iterator[None]:
         self.ensure_ready()
@@ -444,6 +539,7 @@ class SetupStore:
 
         enabled = self.operator_enabled()
         private = self._read_private()
+        diverged = self._diverged(private)
         state = private["state"] if enabled else "disabled"
         setup_enabled = enabled and state != "complete"
         claim_available = (
@@ -451,6 +547,7 @@ class SetupStore:
             and state == "unclaimed"
             and bool(private["claim"])
             and not private["locked"]
+            and not diverged
         )
         return {
             "state": state,
@@ -458,6 +555,7 @@ class SetupStore:
             "setup_enabled": setup_enabled,
             "claim_available": claim_available,
             "locked": private["locked"],
+            "checks": {"state_diverged": "failed"} if diverged else {},
         }
 
     def _persist(
@@ -505,6 +603,8 @@ class SetupStore:
             private = self._read_private()
             if private["state"] != "unclaimed":
                 raise AlreadyClaimed("this installation already has a setup owner")
+            if self._diverged(private):
+                raise AlreadyClaimed("this installation already has a setup owner")
             credential = secrets.token_urlsafe(32)
             private["claim"] = {
                 "hash": hash_password(credential),
@@ -531,6 +631,8 @@ class SetupStore:
         with self._locked():
             private = self._read_private()
             if private["state"] != "unclaimed":
+                raise AlreadyClaimed("this installation already has a setup owner")
+            if self._diverged(private):
                 raise AlreadyClaimed("this installation already has a setup owner")
             credential = secrets.token_urlsafe(32)
             private["claim"] = {
@@ -582,6 +684,8 @@ class SetupStore:
             raise SetupDisabled("setup is not enabled in this state directory")
         with self._locked():
             private = self._read_private()
+            if self._diverged(private):
+                raise AlreadyClaimed("this installation already has a setup owner")
             state = private["state"]
             if state == "claimed":
                 recovery = private.get("recovery")
@@ -621,6 +725,7 @@ class SetupStore:
             private["attempts"] = 0
             private["locked"] = False
             grant = self._new_session(private, recovered=False)
+            self._write_claim_anchor(private["revision"] + 1, private["instance_id"])
             self._persist(
                 private,
                 expected_revision=private["revision"],

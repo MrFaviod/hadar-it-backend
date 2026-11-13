@@ -341,6 +341,7 @@ def test_configured_status_does_not_leak_the_receipt_allowlist(
         "backend",
         "version",
         "instance_id",
+        "checks",
     }
 
 

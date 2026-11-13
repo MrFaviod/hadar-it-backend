@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import stat
 import subprocess
 import sys
@@ -358,6 +359,90 @@ def test_recovery_reauthorizes_without_resetting_state_or_instance(
         assert claim(client, recovery).status_code == 409
 
 
+def snapshot_bootstrap_files(state_dir: Path, target: Path) -> Path:
+    """Copy the restorable pair exactly as a volume snapshot would."""
+
+    target.mkdir(mode=0o700)
+    for name in ("state.json", "secrets.json"):
+        shutil.copy2(state_dir / name, target / name)
+    return target
+
+
+def restore_bootstrap_files(snapshot: Path, state_dir: Path) -> None:
+    for name in ("state.json", "secrets.json"):
+        shutil.copy2(snapshot / name, state_dir / name)
+
+
+def test_a_restored_bootstrap_snapshot_keeps_ownership_closed(
+    store: SetupStore, state_dir: Path, clock: FakeClock, tmp_path: Path
+) -> None:
+    credential = enable_claim(store)
+    snapshot = snapshot_bootstrap_files(state_dir, tmp_path / "pre-claim")
+    with TestClient(build_app(state_dir, clock)) as client:
+        assert claim(client, credential).status_code == 200
+
+    restore_bootstrap_files(snapshot, state_dir)
+
+    with TestClient(build_app(state_dir, clock)) as client:
+        status = client.get(STATUS_PATH).json()
+        assert status["state"] == "unclaimed"
+        assert status["claim_available"] is False
+        assert status["checks"] == {"state_diverged": "failed"}
+        retry = claim(client, credential)
+        assert retry.status_code == 409
+        assert retry.json() == {"error": "already_claimed"}
+        assert "set-cookie" not in {name.lower() for name in retry.headers}
+        assert client.get(SESSION_PATH).status_code == 401
+    private = json.loads((state_dir / "secrets.json").read_text(encoding="utf-8"))
+    assert private["sessions"] == {}
+    assert private["state"] == "unclaimed"
+
+
+def test_a_rewound_private_state_is_refused_while_the_journal_remains(
+    store: SetupStore, state_dir: Path, clock: FakeClock, tmp_path: Path
+) -> None:
+    credential = enable_claim(store)
+    snapshot = snapshot_bootstrap_files(state_dir, tmp_path / "pre-claim")
+    with TestClient(build_app(state_dir, clock)) as client:
+        assert claim(client, credential).status_code == 200
+    journal = [json.loads(line) for line in (state_dir / "journal.jsonl").read_text().splitlines()]
+    assert journal[-1]["action"] == "claim"
+
+    # Only the private half is rewound; the append-only journal still claims.
+    shutil.copy2(snapshot / "secrets.json", state_dir / "secrets.json")
+
+    with TestClient(build_app(state_dir, clock)) as client:
+        assert client.get(STATUS_PATH).json()["checks"] == {"state_diverged": "failed"}
+        assert claim(client, credential).status_code == 409
+    assert (state_dir / "journal.jsonl").read_text().strip()
+
+
+def test_the_claim_anchor_closes_a_state_rewound_without_its_journal(
+    store: SetupStore, state_dir: Path, clock: FakeClock
+) -> None:
+    credential = enable_claim(store)
+    snapshot = snapshot_bootstrap_files(state_dir, state_dir.parent / "pre-claim-anchor")
+    grant = store.claim(credential)
+    assert grant.token
+    anchor = json.loads((state_dir / "anchor.json").read_text(encoding="utf-8"))
+    assert anchor["revision"] >= 1
+    stored = (state_dir / "anchor.json").read_bytes()
+    assert stat.S_IMODE((state_dir / "anchor.json").stat().st_mode) == 0o600
+
+    # A later mutation never rewrites the anchor, and losing the journal does
+    # not erase the high-water mark.
+    store.issue_recovery()
+    assert (state_dir / "anchor.json").read_bytes() == stored
+    (state_dir / "journal.jsonl").unlink()
+    restore_bootstrap_files(snapshot, state_dir)
+
+    with TestClient(build_app(state_dir, clock)) as client:
+        status = client.get(STATUS_PATH).json()
+        assert status["claim_available"] is False
+        assert status["checks"] == {"state_diverged": "failed"}
+        assert claim(client, credential).status_code == 409
+
+
 def test_session_mutations_require_origin_and_csrf(
     store: SetupStore, state_dir: Path, clock: FakeClock
 ) -> None:
@@ -455,7 +540,14 @@ def test_private_directory_and_files_use_restrictive_modes(
     with TestClient(app) as client:
         assert claim(client, credential).status_code == 200
     assert stat.S_IMODE(state_dir.stat().st_mode) == 0o700
-    for name in ("state.json", "secrets.json", "enabled.json", "journal.jsonl", "lock"):
+    for name in (
+        "state.json",
+        "secrets.json",
+        "enabled.json",
+        "journal.jsonl",
+        "anchor.json",
+        "lock",
+    ):
         path = state_dir / name
         assert path.is_file(), name
         assert stat.S_IMODE(path.stat().st_mode) == 0o600, name

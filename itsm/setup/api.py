@@ -252,6 +252,7 @@ def create_setup_router() -> APIRouter:
             backend="unknown",
             version=__version__,
             instance_id=snapshot["instance_id"],
+            checks=snapshot["checks"],
         )
         return JSONResponse(payload.model_dump(mode="json"), headers=NO_STORE)
 
