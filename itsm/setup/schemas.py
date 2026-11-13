@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr, model_validator
+from pydantic import AliasChoices, BaseModel, Field, SecretStr, model_validator
 
 #: Fields ``GET /api/setup/v1/status`` may return. The setup service never
 #: probes the backend, so a missing API is not reported here as a new install.
@@ -88,8 +88,12 @@ class AiConfigureRequest(BaseModel):
 
     base_url: str = Field(min_length=1, max_length=500)
     model: str = Field(min_length=1, max_length=200)
-    api_key: SecretStr | None = Field(default=None, min_length=1, max_length=2048)
-    credential_reference: str | None = Field(default=None, min_length=1, max_length=128)
+    api_key: SecretStr | None = Field(default=None, max_length=2048)
+    credential_reference: str | None = Field(
+        default=None,
+        max_length=128,
+        validation_alias=AliasChoices("credential_reference", "credential"),
+    )
 
     @model_validator(mode="after")
     def _one_credential(self) -> AiConfigureRequest:

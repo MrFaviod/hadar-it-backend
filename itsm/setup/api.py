@@ -337,6 +337,7 @@ def create_setup_router() -> APIRouter:
             scope="personal",
             key_fingerprint=assistant.key_fingerprint(settings),
             receipt=receipt,
+            discovered_models=probe.discovered_models,
         )
         return _ai_response("ai_configured", stored, probe.discovered_models)
 

@@ -696,6 +696,7 @@ class SetupStore:
         scope: str,
         key_fingerprint: str | None,
         receipt: dict[str, Any],
+        discovered_models: int | None = None,
     ) -> dict[str, Any]:
         """Store the ciphertext privately and publish only the sanitized receipt."""
 
@@ -715,6 +716,7 @@ class SetupStore:
                 "model": model,
                 "scope": scope,
                 "key_fingerprint": key_fingerprint,
+                "discovery": {"code": "ok", "models": discovered_models},
                 "configured_at": now,
                 "receipt": public,
             }
