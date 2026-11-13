@@ -31,16 +31,31 @@ from itsm.setup.schemas import (
     AssistantAskRequest,
     ClaimRequest,
     ClaimResponse,
+    OwnerReceipt,
+    OwnerRequest,
+    OwnerResponse,
     SanitizedStatus,
     SessionResponse,
+    StorageApplyResponse,
+    StorageCheckRequest,
+    StorageProbe,
+    StorageSummary,
 )
 from itsm.setup.store import (
     SESSION_TTL_MINUTES,
     AlreadyClaimed,
     ClaimLocked,
     ClaimUnavailable,
+    DatabaseNotAdoptable,
+    DatabaseUnreachable,
+    DatabaseUrlInvalid,
+    InstallationConfigUnavailable,
     InvalidCredential,
     NotClaimed,
+    OwnerExists,
+    OwnerInProgress,
+    OwnerInputInvalid,
+    ProviderTransferFailed,
     RevisionConflict,
     SetupConfigurationError,
     SetupDisabled,
@@ -49,6 +64,7 @@ from itsm.setup.store import (
     SetupStore,
     StateRefused,
     StoreUnsafe,
+    UnsupportedEngine,
 )
 
 SETUP_PREFIX = "/api/setup/v1"
@@ -78,17 +94,38 @@ _ERROR_STATUS: tuple[tuple[type[SetupError], int], ...] = (
     (StateRefused, 409),
     (StoreUnsafe, 503),
     (SetupConfigurationError, 503),
+    (DatabaseNotAdoptable, 409),
+    (DatabaseUrlInvalid, 422),
+    (UnsupportedEngine, 422),
+    (DatabaseUnreachable, 502),
+    (InstallationConfigUnavailable, 503),
+    (OwnerInProgress, 409),
+    (OwnerExists, 409),
+    (OwnerInputInvalid, 422),
+    (ProviderTransferFailed, 502),
+)
+
+_GUIDED_ERRORS = (
+    DatabaseNotAdoptable,
+    DatabaseUrlInvalid,
+    UnsupportedEngine,
+    DatabaseUnreachable,
+    InstallationConfigUnavailable,
 )
 
 
-def _error_response(status_code: int, code: str) -> JSONResponse:
-    return JSONResponse({"error": code}, status_code=status_code, headers=NO_STORE)
+def _error_response(status_code: int, code: str, guidance: str | None = None) -> JSONResponse:
+    payload: dict[str, str] = {"error": code}
+    if guidance:
+        payload["guidance"] = guidance
+    return JSONResponse(payload, status_code=status_code, headers=NO_STORE)
 
 
 def _setup_error_response(exc: SetupError) -> JSONResponse:
+    guidance = str(exc) if isinstance(exc, _GUIDED_ERRORS) else None
     for error_type, status_code in _ERROR_STATUS:
         if isinstance(exc, error_type):
-            return _error_response(status_code, exc.code)
+            return _error_response(status_code, exc.code, guidance)
     return _error_response(500, "setup_error")
 
 
@@ -393,6 +430,79 @@ def create_setup_router() -> APIRouter:
             answer=answer.answer,
             tools=list(answer.tools),
             latency_ms=answer.latency_ms,
+        )
+        return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.post("/storage/check")
+    def check_storage(
+        payload: StorageCheckRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        state = get_store(request).public_state()["state"]
+        if state not in {"ai_configured", "ai_deferred", "storage_ready", "owner_ready"}:
+            return _error_response(409, "state_refused")
+        from itsm.setup import storage
+
+        probe = storage.probe_database(
+            payload.database_url.get_secret_value(), release_mode=settings.release_mode
+        )
+        body = StorageProbe(**probe.as_receipt())
+        return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.post("/storage")
+    def prepare_storage(
+        payload: StorageCheckRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        state = store.public_state()["state"]
+        if state not in {"ai_configured", "ai_deferred"}:
+            receipt = store.storage_receipt()
+            if state in {"storage_ready", "owner_ready", "configuring", "verifying", "complete"}:
+                if receipt is None:
+                    return _error_response(409, "state_refused")
+                body = StorageApplyResponse(state=state, storage=StorageSummary(**dict(receipt)))
+                return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+            return _error_response(409, "state_refused")
+        from itsm.setup import storage
+
+        receipt = storage.apply_storage(store, settings, payload.database_url.get_secret_value())
+        body = StorageApplyResponse(
+            state=store.public_state()["state"], storage=StorageSummary(**dict(receipt))
+        )
+        return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.post("/owner")
+    def create_owner(
+        payload: OwnerRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] not in {"storage_ready", "owner_ready"}:
+            return _error_response(409, "state_refused")
+        from itsm.setup import owner
+
+        receipt = owner.create_first_owner(
+            store,
+            settings,
+            username=payload.username,
+            display_name=payload.display_name,
+            email=payload.email,
+            password=payload.password.get_secret_value(),
+        )
+        body = OwnerResponse(
+            state=store.public_state()["state"],
+            owner=OwnerReceipt(**dict(receipt.get("owner") or {})),
+            ai=receipt.get("ai", "pending"),
         )
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
 

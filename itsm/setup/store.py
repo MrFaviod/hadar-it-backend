@@ -32,6 +32,7 @@ from pydantic import SecretStr
 from itsm.identity.hashing import hash_password, hash_token, verify_password
 
 SESSION_TTL_MINUTES = 60
+OWNER_ATTEMPT_LEASE_MINUTES = 2
 MAX_CLAIM_ATTEMPTS = 5
 DEFAULT_STATE_DIR = Path("/var/lib/itsm-setup")
 SETUP_DIRECTORY_MODE = 0o700
@@ -120,6 +121,60 @@ class StateRefused(SetupError):
     """The current setup state does not allow this operation."""
 
     code = "state_refused"
+
+
+class DatabaseNotAdoptable(SetupError):
+    """The chosen database is foreign or non-empty without our identity."""
+
+    code = "database_not_adoptable"
+
+
+class UnsupportedEngine(SetupError):
+    """The database URL names an engine the installation does not support."""
+
+    code = "unsupported_engine"
+
+
+class DatabaseUrlInvalid(SetupError):
+    """The database URL is empty, malformed or names an unusable target."""
+
+    code = "database_url_invalid"
+
+
+class DatabaseUnreachable(SetupError):
+    """The database could not be reached with a short probe timeout."""
+
+    code = "database_unreachable"
+
+
+class InstallationConfigUnavailable(SetupError):
+    """No private installation file path was configured for the wizard."""
+
+    code = "installation_config_unavailable"
+
+
+class OwnerInProgress(SetupError):
+    """Another setup request is already creating the first owner."""
+
+    code = "owner_in_progress"
+
+
+class OwnerExists(SetupError):
+    """The installation already has a human owner; never replaced here."""
+
+    code = "owner_exists"
+
+
+class OwnerInputInvalid(SetupError):
+    """The first-owner payload violates the existing identity policy."""
+
+    code = "owner_invalid"
+
+
+class ProviderTransferFailed(SetupError):
+    """The early provider could not be verified in the canonical service."""
+
+    code = "provider_transfer_failed"
 
 
 def utcnow() -> datetime:
@@ -477,6 +532,9 @@ class SetupStore:
             "locked": False,
             "sessions": {},
             "ai": None,
+            "storage": None,
+            "owner": None,
+            "owner_attempt": None,
             "created_at": now,
             "updated_at": now,
             "claimed_at": None,
@@ -504,6 +562,9 @@ class SetupStore:
                 "locked": bool(raw.get("locked", False)),
                 "sessions": dict(sessions),
                 "ai": raw.get("ai"),
+                "storage": raw.get("storage"),
+                "owner": raw.get("owner"),
+                "owner_attempt": raw.get("owner_attempt"),
                 "created_at": raw.get("created_at"),
                 "updated_at": raw.get("updated_at"),
                 "claimed_at": raw.get("claimed_at"),
@@ -919,3 +980,143 @@ class SetupStore:
             )
             stored = updated["ai"]["receipt"]
             return dict(stored)
+
+    # --------------------------------------------------------------- storage
+    def storage_receipt(self) -> dict[str, Any] | None:
+        """The sanitized storage result, if the database was already prepared."""
+
+        record = self._read_private().get("storage")
+        return dict(record) if isinstance(record, dict) else None
+
+    def record_storage_ready(self, *, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Move ``ai_configured``/``ai_deferred`` to ``storage_ready`` exactly once."""
+
+        with self._locked():
+            private = self._read_private()
+            if private["state"] in {
+                "storage_ready",
+                "owner_ready",
+                "configuring",
+                "verifying",
+                "complete",
+            }:
+                stored = private.get("storage")
+                return dict(stored) if isinstance(stored, dict) else dict(receipt)
+            if private["state"] not in {"ai_configured", "ai_deferred"}:
+                raise StateRefused("storage preparation requires a claimed installation")
+            private["state"] = "storage_ready"
+            private["storage"] = dict(receipt)
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="apply-storage",
+                receipt=dict(receipt),
+            )
+            return dict(receipt)
+
+    # ----------------------------------------------------------------- owner
+    def begin_owner_attempt(self, username: str) -> str:
+        """Reserve the single first-owner attempt; a live one is refused."""
+
+        with self._locked():
+            private = self._read_private()
+            now = _as_utc(self._clock())
+            current = private.get("owner_attempt")
+            if isinstance(current, dict):
+                try:
+                    expires_at = _parse_iso(current["expires_at"])
+                except KeyError, TypeError, ValueError:
+                    expires_at = now
+                if expires_at > now:
+                    raise OwnerInProgress("another request is already creating the owner")
+            token = uuid.uuid4().hex
+            private["owner_attempt"] = {
+                "username": username,
+                "token": token,
+                "started_at": _iso(now),
+                "expires_at": _iso(now + timedelta(minutes=OWNER_ATTEMPT_LEASE_MINUTES)),
+            }
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="owner-start",
+                receipt={"state": private["state"]},
+            )
+            return token
+
+    def abort_owner_attempt(self, token: str | None) -> None:
+        """Release a reservation that did not create the owner."""
+
+        if not token:
+            return
+        with self._locked():
+            private = self._read_private()
+            current = private.get("owner_attempt")
+            if not isinstance(current, dict) or current.get("token") != token:
+                return
+            private["owner_attempt"] = None
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="owner-abort",
+                receipt={"state": private["state"]},
+            )
+
+    def owner_record(self) -> dict[str, Any] | None:
+        """The public owner record, never a password or a hash."""
+
+        record = self._read_private().get("owner")
+        return dict(record) if isinstance(record, dict) else None
+
+    def record_owner_ready(
+        self,
+        *,
+        username: str,
+        receipt: dict[str, Any],
+        attempt_token: str | None,
+    ) -> dict[str, Any]:
+        """Move ``storage_ready`` to ``owner_ready`` and publish the owner receipt."""
+
+        with self._locked():
+            private = self._read_private()
+            if private["state"] == "owner_ready":
+                stored = private.get("owner")
+                return dict(stored) if isinstance(stored, dict) else dict(receipt)
+            if private["state"] != "storage_ready":
+                raise StateRefused("owner creation requires a prepared database")
+            private["state"] = "owner_ready"
+            private["owner"] = {
+                "username": username,
+                "created_at": _iso(self._clock()),
+                "receipt": dict(receipt),
+            }
+            private["owner_attempt"] = None
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="bootstrap-owner",
+                receipt=dict(receipt),
+                idempotency_key=attempt_token,
+            )
+            return dict(receipt)
+
+    def mark_ai_transferred(self, *, receipt: dict[str, Any]) -> dict[str, Any]:
+        """Delete the transient sealed provider only after the canonical copy exists."""
+
+        with self._locked():
+            private = self._read_private()
+            record = private.get("ai")
+            if not isinstance(record, dict) or not record.get("ciphertext"):
+                published = record.get("receipt") if isinstance(record, dict) else None
+                return dict(published) if isinstance(published, dict) else dict(receipt)
+            public = dict(record.get("receipt") or {})
+            public.update(receipt)
+            public["transferred"] = True
+            private["ai"] = {"receipt": public, "transferred_at": _iso(self._clock())}
+            self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="transfer-ai",
+                receipt=public,
+            )
+            return dict(public)

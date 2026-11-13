@@ -143,3 +143,64 @@ class AssistantAnswerResponse(BaseModel):
     answer: str
     tools: list[str] = Field(default_factory=list)
     latency_ms: int = 0
+
+
+class StorageCheckRequest(BaseModel):
+    """One candidate database URL; treated as a secret so it is never logged."""
+
+    database_url: SecretStr = Field(min_length=1, max_length=2048)
+
+
+class StorageProbe(BaseModel):
+    """Sanitized result of a candidate database probe; never the URL or a password."""
+
+    reachable: bool
+    engine: str | None = None
+    version: str | None = None
+    status: Literal["empty", "ours", "foreign", "unreachable"]
+    identity: str | None = None
+    adoptable: bool = False
+    guidance: str | None = None
+
+
+class StorageSummary(BaseModel):
+    """What ``apply_storage`` actually did, with no secret in it."""
+
+    engine: str
+    version: str | None = None
+    status: Literal["empty", "ours"]
+    identity: str | None = None
+    config_source: Literal["installation", "external"]
+    migrated: bool = True
+    identity_claimed: bool = True
+
+
+class StorageApplyResponse(BaseModel):
+    """Result of ``POST /api/setup/v1/storage``."""
+
+    state: str
+    storage: StorageSummary
+
+
+class OwnerRequest(BaseModel):
+    """The first human owner; the password is only ever handed to the hasher."""
+
+    username: str = Field(min_length=1, max_length=64)
+    display_name: str = Field(min_length=1, max_length=120)
+    email: str | None = Field(default=None, max_length=254)
+    password: SecretStr = Field(min_length=1, max_length=256)
+
+
+class OwnerReceipt(BaseModel):
+    """Public owner fields; never an email digest, hash or password."""
+
+    username: str
+    display_name: str
+
+
+class OwnerResponse(BaseModel):
+    """Result of ``POST /api/setup/v1/owner``."""
+
+    state: str
+    owner: OwnerReceipt
+    ai: Literal["transferred", "pending"]
