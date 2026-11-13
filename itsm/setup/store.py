@@ -27,6 +27,8 @@ from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+from pydantic import SecretStr
+
 from itsm.identity.hashing import hash_password, hash_token, verify_password
 
 SESSION_TTL_MINUTES = 60
@@ -113,6 +115,12 @@ class RevisionConflict(SetupError):
     code = "revision_conflict"
 
 
+class StateRefused(SetupError):
+    """The current setup state does not allow this operation."""
+
+    code = "state_refused"
+
+
 def utcnow() -> datetime:
     """Current UTC time as an aware datetime."""
 
@@ -150,6 +158,12 @@ class SetupSettings:
     release_mode: ReleaseMode
     allowed_origins: tuple[str, ...] = ()
     cookie_secure: bool = True
+    # Operator-supplied ring for provider credentials. Absent means the
+    # credential form is blocked with a diagnosis; this process never generates
+    # a key. The allowlist is the deployment's private-destination policy.
+    ai_credential_keys: SecretStr | None = None
+    ai_credential_key: SecretStr | None = None
+    ai_personal_private_endpoints: str = ""
 
     @classmethod
     def from_environ(cls, environ: Mapping[str, str] | None = None) -> SetupSettings:
@@ -171,11 +185,16 @@ class SetupSettings:
             if part.strip()
         )
         cookie_secure = _parse_bool(source.get("ITSM_AUTH_COOKIE_SECURE", "true"))
+        ring = source.get("ITSM_AI_CREDENTIAL_KEYS")
+        legacy = source.get("ITSM_AI_CREDENTIAL_KEY")
         return cls(
             state_dir=Path(state_dir),
             release_mode=mode,
             allowed_origins=origins,
             cookie_secure=cookie_secure,
+            ai_credential_keys=SecretStr(ring) if ring and ring.strip() else None,
+            ai_credential_key=SecretStr(legacy) if legacy and legacy.strip() else None,
+            ai_personal_private_endpoints=source.get("ITSM_AI_PERSONAL_PRIVATE_ENDPOINTS", ""),
         )
 
     def with_state_dir(self, state_dir: str | Path) -> SetupSettings:
@@ -355,6 +374,7 @@ class SetupStore:
             "attempts": 0,
             "locked": False,
             "sessions": {},
+            "ai": None,
             "created_at": now,
             "updated_at": now,
             "claimed_at": None,
@@ -381,6 +401,7 @@ class SetupStore:
                 "attempts": int(raw.get("attempts", 0)),
                 "locked": bool(raw.get("locked", False)),
                 "sessions": dict(sessions),
+                "ai": raw.get("ai"),
                 "created_at": raw.get("created_at"),
                 "updated_at": raw.get("updated_at"),
                 "claimed_at": raw.get("claimed_at"),
@@ -389,6 +410,8 @@ class SetupStore:
             raise StoreUnsafe("the private setup state is invalid") from exc
 
     def _render_public(self, private: dict[str, Any]) -> dict[str, Any]:
+        record = private.get("ai")
+        receipt = record.get("receipt") if isinstance(record, dict) else None
         return {
             "version": 1,
             "revision": private["revision"],
@@ -396,6 +419,7 @@ class SetupStore:
             "mode": self.release_mode,
             "release_mode": self.release_mode,
             "instance_id": private["instance_id"],
+            "ai": receipt,
             "updated_at": private["updated_at"],
             "claimed_at": private["claimed_at"],
         }
@@ -655,3 +679,79 @@ class SetupStore:
         if expires_at <= _as_utc(self._clock()):
             return None
         return record
+
+    # ---------------------------------------------------------------------- ai
+    def ai_private_record(self) -> dict[str, Any] | None:
+        """Read the sealed provider record; only the setup process may call this."""
+
+        record = self._read_private().get("ai")
+        return dict(record) if isinstance(record, dict) else None
+
+    def record_ai_configured(
+        self,
+        *,
+        ciphertext: str,
+        base_url: str,
+        model: str,
+        scope: str,
+        key_fingerprint: str | None,
+        receipt: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Store the ciphertext privately and publish only the sanitized receipt."""
+
+        with self._locked():
+            private = self._read_private()
+            if private["state"] not in {"claimed", "ai_deferred"}:
+                raise StateRefused("AI configuration requires a claimed installation")
+            now = _iso(self._clock())
+            public = dict(receipt)
+            public["status"] = "configured"
+            public["pending"] = False
+            public["checked_at"] = now
+            private["state"] = "ai_configured"
+            private["ai"] = {
+                "ciphertext": ciphertext,
+                "base_url": base_url,
+                "model": model,
+                "scope": scope,
+                "key_fingerprint": key_fingerprint,
+                "configured_at": now,
+                "receipt": public,
+            }
+            updated = self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="configure-ai",
+                receipt=public,
+            )
+            stored = updated["ai"]["receipt"]
+            return dict(stored)
+
+    def record_ai_deferred(
+        self,
+        *,
+        reason: str | None = None,
+    ) -> dict[str, Any]:
+        """Keep the pending item visible instead of simulating a configured provider."""
+
+        with self._locked():
+            private = self._read_private()
+            if private["state"] != "claimed":
+                raise StateRefused("deferring AI requires a claimed installation")
+            now = _iso(self._clock())
+            public = {
+                "status": "pending",
+                "pending": True,
+                "reason": reason,
+                "deferred_at": now,
+            }
+            private["state"] = "ai_deferred"
+            private["ai"] = {"receipt": public}
+            updated = self._persist(
+                private,
+                expected_revision=private["revision"],
+                action="defer-ai",
+                receipt=public,
+            )
+            stored = updated["ai"]["receipt"]
+            return dict(stored)

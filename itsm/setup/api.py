@@ -10,6 +10,7 @@ require the ``X-CSRF-Token`` value returned once by the claim response.
 
 from __future__ import annotations
 
+import os
 import secrets
 from collections.abc import Callable, Mapping
 from datetime import datetime
@@ -21,7 +22,13 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 
 from itsm import __version__
+from itsm.agent_integrations.providers import ProviderEndpointError, require_secret_destination
 from itsm.setup.schemas import (
+    AiConfigureRequest,
+    AiConfigureResponse,
+    AiReceipt,
+    AssistantAnswerResponse,
+    AssistantAskRequest,
     ClaimRequest,
     ClaimResponse,
     SanitizedStatus,
@@ -40,6 +47,7 @@ from itsm.setup.store import (
     SetupError,
     SetupSettings,
     SetupStore,
+    StateRefused,
     StoreUnsafe,
 )
 
@@ -67,6 +75,7 @@ _ERROR_STATUS: tuple[tuple[type[SetupError], int], ...] = (
     (InvalidCredential, 401),
     (ClaimUnavailable, 403),
     (RevisionConflict, 409),
+    (StateRefused, 409),
     (StoreUnsafe, 503),
     (SetupConfigurationError, 503),
 )
@@ -148,6 +157,85 @@ def _clear_session_cookie(response: Response, settings: SetupSettings) -> None:
     )
 
 
+def _assistant() -> Any:
+    """Import the assistant lazily so status stays independent of Pydantic AI."""
+
+    from itsm.setup import assistant
+
+    return assistant
+
+
+_AI_FAILURE_STATUS: dict[str, int] = {
+    "endpoint_forbidden": 422,
+    "credential_missing": 422,
+    "model_without_tools": 422,
+    "tool_not_called": 422,
+    "credential_key_missing": 409,
+    "provider_unreachable": 502,
+    "auth_failed": 502,
+}
+
+
+def _status_reader(request: Request) -> Callable[[], Mapping[str, Any]]:
+    """Sanitized state the bootstrap assistant may see; never a secret."""
+
+    store = get_store(request)
+    settings: SetupSettings = request.app.state.setup_settings
+
+    def read() -> Mapping[str, Any]:
+        snapshot = store.status_snapshot()
+        receipt = store.public_state().get("ai") or {}
+        return {
+            "state": snapshot["state"],
+            "mode": settings.release_mode,
+            "release_mode": settings.release_mode,
+            "setup_enabled": snapshot["setup_enabled"],
+            "claim_available": snapshot["claim_available"],
+            "ai": receipt.get("status", "not_configured"),
+            "ai_pending": bool(receipt.get("pending")),
+        }
+
+    return read
+
+
+def _resolve_api_key(
+    payload: AiConfigureRequest,
+    request: Request,
+    normalized_base_url: str,
+) -> str:
+    """Take the raw key or an operator-bound environment reference; never log it."""
+
+    if payload.api_key is not None:
+        value = payload.api_key.get_secret_value().strip()
+        if not value:
+            raise ApiError(422, "credential_missing")
+        return value
+    reference = payload.credential_reference
+    if not reference:
+        raise ApiError(422, "credential_missing")
+    value = os.environ.get(reference, "").strip()
+    if not value:
+        raise ApiError(422, "credential_missing")
+    settings: SetupSettings = request.app.state.setup_settings
+    canonical = _assistant().provider_settings(settings)
+    try:
+        require_secret_destination(canonical, reference, normalized_base_url)
+    except ProviderEndpointError as exc:
+        raise ApiError(422, "endpoint_forbidden") from exc
+    return value
+
+
+def _ai_response(
+    state: str, receipt: Mapping[str, Any], discovered_models: int | None = None
+) -> JSONResponse:
+    body = AiConfigureResponse(
+        state=state,
+        ai=AiReceipt(**dict(receipt)),
+        discovered_models=discovered_models,
+    )
+    return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+
 def create_setup_router() -> APIRouter:
     router = APIRouter(prefix=SETUP_PREFIX)
 
@@ -199,6 +287,101 @@ def create_setup_router() -> APIRouter:
             mode=settings.release_mode,
             release_mode=settings.release_mode,
             checks=[],
+        )
+        return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
+
+    @router.post("/ai")
+    async def configure_ai(
+        payload: AiConfigureRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        if store.public_state()["state"] not in {"claimed", "ai_deferred"}:
+            return _error_response(409, "state_refused")
+        assistant = _assistant()
+        if not assistant.storage_available(settings):
+            return _error_response(409, assistant.DIAGNOSTIC_CREDENTIAL_KEY_MISSING)
+        policy = assistant.endpoint_policy(settings)
+        model = payload.model.strip()
+        try:
+            normalized = assistant.normalize_endpoint(payload.base_url, policy)
+            api_key = _resolve_api_key(payload, request, normalized)
+            probe = await assistant.probe_provider(
+                settings=settings,
+                base_url=normalized,
+                model=model,
+                api_key=api_key,
+                status_reader=_status_reader(request),
+            )
+        except assistant.AssistantError as exc:
+            return _error_response(_AI_FAILURE_STATUS.get(exc.code, 502), exc.code)
+        receipt = {
+            "provider": assistant.provider_host(normalized),
+            "model": model,
+            "tool": assistant.TOOL_GET_SETUP_STATUS if probe.tool_called else None,
+            "latency_ms": probe.latency_ms,
+            "input_tokens": probe.input_tokens,
+            "output_tokens": probe.output_tokens,
+        }
+        try:
+            ciphertext = assistant.seal_provider_key(settings, api_key)
+        except assistant.AssistantError as exc:
+            return _error_response(_AI_FAILURE_STATUS.get(exc.code, 409), exc.code)
+        stored = store.record_ai_configured(
+            ciphertext=ciphertext,
+            base_url=normalized,
+            model=model,
+            scope="personal",
+            key_fingerprint=assistant.key_fingerprint(settings),
+            receipt=receipt,
+        )
+        return _ai_response("ai_configured", stored, probe.discovered_models)
+
+    @router.post("/ai/defer")
+    def defer_ai(
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        store = get_store(request)
+        if store.public_state()["state"] != "claimed":
+            return _error_response(409, "state_refused")
+        receipt = store.record_ai_deferred()
+        return _ai_response("ai_deferred", receipt)
+
+    @router.post("/assistant/ask")
+    async def assistant_ask(
+        payload: AssistantAskRequest,
+        request: Request,
+        session: dict[str, Any] = Depends(require_session_mutation),
+    ) -> JSONResponse:
+        _ = session
+        settings: SetupSettings = request.app.state.setup_settings
+        store = get_store(request)
+        record = store.ai_private_record()
+        receipt = store.public_state().get("ai") or {}
+        if not record or not record.get("ciphertext") or receipt.get("status") != "configured":
+            return _error_response(409, "ai_not_configured")
+        assistant = _assistant()
+        try:
+            api_key = assistant.unseal_provider_key(settings, str(record["ciphertext"]))
+            answer = await assistant.ask_provider(
+                settings=settings,
+                base_url=str(record["base_url"]),
+                model=str(record["model"]),
+                api_key=api_key,
+                question=payload.question,
+                status_reader=_status_reader(request),
+            )
+        except assistant.AssistantError as exc:
+            return _error_response(502, exc.code)
+        body = AssistantAnswerResponse(
+            answer=answer.answer,
+            tools=list(answer.tools),
+            latency_ms=answer.latency_ms,
         )
         return JSONResponse(body.model_dump(mode="json"), headers=NO_STORE)
 

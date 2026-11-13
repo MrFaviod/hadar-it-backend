@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import Literal
 
-from pydantic import BaseModel, Field, SecretStr
+from pydantic import BaseModel, Field, SecretStr, model_validator
 
 #: Fields ``GET /api/setup/v1/status`` may return. The setup service never
 #: probes the backend, so a missing API is not reported here as a new install.
@@ -77,3 +77,60 @@ class ErrorResponse(BaseModel):
     """Stable, sanitized error shape."""
 
     error: str
+
+
+class AiConfigureRequest(BaseModel):
+    """Provider endpoint, model and one credential supplied by the operator.
+
+    The credential is either the raw key or the name of an operator-bound
+    environment reference (``ITSM_AI_SECRET_DESTINATIONS``); exactly one.
+    """
+
+    base_url: str = Field(min_length=1, max_length=500)
+    model: str = Field(min_length=1, max_length=200)
+    api_key: SecretStr | None = Field(default=None, min_length=1, max_length=2048)
+    credential_reference: str | None = Field(default=None, min_length=1, max_length=128)
+
+    @model_validator(mode="after")
+    def _one_credential(self) -> AiConfigureRequest:
+        if self.api_key is not None and self.credential_reference is not None:
+            raise ValueError("supply either api_key or credential_reference")
+        return self
+
+
+class AiReceipt(BaseModel):
+    """Sanitized provider result; never a key, ciphertext, URL path or header."""
+
+    status: Literal["configured", "pending"]
+    provider: str | None = None
+    model: str | None = None
+    tool: str | None = None
+    latency_ms: int | None = None
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+    pending: bool = False
+    reason: str | None = None
+    checked_at: str | None = None
+    deferred_at: str | None = None
+
+
+class AiConfigureResponse(BaseModel):
+    """Result of ``POST /api/setup/v1/ai`` or ``/ai/defer``."""
+
+    state: str
+    ai: AiReceipt
+    discovered_models: int | None = None
+
+
+class AssistantAskRequest(BaseModel):
+    """One bounded question for the read-only bootstrap assistant."""
+
+    question: str = Field(min_length=1, max_length=500)
+
+
+class AssistantAnswerResponse(BaseModel):
+    """A bounded answer plus the tools that actually executed for it."""
+
+    answer: str
+    tools: list[str] = Field(default_factory=list)
+    latency_ms: int = 0
