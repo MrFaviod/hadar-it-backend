@@ -218,9 +218,18 @@ def _validate_candidate_file(path: Path) -> None:
         ) from exc
 
 
-def write_installation_database_url(path: Path, database_url: str) -> None:
-    """Atomically publish ``database_url`` in the private installation file."""
+def write_installation_values(path: Path, updates: Mapping[str, Any]) -> None:
+    """Atomically merge ``updates`` into the private installation file.
 
+    The guarantees are the ones storage already needed for the database URL: the
+    directory stays 0700, the file is written 0600 through a private temporary
+    file, a planted symbolic link is refused instead of written through, existing
+    keys survive, and the candidate document must pass the settings contract
+    before it replaces the live file.
+    """
+
+    if not updates:
+        raise SetupConfigurationError("no installation values were proposed")
     parent = path.parent
     try:
         parent.mkdir(mode=0o700, parents=True, exist_ok=True)
@@ -232,7 +241,7 @@ def write_installation_database_url(path: Path, database_url: str) -> None:
             "the installation directory cannot be created or secured"
         ) from exc
     values = _existing_installation_values(path)
-    values["database_url"] = database_url
+    values.update(updates)
     encoded = json.dumps(values, ensure_ascii=False, sort_keys=True).encode("utf-8") + b"\n"
     descriptor, temporary = tempfile.mkstemp(prefix=".installation-", dir=parent)
     try:
@@ -253,6 +262,12 @@ def write_installation_database_url(path: Path, database_url: str) -> None:
         with suppress(FileNotFoundError):
             os.unlink(temporary)
         raise
+
+
+def write_installation_database_url(path: Path, database_url: str) -> None:
+    """Atomically publish ``database_url`` in the private installation file."""
+
+    write_installation_values(path, {"database_url": database_url})
 
 
 def _installation_file(environ: Mapping[str, str]) -> Path | None:
