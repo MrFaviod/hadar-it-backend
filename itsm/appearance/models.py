@@ -67,6 +67,7 @@ class AppearanceState(InventoryBase):
     previous_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
     active: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False)
     previous: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    organization_name: Mapped[str | None] = mapped_column(String(120), nullable=True)
     revision: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
     updated_by: Mapped[str] = mapped_column(String(160), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(

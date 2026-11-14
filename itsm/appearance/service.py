@@ -44,6 +44,44 @@ from itsm.identity.service import (
 )
 
 RESOURCE_ID = re.compile(r"^[a-f0-9]{32}$")
+ORGANIZATION_MAX_NAME = 120
+_ORGANIZATION_SYMBOLS = frozenset(" &.,'\"()+-_/:@#%")
+
+
+def normalize_organization_name(value: Any) -> str:
+    """Return the single-line organization name, or refuse it.
+
+    Control, format and unassigned code points are folded to a space before
+    whitespace collapses: a pasted name cannot carry a newline or a zero-width
+    joiner into the shell. The remaining text is length- and charset-bounded so
+    an arbitrary string never becomes installation identity markup.
+    """
+
+    if not isinstance(value, str):
+        raise ValidationFailed(
+            "organization name must be text",
+            key="api.appearance.organization_name_invalid",
+        )
+    folded = "".join(
+        " " if unicodedata.category(character).startswith("C") else character for character in value
+    )
+    text = " ".join(folded.split())
+    if not text:
+        raise ValidationFailed(
+            "organization name must not be empty",
+            key="api.appearance.organization_name_empty",
+        )
+    if len(text) > ORGANIZATION_MAX_NAME:
+        raise ValidationFailed(
+            "organization name is too long",
+            key="api.appearance.organization_name_too_long",
+        )
+    if any(not (character.isalnum() or character in _ORGANIZATION_SYMBOLS) for character in text):
+        raise ValidationFailed(
+            "organization name contains an unsupported character",
+            key="api.appearance.organization_name_character_not_allowed",
+        )
+    return text
 
 
 class AppearanceStorageUnavailable(Exception):
@@ -119,6 +157,14 @@ class AppearanceService:
                 legacy["name"] = "Asset Manager"
             if document == legacy:
                 document = deepcopy(builtin)
+        # The organization is installation identity, not a preset side effect:
+        # the explicit value survives apply, restore and revert.
+        if state.organization_name:
+            branding = document.get("branding")
+            if not isinstance(branding, dict):
+                branding = {}
+                document["branding"] = branding
+            branding["organizationName"] = state.organization_name
         return document, state.active_id, state.previous_id
 
     def _envelope(self, session: Session) -> dict[str, Any]:
@@ -129,6 +175,13 @@ class AppearanceService:
             "previousId": previous_id,
             "builtinIds": list(BUILTIN_IDS),
         }
+
+    def _organization(self, session: Session) -> str:
+        document, _active_id, _previous_id = self._active(session)
+        branding = document.get("branding")
+        if not isinstance(branding, dict):
+            return ""
+        return str(branding.get("organizationName") or "")
 
     def _presets(self, session: Session) -> list[dict[str, Any]]:
         presets = list(self._builtins().values())
@@ -154,6 +207,11 @@ class AppearanceService:
         """Public identity needed by the login shell; contains no private data."""
         with self._session() as session:
             return self._envelope(session)
+
+    def organization(self) -> dict[str, Any]:
+        """The installation organization name only; never the preset document."""
+        with self._session() as session:
+            return {"organizationName": self._organization(session)}
 
     def presets(self, principal: Principal) -> dict[str, Any]:
         with self._session() as session:
@@ -354,6 +412,40 @@ class AppearanceService:
             row.updated_at = now
         session.flush()
         return row
+
+    def set_organization(self, principal: Principal, value: str) -> dict[str, Any]:
+        """Persist the installation organization name, validated and read back."""
+
+        name = normalize_organization_name(value)
+        with self._session() as session:
+            identity = self._authorize(session, principal)
+            state = self._state(session)
+            if state is None:
+                generic = deepcopy(self._builtins()[GENERIC_ID])
+                state = AppearanceState(
+                    id=1,
+                    active_id=GENERIC_ID,
+                    previous_id=GENERIC_ID,
+                    active=generic,
+                    previous=deepcopy(generic),
+                    organization_name=name,
+                    revision=1,
+                    updated_by=principal.username,
+                    updated_at=utcnow(),
+                )
+                session.add(state)
+            else:
+                state.organization_name = name
+                state.revision = (state.revision or 0) + 1
+                state.updated_by = principal.username
+                state.updated_at = utcnow()
+            session.commit()
+            identity.record_operation(
+                principal,
+                action="appearance.organization_set",
+                resource="appearance:installation",
+            )
+            return {"organizationName": self._organization(session)}
 
     def create_preset(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
         with self._session() as session:
