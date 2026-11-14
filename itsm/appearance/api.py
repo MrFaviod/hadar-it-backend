@@ -56,6 +56,11 @@ def create_appearance_router() -> APIRouter:
         response.headers.update(AUTH_HEADERS)
         return service.active()
 
+    @router.get("/appearance/organization")
+    def organization(service: Service, context: Auth, response: Response):
+        response.headers.update(AUTH_HEADERS)
+        return service.organization()
+
     @router.get("/appearance/presets")
     def presets(service: Service, context: Auth, response: Response):
         response.headers.update(AUTH_HEADERS)

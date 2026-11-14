@@ -175,8 +175,10 @@ def _appearance_current(settings: Any, factory: Any, principal: Any) -> dict[str
 
     service = AppearanceService(factory, settings=settings)
     active = service.active()
+    branding = (active.get("active") or {}).get("branding") or {}
     return {
         "preset": active.get("activeId"),
+        "organizationName": str(branding.get("organizationName") or ""),
         "previous": active.get("previousId"),
         "builtinIds": list(active.get("builtinIds") or []),
     }
@@ -185,25 +187,40 @@ def _appearance_current(settings: Any, factory: Any, principal: Any) -> dict[str
 def _appearance_apply(
     settings: Any, factory: Any, principal: Any, values: dict[str, Any]
 ) -> dict[str, Any]:
-    from itsm.appearance.service import AppearanceService
+    from itsm.appearance.service import AppearanceService, normalize_organization_name
 
     service = AppearanceService(factory, settings=settings)
     preset = str(values.get("preset") or "").strip()
-    if not preset:
-        raise ConfigurationInvalid("a preset is required")
-    catalog = _translate(lambda: service.presets(principal))
-    known = {str(item.get("id")) for item in catalog.get("presets") or []}
-    if preset not in known:
-        raise ConfigurationInvalid("unknown appearance preset")
-    _translate(lambda: service.apply_preset(principal, preset))
+    organization = "organizationName" in values and values.get("organizationName") is not None
+    name = (
+        _translate(lambda: normalize_organization_name(values.get("organizationName")))
+        if organization
+        else ""
+    )
+    if not preset and not organization:
+        raise ConfigurationInvalid("a preset or an organization name is required")
+    sources: list[str] = []
+    if preset:
+        catalog = _translate(lambda: service.presets(principal))
+        known = {str(item.get("id")) for item in catalog.get("presets") or []}
+        if preset not in known:
+            raise ConfigurationInvalid("unknown appearance preset")
+        _translate(lambda: service.apply_preset(principal, preset))
+        sources.append("apply_preset")
+    if organization:
+        _translate(lambda: service.set_organization(principal, name))
+        sources.append("set_organization")
     current = _appearance_current(settings, factory, principal)
-    if current["preset"] != preset:
+    if preset and current["preset"] != preset:
         raise ConfigurationUnavailable("the appearance change did not persist")
+    if organization and current["organizationName"] != name:
+        raise ConfigurationUnavailable("the organization name did not persist")
     return {
         "status": checklist_module.GREEN,
         "receipt": {
-            "source": "apply_preset",
+            "source": "+".join(sources),
             "active_id": current["preset"],
+            "organizationName": current["organizationName"],
             "previous_id": current["previous"],
         },
     }
@@ -869,8 +886,21 @@ def preview(
     current_now = read_section(store, mode, section, environ=environ)
     current = current_now.get("current") or {}
     if section == "appearance":
-        current_value = {"preset": current.get("preset", "generic")}
-        proposed = {"preset": str(values.get("preset") or "").strip()}
+        from itsm.appearance.service import normalize_organization_name
+
+        current_value: dict[str, Any] = {}
+        proposed: dict[str, Any] = {}
+        preset = str(values.get("preset") or "").strip()
+        if preset:
+            current_value["preset"] = current.get("preset", "generic")
+            proposed["preset"] = preset
+        if "organizationName" in values and values.get("organizationName") is not None:
+            current_value["organizationName"] = current.get("organizationName") or ""
+            proposed["organizationName"] = _translate(
+                lambda: normalize_organization_name(values.get("organizationName"))
+            )
+        if not proposed:
+            raise ConfigurationInvalid("a preset or an organization name is required")
     elif section == "agent":
         current_value = {
             "provider": current.get("provider"),
