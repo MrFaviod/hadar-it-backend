@@ -217,7 +217,7 @@ class ConfigurationSectionRequest(BaseModel):
     """One section proposal; ``confirm`` is the human confirmation bit."""
 
     values: dict[str, Any] = Field(default_factory=dict)
-    action: Literal["apply", "postpone", "accept_risk"] = "apply"
+    action: Literal["apply", "postpone", "accept_risk", "declare"] = "apply"
     confirm: bool = False
 
 
@@ -231,6 +231,7 @@ class ConfigurationSectionResponse(BaseModel):
     current: dict[str, Any] | None = None
     proposed: dict[str, Any] | None = None
     changes: list[dict[str, Any]] | None = None
+    env_override: list[str] | None = None
     receipt: dict[str, Any] | None = None
     actions: list[str] | None = None
     preview_only: bool | None = None

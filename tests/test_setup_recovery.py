@@ -436,6 +436,7 @@ def test_the_installation_setup_migration_upgrades_and_downgrades(settings_facto
     )
     assert downgraded.returncode == 0, downgraded.stderr
     assert "installation_setup" not in table_names(settings.database_url)
+    assert "installation_backup_policy" not in table_names(settings.database_url)
 
     upgraded = run_migrations(settings)
     assert upgraded.returncode == 0, upgraded.stderr

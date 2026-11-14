@@ -24,8 +24,11 @@ SECTIONS: tuple[str, ...] = (
 POSTPONABLE_SECTIONS: tuple[str, ...] = ("notifications", "monitoring")
 
 #: Statuses that satisfy a required item. ``risk`` only satisfies the one item
-#: that the operator is allowed to accept explicitly.
+#: that the operator is allowed to accept explicitly, and ``declared`` is a
+#: policy the operator stated (read back from the installation database), never
+#: an observed backup status.
 GREEN = "passed"
+DECLARED = "declared"
 _PASSING = frozenset({GREEN})
 
 
@@ -188,7 +191,7 @@ def build_checklist(
         status = resolved["status"]
         accepted_risk = bool(resolved.get("acceptedRisk"))
         satisfied = status in _PASSING or (
-            accepted_risk and requirement.id == "backup_policy_declared"
+            requirement.id == "backup_policy_declared" and (accepted_risk or status == DECLARED)
         )
         blocking = required and not satisfied
         items.append(
