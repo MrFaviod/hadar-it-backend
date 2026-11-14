@@ -32,6 +32,26 @@ from itsm.setup import checklist as checklist_module
 from itsm.setup.store import SetupError, SetupStore, StateRefused
 
 PROBE_CATEGORY = "default"
+#: Operational settings that setup owns in the private installation file. The
+#: environment still wins over the file, by design; the read-back says so.
+OPERATIONAL_SETTING_KEYS: tuple[str, ...] = (
+    "auth_origin",
+    "auth_cookie_secure",
+    "auth_cookie_name",
+    "auth_session_minutes_default",
+)
+_OPERATIONAL_ENV: dict[str, str] = {
+    "auth_origin": "ITSM_AUTH_ORIGIN",
+    "auth_cookie_secure": "ITSM_AUTH_COOKIE_SECURE",
+    "auth_cookie_name": "ITSM_AUTH_COOKIE_NAME",
+    "auth_session_minutes_default": "ITSM_AUTH_SESSION_MINUTES_DEFAULT",
+}
+RESTART_SCOPE: tuple[str, ...] = ("backend", "worker")
+RESTART_NOTE = (
+    "the installation file now carries these values; the backend and worker "
+    "apply them after a restart"
+)
+_OPERATIONAL_STATUS_RANK = {"applied": 0, "risk": 1, "declared": 2}
 #: The probe owns its client for one bounded turn; the address policy and the
 #: assistant timeout bound the run, this only stops a socket hanging forever.
 _PROBE_CLIENT_TIMEOUT = 30.0
@@ -631,7 +651,8 @@ def read_section(
     }
     try:
         if section == "operational":
-            body["current"] = _operational_current(store)
+            with _domain(environ) as (settings, _engine, factory):
+                body["current"] = _operational_current(settings, factory, environ)
         elif section == "agent":
             with _domain(environ) as (settings, _engine, factory):
                 body["current"] = _agent_current(settings, factory)
@@ -650,15 +671,296 @@ def read_section(
     return body
 
 
-def _operational_current(store: SetupStore) -> dict[str, Any]:
-    settings = _runtime_settings()
-    origin = settings.auth_origin
+def _installation_file_values(environ: Mapping[str, str] | None) -> dict[str, Any]:
+    """Read the installation file's values for provenance; never raise to readers."""
+
+    from itsm.config import (
+        InstallationConfigError,
+        _load_installation_values,
+        installation_config_path,
+    )
+
+    try:
+        path = installation_config_path(environ)
+    except InstallationConfigError:
+        return {}
+    if path is None:
+        return {}
+    try:
+        return dict(_load_installation_values(path))
+    except InstallationConfigError:
+        return {}
+
+
+def _same_setting(left: Any, right: Any) -> bool:
+    return str(left).strip().lower() == str(right).strip().lower()
+
+
+def _operational_provenance(
+    environ: Mapping[str, str] | None, settings: Any
+) -> dict[str, dict[str, Any]]:
+    """Say, per setting, whether the environment or the file produced the value."""
+
+    file_values = _installation_file_values(environ)
+    source_environment = dict(os.environ if environ is None else environ)
+    detail: dict[str, dict[str, Any]] = {}
+    for key in OPERATIONAL_SETTING_KEYS:
+        env_name = _OPERATIONAL_ENV[key]
+        effective = getattr(settings, key)
+        source = "default"
+        overridden_by = None
+        if env_name in source_environment:
+            source = "env"
+            if key in file_values and not _same_setting(file_values[key], effective):
+                overridden_by = env_name
+        elif key in file_values:
+            source = "installation"
+        detail[key] = {
+            "value": effective,
+            "source": source,
+            "overridden_by": overridden_by,
+        }
+    return detail
+
+
+def _declared_policy(factory: Any) -> dict[str, Any] | None:
+    """Read the declaration back from the installation database."""
+
+    from itsm.setup import backup_policy
+
+    try:
+        with factory() as session:
+            row = backup_policy.read_policy(session)
+            return backup_policy.as_body(row) if row is not None else None
+    except Exception:  # a missing table or a dead database is simply "not declared"
+        return None
+
+
+def _operational_current(
+    settings: Any, factory: Any, environ: Mapping[str, str] | None
+) -> dict[str, Any]:
+    provenance = _operational_provenance(environ, settings)
+    file_values = _installation_file_values(environ)
+    restart_required = any(key in file_values for key in OPERATIONAL_SETTING_KEYS)
     return {
-        "origin": origin,
+        "origin": settings.auth_origin,
         "cookie_secure": bool(settings.auth_cookie_secure),
         "worker": "unknown",
-        "notes": "operational items are observed by verify, not configured here",
+        "settings": provenance,
+        "backup_policy": _declared_policy(factory),
+        "restart_required": restart_required,
+        "restart_scope": list(RESTART_SCOPE),
+        "note": RESTART_NOTE if restart_required else "operational items are observed by verify",
     }
+
+
+def _policy_source(values: dict[str, Any]) -> dict[str, Any]:
+    from itsm.setup import backup_policy
+
+    source = values.get("policy")
+    if not isinstance(source, dict):
+        source = values
+    return {key: source.get(key) for key in backup_policy.FIELDS}
+
+
+def _operational_values(values: dict[str, Any]) -> dict[str, Any]:
+    """Validate the origin/session values the operator proposed, before any write."""
+
+    from pydantic import ValidationError
+
+    from itsm.config import Settings
+
+    if not isinstance(values, dict):
+        raise ConfigurationInvalid("operational settings must be proposed as an object")
+    if set(values) - set(OPERATIONAL_SETTING_KEYS):
+        raise ConfigurationInvalid("only the public origin and session settings can be applied")
+    picked = {
+        key: values[key]
+        for key in OPERATIONAL_SETTING_KEYS
+        if key in values and values[key] is not None
+    }
+    if not picked:
+        raise ConfigurationInvalid("no operational setting was proposed")
+    try:
+        validated = Settings(_env_file=None, **picked)
+    except ValidationError as exc:
+        raise ConfigurationInvalid("the proposed operational values are not valid") from exc
+    return {key: getattr(validated, key) for key in picked}
+
+
+def _record_operational(store: SetupStore, status: str, receipt: dict[str, Any]) -> dict[str, Any]:
+    """Keep one operational receipt: an origin apply and a declaration coexist."""
+
+    entry = _stored_sections(store).get("operational")
+    existing = entry if isinstance(entry, dict) else {}
+    merged = dict(existing.get("receipt") or {})
+    merged.update(receipt)
+    previous = str(existing.get("status") or "pending")
+    chosen = (
+        status
+        if _OPERATIONAL_STATUS_RANK.get(status, -1) >= _OPERATIONAL_STATUS_RANK.get(previous, -1)
+        else previous
+    )
+    return store.record_configuration_section("operational", status=chosen, receipt=merged)
+
+
+def _section_result(mode: str, entry: dict[str, Any]) -> dict[str, Any]:
+    plan = section_plan(mode, "operational")
+    return {
+        "section": "operational",
+        "required": plan.required,
+        "postponable": plan.postponable,
+        "status": entry["status"],
+        "receipt": entry["receipt"],
+    }
+
+
+def _operational_preview(
+    plan: SectionPlan,
+    environ: Mapping[str, str] | None,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Preview a policy declaration or an origin/session change; write nothing."""
+
+    from itsm.setup import backup_policy
+
+    if values.get("item") == "backup_policy_declared":
+        try:
+            proposed = backup_policy.normalize(_policy_source(values))
+        except backup_policy.BackupPolicyInvalid as exc:
+            raise ConfigurationInvalid(str(exc)) from exc
+        with _domain(environ) as (_settings, _engine, factory):
+            current = _declared_policy(factory) or {}
+        changes = [
+            {"field": key, "from": current.get(key), "to": proposed[key]}
+            for key in backup_policy.FIELDS
+            if current.get(key) != proposed[key]
+        ]
+        return {
+            "section": "operational",
+            "status": "preview",
+            "required": plan.required,
+            "postponable": plan.postponable,
+            "current": current,
+            "proposed": proposed,
+            "changes": changes,
+            "preview_only": True,
+        }
+
+    picked = _operational_values(values)
+    settings = _runtime_settings(environ)
+    provenance = _operational_provenance(environ, settings)
+    source_environment = dict(os.environ if environ is None else environ)
+    changes = [
+        {"field": key, "from": getattr(settings, key), "to": value}
+        for key, value in picked.items()
+        if not _same_setting(getattr(settings, key), value)
+    ]
+    env_override = sorted(
+        {_OPERATIONAL_ENV[key] for key in picked if _OPERATIONAL_ENV[key] in source_environment}
+    )
+    return {
+        "section": "operational",
+        "status": "preview",
+        "required": plan.required,
+        "postponable": plan.postponable,
+        "current": {key: provenance[key]["value"] for key in OPERATIONAL_SETTING_KEYS},
+        "proposed": picked,
+        "changes": changes,
+        "env_override": env_override,
+        "preview_only": True,
+    }
+
+
+def _declare_backup_policy(
+    store: SetupStore,
+    mode: str,
+    environ: Mapping[str, str] | None,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Store the operator's declaration, then read it back from the database.
+
+    This writes installation metadata, never a domain setting: the effective
+    backup state still belongs to ``SystemService.backup_status``.
+    """
+
+    from sqlalchemy.exc import SQLAlchemyError
+
+    from itsm.setup import backup_policy
+
+    if values.get("item") != "backup_policy_declared":
+        raise ConfigurationInvalid(
+            "only the backup policy can be declared in the operational section"
+        )
+    try:
+        policy = backup_policy.normalize(_policy_source(values))
+    except backup_policy.BackupPolicyInvalid as exc:
+        raise ConfigurationInvalid(str(exc)) from exc
+    owner = store.owner_record() or {}
+    with _domain(environ) as (_settings, _engine, factory):
+        try:
+            with factory() as session:
+                row = backup_policy.declare(session, policy, declared_by=owner.get("username"))
+                body = backup_policy.as_body(row)
+        except SQLAlchemyError as exc:
+            raise ConfigurationUnavailable(
+                "the installation database refused the backup policy declaration"
+            ) from exc
+    entry = _record_operational(
+        store,
+        "declared",
+        {
+            "item": "backup_policy_declared",
+            "status": "declared",
+            "source": backup_policy.TABLE_NAME,
+            "backup_policy": body,
+        },
+    )
+    return _section_result(mode, entry)
+
+
+def _apply_operational(
+    store: SetupStore,
+    mode: str,
+    environ: Mapping[str, str] | None,
+    values: dict[str, Any],
+) -> dict[str, Any]:
+    """Publish validated settings into the private file and report what is effective."""
+
+    from itsm.config import InstallationConfigError, installation_config_path
+    from itsm.setup.storage import write_installation_values
+
+    picked = _operational_values(values)
+    try:
+        path = installation_config_path(environ)
+    except InstallationConfigError as exc:
+        raise ConfigurationUnavailable(
+            "ITSM_INSTALLATION_CONFIG must be an absolute private file path"
+        ) from exc
+    if path is None:
+        raise ConfigurationInvalid(
+            "ITSM_INSTALLATION_CONFIG is not set, so the operational values cannot be published"
+        )
+    write_installation_values(path, picked)
+    effective = _runtime_settings(environ)
+    provenance = _operational_provenance(environ, effective)
+    overridden = sorted(
+        {detail["overridden_by"] for detail in provenance.values() if detail["overridden_by"]}
+    )
+    entry = _record_operational(
+        store,
+        "applied",
+        {
+            "source": "installation_file",
+            "written": sorted(picked),
+            "effective": provenance,
+            "overridden_by": overridden,
+            "restart_required": True,
+            "restart_scope": list(RESTART_SCOPE),
+            "note": RESTART_NOTE,
+        },
+    )
+    return _section_result(mode, entry)
 
 
 def preview(
@@ -673,7 +975,7 @@ def preview(
 
     plan = section_plan(mode, section)
     if section == "operational":
-        raise ConfigurationInvalid("operational items are observed, not configured")
+        return _operational_preview(plan, environ, values)
     if section not in _APPLIERS:
         raise ConfigurationInvalid("unknown configuration section")
 
@@ -749,7 +1051,7 @@ def apply_section(
     """Apply one section after the human confirmation; never a silent write."""
 
     plan = section_plan(mode, section)
-    if action not in {"apply", "postpone", "accept_risk"}:
+    if action not in {"apply", "postpone", "accept_risk", "declare"}:
         raise ConfigurationInvalid("unknown configuration action")
     if action == "postpone":
         if not plan.postponable:
@@ -785,7 +1087,7 @@ def apply_section(
             "reason": _clean_reason(values.get("reason")),
             "accepted_at": _iso(_now()),
         }
-        entry = store.record_configuration_section(section, status="risk", receipt=receipt)
+        entry = _record_operational(store, "risk", receipt)
         return {
             "section": section,
             "required": plan.required,
@@ -796,6 +1098,14 @@ def apply_section(
 
     if not confirm:
         raise ConfirmationRequired("applying a configuration needs explicit confirmation")
+    if section == "operational":
+        if action == "declare":
+            return _declare_backup_policy(store, mode, environ, values)
+        if action == "apply":
+            return _apply_operational(store, mode, environ, values)
+        raise ConfigurationInvalid("unknown configuration action for the operational section")
+    if action == "declare":
+        raise ConfigurationInvalid("only the operational backup policy can be declared")
     return _apply_values(store, mode, section, values, environ)
 
 
@@ -925,10 +1235,21 @@ def _observe(
         status = _translate(lambda: SystemService(settings, factory).backup_status(principal))
     except SetupError:
         status = {"available": False, "reason": "unreadable"}
+    declared = _declared_policy(factory)
     if status.get("available"):
         observations["backup_policy_declared"] = {
             "status": "passed",
             "evidence": str(status.get("summary") or "published backup status")[:120],
+        }
+    elif declared:
+        observations["backup_policy_declared"] = {
+            "status": "declared",
+            "evidence": (
+                "declared: "
+                f"{declared['location_kind']} target {declared['target']}; "
+                f"{declared['schedule']}; retention {declared['retention']}; "
+                f"responsible {declared['responsible']}"
+            )[:240],
         }
     else:
         observations["backup_policy_declared"] = {

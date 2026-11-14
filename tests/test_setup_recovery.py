@@ -424,11 +424,19 @@ def test_the_installation_setup_migration_upgrades_and_downgrades(settings_facto
     assert "installation_setup" in table_names(settings.database_url)
 
     downgraded = run_cli(
-        ["-m", "alembic", "-c", str(BACKEND_ROOT / "alembic.ini"), "downgrade", "-1"],
+        [
+            "-m",
+            "alembic",
+            "-c",
+            str(BACKEND_ROOT / "alembic.ini"),
+            "downgrade",
+            "0045_machine_expiry",
+        ],
         settings,
     )
     assert downgraded.returncode == 0, downgraded.stderr
     assert "installation_setup" not in table_names(settings.database_url)
+    assert "installation_backup_policy" not in table_names(settings.database_url)
 
     upgraded = run_migrations(settings)
     assert upgraded.returncode == 0, upgraded.stderr
