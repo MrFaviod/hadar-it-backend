@@ -32,6 +32,9 @@ from itsm.setup import checklist as checklist_module
 from itsm.setup.store import SetupError, SetupStore, StateRefused
 
 PROBE_CATEGORY = "default"
+#: The probe owns its client for one bounded turn; the address policy and the
+#: assistant timeout bound the run, this only stops a socket hanging forever.
+_PROBE_CLIENT_TIMEOUT = 30.0
 _SAFE_REASON = re.compile(r"[^a-z0-9_]+")
 _MAX_REASON = 80
 
@@ -267,7 +270,7 @@ def _agent_apply(
         "reason": "credential_missing",
     }
     if credential:
-        probe = _probe_agent(settings, provider, model, mode)
+        probe = _probe_agent(settings, factory, principal, provider, model, mode)
     reason = probe.get("reason")
     ai_deferred = bool(ai.get("pending"))
     if ai_deferred:
@@ -295,37 +298,175 @@ def _unverified(reason: str) -> dict[str, Any]:
     return {"capability": "unverified", "tool": None, "latency_ms": None, "reason": reason}
 
 
-def _probe_agent(settings: Any, provider: str, model_name: str, mode: str) -> dict[str, Any]:
-    """Ask the configured model to call a read-only tool; observation only."""
+class _OperatorDestinationMissing(Exception):
+    """No destination the operator entered exists for this probe."""
 
-    from types import SimpleNamespace
 
-    from itsm.agents.runtime import AgentUnavailable, resolve_model
+def _provider_credential(provider: str) -> str:
+    """Read the allowlisted credential of one provider from the process env."""
+
+    from itsm.system.providers import PROVIDER_CATALOG
+
+    entry = PROVIDER_CATALOG.get(provider) or {}
+    for name in entry.get("credentialEnv") or ():  # type: ignore[union-attr]
+        value = os.environ.get(str(name), "").strip()
+        if value:
+            return value
+    return ""
+
+
+def _verified_setup_provider(settings: Any, factory: Any, principal: Any) -> tuple[str, str] | None:
+    """Read the provider this setup verified and handed to the owner, if it stayed."""
+
+    from sqlalchemy import select
+
+    from itsm.agent_integrations.models import AgentProvider
+    from itsm.agent_integrations.providers import unseal_credential
+    from itsm.setup.owner import PROVIDER_NAME
+
+    owner_id = str(getattr(principal, "actor_id", "") or "")
+    if not owner_id:
+        return None
+    try:
+        with factory() as session:
+            rows = [
+                row
+                for row in session.scalars(
+                    select(AgentProvider).where(
+                        AgentProvider.scope == "personal",
+                        AgentProvider.owner_id == owner_id,
+                        AgentProvider.enabled.is_(True),
+                    )
+                ).all()
+                if (row.name or "") == PROVIDER_NAME
+            ]
+            if len(rows) != 1:
+                return None
+            row = rows[0]
+            token = row.api_key_ciphertext or ""
+            base_url = row.base_url or ""
+            if not token or not base_url:
+                return None
+            return base_url, unseal_credential(settings, token)
+    except Exception:  # observation only: a missing row leaves the section unverified
+        return None
+
+
+def _probe_model(
+    settings: Any, factory: Any, principal: Any, provider: str, model_name: str
+) -> tuple[Any, Any]:
+    """Build the probe model over a client this probe owns and closes.
+
+    The probe only talks to a destination the operator entered: the explicit
+    installation base URL, or the provider the setup step verified and handed
+    to this owner. Both are reached through
+    :mod:`itsm.agent_integrations.providers`, which owns the address policy.
+    The provider SDK would otherwise fall back to an ambient
+    ``OPENAI_BASE_URL``, a destination nobody entered in this setup.
+    """
+
+    from itsm.agent_integrations.providers import (
+        ProviderModelSelection,
+        build_provider_model,
+        personal_endpoint_policy,
+        provider_http_client,
+        validate_provider_endpoint,
+    )
+
+    if provider != "openai":
+        from types import SimpleNamespace
+
+        from itsm.agents.runtime import resolve_model
+
+        client = provider_http_client(allow_private=True, timeout=_PROBE_CLIENT_TIMEOUT)
+        model = resolve_model(
+            settings, SimpleNamespace(provider=provider, model=model_name), http_client=client
+        )
+        return model, client
+    explicit = getattr(settings, "agent_openai_base_url", None)
+    api_key = _provider_credential(provider)
+    if explicit and api_key:
+        endpoint = validate_provider_endpoint(explicit, scope="global")
+        client = provider_http_client(allow_private=True, timeout=_PROBE_CLIENT_TIMEOUT)
+        selection = ProviderModelSelection(
+            base_url=endpoint,
+            model=model_name,
+            api_key=api_key,
+            allow_private=True,
+        )
+        return build_provider_model(selection, http_client=client), client
+    verified = _verified_setup_provider(settings, factory, principal)
+    if verified is None:
+        raise _OperatorDestinationMissing()
+    base_url, api_key = verified
+    policy = personal_endpoint_policy(settings)
+    endpoint = validate_provider_endpoint(base_url, scope="personal", policy=policy)
+    client = provider_http_client(policy=policy, timeout=_PROBE_CLIENT_TIMEOUT)
+    selection = ProviderModelSelection(
+        base_url=endpoint,
+        model=model_name,
+        api_key=api_key,
+        allow_private=policy,
+    )
+    return build_provider_model(selection, http_client=client), client
+
+
+async def _probe_turn(model: Any, client: Any, reader: Callable[[], Mapping[str, Any]]) -> Any:
+    """Run one probe turn and always close the client the probe opened."""
+
+    from itsm.setup import assistant as bootstrap
+
+    try:
+        instance = bootstrap.BootstrapAssistant(
+            model,
+            status_reader=reader,
+            timeout=bootstrap.PROBE_TIMEOUT_SECONDS,
+            request_limit=bootstrap.PROBE_REQUEST_LIMIT,
+            tool_calls_limit=bootstrap.PROBE_TOOL_CALLS_LIMIT,
+            output_tokens=bootstrap.PROBE_OUTPUT_TOKENS,
+            system_prompt=bootstrap._PROBE_SYSTEM_PROMPT,
+        )
+        return await asyncio.wait_for(
+            instance.run(bootstrap.PROBE_QUESTION),
+            timeout=bootstrap.PROBE_TIMEOUT_SECONDS + 5.0,
+        )
+    finally:
+        await client.aclose()
+
+
+def _probe_agent(
+    settings: Any, factory: Any, principal: Any, provider: str, model_name: str, mode: str
+) -> dict[str, Any]:
+    """Ask the configured model to call a read-only tool; observation only.
+
+    The probe only talks to a destination the operator entered: the provider
+    verified in the setup step when there is one, otherwise the explicit
+    installation base URL. An ambient ``OPENAI_BASE_URL`` is not a destination
+    of its own, so a probe without either fails closed before any request.
+    """
+
+    from itsm.agent_integrations.providers import (
+        CredentialInvalid,
+        CredentialUnavailable,
+        ProviderEndpointError,
+    )
     from itsm.setup import assistant as bootstrap
 
     started = time.monotonic()
     try:
-        model = resolve_model(settings, SimpleNamespace(provider=provider, model=model_name))
-    except AgentUnavailable, Exception:
+        model, client = _probe_model(settings, factory, principal, provider, model_name)
+    except _OperatorDestinationMissing:
+        return _unverified("credential_missing")
+    except CredentialUnavailable, CredentialInvalid:
+        return _unverified("credential_missing")
+    except ProviderEndpointError:
+        return _unverified("endpoint_forbidden")
+    except Exception:
         return _unverified("model_unavailable")
 
     reader = lambda: {"state": "configuring", "mode": mode}  # noqa: E731 - tiny closure
-    instance = bootstrap.BootstrapAssistant(
-        model,
-        status_reader=reader,
-        timeout=bootstrap.PROBE_TIMEOUT_SECONDS,
-        request_limit=bootstrap.PROBE_REQUEST_LIMIT,
-        tool_calls_limit=bootstrap.PROBE_TOOL_CALLS_LIMIT,
-        output_tokens=bootstrap.PROBE_OUTPUT_TOKENS,
-        system_prompt=bootstrap._PROBE_SYSTEM_PROMPT,
-    )
     try:
-        answer = asyncio.run(
-            asyncio.wait_for(
-                instance.run(bootstrap.PROBE_QUESTION),
-                timeout=bootstrap.PROBE_TIMEOUT_SECONDS + 5.0,
-            )
-        )
+        answer = asyncio.run(_probe_turn(model, client, reader))
     except Exception as exc:  # transport, provider and timeout failures
         return {
             "capability": "unverified",
