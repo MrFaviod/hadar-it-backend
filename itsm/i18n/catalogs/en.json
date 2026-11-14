@@ -1027,6 +1027,8 @@
   "api.system.maintenance_window_not_supported": "maintenance window is not supported",
   "api.system.module_id_invalid": "module id is invalid",
   "api.system.module_payload_contain_only_boolean_enabled": "module payload must contain only a boolean enabled",
+  "api.system.provider_id_invalid": "providerId is invalid",
+  "api.system.provider_id_mismatch": "providerId does not name an enabled global record for this model",
   "api.system.provider_selection_invalid": "The provider selection is invalid: {reason}",
   "api.system.system_operations_reserved_installation_owner": "system operations are reserved to the installation owner",
   "api.system.unknown_system_operation": "unknown system operation",

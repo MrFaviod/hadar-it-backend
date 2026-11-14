@@ -1027,6 +1027,8 @@
   "api.system.maintenance_window_not_supported": "La ventana de mantenimiento no es compatible.",
   "api.system.module_id_invalid": "El id del módulo no es válido.",
   "api.system.module_payload_contain_only_boolean_enabled": "Los datos del módulo solo deben contener un valor booleano enabled.",
+  "api.system.provider_id_invalid": "El providerId no es válido.",
+  "api.system.provider_id_mismatch": "El providerId no identifica un registro global habilitado para este modelo.",
   "api.system.provider_selection_invalid": "La selección de proveedor no es válida: {reason}.",
   "api.system.system_operations_reserved_installation_owner": "Las operaciones de sistema están reservadas al propietario de la instalación.",
   "api.system.unknown_system_operation": "Operación de sistema desconocida.",

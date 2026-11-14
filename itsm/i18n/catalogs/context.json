@@ -1027,6 +1027,8 @@
   "api.system.maintenance_window_not_supported": "ValidationFailed domain error from the system module: maintenance window is not supported",
   "api.system.module_id_invalid": "ValidationFailed domain error from the system module: module id is invalid",
   "api.system.module_payload_contain_only_boolean_enabled": "ValidationFailed domain error from the system module: module payload must contain only a boolean enabled",
+  "api.system.provider_id_invalid": "ValidationFailed domain error from the system module: providerId is invalid",
+  "api.system.provider_id_mismatch": "ValidationFailed domain error from the system module: providerId does not name an enabled global record for this model",
   "api.system.provider_selection_invalid": "ValidationFailed domain error from the system module: {reason}",
   "api.system.system_operations_reserved_installation_owner": "PermissionDenied domain error from the system module: system operations are reserved to the installation owner",
   "api.system.unknown_system_operation": "ValidationFailed domain error from the system module: unknown system operation",
