@@ -48,6 +48,15 @@ class PassingValidator:
         }
 
 
+@pytest.fixture(autouse=True)
+def _forbid_real_model_requests(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Deny model traffic here, scoped to this module so the flag never leaks."""
+
+    import pydantic_ai.models
+
+    monkeypatch.setattr(pydantic_ai.models, "ALLOW_MODEL_REQUESTS", False)
+
+
 @pytest.fixture
 def catalog(settings_factory: Callable[..., Settings]) -> Iterator[Catalog]:
     database = prepare(settings_factory)
@@ -520,7 +529,6 @@ class RecordingRuntime:
 
 
 def _capture_agent(catalog: Catalog, client: Any, seen: list[dict[str, Any]]) -> Any:
-    import pydantic_ai.models
     from itsm.agents.runtime import AgentRuntime
     from pydantic_ai.messages import ModelResponse, TextPart
     from pydantic_ai.models.function import FunctionModel
@@ -540,7 +548,6 @@ def _capture_agent(catalog: Catalog, client: Any, seen: list[dict[str, Any]]) ->
         )
         return ModelResponse(parts=[TextPart(content="ok")])
 
-    pydantic_ai.models.ALLOW_MODEL_REQUESTS = False
     test_client = client(catalog.settings)
     runtime = AgentRuntime(catalog.settings, catalog.factory(), model=FunctionModel(run))
     test_client.app.state.agent_runtime = runtime
