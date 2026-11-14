@@ -49,6 +49,7 @@ class ProviderSelection:
     source: str
     updated_at: datetime | None = None
     updated_by: str | None = None
+    provider_id: str | None = None
 
 
 def validate_selection(provider: object, model: object) -> tuple[str, str]:
@@ -110,6 +111,7 @@ def persisted_selection(session: Session) -> ProviderSelection | None:
         source="installation",
         updated_at=row.updated_at,
         updated_by=row.updated_by,
+        provider_id=getattr(row, "provider_id", None),
     )
 
 

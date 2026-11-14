@@ -2109,7 +2109,7 @@ class AgentRuntime:
         self._extension_development = extension_development
         self._owns_provider_client = provider_http_client is None
         self._agent: Agent[AgentDeps, str] | None = None
-        self._selection_key: tuple[str, str, str] | None = None
+        self._selection_key: tuple[Any, ...] | None = None
         self._agent_locale: str | None = None
 
     async def aclose(self) -> None:
@@ -2149,6 +2149,47 @@ class AgentRuntime:
             logger.warning("provider selection could not be read: %s", type(exc).__name__)
             return None
 
+    def _linked_provider_selection(self, selection: Any) -> ProviderModelSelection | None:
+        """Resolve the installation provider record the selection points at.
+
+        The record owns the sealed credential, so this is read only when no
+        allowlisted environment credential exists: the environment keeps its
+        priority. A record that vanished, was disabled or does not offer the
+        selected model leaves the runtime unavailable instead of falling back
+        to an ambient destination nobody entered.
+        """
+
+        provider_id = getattr(selection, "provider_id", None)
+        if not provider_id or self._session_factory is None:
+            return None
+        from itsm.agent_integrations.models import AgentProvider
+        from itsm.agent_integrations.providers import unseal_credential
+
+        try:
+            with self._session_factory() as session:
+                row = session.get(AgentProvider, provider_id)
+                if (
+                    row is None
+                    or not row.enabled
+                    or row.scope != "global"
+                    or selection.model not in list(row.models or [])
+                ):
+                    return None
+                base_url = (row.base_url or "").strip()
+                ciphertext = row.api_key_ciphertext or ""
+                if not base_url or not ciphertext:
+                    return None
+                api_key = unseal_credential(self._settings, ciphertext)
+        except Exception as exc:
+            logger.warning("linked provider record could not be read: %s", type(exc).__name__)
+            return None
+        return ProviderModelSelection(
+            base_url=base_url,
+            model=selection.model,
+            api_key=api_key,
+            allow_private=True,
+        )
+
     def _compose(self, model: Model, locale: str | None = None) -> Agent[AgentDeps, str]:
         agent: Agent[AgentDeps, str] = Agent(
             model,
@@ -2169,6 +2210,15 @@ class AgentRuntime:
         http_client: Any = None,
         locale: str | None = None,
     ) -> Agent[AgentDeps, str]:
+        if provider_selection is None and selection is not None:
+            from itsm.system.providers import credential_configured
+
+            provider_id = getattr(selection, "provider_id", None)
+            if provider_id and not credential_configured(selection.provider):
+                provider_selection = self._linked_provider_selection(selection)
+                if provider_selection is None:
+                    logger.warning("linked provider record is unavailable")
+                    raise AgentUnavailable()
         model = self._model
         if model is None:
             if provider_selection is not None:
@@ -2227,7 +2277,18 @@ class AgentRuntime:
                 self._agent_locale = language
             return self._agent
         selection = self._selection()
-        key = None if selection is None else (selection.provider, selection.model, language)
+        if selection is None:
+            key = None
+        else:
+            from itsm.system.providers import credential_configured
+
+            key = (
+                selection.provider,
+                selection.model,
+                getattr(selection, "provider_id", None),
+                credential_configured(selection.provider),
+                language,
+            )
         if self._agent is None or key != self._selection_key:
             self._agent = self._build(selection, locale=locale)
             self._selection_key = key
