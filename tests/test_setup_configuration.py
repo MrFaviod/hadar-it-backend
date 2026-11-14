@@ -510,6 +510,45 @@ def test_agent_requires_a_provider_row_credential_and_tool_probe(
         assert checklist_by_id(checklist)["ai_explicit"]["status"] == "passed"
 
 
+def test_agent_probe_prefers_the_verified_setup_provider_over_ambient_env(
+    app, store, tmp_path: Path, provider: ProviderFixture, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """An ambient OPENAI_BASE_URL must never replace the provider the operator entered."""
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("OPENAI_API_KEY", API_KEY)
+    monkeypatch.delenv("ITSM_AGENT_OPENAI_BASE_URL", raising=False)
+    with TestClient(app) as client:
+        csrf, _database_url = reach_owner_ready(client, store, tmp_path, provider=provider)
+        assert start_configuration(client, csrf).status_code == 200
+
+        applied = apply_section(client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL})
+        body = section_body(applied)
+        assert body["status"] == "passed", body
+        assert body["receipt"]["capability"] == "verified"
+        assert body["receipt"]["tool"] == "get_setup_status"
+        assert any(request.get("tools") for request in provider.chat_requests())
+
+
+def test_agent_probe_fails_closed_without_an_operator_destination(
+    app, store, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """With no verified provider and no installation URL the probe makes no request."""
+
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://127.0.0.1:9")
+    monkeypatch.setenv("OPENAI_API_KEY", API_KEY)
+    monkeypatch.delenv("ITSM_AGENT_OPENAI_BASE_URL", raising=False)
+    with TestClient(app) as client:
+        csrf, _database_url = reach_owner_ready(client, store, tmp_path)
+        assert start_configuration(client, csrf).status_code == 200
+
+        applied = apply_section(client, csrf, "agent", {"provider": "openai", "model": PROBE_MODEL})
+        body = section_body(applied)
+        assert body["status"] == "pending"
+        assert body["receipt"]["latency_ms"] is None
+        assert body["receipt"]["capability"] == "unverified"
+
+
 def test_agent_stays_pending_when_ai_was_deferred(
     app, store, tmp_path: Path, provider: ProviderFixture, monkeypatch: pytest.MonkeyPatch
 ) -> None:
