@@ -385,7 +385,7 @@ class SystemService:
             return self._providers_payload(session)
 
     def set_provider(self, principal: Principal, payload: Mapping[str, Any]) -> dict[str, Any]:
-        if set(payload) - {"provider", "model"}:
+        if set(payload) - {"provider", "model", "providerId"}:
             raise ValidationFailed(
                 "unsupported provider field", key="api.system.unsupported_provider_field"
             )
@@ -395,8 +395,33 @@ class SystemService:
             raise ValidationFailed(
                 str(exc), key="api.system.provider_selection_invalid", params={"reason": str(exc)}
             ) from None
+        provider_id = payload.get("providerId")
+        if provider_id is not None:
+            if not isinstance(provider_id, str) or not provider_id or len(provider_id) > 36:
+                raise ValidationFailed(
+                    "providerId is invalid", key="api.system.provider_id_invalid"
+                )
+            if provider != "openai":
+                raise ValidationFailed(
+                    "only an OpenAI-compatible installation record can be linked",
+                    key="api.system.provider_id_mismatch",
+                )
         with self._session_factory() as session:
             self._authorize(session, principal, "system.providers", "system:providers")
+            if provider_id is not None:
+                from itsm.agent_integrations.models import AgentProvider
+
+                record = session.get(AgentProvider, provider_id)
+                if (
+                    record is None
+                    or record.scope != "global"
+                    or not record.enabled
+                    or model not in list(record.models or [])
+                ):
+                    raise ValidationFailed(
+                        "providerId does not name an enabled global record for this model",
+                        key="api.system.provider_id_mismatch",
+                    )
             row = session.get(SystemProviderSettings, 1)
             if row is None:
                 row = SystemProviderSettings(id=1, provider=provider, model=model)
@@ -404,6 +429,7 @@ class SystemService:
             else:
                 row.provider = provider
                 row.model = model
+            row.provider_id = provider_id
             row.updated_at = utcnow()
             row.updated_by = principal.actor_id
             session.commit()

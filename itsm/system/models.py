@@ -33,6 +33,7 @@ class SystemProviderSettings(InventoryBase):
     id: Mapped[int] = mapped_column(Integer, primary_key=True, default=1)
     provider: Mapped[str] = mapped_column(String(32), nullable=False)
     model: Mapped[str] = mapped_column(String(120), nullable=False)
+    provider_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, default=utcnow
     )

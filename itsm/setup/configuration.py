@@ -219,12 +219,20 @@ def _agent_current(settings: Any, factory: Any) -> dict[str, Any]:
     with factory() as session:
         persisted = persisted_selection(session)
         effective = persisted or effective_selection(session, settings)
+    provider_id = getattr(persisted, "provider_id", None)
     return {
         "provider": effective.provider if effective else None,
         "model": effective.model if effective else None,
         "source": effective.source if effective else None,
         "persisted": persisted is not None,
-        "credential_configured": bool(effective and credential_configured(effective.provider)),
+        "provider_record": bool(provider_id),
+        "credential_configured": bool(
+            effective
+            and (
+                credential_configured(effective.provider)
+                or _provider_record_credential_available(settings, factory, provider_id)
+            )
+        ),
     }
 
 
@@ -251,17 +259,31 @@ def _agent_apply(
     except ProviderSelectionError as exc:
         raise ConfigurationInvalid("the provider selection is not valid") from exc
 
-    _translate(
-        lambda: SystemService(settings, factory).set_provider(
-            principal, {"provider": provider, "model": model}
+    provider_id: str | None = None
+    verified = _verified_setup_provider(settings, factory, principal)
+    if verified is not None and provider == "openai":
+        base_url, api_key = verified
+        provider_id = _promote_setup_provider(
+            settings, factory, principal, base_url, api_key, model
         )
-    )
+
+    payload: dict[str, Any] = {"provider": provider, "model": model}
+    if provider_id is not None:
+        payload["providerId"] = provider_id
+    _translate(lambda: SystemService(settings, factory).set_provider(principal, payload))
     with factory() as session:
         persisted = persisted_selection(session)
-    if persisted is None or persisted.provider != provider or persisted.model != model:
+    if (
+        persisted is None
+        or persisted.provider != provider
+        or persisted.model != model
+        or getattr(persisted, "provider_id", None) != provider_id
+    ):
         raise ConfigurationUnavailable("the provider selection did not persist")
 
-    credential = credential_configured(provider)
+    credential = credential_configured(provider) or _provider_record_credential_available(
+        settings, factory, provider_id
+    )
     ai = store.public_state().get("ai") or {}
     probe = {
         "capability": "unverified",
@@ -270,7 +292,9 @@ def _agent_apply(
         "reason": "credential_missing",
     }
     if credential:
-        probe = _probe_agent(settings, factory, principal, provider, model, mode)
+        probe = _probe_agent(
+            settings, factory, principal, provider, model, mode, provider_id=provider_id
+        )
     reason = probe.get("reason")
     ai_deferred = bool(ai.get("pending"))
     if ai_deferred:
@@ -285,6 +309,7 @@ def _agent_apply(
         "status": status,
         "provider": provider,
         "model": model,
+        "provider_record": provider_id is not None,
         "credential_configured": credential,
         "capability": probe.get("capability"),
         "tool": probe.get("tool"),
@@ -352,16 +377,154 @@ def _verified_setup_provider(settings: Any, factory: Any, principal: Any) -> tup
         return None
 
 
+def _provider_record(settings: Any, factory: Any, provider_id: str | None) -> Any:
+    """Read one provider record by id; observation only, never a mutation."""
+
+    if not provider_id:
+        return None
+    from itsm.agent_integrations.models import AgentProvider
+
+    try:
+        with factory() as session:
+            return session.get(AgentProvider, provider_id)
+    except Exception:
+        return None
+
+
+def _provider_record_credential_available(
+    settings: Any, factory: Any, provider_id: str | None
+) -> bool:
+    """Tell whether the linked record carries a credential this key ring opens."""
+
+    from itsm.agent_integrations.providers import unseal_credential
+
+    record = _provider_record(settings, factory, provider_id)
+    if record is None or not record.enabled or record.scope != "global":
+        return False
+    try:
+        return bool(unseal_credential(settings, record.api_key_ciphertext or ""))
+    except Exception:
+        return False
+
+
+def _promote_setup_provider(
+    settings: Any,
+    factory: Any,
+    principal: Any,
+    base_url: str,
+    api_key: str,
+    model: str,
+) -> str:
+    """Promote the verified destination to an operator-managed global record.
+
+    The credential is handed to ``AgentIntegrationService``, which seals it with
+    the external key exactly like any other provider record. The row is read
+    back before its id is returned, so the installation selection only links a
+    record whose credential really opens. Existing records for the same
+    destination are reused instead of duplicated.
+    """
+
+    from sqlalchemy import select
+
+    from itsm.agent_integrations.models import AgentProvider
+    from itsm.agent_integrations.providers import unseal_credential
+    from itsm.agent_integrations.service import AgentIntegrationService
+    from itsm.setup.owner import PROVIDER_NAME
+
+    normalized = base_url.rstrip("/")
+    try:
+        with factory() as session:
+            rows = [
+                row
+                for row in session.scalars(
+                    select(AgentProvider).where(AgentProvider.scope == "global")
+                ).all()
+                if (row.base_url or "").rstrip("/") == normalized
+            ]
+    except Exception as exc:
+        raise ConfigurationUnavailable("the provider record could not be read") from exc
+    if len(rows) > 1:
+        raise ConfigurationInvalid("more than one installation provider uses this destination")
+
+    service = AgentIntegrationService(settings, factory)
+    if rows:
+        row = rows[0]
+        provider_id = str(row.id)
+        try:
+            current_key = unseal_credential(settings, row.api_key_ciphertext or "")
+        except Exception:
+            current_key = ""
+        if current_key == api_key and model in list(row.models or []) and row.enabled:
+            return provider_id
+        try:
+            asyncio.run(
+                service.update_provider(
+                    principal,
+                    provider_id,
+                    {
+                        "apiKey": api_key,
+                        "models": [model],
+                        "modelSelection": "manual",
+                        "enabled": True,
+                    },
+                )
+            )
+        except Exception as exc:
+            raise ConfigurationUnavailable("the verified provider could not be promoted") from exc
+    else:
+        try:
+            created = asyncio.run(
+                service.create_provider(
+                    principal,
+                    {
+                        "name": PROVIDER_NAME,
+                        "baseUrl": base_url,
+                        "scope": "global",
+                        "apiKey": api_key,
+                        "models": [model],
+                        "modelSelection": "manual",
+                    },
+                )
+            )
+        except Exception as exc:
+            raise ConfigurationUnavailable("the verified provider could not be promoted") from exc
+        provider_id = str((created or {}).get("id") or "")
+        if not provider_id:
+            raise ConfigurationUnavailable("the promoted provider could not be read back")
+
+    record = _provider_record(settings, factory, provider_id)
+    if (
+        record is None
+        or record.scope != "global"
+        or not record.enabled
+        or model not in list(record.models or [])
+    ):
+        raise ConfigurationUnavailable("the promoted provider could not be read back")
+    try:
+        stored = unseal_credential(settings, record.api_key_ciphertext or "")
+    except Exception as exc:
+        raise ConfigurationUnavailable("the promoted provider credential cannot be read") from exc
+    if stored != api_key:
+        raise ConfigurationUnavailable("the promoted provider credential does not match")
+    return provider_id
+
+
 def _probe_model(
-    settings: Any, factory: Any, principal: Any, provider: str, model_name: str
+    settings: Any,
+    factory: Any,
+    principal: Any,
+    provider: str,
+    model_name: str,
+    *,
+    provider_id: str | None = None,
 ) -> tuple[Any, Any]:
     """Build the probe model over a client this probe owns and closes.
 
     The probe only talks to a destination the operator entered: the explicit
-    installation base URL, or the provider the setup step verified and handed
-    to this owner. Both are reached through
-    :mod:`itsm.agent_integrations.providers`, which owns the address policy.
-    The provider SDK would otherwise fall back to an ambient
+    installation base URL, the installation record promoted from the provider
+    the setup step verified, or that owner's verified record. All are reached
+    through :mod:`itsm.agent_integrations.providers`, which owns the address
+    policy. The provider SDK would otherwise fall back to an ambient
     ``OPENAI_BASE_URL``, a destination nobody entered in this setup.
     """
 
@@ -370,6 +533,7 @@ def _probe_model(
         build_provider_model,
         personal_endpoint_policy,
         provider_http_client,
+        unseal_credential,
         validate_provider_endpoint,
     )
 
@@ -392,6 +556,22 @@ def _probe_model(
             base_url=endpoint,
             model=model_name,
             api_key=api_key,
+            allow_private=True,
+        )
+        return build_provider_model(selection, http_client=client), client
+    linked = _provider_record(settings, factory, provider_id)
+    if (
+        linked is not None
+        and linked.enabled
+        and linked.scope == "global"
+        and model_name in list(linked.models or [])
+    ):
+        endpoint = validate_provider_endpoint(linked.base_url, scope="global")
+        client = provider_http_client(allow_private=True, timeout=_PROBE_CLIENT_TIMEOUT)
+        selection = ProviderModelSelection(
+            base_url=endpoint,
+            model=model_name,
+            api_key=unseal_credential(settings, linked.api_key_ciphertext or ""),
             allow_private=True,
         )
         return build_provider_model(selection, http_client=client), client
@@ -435,7 +615,14 @@ async def _probe_turn(model: Any, client: Any, reader: Callable[[], Mapping[str,
 
 
 def _probe_agent(
-    settings: Any, factory: Any, principal: Any, provider: str, model_name: str, mode: str
+    settings: Any,
+    factory: Any,
+    principal: Any,
+    provider: str,
+    model_name: str,
+    mode: str,
+    *,
+    provider_id: str | None = None,
 ) -> dict[str, Any]:
     """Ask the configured model to call a read-only tool; observation only.
 
@@ -454,7 +641,9 @@ def _probe_agent(
 
     started = time.monotonic()
     try:
-        model, client = _probe_model(settings, factory, principal, provider, model_name)
+        model, client = _probe_model(
+            settings, factory, principal, provider, model_name, provider_id=provider_id
+        )
     except _OperatorDestinationMissing:
         return _unverified("credential_missing")
     except CredentialUnavailable, CredentialInvalid:
@@ -724,12 +913,15 @@ def preview(
         for key in sorted(proposed)
         if current_value.get(key) != proposed.get(key)
     ]
+    current_view = dict(current_value)
+    if section == "agent":
+        current_view["provider_record"] = bool(current.get("provider_record"))
     return {
         "section": section,
         "status": "preview",
         "required": plan.required,
         "postponable": plan.postponable,
-        "current": current_value,
+        "current": current_view,
         "proposed": proposed,
         "changes": changes,
         "preview_only": True,
