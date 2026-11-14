@@ -1296,10 +1296,9 @@ def apply_section(
     if action == "accept_risk":
         if section != "operational" or str(values.get("item")) != "backup_policy_declared":
             raise ConfigurationInvalid("only the production backup can be accepted as a risk")
-        if (
-            store.public_state().get("mode") != "prod"
-            and _runtime_settings(environ).release_mode != "prod"
-        ):
+        # ``mode`` is this setup process's validated RELEASE_MODE; the runtime
+        # Settings object has no release_mode, so the guard never reads one there.
+        if store.public_state().get("mode") != "prod" and mode != "prod":
             raise ConfigurationInvalid("a backup risk only exists in production")
         if not confirm:
             raise ConfirmationRequired("accepting a risk needs the operator's confirmation")

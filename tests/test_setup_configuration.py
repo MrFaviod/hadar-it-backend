@@ -711,6 +711,24 @@ def test_prod_backup_must_be_declared_or_accepted_as_risk(
             assert body["acceptedRisk"] == ["backup_policy_declared"]
 
 
+def test_dev_backup_risk_is_refused_before_it_reaches_the_store(app, store, tmp_path: Path) -> None:
+    with TestClient(app) as client:
+        csrf, _ = reach_owner_ready(client, store, tmp_path)
+        started = start_configuration(client, csrf)
+        assert started.status_code == 200, started.text
+
+        refused = apply_section(
+            client,
+            csrf,
+            "operational",
+            {"item": "backup_policy_declared", "reason": "restore drill scheduled"},
+            action="accept_risk",
+        )
+        assert refused.status_code == 422, refused.text
+        assert refused.json()["error"] == "configuration_invalid"
+        assert public_state(store.state_dir)["state"] == "configuring"
+
+
 # ------------------------------------------------------------------ assistant
 def test_assistant_can_only_propose_configuration() -> None:
     from itsm.setup import assistant
