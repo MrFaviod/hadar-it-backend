@@ -1,7 +1,7 @@
 """installation_backup_policy: the declared production backup policy
 
-Revision ID: 0048_setup_backup_policy
-Revises: 0046_installation_setup
+Revision ID: 0049_setup_backup_policy
+Revises: 0048_appearance_organization
 Create Date: 2026-11-13
 
 The declaration is installation metadata, not a domain setting: it records what
@@ -14,8 +14,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0048_setup_backup_policy"
-down_revision = "0046_installation_setup"
+revision = "0049_setup_backup_policy"
+down_revision = "0048_appearance_organization"
 branch_labels = None
 depends_on = None
 

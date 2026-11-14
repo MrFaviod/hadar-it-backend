@@ -1,7 +1,7 @@
 """appearance_organization: one installable organization name for the shell
 
-Revision ID: 0047_appearance_organization
-Revises: 0046_installation_setup
+Revision ID: 0048_appearance_organization
+Revises: 0047_agent_provider_link
 Create Date: 2026-11-13
 """
 
@@ -10,8 +10,8 @@ from __future__ import annotations
 import sqlalchemy as sa
 from alembic import op
 
-revision = "0047_appearance_organization"
-down_revision = "0046_installation_setup"
+revision = "0048_appearance_organization"
+down_revision = "0047_agent_provider_link"
 branch_labels = None
 depends_on = None
 
