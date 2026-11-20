@@ -135,7 +135,7 @@
       "title": "Overview"
     },
     {
-      "bytes": 6527,
+      "bytes": 6585,
       "path": "docs/README.md",
       "sections": [
         {
@@ -201,11 +201,11 @@
         {
           "anchor": "deployment-operations-and-development",
           "level": 2,
-          "text": "## Deployment, operations and development\n\nRelease modes, preparation and backups, the demo, system operations and working on each component.\n\n- [Release-mode deployment: `dev`, `prod` and `demo`](release-modes-deployment.md)\n- [Release modes: `dev`, `prod`, `demo`](backend/release-modes.md)\n- [Mode preparation and backup scheduler](backend/deployment-preparation.md)\n- [Backup, restore, retention and guarded upgrade](backend/ops-backup-restore.md)\n- [System operations](backend/system-operations.md)\n- [Isolated demonstration installation](backend/demo.md)\n- [Public demo: restricted administrator and exposure limits](backend/demo-public.md)\n- [Shared demo reset](backend/demo-reset.md)\n- [Development mode: initialize, inspect and reset a dev database](backend/dev-mode.md)\n- [Backend foundation](backend/foundation.md)\n- [Backend development](backend/development.md)\n- [Frontend development](frontend/development.md)",
+          "text": "## Deployment, operations and development\n\nRelease modes, preparation and backups, the demo, system operations and working on each component.\n\n- [Release-mode deployment: `dev`, `prod` and `demo`](release-modes-deployment.md)\n- [Release modes: `dev`, `prod`, `demo`](backend/release-modes.md)\n- [Mode preparation and backup scheduler](backend/deployment-preparation.md)\n- [Backup, restore, retention and guarded upgrade](backend/ops-backup-restore.md)\n- [System operations](backend/system-operations.md)\n- [Isolated demonstration installation](backend/demo.md)\n- [Public demo: restricted administrator and exposure limits](backend/demo-public.md)\n- [Shared demo reset](backend/demo-reset.md)\n- [Development mode: initialize, inspect and reset a dev database](backend/dev-mode.md)\n- [Backend foundation](backend/foundation.md)\n- [Backend development](backend/development.md)\n- [Frontend development](frontend/development.md)\n- [Setup and onboarding contract](onboarding-contract.md)",
           "title": "Deployment, operations and development"
         }
       ],
-      "sha256": "771c3e10ecec9b5166ec9a1737c1f389c8935a968a6b27044b9d18dbebe0eef0",
+      "sha256": "bf45c47af3db1b956f7c3d25167970dfddcedbaae357c4e2e901e354cbc602a9",
       "title": "Documentation"
     },
     {
@@ -283,7 +283,7 @@
       "title": "Feature tour"
     },
     {
-      "bytes": 60439,
+      "bytes": 60512,
       "path": "docs/operations.es.md",
       "sections": [
         {
@@ -331,7 +331,7 @@
         {
           "anchor": "primer-arranque-y-el-servicio-de-configuracion",
           "level": 3,
-          "text": "### Primer arranque y el servicio de configuración\n\nUna instalación nueva de `dev` o `prod` arranca el servicio **setup** junto a la API:\nun proceso separado y sin privilegios que sirve el asistente de primer arranque.\nResponde aunque la API y la base de datos no existan, escucha solo en la red del\nproyecto y se alcanza a través del borde del frontend en `/api/setup/v1/`; nunca se\npublica en un puerto del host. No tiene socket de Docker, montaje del sistema de\narchivos del host ni contenedor privilegiado, así que nunca modifica el despliegue:\nregistra el reclamo, la elección de IA, la comprobación de almacenamiento y el primer\npropietario en su propio volumen privado.\n\nEl operador habilita el asistente con `enable-claim` dentro de ese contenedor,\ncompleta los pasos en el navegador y `complete` deja de aceptar mutaciones de\narranque. Un reclamo perdido se reemplaza con `rotate-claim`; `recover` reabre un\nasistente completado sin reiniciar la instalación. `ITSM_AI_CREDENTIAL_KEYS` debe\nestar presente para que el paso de IA selle una clave de proveedor; sin ella el paso\naún puede posponerse. Quitar o deshabilitar el servicio `setup` tras completar está\npendiente: hoy sigue ejecutándose, de solo lectura y sin autoridad de arranque.",
+          "text": "### Primer arranque y el servicio de configuración\n\nUna instalación nueva de `dev` o `prod` arranca el servicio **setup** junto a la API:\nun proceso separado y sin privilegios que sirve el asistente de primer arranque.\nResponde aunque la API y la base de datos no existan, escucha solo en la red del\nproyecto y se alcanza a través del borde del frontend en `/api/setup/v1/`; nunca se\npublica en un puerto del host. No tiene socket de Docker, montaje del sistema de\narchivos del host ni contenedor privilegiado, así que nunca modifica el despliegue:\nescribe su propio volumen privado, el archivo de ajustes de instalación que el resto\nde servicios lee en solo lectura y, durante la verificación, la cola de tareas del\nworker y el volumen de adjuntos.\n\nEl operador habilita el asistente con `enable-claim` dentro de ese contenedor,\ncompleta los pasos en el navegador y `complete` deja de aceptar mutaciones de\narranque. Un reclamo perdido se reemplaza con `rotate-claim`; `recover` reabre un\nasistente completado sin reiniciar la instalación. `ITSM_AI_CREDENTIAL_KEYS` debe\nestar presente para que el paso de IA selle una clave de proveedor; sin ella el paso\naún puede posponerse. Quitar o deshabilitar el servicio `setup` tras completar está\npendiente: hoy sigue ejecutándose, de solo lectura y sin autoridad de arranque.",
           "title": "Primer arranque y el servicio de configuración"
         },
         {
@@ -449,11 +449,11 @@
           "title": "Broker de validación fijo"
         }
       ],
-      "sha256": "3045c9c81727dac5e95d13899e9782cc7d3896575e1689334184efff0a0da2b1",
+      "sha256": "fe4d0689b25a4d386a0fa8f75e45fbe2b4caeb930bfdc8f4815b34e2fc9bc5a6",
       "title": "Operaciones de infraestructura e identidad"
     },
     {
-      "bytes": 54213,
+      "bytes": 54298,
       "path": "docs/operations.md",
       "sections": [
         {
@@ -501,7 +501,7 @@
         {
           "anchor": "first-start-and-the-setup-service",
           "level": 3,
-          "text": "### First start and the setup service\n\nA fresh `dev` or `prod` installation starts the **setup** service next to the API:\na separate, unprivileged process that serves the first-start wizard. It answers\nwhile the API and database are absent, listens only on the project network and is\nreached through the frontend edge at `/api/setup/v1/`; it is never published on a\nhost port. It holds no Docker socket, no host filesystem mount and no privileged\ncontainer, so it never changes the deployment: it records the claim, the AI\nchoice, the storage check and the first owner in its own private volume.\n\nThe operator enables the wizard with `enable-claim` inside that container,\ncompletes the browser steps, and `complete` stops accepting bootstrap mutations.\nA lost claim is replaced with `rotate-claim`; `recover` reopens a completed wizard\nwithout resetting the installation. `ITSM_AI_CREDENTIAL_KEYS` must be present for\nthe AI step to seal a provider key; without it the step can still be deferred.\nRemoving or disabling the `setup` service after completion is pending: today it\nkeeps running, read-only and without bootstrap authority.",
+          "text": "### First start and the setup service\n\nA fresh `dev` or `prod` installation starts the **setup** service next to the API:\na separate, unprivileged process that serves the first-start wizard. It answers\nwhile the API and database are absent, listens only on the project network and is\nreached through the frontend edge at `/api/setup/v1/`; it is never published on a\nhost port. It holds no Docker socket, no host filesystem mount and no privileged\ncontainer, so it never changes the deployment: it writes its own private volume,\nthe installation settings file that every other service reads read-only, and —\nwhile verifying — the worker's task queue and the attachments volume.\n\nThe operator enables the wizard with `enable-claim` inside that container,\ncompletes the browser steps, and `complete` stops accepting bootstrap mutations.\nA lost claim is replaced with `rotate-claim`; `recover` reopens a completed wizard\nwithout resetting the installation. `ITSM_AI_CREDENTIAL_KEYS` must be present for\nthe AI step to seal a provider key; without it the step can still be deferred.\nRemoving or disabling the `setup` service after completion is pending: today it\nkeeps running, read-only and without bootstrap authority.",
           "title": "First start and the setup service"
         },
         {
@@ -619,11 +619,11 @@
           "title": "Fixed validation broker"
         }
       ],
-      "sha256": "184f70ef05d46a14feeaabef243c0a4ff33b8f0a4f0f0c5f3fc144b2b574f2d9",
+      "sha256": "8919db3456cde63d5e0b536cad6a8f0ad807d52eaf5da5c6b6f08a4d282d314f",
       "title": "Infrastructure and identity operations"
     },
     {
-      "bytes": 15361,
+      "bytes": 15635,
       "path": "docs/release-modes-deployment.md",
       "sections": [
         {
@@ -665,7 +665,7 @@
         {
           "anchor": "the-setup-service",
           "level": 3,
-          "text": "### The setup service\n\n`setup` is a separate, unprivileged Compose service (`python -m itsm.setup`) that\nserves the first-start wizard. It depends only on initializing its private state\nvolume, never on the API or database, and it answers while both are absent. It has\nno Docker socket, no host path and no published port: the frontend edge proxies\n`/api/setup/v1/` to it. Its only writable state is the setup volume; it never\nedits this deployment.\n\nThe service starts disabled. The operator enables the wizard with\n`python -m itsm.setup.cli enable-claim` inside the container, completes claim, AI,\nstorage and owner in the browser, and `complete` stops accepting bootstrap\nmutations; `rotate-claim` replaces a lost claim and `recover` reopens a completed\nwizard. The AI step needs `ITSM_AI_CREDENTIAL_KEYS` to seal a provider key and\ncan be deferred without it. Production narrows the wizard origin with\n`ITSM_SETUP_ALLOWED_ORIGINS`, derived from `ITSM_AUTH_ORIGIN` in the overlay.\nRemoving or disabling `setup` after completion is pending: today it keeps\nrunning, read-only and without bootstrap authority.",
+          "text": "### The setup service\n\n`setup` is a separate, unprivileged Compose service (`python -m itsm.setup`) that\nserves the first-start wizard. It depends only on initializing its private state\nvolume, never on the API or database, and it answers while both are absent. It has\nno Docker socket, no host path and no published port: the frontend edge proxies\n`/api/setup/v1/` to it. It writes its private setup volume, is the only writer of\nthe installation settings file (read-only for the API, worker and initializer),\nand during verification it enqueues a real task on the worker queue and writes a\nprobe into the attachments volume. It has no Docker socket, no host path and no\npublished port, and it never edits this deployment.\n\nThe service starts disabled. The operator enables the wizard with\n`python -m itsm.setup.cli enable-claim` inside the container, completes claim, AI,\nstorage and owner in the browser, and `complete` stops accepting bootstrap\nmutations; `rotate-claim` replaces a lost claim and `recover` reopens a completed\nwizard. The AI step needs `ITSM_AI_CREDENTIAL_KEYS` to seal a provider key and\ncan be deferred without it. Production narrows the wizard origin with\n`ITSM_SETUP_ALLOWED_ORIGINS`, derived from `ITSM_AUTH_ORIGIN` in the overlay.\nRemoving or disabling `setup` after completion is pending: today it keeps\nrunning, read-only and without bootstrap authority.",
           "title": "The setup service"
         },
         {
@@ -699,11 +699,11 @@
           "title": "10. Operational limits"
         }
       ],
-      "sha256": "7223e9f0cc8ec306ced0f67828d1f1f23d3b0d7129fb109fb07aa413951e4c94",
+      "sha256": "b07e1aa5faef35a9f0e063beef39a6e346fe4b29c283944d4f3ef6fbdc9ddf80",
       "title": "Release-mode deployment: `dev`, `prod` and `demo`"
     },
     {
-      "bytes": 8250,
+      "bytes": 8160,
       "path": "docs/technical-guide.md",
       "sections": [
         {
@@ -727,7 +727,7 @@
         {
           "anchor": "stack",
           "level": 2,
-          "text": "## Stack\n\n| Layer | Implementation |\n|---|---|\n| Browser | React 19 + TypeScript + Vite 6 host; locally vendored Vue 3 renders domain views. No runtime OpenDesign dependency or iframe for the main application. |\n| API and services | Python 3.14+, FastAPI, Pydantic v2, SQLAlchemy 2 and Alembic |\n| Identity | Argon2id passwords, server-side sessions, Casbin policies, audit and personal API keys |\n| Background work | Huey; SQLite queue by default, separately configurable Redis or PostgreSQL queue |\n| Agents | Pydantic AI; operator-installed Hermes Agent and OpenCode connectors; Streamable HTTP FastMCP |\n| Optional services | Prometheus/exporters, Alertmanager and Meilisearch |\n| Deployment | Docker Compose; Nginx serves the frontend and proxies the API |\n\nPostgreSQL is the default application database; the local walkthrough deliberately uses SQLite. The application targets PostgreSQL, SQLite and MariaDB. SQL Server configuration is preparation-only, **not validated compatibility**. See the [database matrix](backend/foundation.md).",
+          "text": "## Stack\n\n| Layer | Implementation |\n|---|---|\n| Browser | React 19 + TypeScript + Vite 8 host; locally vendored Vue 3 renders domain views. No runtime OpenDesign dependency or iframe for the main application. |\n| API and services | Python 3.14+, FastAPI, Pydantic v2, SQLAlchemy 2 and Alembic |\n| Identity | Argon2id passwords, server-side sessions, Casbin policies, audit and personal API keys |\n| Background work | Huey; SQLite queue by default, separately configurable Redis or PostgreSQL queue |\n| Agents | Pydantic AI; operator-installed Hermes Agent and OpenCode connectors; Streamable HTTP FastMCP |\n| Optional services | Prometheus/exporters, Alertmanager and Meilisearch |\n| Deployment | Docker Compose; Nginx serves the frontend and proxies the API |\n\nPostgreSQL is the default application database; the local walkthrough deliberately uses SQLite. The application targets PostgreSQL, SQLite and MariaDB. SQL Server configuration is preparation-only, **not validated compatibility**. See the [database matrix](backend/foundation.md).",
           "title": "Stack"
         },
         {
@@ -763,15 +763,15 @@
         {
           "anchor": "identity-and-licensing",
           "level": 2,
-          "text": "## Identity and licensing\n\n**Hadar IT** is the current product name, with the tagline **Bring your own department.** The visible installation name is configurable in **Settings → Appearance**; changing that name does not require renaming packages, database objects or storage paths. Preserve installation-specific names.\n\nThe root project is distributed under [MIT](../LICENSE). Backend packaging still declares `LicenseRef-Proprietary`; that metadata discrepancy must be resolved before a release. Documentation does not change licensing metadata.",
+          "text": "## Identity and licensing\n\n**Hadar IT** is the current product name, with the tagline **Bring your own department.** The visible installation name is configurable in **Settings → Appearance**; changing that name does not require renaming packages, database objects or storage paths. Preserve installation-specific names.\n\nThe root project and the backend package are both distributed under [MIT](../LICENSE). Documentation does not change licensing metadata.",
           "title": "Identity and licensing"
         }
       ],
-      "sha256": "b639893b5772122bdbc3f9ba35d18bfe0b1c0d97e6bfa1db8326d5cdff56029c",
+      "sha256": "605e6ef45b877f5721bd0e026e6a0ff8b86e33aa7dfe9f17a1175a9e9a1b144c",
       "title": "Technical guide"
     },
     {
-      "bytes": 11155,
+      "bytes": 11079,
       "path": "docs/user-operations.en.md",
       "sections": [
         {
@@ -795,13 +795,13 @@
         {
           "anchor": "three-independent-repositories",
           "level": 3,
-          "text": "### Three independent repositories\n\nThe product is three different Git repositories, not a monorepo and not submodules. The root ignores `frontend/` and `backend/`: it does not see their commits, changes or backups.\n\n| Path | Content | Verification |\n|---|---|---|\n| `asset/` (root) | Coordination documentation, `compose.yaml`, product version | `git status --short --branch` |\n| `frontend/` | Interface, tests and help in Spanish | `git -C frontend status --short --branch` |\n| `backend/` | API, persistence, worker and identity CLI | `git -C backend status --short --branch` |\n\nReview each repository where you are going to work before editing and before confirming changes. Component versions evolve separately from `VERSION`.",
+          "text": "### Three independent repositories\n\nThe product is three different Git repositories, not a monorepo and not submodules. The root ignores `frontend/` and `backend/`: it does not see their commits, changes or backups.\n\n| Path | Content | Verification |\n|---|---|---|\n| root | Coordination documentation, `compose.yaml`, product version | `git status --short --branch` |\n| `frontend/` | Interface, tests and help in Spanish | `git -C frontend status --short --branch` |\n| `backend/` | API, persistence, worker and identity CLI | `git -C backend status --short --branch` |\n\nReview each repository where you are going to work before editing and before confirming changes. Component versions evolve separately from `VERSION`.",
           "title": "Three independent repositories"
         },
         {
           "anchor": "product-identity-hadar-it",
           "level": 3,
-          "text": "### Product identity: Hadar IT\n\n**Hadar IT** is the temporary official name, with the tagline \"Bring your own department.\" The name the interface shows is a separate setting, under **Configuración → Apariencia** (`#/configuracion/apariencia`), in the field **Nombre visible de la aplicación** (`appName` of the active appearance): the shell and the document title take it from there. \"Asset Manager\" is only the label the interface inherited, not the product name. Do not rename packages, identifiers, storage paths or the database to change the presentation. See [phase10-appearance.md](backend/appearance.md).",
+          "text": "### Product identity: Hadar IT\n\n**Hadar IT** is the product name, with the tagline \"Bring your own department.\" The name the interface shows is a separate setting, under **Settings → Appearance** (`#/configuracion/apariencia`), in the field **Visible application name** (`appName` of the active appearance): the shell and the document title take it from there. \"Asset Manager\" is only the label the interface inherited, not the product name. Do not rename packages, identifiers, storage paths or the database to change the presentation. See [appearance.md](backend/appearance.md).",
           "title": "Product identity: Hadar IT"
         },
         {
@@ -825,7 +825,7 @@
         {
           "anchor": "external-modules",
           "level": 2,
-          "text": "## External modules\n\nSDK v2 separates declarative modules from executable packages. Executable code uses a restricted runner and isolated frontend rendering. A human owner must approve the exact package digest, requested permissions, migration plan and validation result. Changed code needs new validation and approval. Disabling a module does not delete its data.\n\nSDK interface composition allows adding, hiding or replacing navigation, pages, widgets, panels and business actions through declared contributions. It is integrated in this development branch and requires a validated, approved and enabled extension; it does not imply a deployment or a publication. Login, permissions, extension recovery and system operations remain core surfaces. See [extensions-sdk.md](backend/extensions-sdk.md) and [frontend/docs/extensions-sdk.md](frontend/extensions-sdk.md).",
+          "text": "## External modules\n\nSDK v2 separates declarative modules from executable packages. Executable code uses a restricted runner and isolated frontend rendering. A human owner must approve the exact package digest, requested permissions, migration plan and validation result. Changed code needs new validation and approval. Disabling a module does not delete its data.\n\nSDK interface composition allows adding, hiding or replacing navigation, pages, widgets, panels and business actions through declared contributions. It is part of the product and requires a validated, approved and enabled extension; it does not imply a deployment or a publication. Login, permissions, extension recovery and system operations remain core surfaces. See [extensions-sdk.md](backend/extensions-sdk.md) and [extensions-sdk.md](frontend/extensions-sdk.md).",
           "title": "External modules"
         },
         {
@@ -841,11 +841,11 @@
           "title": "Limits of this stage"
         }
       ],
-      "sha256": "32be27946c55d0af0e440efd0d8666ca3f198216dc368740c65ec8efe41cf240",
+      "sha256": "a4e7a4a869c43e4f0c8c28c4c0e46ba1f73549f4bb12f471f211a0ebefa162bb",
       "title": "Advanced operation of the installation"
     },
     {
-      "bytes": 11529,
+      "bytes": 11474,
       "path": "docs/user-operations.md",
       "sections": [
         {
@@ -869,13 +869,13 @@
         {
           "anchor": "tres-repositorios-independientes",
           "level": 3,
-          "text": "### Tres repositorios independientes\n\nEl producto son tres repositorios Git distintos, no un monorepo ni submódulos. La raíz ignora `frontend/` y `backend/`: no ve sus commits, cambios ni respaldos.\n\n| Ruta | Contenido | Verificación |\n|---|---|---|\n| `asset/` (raíz) | Documentación de coordinación, `compose.yaml`, versión de producto | `git status --short --branch` |\n| `frontend/` | Interfaz, pruebas y ayuda en español | `git -C frontend status --short --branch` |\n| `backend/` | API, persistencia, worker y CLI de identidad | `git -C backend status --short --branch` |\n\nRevisa cada repositorio donde vas a trabajar antes de editar y antes de confirmar cambios. Las versiones de los componentes evolucionan por separado de `VERSION`.",
+          "text": "### Tres repositorios independientes\n\nEl producto son tres repositorios Git distintos, no un monorepo ni submódulos. La raíz ignora `frontend/` y `backend/`: no ve sus commits, cambios ni respaldos.\n\n| Ruta | Contenido | Verificación |\n|---|---|---|\n| raíz | Documentación de coordinación, `compose.yaml`, versión de producto | `git status --short --branch` |\n| `frontend/` | Interfaz, pruebas y ayuda en español | `git -C frontend status --short --branch` |\n| `backend/` | API, persistencia, worker y CLI de identidad | `git -C backend status --short --branch` |\n\nRevisa cada repositorio donde vas a trabajar antes de editar y antes de confirmar cambios. Las versiones de los componentes evolucionan por separado de `VERSION`.",
           "title": "Tres repositorios independientes"
         },
         {
           "anchor": "identidad-del-producto-hadar-it",
           "level": 3,
-          "text": "### Identidad del producto: Hadar IT\n\n**Hadar IT** es el nombre oficial temporal, con la bajada \"Bring your own department.\" El nombre que muestra la interfaz es otra cosa y se configura en **Configuración → Apariencia** (`#/configuracion/apariencia`), campo **Nombre visible de la aplicación** (`appName` de la apariencia activa): el shell y el título del documento lo toman de ahí. \"Asset Manager\" es solo la etiqueta que la interfaz heredó, no el nombre del producto. No renombres paquetes, identificadores, rutas de almacenamiento ni la base de datos para cambiar la presentación. Ver [phase10-appearance.md](backend/appearance.md).",
+          "text": "### Identidad del producto: Hadar IT\n\n**Hadar IT** es el nombre del producto, con la bajada \"Bring your own department.\" El nombre que muestra la interfaz es otra cosa y se configura en **Configuración → Apariencia** (`#/configuracion/apariencia`), campo **Nombre visible de la aplicación** (`appName` de la apariencia activa): el shell y el título del documento lo toman de ahí. \"Asset Manager\" es solo la etiqueta que la interfaz heredó, no el nombre del producto. No renombres paquetes, identificadores, rutas de almacenamiento ni la base de datos para cambiar la presentación. Ver [appearance.md](backend/appearance.md).",
           "title": "Identidad del producto: Hadar IT"
         },
         {
@@ -899,7 +899,7 @@
         {
           "anchor": "modulos-externos",
           "level": 2,
-          "text": "## Módulos externos\n\nEl SDK v2 distingue módulos declarativos de paquetes ejecutables. El código ejecutable usa un proceso restringido y renderizado aislado. Una persona responsable debe aprobar el digest exacto, los permisos, el plan de migración y la validación. Los cambios de código requieren nueva validación y aprobación. Deshabilitar un módulo no elimina sus datos.\n\nLa composición de interfaz por SDK permite agregar, ocultar o reemplazar navegación, páginas, widgets, paneles y acciones de negocio mediante contribuciones declaradas. Está integrada en esta rama de desarrollo y requiere una extensión validada, aprobada y habilitada; no implica un despliegue ni una publicación. Login, permisos, recuperación de extensiones y operaciones de sistema siguen siendo superficies del core. Ver [extensions-sdk.md](backend/extensions-sdk.md) y [frontend/docs/extensions-sdk.md](frontend/extensions-sdk.md).",
+          "text": "## Módulos externos\n\nEl SDK v2 distingue módulos declarativos de paquetes ejecutables. El código ejecutable usa un proceso restringido y renderizado aislado. Una persona responsable debe aprobar el digest exacto, los permisos, el plan de migración y la validación. Los cambios de código requieren nueva validación y aprobación. Deshabilitar un módulo no elimina sus datos.\n\nLa composición de interfaz por SDK permite agregar, ocultar o reemplazar navegación, páginas, widgets, paneles y acciones de negocio mediante contribuciones declaradas. Forma parte del producto y requiere una extensión validada, aprobada y habilitada; no implica un despliegue ni una publicación. Login, permisos, recuperación de extensiones y operaciones de sistema siguen siendo superficies del core. Ver [extensions-sdk.md](backend/extensions-sdk.md) y [extensions-sdk.md](frontend/extensions-sdk.md).",
           "title": "Módulos externos"
         },
         {
@@ -915,7 +915,7 @@
           "title": "Límites de esta etapa"
         }
       ],
-      "sha256": "8e110b05068822746134080def997b7a3b2c244c084dbd2069db7907518bab88",
+      "sha256": "133747008d9a7dbbead7c3759605ea6de290bbf7985992d58b2d60f581445934",
       "title": "Operación avanzada de la instalación"
     }
   ],
@@ -923,5 +923,5 @@
   "generated_by": "tools/build-project-context.py",
   "schema": "project-context-pack",
   "schema_version": 1,
-  "source_digest": "5095e1310d0a0a891177bad3aff743eb947d7da6873f1392948a5293228e8eb7"
+  "source_digest": "e9991badb2d0b7e077669a687b75c7df0da20c6f675be6bc334d18a5297ab8e0"
 }

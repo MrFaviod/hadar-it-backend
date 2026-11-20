@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "itsm-backend"
 version = "0.1.0"
-description = "ITSM backend foundation: FastAPI API, SQLAlchemy database layer and Huey task adapter."
+description = "Hadar IT backend: FastAPI API, SQLAlchemy persistence and Huey worker."
 requires-python = ">=3.14"
 license = "MIT"
 dependencies = [
